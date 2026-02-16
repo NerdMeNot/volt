@@ -1,0 +1,83 @@
+# Zig build artifacts
+zig-out/
+.zig-cache/
+libroot.a
+
+# Reference implementations (not part of this project)
+tokio/
+tigerbeetle/
+zio/
+
+# Test and benchmark binaries (Mach-O / ELF executables)
+test_bounded
+blitz_bench_test
+mpmc_test
+*.exe
+
+# Rust build artifacts (entire target directory)
+bench/rust_bench/target/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Coverage
+coverage/
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# Logs
+*.log
+
+# Local development
+.env
+.env.local
+.env.*
+
+# Temporary files
+*.tmp
+*.temp
+
+# Docs build artifacts
+docs/node_modules/
+docs/dist/
+docs/.astro/
+docs/bun.lock
+
+# Benchmark results (keep committed ones in bench/)
+bench-results/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+._*
+
+# Debug info
+*.dSYM/
+*.pdb
+*.ilk
+
+# Archives (shouldn't be committed)
+*.tar.gz
+*.zip
+*.7z
+
+# Claude Code / Playwright MCP (local tooling)
+.claude/
+.playwright-mcp/
+
+# Proto version manager
+.prototools
+.zig-version
+
+# Empty directories
+benchmarks/
+
+# Build temp files
+build.zig.tmp

@@ -1,0 +1,25 @@
+.{
+    .fingerprint = 0xb2bb3dcf10d2de94,
+    .name = .volt,
+    .version = "0.3.0",
+    .minimum_zig_version = "0.15.0",
+
+    .dependencies = .{
+        // Blitz compute pool - lazy dependency (only fetched with -Denable_blitz=true)
+        .blitz = .{
+            .url = "https://github.com/NerdMeNot/blitz/archive/refs/tags/v1.0.0-zig0.15.2.tar.gz",
+            .hash = "blitz-1.0.0-EtiuY4kMCAAdTfAbvWPvmLHHGElm8geziOIg7qc40jkq",
+            .lazy = true,
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "README.md",
+        "CLAUDE.md",
+        "LICENSE",
+    },
+}

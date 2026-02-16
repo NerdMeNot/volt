@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & Discussions
+    url: https://github.com/your-org/volt/discussions
+    about: Ask questions and discuss ideas
+  - name: Tokio Reference
+    url: https://github.com/tokio-rs/tokio
+    about: Reference implementation for design questions

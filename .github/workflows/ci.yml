@@ -1,0 +1,266 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  ZIG_VERSION: "0.15.2"
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Quick Check - Formatting (fails fast)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  format:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Check formatting
+        run: zig fmt --check src/ tests/ bench/
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Unit Tests - All Platforms
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  unit-tests:
+    name: Unit Tests (${{ matrix.name }})
+    needs: format
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-arm64
+          - os: macos-13
+            name: macos-x86_64
+          - os: windows-latest
+            name: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: System info
+        shell: bash
+        run: |
+          echo "Platform: ${{ matrix.name }}"
+          echo "Runner: ${{ matrix.os }}"
+          uname -a || ver
+
+      - name: Run unit tests
+        run: zig build test
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Concurrency Tests (Loom-style) - All Platforms
+  # Memory ordering bugs often manifest differently on ARM vs x86
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  concurrency-tests:
+    name: Concurrency (${{ matrix.name }})
+    needs: unit-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-arm64
+          - os: macos-13
+            name: macos-x86_64
+          - os: windows-latest
+            name: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Run concurrency tests
+        run: zig build test-concurrency
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Stress Tests - Linux and macOS (need more resources)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  stress-tests:
+    name: Stress (${{ matrix.name }})
+    needs: unit-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-arm64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Run stress tests
+        run: zig build test-stress
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Robustness Tests - Edge cases and boundary conditions
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  robustness-tests:
+    name: Robustness (${{ matrix.name }})
+    needs: unit-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-arm64
+          - os: windows-latest
+            name: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Run robustness tests
+        run: zig build test-robustness
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Release Build Verification
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  release-build:
+    name: Release (${{ matrix.name }})
+    needs: [concurrency-tests, stress-tests]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-arm64
+          - os: windows-latest
+            name: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build release
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Test in release mode
+        run: zig build test -Doptimize=ReleaseFast
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Benchmarks (build only - verify compilation)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  benchmarks:
+    name: Benchmarks (${{ matrix.name }})
+    needs: unit-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-arm64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build benchmarks
+        run: zig build bench
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # CI Success Gate
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  ci-success:
+    name: CI Success
+    needs:
+      - unit-tests
+      - concurrency-tests
+      - stress-tests
+      - robustness-tests
+      - release-build
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check all required jobs passed
+        run: |
+          echo "Unit tests: ${{ needs.unit-tests.result }}"
+          echo "Concurrency tests: ${{ needs.concurrency-tests.result }}"
+          echo "Stress tests: ${{ needs.stress-tests.result }}"
+          echo "Robustness tests: ${{ needs.robustness-tests.result }}"
+          echo "Release build: ${{ needs.release-build.result }}"
+
+          if [[ "${{ needs.unit-tests.result }}" != "success" ]]; then
+            echo "❌ Unit tests failed"
+            exit 1
+          fi
+          if [[ "${{ needs.concurrency-tests.result }}" != "success" ]]; then
+            echo "❌ Concurrency tests failed"
+            exit 1
+          fi
+          if [[ "${{ needs.stress-tests.result }}" != "success" ]]; then
+            echo "❌ Stress tests failed"
+            exit 1
+          fi
+          if [[ "${{ needs.robustness-tests.result }}" != "success" ]]; then
+            echo "❌ Robustness tests failed"
+            exit 1
+          fi
+          if [[ "${{ needs.release-build.result }}" != "success" ]]; then
+            echo "❌ Release build failed"
+            exit 1
+          fi
+
+          echo "✅ All CI checks passed!"

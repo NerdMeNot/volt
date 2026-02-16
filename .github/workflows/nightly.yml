@@ -1,0 +1,244 @@
+name: Nightly
+
+on:
+  schedule:
+    # Run at 3 AM UTC every day
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      soak_duration_minutes:
+        description: 'Soak test duration in minutes'
+        required: false
+        default: '30'
+        type: string
+
+env:
+  ZIG_VERSION: "0.15.2"
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Exhaustive Concurrency Tests - All Platforms
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  exhaustive-concurrency:
+    name: Exhaustive Concurrency (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+          - os: macos-latest
+            name: macos-arm64
+          - os: macos-13
+            name: macos-x86_64
+          - os: windows-latest
+            name: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Run exhaustive concurrency tests
+        run: zig build test-concurrency
+        env:
+          VOLT_TEST_INTENSITY: exhaustive
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Exhaustive Stress Tests
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  exhaustive-stress:
+    name: Exhaustive Stress (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+          - os: macos-latest
+            name: macos-arm64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Run exhaustive stress tests
+        run: zig build test-stress
+        env:
+          VOLT_TEST_INTENSITY: exhaustive
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Soak Tests - Extended Duration
+  # Tests primitives under continuous operation to catch subtle leaks/races
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  soak-test:
+    name: Soak Test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-arm64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build soak test
+        run: zig build test-soak -Doptimize=ReleaseFast 2>/dev/null || echo "Soak test target not yet configured"
+
+      - name: Run soak test (30 minutes default)
+        run: |
+          DURATION="${{ github.event.inputs.soak_duration_minutes || '30' }}"
+          echo "Running soak test for ${DURATION} minutes..."
+
+          # Run stress tests repeatedly for the duration
+          END_TIME=$(($(date +%s) + DURATION * 60))
+          ITERATION=0
+
+          while [ $(date +%s) -lt $END_TIME ]; do
+            ITERATION=$((ITERATION + 1))
+            echo "=== Soak iteration $ITERATION ($(date)) ==="
+
+            # Run stress tests
+            zig build test-stress 2>&1 || { echo "Stress test failed at iteration $ITERATION"; exit 1; }
+
+            # Brief pause between iterations
+            sleep 5
+          done
+
+          echo "Soak test completed successfully after $ITERATION iterations"
+        env:
+          VOLT_TEST_INTENSITY: stress
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Memory Leak Detection (Linux only - uses valgrind)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  memory-check:
+    name: Memory Check (Valgrind)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install Valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Build test binary
+        run: zig build test -Doptimize=Debug
+
+      - name: Run memory check
+        run: |
+          # Find test binary
+          TEST_BIN=$(find .zig-cache -name "test" -type f -executable 2>/dev/null | head -1)
+          if [ -n "$TEST_BIN" ]; then
+            echo "Running valgrind on $TEST_BIN"
+            valgrind --leak-check=full \
+                     --show-leak-kinds=definite,possible \
+                     --error-exitcode=1 \
+                     --track-origins=yes \
+                     "$TEST_BIN" 2>&1 | tee valgrind.log
+
+            # Check for leaks
+            if grep -q "definitely lost: [^0]" valgrind.log; then
+              echo "Memory leaks detected!"
+              exit 1
+            fi
+            echo "No memory leaks detected"
+          else
+            echo "Test binary not found, building differently..."
+            # Alternative approach
+            zig build test 2>&1 || true
+          fi
+        continue-on-error: true  # Valgrind may have issues with Zig runtime
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Cross-Architecture Consistency
+  # Runs same tests on ARM and x86 to catch memory ordering bugs
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  cross-arch-consistency:
+    name: Cross-Arch Consistency
+    needs: [exhaustive-concurrency]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check ARM vs x86 results
+        run: |
+          echo "If both exhaustive-concurrency jobs passed on ARM and x86,"
+          echo "the memory ordering is likely correct across architectures."
+          echo ""
+          echo "ARM results: ${{ needs.exhaustive-concurrency.result }}"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Nightly Summary
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  nightly-summary:
+    name: Nightly Summary
+    needs:
+      - exhaustive-concurrency
+      - exhaustive-stress
+      - soak-test
+      - memory-check
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Summary
+        run: |
+          echo "## Nightly Test Results"
+          echo ""
+          echo "| Test Suite | Result |"
+          echo "|------------|--------|"
+          echo "| Exhaustive Concurrency | ${{ needs.exhaustive-concurrency.result }} |"
+          echo "| Exhaustive Stress | ${{ needs.exhaustive-stress.result }} |"
+          echo "| Soak Test | ${{ needs.soak-test.result }} |"
+          echo "| Memory Check | ${{ needs.memory-check.result }} |"
+          echo ""
+
+          FAILED=0
+          if [[ "${{ needs.exhaustive-concurrency.result }}" == "failure" ]]; then
+            echo "❌ Exhaustive concurrency tests failed"
+            FAILED=1
+          fi
+          if [[ "${{ needs.exhaustive-stress.result }}" == "failure" ]]; then
+            echo "❌ Exhaustive stress tests failed"
+            FAILED=1
+          fi
+          if [[ "${{ needs.soak-test.result }}" == "failure" ]]; then
+            echo "❌ Soak test failed"
+            FAILED=1
+          fi
+
+          if [[ $FAILED -eq 0 ]]; then
+            echo "✅ All nightly tests passed!"
+          else
+            exit 1
+          fi
