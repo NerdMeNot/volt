@@ -167,10 +167,7 @@ pub const PollBackend = struct {
             .active_count = 0,
             .timers = std.ArrayList(Timer).empty,
             .next_timer_id = 1,
-            .start_instant = std.time.Instant.now() catch std.time.Instant{
-                // Fallback if monotonic clock unavailable (shouldn't happen on modern systems)
-                .timestamp = .{ .sec = 0, .nsec = 0 },
-            },
+            .start_instant = std.time.Instant.now() catch std.mem.zeroes(std.time.Instant),
             .wakeup_pipe = wakeup_pipe,
             .wakeup_pending = std.atomic.Value(bool).init(false),
         };

@@ -663,7 +663,7 @@ test "OwnedHalves - reunite via write half" {
     var stream = try write_half.reunite(read_half);
     defer stream.close();
 
-    try testing.expect(stream.fileno() >= 0);
+    try testing.expect(c.isValidSocket(stream.fileno()));
 }
 
 test "OwnedHalves - vectored write" {

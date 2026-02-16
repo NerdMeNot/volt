@@ -1007,7 +1007,11 @@ test "UdpSocket - send and receive" {
 
     // Send from client to server
     const msg = "hello udp";
-    _ = try client.trySendTo(msg, server_addr);
+    _ = client.trySendTo(msg, server_addr) catch |err| {
+        // CI VMs may not have full IPv4 networking (e.g., GitHub Actions macOS)
+        if (err == error.NetworkUnreachable) return error.SkipZigTest;
+        return err;
+    };
 
     // Receive on server
     var buf: [64]u8 = undefined;
@@ -1158,7 +1162,11 @@ test "UdpSocket - peek" {
 
     // Send message
     const msg = "peek test";
-    _ = try client.trySendTo(msg, server.localAddr());
+    _ = client.trySendTo(msg, server.localAddr()) catch |err| {
+        // CI VMs may not have full IPv4 networking
+        if (err == error.NetworkUnreachable) return error.SkipZigTest;
+        return err;
+    };
 
     std.Thread.sleep(1_000_000); // 1ms
 

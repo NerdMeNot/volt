@@ -53,10 +53,13 @@ const std = @import("std");
 // Sub-modules (for advanced access to internal types)
 // ═══════════════════════════════════════════════════════════════════════════
 
+const builtin = @import("builtin");
+
 pub const address = @import("net/address.zig");
 pub const tcp = @import("net/tcp.zig");
 pub const udp = @import("net/udp.zig");
-pub const unix = @import("net/unix.zig");
+/// Unix domain sockets (not available on Windows).
+pub const unix = if (builtin.os.tag != .windows) @import("net/unix.zig") else struct {};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Primary API — Socket Types
@@ -77,14 +80,14 @@ pub const TcpStream = tcp.TcpStream;
 /// UDP socket for connectionless datagram communication.
 pub const UdpSocket = udp.UdpSocket;
 
-/// Unix domain stream socket (connection-oriented).
-pub const UnixStream = unix.UnixStream;
+/// Unix domain stream socket (connection-oriented, not available on Windows).
+pub const UnixStream = if (builtin.os.tag != .windows) unix.UnixStream else void;
 
-/// Unix domain socket listener (for stream connections).
-pub const UnixListener = unix.UnixListener;
+/// Unix domain socket listener (for stream connections, not available on Windows).
+pub const UnixListener = if (builtin.os.tag != .windows) unix.UnixListener else void;
 
-/// Unix domain datagram socket (connectionless).
-pub const UnixDatagram = unix.UnixDatagram;
+/// Unix domain datagram socket (connectionless, not available on Windows).
+pub const UnixDatagram = if (builtin.os.tag != .windows) unix.UnixDatagram else void;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Convenience Functions
@@ -165,5 +168,7 @@ test {
     _ = address;
     _ = tcp;
     _ = udp;
-    _ = unix;
+    if (builtin.os.tag != .windows) {
+        _ = @import("net/unix.zig");
+    }
 }

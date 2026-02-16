@@ -357,10 +357,8 @@ pub const TimerWheel = struct {
         wheel.count = 0;
         wheel.overflow = Slot.init();
         wheel.start_instant = std.time.Instant.now() catch blk: {
-            // Fallback if Instant.now() fails
-            break :blk std.time.Instant{
-                .timestamp = .{ .sec = 0, .nsec = 0 },
-            };
+            // Fallback if Instant.now() fails — use zero-initialized Instant
+            break :blk std.mem.zeroes(std.time.Instant);
         };
         wheel.now_ns = 0;
 

@@ -22,7 +22,8 @@ pub const io_uring = if (builtin.os.tag == .linux) @import("backend/io_uring.zig
 pub const kqueue = if (builtin.os.tag == .macos or builtin.os.tag == .freebsd or builtin.os.tag == .openbsd or builtin.os.tag == .netbsd) @import("backend/kqueue.zig") else struct {};
 pub const epoll = if (builtin.os.tag == .linux) @import("backend/epoll.zig") else struct {};
 pub const iocp = @import("backend/iocp.zig");
-pub const poll = @import("backend/poll.zig");
+/// POSIX poll(2) backend — universal fallback for non-Windows POSIX systems.
+pub const poll = if (builtin.os.tag != .windows) @import("backend/poll.zig") else struct {};
 
 /// Backend selection strategy.
 pub const BackendType = enum {
@@ -104,7 +105,7 @@ pub const Backend = union(BackendType) {
     epoll: if (builtin.os.tag == .linux) epoll.EpollBackend else void,
     kqueue: if (builtin.os.tag == .macos or builtin.os.tag == .freebsd) kqueue.KqueueBackend else void,
     iocp: if (builtin.os.tag == .windows) iocp.IocpBackend else void,
-    poll: poll.PollBackend, // Universal POSIX fallback
+    poll: if (builtin.os.tag != .windows) poll.PollBackend else void, // POSIX fallback (not on Windows)
 
     /// Initialize the backend with given configuration.
     /// Configuration values are validated and clamped to safe ranges.
@@ -133,6 +134,7 @@ pub const Backend = union(BackendType) {
                 return Backend{ .iocp = try iocp.IocpBackend.init(allocator, safe_config) };
             },
             .poll => {
+                if (builtin.os.tag == .windows) return error.UnsupportedPlatform;
                 return Backend{ .poll = try poll.PollBackend.init(allocator, safe_config) };
             },
         };
@@ -238,7 +240,11 @@ pub fn detectBestBackend() BackendType {
         },
         .macos, .freebsd, .openbsd, .netbsd => return .kqueue,
         .windows => return .iocp,
-        else => return .poll,
+        else => {
+            // POSIX poll fallback (not available on Windows)
+            if (builtin.os.tag == .windows) return .iocp;
+            return .poll;
+        },
     }
 }
 

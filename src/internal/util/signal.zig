@@ -23,8 +23,51 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 
-// Windows-specific imports
-const windows = if (builtin.os.tag == .windows) std.os.windows else undefined;
+// Windows-specific imports.
+// On Windows, `windows` is the real `std.os.windows` which provides:
+//   - CloseHandle, WaitForSingleObject, SetConsoleCtrlHandler (high-level wrappers)
+//   - kernel32.CreateEventExW, kernel32.WaitForSingleObject (extern decls)
+//   - HANDLE, DWORD, BOOL, INFINITE, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS
+// SetEvent/ResetEvent are not in Zig 0.15's stdlib, so we declare them in win32_event.
+//
+// On non-Windows, both `windows` and `win32_event` are stub structs so the code compiles
+// (guarded by comptime checks) but is never called.
+const windows = if (builtin.os.tag == .windows) std.os.windows else struct {
+    pub const HANDLE = *anyopaque;
+    pub const INVALID_HANDLE_VALUE = @as(HANDLE, @ptrFromInt(std.math.maxInt(usize)));
+    pub const DWORD = u32;
+    pub const BOOL = c_int;
+    pub const INFINITE: DWORD = 0xFFFFFFFF;
+    pub const TRUE: BOOL = 1;
+    pub const FALSE: BOOL = 0;
+    pub const HANDLER_ROUTINE = *const fn (dwCtrlType: DWORD) callconv(.winapi) BOOL;
+    pub const CREATE_EVENT_MANUAL_RESET: DWORD = 0x00000001;
+    pub const EVENT_ALL_ACCESS: DWORD = 0x1F0003;
+    pub fn CloseHandle(_: HANDLE) void {}
+    pub fn SetConsoleCtrlHandler(_: ?HANDLER_ROUTINE, _: bool) !void {}
+    pub const kernel32 = struct {
+        pub fn CreateEventExW(_: ?*anyopaque, _: ?*const anyopaque, _: DWORD, _: DWORD) callconv(.winapi) ?HANDLE {
+            return null;
+        }
+        pub fn WaitForSingleObject(_: HANDLE, _: DWORD) callconv(.winapi) DWORD {
+            return 0;
+        }
+    };
+};
+
+// SetEvent and ResetEvent are not exported by Zig 0.15's std.os.windows.kernel32,
+// so we declare them as extern "kernel32" ourselves. On non-Windows these are stubs.
+const win32_event = if (builtin.os.tag == .windows) struct {
+    pub extern "kernel32" fn SetEvent(hEvent: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.BOOL;
+    pub extern "kernel32" fn ResetEvent(hEvent: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.BOOL;
+} else struct {
+    pub fn SetEvent(_: windows.HANDLE) windows.BOOL {
+        return 0;
+    }
+    pub fn ResetEvent(_: windows.HANDLE) windows.BOOL {
+        return 0;
+    }
+};
 
 /// Signal numbers we care about.
 /// On Windows, these map to console control events:
@@ -183,12 +226,12 @@ pub const SignalHandler = struct {
     // ─────────────────────────────────────────────────────────────────────
 
     fn initSignalfd(signals: SignalSet) !Self {
-        if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
+        if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
 
         const sigset = signals.toSigset();
 
         // Block signals so they go to signalfd instead of default handler
-        _ = posix.sigprocmask(.{ .BLOCK = true }, &sigset, null);
+        _ = posix.sigprocmask(std.os.linux.SIG.BLOCK, &sigset, null);
 
         // Create signalfd
         const fd = std.os.linux.signalfd(-1, &sigset, std.os.linux.SFD.NONBLOCK | std.os.linux.SFD.CLOEXEC);
@@ -205,7 +248,7 @@ pub const SignalHandler = struct {
     }
 
     fn readSignalfd(self: *Self) !SignalSet {
-        if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
+        if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
 
         var result = SignalSet.empty();
         var info: std.os.linux.signalfd_siginfo = undefined;
@@ -231,68 +274,78 @@ pub const SignalHandler = struct {
     // ─────────────────────────────────────────────────────────────────────
 
     fn initKqueue(signals: SignalSet) !Self {
-        const kq = posix.kqueue() catch return error.KqueueFailed;
-        errdefer posix.close(kq);
+        const is_bsd = comptime (builtin.os.tag == .macos or builtin.os.tag == .freebsd or
+            builtin.os.tag == .openbsd or builtin.os.tag == .netbsd);
+        if (!is_bsd) return error.UnsupportedPlatform;
+        {
+            const kq = posix.kqueue() catch return error.KqueueFailed;
+            errdefer posix.close(kq);
 
-        // Register for each signal
-        var changelist: [8]posix.Kevent = undefined;
-        var change_count: usize = 0;
+            // Register for each signal
+            var changelist: [8]posix.Kevent = undefined;
+            var change_count: usize = 0;
 
-        inline for (std.meta.fields(Signal)) |field| {
-            const sig: Signal = @enumFromInt(field.value);
-            if (signals.contains(sig)) {
-                if (change_count >= changelist.len) break;
+            inline for (std.meta.fields(Signal)) |field| {
+                const sig: Signal = @enumFromInt(field.value);
+                if (signals.contains(sig)) {
+                    if (change_count >= changelist.len) break;
 
-                changelist[change_count] = .{
-                    .ident = sig.toInt(),
-                    .filter = posix.system.EVFILT.SIGNAL,
-                    .flags = posix.system.EV.ADD,
-                    .fflags = 0,
-                    .data = 0,
-                    .udata = 0,
-                };
-                change_count += 1;
+                    changelist[change_count] = .{
+                        .ident = sig.toInt(),
+                        .filter = posix.system.EVFILT.SIGNAL,
+                        .flags = posix.system.EV.ADD,
+                        .fflags = 0,
+                        .data = 0,
+                        .udata = 0,
+                    };
+                    change_count += 1;
 
-                // Ignore default handler
-                const act = posix.Sigaction{
-                    .handler = .{ .handler = posix.SIG.IGN },
-                    .mask = posix.sigemptyset(),
-                    .flags = 0,
-                };
-                posix.sigaction(sig.toInt(), &act, null);
+                    // Ignore default handler
+                    const act = posix.Sigaction{
+                        .handler = .{ .handler = posix.SIG.IGN },
+                        .mask = posix.sigemptyset(),
+                        .flags = 0,
+                    };
+                    posix.sigaction(sig.toInt(), &act, null);
+                }
             }
-        }
 
-        if (change_count > 0) {
-            _ = posix.kevent(kq, changelist[0..change_count], &.{}, null) catch |err| {
-                return err;
+            if (change_count > 0) {
+                _ = posix.kevent(kq, changelist[0..change_count], &.{}, null) catch |err| {
+                    return err;
+                };
+            }
+
+            return Self{
+                .fd = kq,
+                .kind = .kqueue,
+                .signals = signals,
             };
         }
-
-        return Self{
-            .fd = kq,
-            .kind = .kqueue,
-            .signals = signals,
-        };
     }
 
     fn readKqueue(self: *Self) !SignalSet {
-        var result = SignalSet.empty();
-        var events: [8]posix.Kevent = undefined;
+        const is_bsd = comptime (builtin.os.tag == .macos or builtin.os.tag == .freebsd or
+            builtin.os.tag == .openbsd or builtin.os.tag == .netbsd);
+        if (!is_bsd) return error.UnsupportedPlatform;
+        {
+            var result = SignalSet.empty();
+            var events: [8]posix.Kevent = undefined;
 
-        const count = posix.kevent(self.fd, &.{}, &events, &posix.timespec{ .sec = 0, .nsec = 0 }) catch |err| {
-            return err;
-        };
+            const count = posix.kevent(self.fd, &.{}, &events, &posix.timespec{ .sec = 0, .nsec = 0 }) catch |err| {
+                return err;
+            };
 
-        for (events[0..count]) |ev| {
-            if (ev.filter == posix.system.EVFILT.SIGNAL) {
-                if (Signal.fromInt(@intCast(ev.ident))) |sig| {
-                    result.add(sig);
+            for (events[0..count]) |ev| {
+                if (ev.filter == posix.system.EVFILT.SIGNAL) {
+                    if (Signal.fromInt(@intCast(ev.ident))) |sig| {
+                        result.add(sig);
+                    }
                 }
             }
-        }
 
-        return result;
+            return result;
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -376,8 +429,10 @@ pub const SignalHandler = struct {
         };
     }
 
-    /// Clean up self-pipe resources.
+    /// Clean up self-pipe resources (Unix only).
     fn deinitSelfPipe(self: *Self) void {
+        if (comptime builtin.os.tag == .windows) return;
+
         // Close read end
         posix.close(self.fd);
 
@@ -447,26 +502,27 @@ pub const SignalHandler = struct {
     var windows_handler_ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
     fn initWindowsConsole(signals: SignalSet) !Self {
-        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        if (comptime builtin.os.tag != .windows) return error.UnsupportedPlatform;
 
-        // Create an event for signaling
-        const event = windows.kernel32.CreateEventW(
+        // Create a manual-reset event for signaling (initially non-signaled).
+        // Zig 0.15 stdlib has CreateEventExW (not CreateEventW).
+        const event = windows.kernel32.CreateEventExW(
             null, // default security
-            1, // manual reset
-            0, // initial state: non-signaled
             null, // unnamed
+            windows.CREATE_EVENT_MANUAL_RESET, // manual reset, initial state non-signaled
+            windows.EVENT_ALL_ACCESS, // full access
         ) orelse return error.WindowsEventFailed;
-        errdefer _ = windows.kernel32.CloseHandle(event);
+        errdefer windows.CloseHandle(event);
 
         // Try to install the console handler (once globally)
         const old_count = windows_handler_ref_count.fetchAdd(1, .acq_rel);
         if (old_count == 0) {
             // First handler - install the console ctrl handler
             windows_event_handle.store(@intFromPtr(event), .release);
-            if (windows.kernel32.SetConsoleCtrlHandler(windowsCtrlHandler, 1) == 0) {
+            windows.SetConsoleCtrlHandler(windowsCtrlHandler, true) catch {
                 _ = windows_handler_ref_count.fetchSub(1, .acq_rel);
                 return error.WindowsHandlerFailed;
-            }
+            };
         } else {
             // Handler already installed, just update event handle
             windows_event_handle.store(@intFromPtr(event), .release);
@@ -481,22 +537,22 @@ pub const SignalHandler = struct {
     }
 
     fn deinitWindowsConsole(self: *Self) void {
-        if (builtin.os.tag != .windows) return;
+        if (comptime builtin.os.tag != .windows) return;
 
         const remaining = windows_handler_ref_count.fetchSub(1, .acq_rel);
         if (remaining == 1) {
             // Last handler - remove console ctrl handler
-            _ = windows.kernel32.SetConsoleCtrlHandler(windowsCtrlHandler, 0);
+            windows.SetConsoleCtrlHandler(windowsCtrlHandler, false) catch {};
             _ = windows_event_handle.swap(0, .acq_rel);
             _ = windows_pending_signals.swap(0, .release);
         }
 
         // Close the event handle
-        _ = windows.kernel32.CloseHandle(self.fd);
+        windows.CloseHandle(self.fd);
     }
 
-    fn windowsCtrlHandler(ctrl_type: windows.DWORD) callconv(windows.WINAPI) windows.BOOL {
-        if (builtin.os.tag != .windows) return 0;
+    fn windowsCtrlHandler(ctrl_type: windows.DWORD) callconv(.winapi) windows.BOOL {
+        if (comptime builtin.os.tag != .windows) return 0;
 
         // Map Windows control type to our Signal enum
         const sig = SignalSet.fromWindowsCtrlType(ctrl_type) orelse return 0;
@@ -509,33 +565,34 @@ pub const SignalHandler = struct {
         const event_ptr = windows_event_handle.load(.acquire);
         if (event_ptr != 0) {
             const event: windows.HANDLE = @ptrFromInt(event_ptr);
-            _ = windows.kernel32.SetEvent(event);
+            _ = win32_event.SetEvent(event);
         }
 
         // Return TRUE to indicate we handled it (prevents default behavior)
-        return 1;
+        return windows.TRUE;
     }
 
     fn readWindowsConsole(self: *Self) !SignalSet {
-        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        if (comptime builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        {
+            // Reset the event
+            _ = win32_event.ResetEvent(self.fd);
 
-        // Reset the event
-        _ = windows.kernel32.ResetEvent(self.fd);
+            // Get and clear pending signals
+            const mask = windows_pending_signals.swap(0, .acq_rel);
 
-        // Get and clear pending signals
-        const mask = windows_pending_signals.swap(0, .acq_rel);
-
-        var result = SignalSet.empty();
-        inline for (std.meta.fields(Signal)) |field| {
-            const sig: Signal = @enumFromInt(field.value);
-            if ((mask & (@as(u64, 1) << sig.toInt())) != 0) {
-                if (self.signals.contains(sig)) {
-                    result.add(sig);
+            var result = SignalSet.empty();
+            inline for (std.meta.fields(Signal)) |field| {
+                const sig: Signal = @enumFromInt(field.value);
+                if ((mask & (@as(u64, 1) << sig.toInt())) != 0) {
+                    if (self.signals.contains(sig)) {
+                        result.add(sig);
+                    }
                 }
             }
-        }
 
-        return result;
+            return result;
+        }
     }
 };
 

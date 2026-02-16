@@ -182,7 +182,7 @@ pub const IoUringBackend = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: anytype) !Self {
         const entries = if (config.ring_entries == 0)
-            config.defaultRingEntries()
+            @import("../backend.zig").Config.defaultRingEntries()
         else
             config.ring_entries;
 
@@ -229,11 +229,9 @@ pub const IoUringBackend = struct {
 
         // Register eventfd with io_uring for efficient wakeup
         // This allows the kernel to signal when the eventfd is written to
-        const reg_result = ring.register_eventfd(wakeup_fd);
-        if (reg_result != 0) {
-            // Non-fatal: wakeup will still work via polling
-            // Some older kernels may not support this
-        }
+        // Non-fatal if it fails: wakeup will still work via polling
+        // Some older kernels may not support this
+        ring.register_eventfd(wakeup_fd) catch {};
 
         return Self{
             .ring = ring,
@@ -364,7 +362,7 @@ pub const IoUringBackend = struct {
                 sqe.prep_write(w.fd, w.buffer, w.offset orelse 0);
             },
             .open => |o| {
-                sqe.prep_openat(linux.AT.FDCWD, o.path, o.flags, o.mode);
+                sqe.prep_openat(linux.AT.FDCWD, o.path, @bitCast(o.flags), o.mode);
             },
             .close => |c| {
                 sqe.prep_close(c.fd);
@@ -412,7 +410,11 @@ pub const IoUringBackend = struct {
             .timeout => |t| {
                 // Clamp timeout to safe maximum to prevent overflow
                 const safe_ns = completion.clampTimeout(t.ns);
-                const ts = completion.timespecFromNanos(safe_ns);
+                // io_uring requires kernel_timespec, not posix timespec
+                const ts = linux.kernel_timespec{
+                    .sec = @intCast(safe_ns / std.time.ns_per_s),
+                    .nsec = @intCast(safe_ns % std.time.ns_per_s),
+                };
                 sqe.prep_timeout(&ts, 0, 0);
             },
             .cancel => |c| {
@@ -435,7 +437,7 @@ pub const IoUringBackend = struct {
             const submitted = self.ring.submit() catch |err| {
                 return switch (err) {
                     error.SignalInterrupt => continue, // Retry on EINTR
-                    error.CompletionQueueOvercommitted, error.SubmissionQueueEntryOverflow => {
+                    error.CompletionQueueOvercommitted => {
                         // CQ overcommitted - drain completions and retry
                         var temp: [64]Completion = undefined;
                         _ = try self.drainCompletions(&temp);
@@ -698,7 +700,7 @@ test "IoUringBackend - batching" {
     var completions: [8]Completion = undefined;
     var total: usize = 0;
     while (total < 3) {
-        const count = try backend.wait(&completions[total..], 1_000_000_000);
+        const count = try backend.wait(completions[total..], 1_000_000_000);
         total += count;
     }
     try std.testing.expectEqual(@as(usize, 3), total);

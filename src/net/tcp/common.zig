@@ -23,6 +23,26 @@ pub const runtime_mod = @import("../../runtime.zig");
 pub const IoDriver = @import("../../internal/io_driver.zig").IoDriver;
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Cross-Platform Socket Helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Invalid socket sentinel value (cross-platform).
+/// On Windows, socket_t is an opaque pointer, so we can't use -1.
+pub const INVALID_SOCKET: posix.socket_t = if (builtin.os.tag == .windows)
+    @ptrFromInt(~@as(usize, 0)) // INVALID_SOCKET = ~0 on Windows
+else
+    -1;
+
+/// Check if a socket is valid (cross-platform).
+pub fn isValidSocket(fd: posix.socket_t) bool {
+    if (comptime builtin.os.tag == .windows) {
+        return fd != INVALID_SOCKET;
+    } else {
+        return fd >= 0;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Socket Helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -48,37 +68,53 @@ pub fn getIntOption(fd: posix.socket_t, level: i32, opt: u32) !u32 {
 }
 
 pub fn setNonBlocking(fd: posix.socket_t, value: bool) !void {
-    const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
-    const new_flags = if (value)
-        flags | @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))
-    else
-        flags & ~@as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
+    if (comptime builtin.os.tag == .windows) {
+        // Windows uses ioctlsocket with FIONBIO
+        var mode: u32 = if (value) 1 else 0;
+        const rc = std.os.windows.ws2_32.ioctlsocket(fd, @bitCast(@as(i32, std.os.windows.ws2_32.FIONBIO)), &mode);
+        if (rc != 0) return error.Unexpected;
+    } else {
+        const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
+        const new_flags = if (value)
+            flags | @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))
+        else
+            flags & ~@as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
 
-    _ = try posix.fcntl(fd, posix.F.SETFL, new_flags);
+        _ = try posix.fcntl(fd, posix.F.SETFL, new_flags);
+    }
 }
 
 pub fn waitForConnect(sock_fd: posix.socket_t) !void {
-    // Poll for writability (connect complete)
-    var pfd = [_]posix.pollfd{
-        .{
-            .fd = sock_fd,
-            .events = posix.POLL.OUT,
-            .revents = 0,
-        },
-    };
+    if (comptime builtin.os.tag == .windows) {
+        // Windows: use select() for connect completion
+        // For now, connect is synchronous on Windows (IOCP handles async)
+        var err_buf: [4]u8 = undefined;
+        posix.getsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.ERROR, &err_buf) catch return;
+        const err = mem.readInt(u32, &err_buf, .little);
+        if (err != 0) return error.ConnectionRefused;
+    } else {
+        // POSIX: poll for writability (connect complete)
+        var pfd = [_]posix.pollfd{
+            .{
+                .fd = sock_fd,
+                .events = posix.POLL.OUT,
+                .revents = 0,
+            },
+        };
 
-    const timeout_ms = 30000; // 30 second timeout
-    const n = try posix.poll(&pfd, timeout_ms);
+        const timeout_ms = 30000; // 30 second timeout
+        const n = try posix.poll(&pfd, timeout_ms);
 
-    if (n == 0) return error.TimedOut;
+        if (n == 0) return error.TimedOut;
 
-    // Check for connection error
-    var err_buf: [4]u8 = undefined;
-    try posix.getsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.ERROR, &err_buf);
-    const err = mem.readInt(u32, &err_buf, .little);
+        // Check for connection error
+        var err_buf: [4]u8 = undefined;
+        try posix.getsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.ERROR, &err_buf);
+        const err = mem.readInt(u32, &err_buf, .little);
 
-    if (err != 0) {
-        return posix.unexpectedErrno(@enumFromInt(err));
+        if (err != 0) {
+            return posix.unexpectedErrno(@enumFromInt(err));
+        }
     }
 }
 

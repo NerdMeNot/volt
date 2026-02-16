@@ -28,8 +28,76 @@ const SubmissionId = completion.SubmissionId;
 
 const slab = @import("../util/slab.zig");
 
-// Only compile on Windows
-const windows = if (builtin.os.tag == .windows) std.os.windows else struct {
+// Platform-specific Windows API abstraction.
+// On Windows: wraps std.os.windows with correct Zig 0.15 API paths.
+// On non-Windows: provides stub types/functions for cross-compilation.
+const windows = if (builtin.os.tag == .windows) struct {
+    const w = std.os.windows;
+
+    pub const HANDLE = w.HANDLE;
+    pub const INVALID_HANDLE_VALUE = w.INVALID_HANDLE_VALUE;
+    pub const OVERLAPPED = w.OVERLAPPED;
+    pub const DWORD = w.DWORD;
+    pub const ULONG = u32;
+    pub const ULONG_PTR = usize;
+    pub const BOOL = w.BOOL;
+    pub const TRUE = w.TRUE;
+    pub const FALSE = w.FALSE;
+    pub const INFINITE = w.INFINITE;
+
+    pub const OVERLAPPED_ENTRY = extern struct {
+        lpCompletionKey: usize,
+        lpOverlapped: ?*OVERLAPPED,
+        Internal: usize,
+        dwNumberOfBytesTransferred: u32,
+    };
+
+    pub const Win32Error = enum(u32) {
+        SUCCESS = 0,
+        IO_PENDING = 997,
+        OPERATION_ABORTED = 995,
+        INVALID_HANDLE = 6,
+        NOT_ENOUGH_MEMORY = 8,
+        _,
+    };
+
+    // Unified kernel32 API — routes to correct Zig 0.15 locations or extern decls
+    pub const kernel32 = struct {
+        // These are available in std.os.windows.kernel32 in Zig 0.15:
+        pub const CreateIoCompletionPort = w.kernel32.CreateIoCompletionPort;
+        pub const PostQueuedCompletionStatus = w.kernel32.PostQueuedCompletionStatus;
+        pub const ReadFile = w.kernel32.ReadFile;
+        pub const WriteFile = w.kernel32.WriteFile;
+
+        // GetLastError in Zig 0.15 returns Win32Error (enum(u16)), but our
+        // callers expect DWORD (u32) to match the stub path. Wrap it.
+        pub fn GetLastError() callconv(.winapi) DWORD {
+            return @intFromEnum(w.kernel32.GetLastError());
+        }
+
+        // CloseHandle is at std.os.windows directly (not kernel32) in Zig 0.15.
+        // The std wrapper returns void; we adapt to BOOL for a consistent API.
+        pub fn CloseHandle(handle: HANDLE) BOOL {
+            w.CloseHandle(handle);
+            return TRUE;
+        }
+
+        // These may not be in Zig 0.15 std — declare as extern
+        pub extern "kernel32" fn GetQueuedCompletionStatusEx(
+            CompletionPort: HANDLE,
+            lpCompletionPortEntries: [*]OVERLAPPED_ENTRY,
+            ulCount: ULONG,
+            ulNumEntriesRemoved: *ULONG,
+            dwMilliseconds: DWORD,
+            fAlertable: BOOL,
+        ) callconv(.winapi) BOOL;
+
+        pub extern "kernel32" fn CancelIoEx(
+            hFile: HANDLE,
+            lpOverlapped: ?*OVERLAPPED,
+        ) callconv(.winapi) BOOL;
+    };
+} else struct {
     // Stub types for non-Windows compilation
     pub const HANDLE = *anyopaque;
     pub const INVALID_HANDLE_VALUE = @as(HANDLE, @ptrFromInt(std.math.maxInt(usize)));
@@ -76,6 +144,12 @@ const windows = if (builtin.os.tag == .windows) std.os.windows else struct {
         }
         pub fn GetLastError() callconv(.winapi) DWORD {
             return 0;
+        }
+        pub fn ReadFile(_: HANDLE, _: ?[*]u8, _: DWORD, _: ?*DWORD, _: ?*OVERLAPPED) callconv(.winapi) BOOL {
+            return FALSE;
+        }
+        pub fn WriteFile(_: HANDLE, _: ?[*]const u8, _: DWORD, _: ?*DWORD, _: ?*OVERLAPPED) callconv(.winapi) BOOL {
+            return FALSE;
         }
     };
     pub const Win32Error = enum(u32) {
@@ -256,7 +330,10 @@ pub const IocpBackend = struct {
             .timers = std.ArrayList(Timer).empty,
             .next_timer_id = 1,
             .start_instant = std.time.Instant.now() catch std.time.Instant{
-                .timestamp = .{ .sec = 0, .nsec = 0 },
+                .timestamp = if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .uefi)
+                    0
+                else
+                    .{ .sec = 0, .nsec = 0 },
             },
         };
     }
@@ -378,7 +455,7 @@ pub const IocpBackend = struct {
 
         // Use ReadFile for async read
         var bytes_read: windows.DWORD = 0;
-        const result = std.os.windows.kernel32.ReadFile(
+        const result = windows.kernel32.ReadFile(
             handle,
             buffer.ptr,
             @intCast(buffer.len),
@@ -394,7 +471,7 @@ pub const IocpBackend = struct {
         if (builtin.os.tag != .windows) return false;
 
         var bytes_written: windows.DWORD = 0;
-        const result = std.os.windows.kernel32.WriteFile(
+        const result = windows.kernel32.WriteFile(
             handle,
             buffer.ptr,
             @intCast(buffer.len),
@@ -615,16 +692,31 @@ pub const IocpBackend = struct {
     }
 };
 
+/// Convert an fd_t to a Windows HANDLE.
+/// On non-Windows (stub path), fd_t is an integer, so we convert via @ptrFromInt.
+/// On Windows, std.posix.fd_t is void, so callers must use fdToHandleFromInt
+/// or pass a HANDLE directly. This function is only valid on non-Windows.
+inline fn fdToHandle(fd: std.posix.fd_t) windows.HANDLE {
+    if (builtin.os.tag == .windows) {
+        // fd_t is void on Windows -- this path should never be reached.
+        // Operations on Windows carry HANDLE values, not POSIX fds.
+        unreachable;
+    } else {
+        // Non-Windows stub: fd_t is an integer
+        return @ptrFromInt(@as(usize, @intCast(fd)));
+    }
+}
+
 /// Extract handle from an operation.
 fn getHandleFromOp(op: Operation) ?windows.HANDLE {
     return switch (op.op) {
-        .read => |r| @ptrFromInt(@as(usize, @intCast(r.fd))),
-        .write => |w| @ptrFromInt(@as(usize, @intCast(w.fd))),
-        .close => |c| @ptrFromInt(@as(usize, @intCast(c.fd))),
-        .accept => |a| @ptrFromInt(@as(usize, @intCast(a.fd))),
-        .connect => |c| @ptrFromInt(@as(usize, @intCast(c.fd))),
-        .recv => |r| @ptrFromInt(@as(usize, @intCast(r.fd))),
-        .send => |s| @ptrFromInt(@as(usize, @intCast(s.fd))),
+        .read => |r| fdToHandle(r.fd),
+        .write => |w| fdToHandle(w.fd),
+        .close => |c| fdToHandle(c.fd),
+        .accept => |a| fdToHandle(a.fd),
+        .connect => |c| fdToHandle(c.fd),
+        .recv => |r| fdToHandle(r.fd),
+        .send => |s| fdToHandle(s.fd),
         .nop, .timeout, .cancel => windows.INVALID_HANDLE_VALUE,
         else => null,
     };
@@ -666,6 +758,17 @@ fn mapNtStatusToErrno(status: usize) i32 {
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Create a dummy fd_t value for tests. On Windows fd_t is *anyopaque (HANDLE),
+/// on non-Windows it is an integer. This helper produces a valid-typed value
+/// from a comptime-known integer for cross-platform test compilation.
+fn testDummyFd(comptime val: usize) std.posix.fd_t {
+    if (builtin.os.tag == .windows) {
+        return @ptrFromInt(val);
+    } else {
+        return @intCast(val);
+    }
+}
+
 test "IOCP - unsupported on non-Windows" {
     if (builtin.os.tag == .windows) return;
 
@@ -688,7 +791,7 @@ test "IOCP - TrackedOp with offset" {
     const offset: u64 = 0x123456789ABCDEF0;
     const op = Operation{
         .op = .{ .read = .{
-            .fd = 0,
+            .fd = testDummyFd(1),
             .buffer = &[_]u8{},
             .offset = offset,
         } },
@@ -889,14 +992,14 @@ test "IOCP - Overlapped lifecycle tracking" {
 test "IOCP - getHandleFromOp" {
     // Test handle extraction from various operations
     const read_op = Operation{
-        .op = .{ .read = .{ .fd = 123, .buffer = &[_]u8{}, .offset = null } },
+        .op = .{ .read = .{ .fd = testDummyFd(123), .buffer = &[_]u8{}, .offset = null } },
         .user_data = 0,
     };
     const read_handle = getHandleFromOp(read_op);
     try std.testing.expect(read_handle != null);
 
     const write_op = Operation{
-        .op = .{ .write = .{ .fd = 456, .buffer = &[_]u8{}, .offset = null } },
+        .op = .{ .write = .{ .fd = testDummyFd(456), .buffer = &[_]u8{}, .offset = null } },
         .user_data = 0,
     };
     const write_handle = getHandleFromOp(write_op);

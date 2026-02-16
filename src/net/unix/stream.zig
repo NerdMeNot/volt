@@ -392,8 +392,15 @@ test "UnixStream - shutdown modes" {
 
     // Create a socketpair for testing shutdown
     var fds: [2]posix.socket_t = undefined;
-    const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
-    if (rc != 0) return error.SkipZigTest;
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const sock_type = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+        const rc2 = linux.socketpair(linux.AF.UNIX, sock_type, 0, &fds);
+        if (std.posix.errno(rc2) != .SUCCESS) return error.SkipZigTest;
+    } else {
+        const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+        if (rc != 0) return error.SkipZigTest;
+    }
 
     var stream1 = UnixStream.fromFd(fds[0]);
     defer stream1.close();
@@ -421,8 +428,15 @@ test "UnixStream - writeAll" {
 
     // Create a socketpair
     var fds: [2]posix.socket_t = undefined;
-    const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
-    if (rc != 0) return error.SkipZigTest;
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const sock_type = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+        const rc2 = linux.socketpair(linux.AF.UNIX, sock_type, 0, &fds);
+        if (std.posix.errno(rc2) != .SUCCESS) return error.SkipZigTest;
+    } else {
+        const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+        if (rc != 0) return error.SkipZigTest;
+    }
 
     var stream1 = UnixStream.fromFd(fds[0]);
     defer stream1.close();
@@ -449,20 +463,16 @@ test "UnixStream - tryRead tryWrite" {
 
     // Create non-blocking socketpair
     var fds: [2]posix.socket_t = undefined;
-    const sock_type = if (builtin.os.tag == .linux)
-        posix.SOCK.STREAM | posix.SOCK.NONBLOCK
-    else
-        posix.SOCK.STREAM;
-
-    const rc = std.c.socketpair(posix.AF.UNIX, sock_type, 0, &fds);
-    if (rc != 0) return error.SkipZigTest;
-
-    // Set non-blocking on non-Linux
-    if (builtin.os.tag != .linux) {
-        const F_SETFL = 4;
-        const O_NONBLOCK: usize = 0x0004;
-        _ = posix.fcntl(fds[0], F_SETFL, O_NONBLOCK) catch {};
-        _ = posix.fcntl(fds[1], F_SETFL, O_NONBLOCK) catch {};
+    if (builtin.os.tag == .linux) {
+        const sock_type = std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC | std.os.linux.SOCK.NONBLOCK;
+        const rc = std.os.linux.socketpair(std.os.linux.AF.UNIX, sock_type, 0, &fds);
+        if (std.posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    } else {
+        const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+        if (rc != 0) return error.SkipZigTest;
+        for (&fds) |fd| {
+            _ = posix.fcntl(fd, posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))) catch {};
+        }
     }
 
     var stream1 = UnixStream.fromFd(fds[0]);

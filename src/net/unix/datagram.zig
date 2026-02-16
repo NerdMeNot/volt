@@ -136,30 +136,26 @@ pub const UnixDatagram = struct {
 
         var fds: [2]posix.socket_t = undefined;
 
-        // On Linux, we can use SOCK_CLOEXEC | SOCK_NONBLOCK directly
-        // On macOS/BSD, we need to set them separately
-        const sock_type = if (builtin.os.tag == .linux)
-            posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK
-        else
-            posix.SOCK.DGRAM;
-
-        const rc = std.c.socketpair(posix.AF.UNIX, sock_type, 0, &fds);
-        if (rc != 0) {
-            return error.SocketPairFailed;
-        }
-
-        // On non-Linux, set CLOEXEC and NONBLOCK manually
-        if (builtin.os.tag != .linux) {
-            const F_SETFL = 4;
-            const F_SETFD = 2;
-            const O_NONBLOCK: usize = 0x0004;
-            const FD_CLOEXEC: usize = 1;
-
+        if (builtin.os.tag == .linux) {
+            // Linux: use direct syscall to avoid libc dependency.
+            // SOCK_CLOEXEC and SOCK_NONBLOCK are set atomically.
+            const linux = std.os.linux;
+            const sock_type = linux.SOCK.DGRAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK;
+            const rc = linux.socketpair(linux.AF.UNIX, sock_type, 0, &fds);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => {},
+                else => return error.SocketPairFailed,
+            }
+        } else {
+            // macOS/BSD: use libc (always linked on macOS).
+            const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.DGRAM, 0, &fds);
+            if (rc != 0) {
+                return error.SocketPairFailed;
+            }
+            // Set NONBLOCK and CLOEXEC manually
             for (&fds) |fd| {
-                // Set non-blocking
-                _ = posix.fcntl(fd, F_SETFL, O_NONBLOCK) catch {};
-                // Set close-on-exec
-                _ = posix.fcntl(fd, F_SETFD, FD_CLOEXEC) catch {};
+                _ = posix.fcntl(fd, posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))) catch {};
+                _ = posix.fcntl(fd, posix.F.SETFD, @as(u32, 1)) catch {}; // FD_CLOEXEC
             }
         }
 

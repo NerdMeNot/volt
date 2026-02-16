@@ -54,6 +54,8 @@
 //! | `volt.shutdown` | Graceful shutdown |
 
 const std = @import("std");
+const builtin = @import("builtin");
+const is_windows = builtin.os.tag == .windows;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Namespaced Modules — Primary API
@@ -77,8 +79,8 @@ pub const stream = @import("stream.zig");
 /// Networking (TCP, UDP, Unix sockets, DNS).
 pub const net = @import("net.zig");
 
-/// Filesystem operations.
-pub const fs = @import("fs.zig");
+/// Filesystem operations (POSIX only — not yet available on Windows).
+pub const fs = if (!is_windows) @import("fs.zig") else struct {};
 
 /// Time primitives.
 pub const time = @import("time.zig");
@@ -86,8 +88,8 @@ pub const time = @import("time.zig");
 /// Signal handling.
 pub const signal = @import("signal.zig");
 
-/// Process spawning and management.
-pub const process = @import("process.zig");
+/// Process spawning and management (POSIX only — not yet available on Windows).
+pub const process = if (!is_windows) @import("process.zig") else struct {};
 
 /// Graceful shutdown handler for async servers.
 pub const shutdown = @import("shutdown.zig");
@@ -239,17 +241,21 @@ test {
     _ = @import("internal/executor.zig");
     _ = @import("net.zig");
     _ = @import("stream.zig");
-    _ = @import("fs.zig");
     _ = @import("sync.zig");
     _ = @import("channel.zig");
     _ = @import("task.zig");
     _ = @import("internal/util/signal.zig");
     _ = @import("signal.zig");
-    _ = @import("process.zig");
     _ = @import("async.zig");
     _ = @import("shutdown.zig");
     _ = @import("io/Future.zig");
     _ = @import("io/Group.zig");
+
+    // POSIX-only modules (filesystem, process)
+    if (!is_windows) {
+        _ = @import("fs.zig");
+        _ = @import("process.zig");
+    }
 
     // Scheduler tests
     _ = @import("internal/scheduler/Header.zig");
@@ -315,10 +321,12 @@ test "namespace structure" {
     _ = stream.Reader;
     _ = stream.Writer;
     _ = net.TcpListener;
-    _ = fs.File;
     _ = time.Duration;
     _ = signal.AsyncSignal;
-    _ = process.Command;
+    if (!is_windows) {
+        _ = fs.File;
+        _ = process.Command;
+    }
 
     // Shutdown
     _ = shutdown.Shutdown;

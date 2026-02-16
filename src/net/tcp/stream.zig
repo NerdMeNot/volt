@@ -105,7 +105,7 @@ pub const TcpStream = struct {
     /// The underlying fd is transferred (this TcpStream becomes invalid).
     pub fn toStd(self: *TcpStream) std.net.Stream {
         const fd = self.fd;
-        self.fd = -1;
+        self.fd = c.INVALID_SOCKET;
         return .{ .handle = fd };
     }
 
@@ -382,7 +382,7 @@ pub const TcpStream = struct {
             sio.shutdown();
         }
         posix.close(self.fd);
-        self.fd = -1;
+        self.fd = c.INVALID_SOCKET;
     }
 
     /// Register with ScheduledIo for async operations.
@@ -421,7 +421,7 @@ pub const TcpStream = struct {
         };
 
         // Invalidate the original stream
-        self.fd = -1;
+        self.fd = c.INVALID_SOCKET;
 
         return .{
             .read = .{ .inner = shared },
@@ -913,7 +913,7 @@ test "TcpStream - fileno returns valid fd" {
     defer pair.listener.close();
 
     const fd = pair.client.fileno();
-    try testing.expect(fd >= 0);
+    try testing.expect(c.isValidSocket(fd));
 }
 
 test "TcpStream - reader interface" {

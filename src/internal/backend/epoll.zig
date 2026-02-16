@@ -74,7 +74,7 @@ pub const EpollBackend = struct {
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, config: anytype) !Self {
-        const epoll_fd = try posix.epoll_create1(.{ .CLOEXEC = true });
+        const epoll_fd = try posix.epoll_create1(linux.EPOLL.CLOEXEC);
         errdefer posix.close(epoll_fd);
 
         const max_events = config.max_completions;
@@ -98,7 +98,7 @@ pub const EpollBackend = struct {
             .events = linux.EPOLL.IN | linux.EPOLL.ET,
             .data = .{ .ptr = TOKEN_WAKEUP },
         };
-        const ctl_result = linux.epoll_ctl(epoll_fd, .ADD, wakeup_fd, &wakeup_event);
+        const ctl_result = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, wakeup_fd, &wakeup_event);
         if (@as(isize, @bitCast(ctl_result)) < 0) {
             return error.WakeupRegistrationFailed;
         }
@@ -205,9 +205,9 @@ pub const EpollBackend = struct {
         };
 
         // Try to add, if already exists, modify
-        posix.epoll_ctl(self.epoll_fd, .ADD, target_fd, &event) catch |err| {
+        posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, target_fd, &event) catch |err| {
             if (err == error.FileDescriptorAlreadyPresentInSet) {
-                try posix.epoll_ctl(self.epoll_fd, .MOD, target_fd, &event);
+                try posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, target_fd, &event);
             } else {
                 return err;
             }
@@ -263,7 +263,7 @@ pub const EpollBackend = struct {
             .data = .{ .ptr = token },
         };
 
-        try posix.epoll_ctl(self.epoll_fd, .ADD, timer_fd, &event);
+        try posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, timer_fd, &event);
 
         // All kernel operations succeeded - now store in registration
         // and transfer ownership (defer won't close)
@@ -274,7 +274,7 @@ pub const EpollBackend = struct {
             // Registration disappeared (shouldn't happen, but be safe)
             // Remove from epoll since we're about to close
             // Best-effort cleanup: DEL errors are non-critical during error recovery
-            posix.epoll_ctl(self.epoll_fd, .DEL, timer_fd, null) catch {};
+            posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, timer_fd, null) catch {};
             return error.InvalidArgument;
         }
     }
@@ -340,7 +340,7 @@ pub const EpollBackend = struct {
             // Clean up timer fd if present
             if (reg.timer_fd) |tfd| {
                 // Best-effort removal: timer already fired, DEL failure is non-critical
-                posix.epoll_ctl(self.epoll_fd, .DEL, tfd, null) catch {};
+                posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, tfd, null) catch {};
                 posix.close(tfd);
             }
 
@@ -516,13 +516,13 @@ pub const EpollBackend = struct {
 
                 // Remove from epoll - best-effort, fd is being cancelled anyway
                 if (entry.value.monitored_fd) |mon_fd| {
-                    posix.epoll_ctl(self.epoll_fd, .DEL, mon_fd, null) catch {};
+                    posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, mon_fd, null) catch {};
                 }
 
                 // Clean up timer fd if present (and mark as null to prevent double-close)
                 if (entry.value.timer_fd) |tfd| {
                     // Best-effort removal: operation is cancelled, DEL failure is non-critical
-                    posix.epoll_ctl(self.epoll_fd, .DEL, tfd, null) catch {};
+                    posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, tfd, null) catch {};
                     posix.close(tfd);
                     entry.value.timer_fd = null; // Prevent double-close in deinit
                 }

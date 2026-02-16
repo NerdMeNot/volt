@@ -283,7 +283,7 @@ pub const TcpSocket = struct {
     /// Close without converting to stream/listener.
     pub fn close(self: *TcpSocket) void {
         posix.close(self.fd);
-        self.fd = -1;
+        self.fd = c.INVALID_SOCKET;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -397,14 +397,14 @@ const testing = std.testing;
 
 test "TcpSocket - newV4 create and close" {
     var socket = try TcpSocket.newV4();
-    try testing.expect(socket.fileno() >= 0);
+    try testing.expect(c.isValidSocket(socket.fileno()));
     socket.close();
 }
 
 test "TcpSocket - newV6 create and close" {
     var socket = try TcpSocket.newV6();
     defer socket.close();
-    try testing.expect(socket.fileno() >= 0);
+    try testing.expect(c.isValidSocket(socket.fileno()));
 }
 
 test "TcpSocket - fromRaw" {

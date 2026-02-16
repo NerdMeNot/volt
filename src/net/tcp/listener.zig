@@ -115,7 +115,7 @@ pub const TcpListener = struct {
     /// The underlying fd is transferred (this TcpListener becomes invalid).
     pub fn toStd(self: *TcpListener) std.net.Server {
         const fd = self.fd;
-        self.fd = -1;
+        self.fd = c.INVALID_SOCKET;
         return .{ .stream = .{ .handle = fd } };
     }
 
@@ -193,7 +193,7 @@ pub const TcpListener = struct {
             sio.shutdown();
         }
         posix.close(self.fd);
-        self.fd = -1;
+        self.fd = c.INVALID_SOCKET;
     }
 
     /// Register with ScheduledIo for async operations.
@@ -317,7 +317,7 @@ test "TcpListener - fileno returns valid fd" {
     var listener = try TcpListener.bind(Address.fromPort(0));
     defer listener.close();
 
-    try testing.expect(listener.fileno() >= 0);
+    try testing.expect(c.isValidSocket(listener.fileno()));
 }
 
 test "TcpListener - setTtl/getTtl" {
