@@ -116,7 +116,7 @@ pub const TcpStream = struct {
     /// Try to read without blocking.
     /// Returns: bytes read, 0 for EOF, null for WouldBlock.
     pub fn tryRead(self: *TcpStream, buf: []u8) !?usize {
-        const n = posix.recv(self.fd, buf, 0) catch |err| switch (err) {
+        const n = c.recv(self.fd, buf, 0) catch |err| switch (err) {
             error.WouldBlock => return null,
             error.ConnectionResetByPeer => return 0,
             else => return err,
@@ -127,7 +127,7 @@ pub const TcpStream = struct {
     /// Try to write without blocking.
     /// Returns: bytes written, null for WouldBlock.
     pub fn tryWrite(self: *TcpStream, data: []const u8) !?usize {
-        const n = posix.send(self.fd, data, 0) catch |err| switch (err) {
+        const n = c.send(self.fd, data, 0) catch |err| switch (err) {
             error.WouldBlock => return null,
             error.BrokenPipe, error.ConnectionResetByPeer => return 0,
             else => return err,
@@ -197,7 +197,7 @@ pub const TcpStream = struct {
 
     fn tcpReadFn(ctx: *anyopaque, buffer: []u8) io.Error!usize {
         const self: *TcpStream = @ptrCast(@alignCast(ctx));
-        const n = posix.recv(self.fd, buffer, 0) catch |err| switch (err) {
+        const n = c.recv(self.fd, buffer, 0) catch |err| switch (err) {
             error.WouldBlock => return error.WouldBlock,
             error.ConnectionResetByPeer => return error.ConnectionReset,
             error.ConnectionRefused => return error.ConnectionRefused,
@@ -209,7 +209,7 @@ pub const TcpStream = struct {
 
     fn tcpWriteFn(ctx: *anyopaque, data: []const u8) io.Error!usize {
         const self: *TcpStream = @ptrCast(@alignCast(ctx));
-        const n = posix.send(self.fd, data, 0) catch |err| switch (err) {
+        const n = c.send(self.fd, data, 0) catch |err| switch (err) {
             error.WouldBlock => return error.WouldBlock,
             error.ConnectionResetByPeer => return error.ConnectionReset,
             error.BrokenPipe => return error.BrokenPipe,
@@ -303,7 +303,7 @@ pub const TcpStream = struct {
     /// Get and clear the pending socket error (SO_ERROR).
     pub fn takeError(self: *TcpStream) !?anyerror {
         var buf: [4]u8 = undefined;
-        try posix.getsockopt(self.fd, posix.SOL.SOCKET, posix.SO.ERROR, &buf);
+        try c.getsockopt(self.fd, posix.SOL.SOCKET, posix.SO.ERROR, &buf);
         const err_val = mem.readInt(u32, &buf, .little);
         if (err_val == 0) return null;
         return posix.unexpectedErrno(@enumFromInt(@as(u16, @intCast(err_val))));
@@ -349,7 +349,7 @@ pub const TcpStream = struct {
 
     /// Peek at data without consuming it.
     pub fn peek(self: *TcpStream, buf: []u8) !usize {
-        return posix.recv(self.fd, buf, posix.MSG.PEEK) catch |err| switch (err) {
+        return c.recv(self.fd, buf, posix.MSG.PEEK) catch |err| switch (err) {
             error.WouldBlock => return 0,
             else => return err,
         };
@@ -616,7 +616,7 @@ pub const PeekFuture = struct {
 
     pub fn poll(self: *PeekFuture, ctx: *FutureContext) FuturePollResult(Output) {
         // Try to peek
-        const n = posix.recv(self.stream.fd, self.buf, posix.MSG.PEEK) catch |err| switch (err) {
+        const n = c.recv(self.stream.fd, self.buf, posix.MSG.PEEK) catch |err| switch (err) {
             error.WouldBlock => {
                 // Register for readable notification
                 updateStoredWaker(&self.stored_waker, ctx);

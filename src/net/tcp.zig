@@ -32,6 +32,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const c = @import("tcp/common.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Sub-modules
@@ -481,7 +482,7 @@ test "TcpStream - tryIo custom operation" {
     const result = try stream.tryIo(.{ .readable = true }, struct {
         fn io(fd: posix.socket_t) !usize {
             var buf: [64]u8 = undefined;
-            return posix.recv(fd, &buf, 0);
+            return c.recv(fd, &buf, 0);
         }
     }.io);
 

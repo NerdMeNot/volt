@@ -192,13 +192,13 @@ pub const TcpSocket = struct {
             .l_onoff = if (duration != null) 1 else 0,
             .l_linger = if (duration) |d| @intCast(d.asSeconds()) else 0,
         };
-        try posix.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.LINGER, mem.asBytes(&linger_val));
+        try c.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.LINGER, mem.asBytes(&linger_val));
     }
 
     /// Get SO_LINGER value.
     pub fn getLinger(self: TcpSocket) !?Duration {
         var linger_val: LingerVal = undefined;
-        try posix.getsockopt(self.fd, posix.SOL.SOCKET, posix.SO.LINGER, mem.asBytes(&linger_val));
+        try c.getsockopt(self.fd, posix.SOL.SOCKET, posix.SO.LINGER, mem.asBytes(&linger_val));
 
         if (linger_val.l_onoff != 0) {
             return Duration.fromSecs(@intCast(linger_val.l_linger));

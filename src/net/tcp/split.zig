@@ -135,7 +135,7 @@ pub const OwnedReadHalf = struct {
     inner: *SharedStream,
 
     pub fn tryRead(self: *OwnedReadHalf, buf: []u8) !?usize {
-        const n = posix.recv(self.inner.fd, buf, 0) catch |err| switch (err) {
+        const n = c.recv(self.inner.fd, buf, 0) catch |err| switch (err) {
             error.WouldBlock => return null,
             error.ConnectionResetByPeer => return 0,
             else => return err,
@@ -157,7 +157,7 @@ pub const OwnedReadHalf = struct {
     }
 
     pub fn peek(self: *OwnedReadHalf, buf: []u8) !usize {
-        return posix.recv(self.inner.fd, buf, posix.MSG.PEEK) catch |err| switch (err) {
+        return c.recv(self.inner.fd, buf, posix.MSG.PEEK) catch |err| switch (err) {
             error.WouldBlock => return 0,
             else => return err,
         };
@@ -220,7 +220,7 @@ pub const OwnedWriteHalf = struct {
     shutdown_on_drop: bool,
 
     pub fn tryWrite(self: *OwnedWriteHalf, data: []const u8) !?usize {
-        const n = posix.send(self.inner.fd, data, 0) catch |err| switch (err) {
+        const n = c.send(self.inner.fd, data, 0) catch |err| switch (err) {
             error.WouldBlock => return null,
             error.BrokenPipe, error.ConnectionResetByPeer => return 0,
             else => return err,

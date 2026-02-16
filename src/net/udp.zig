@@ -47,6 +47,7 @@ const FutureContext = @import("../future/Waker.zig").Context;
 const FuturePollResult = @import("../future/Poll.zig").PollResult;
 const runtime_mod = @import("../runtime.zig");
 const IoDriver = @import("../internal/io_driver.zig").IoDriver;
+const xplat = @import("tcp/common.zig");
 
 // IP socket options (cross-platform definitions)
 // Linux values from linux/in.h, macOS/BSD values from netinet/in.h
@@ -207,7 +208,7 @@ pub const UdpSocket = struct {
     /// Send data to the connected peer. Returns bytes sent.
     /// Returns null if would block.
     pub fn trySend(self: *UdpSocket, data: []const u8) !?usize {
-        const n = posix.send(self.fd, data, 0) catch |err| switch (err) {
+        const n = xplat.send(self.fd, data, 0) catch |err| switch (err) {
             error.WouldBlock => return null,
             else => return err,
         };
@@ -221,7 +222,7 @@ pub const UdpSocket = struct {
     /// Send data to a specific address. Returns bytes sent.
     /// Returns null if would block.
     pub fn trySendTo(self: *UdpSocket, data: []const u8, addr: Address) !?usize {
-        const n = posix.sendto(self.fd, data, 0, addr.sockaddr(), addr.len) catch |err| switch (err) {
+        const n = xplat.sendto(self.fd, data, 0, addr.sockaddr(), addr.len) catch |err| switch (err) {
             error.WouldBlock => return null,
             else => return err,
         };
@@ -236,7 +237,7 @@ pub const UdpSocket = struct {
     /// Returns bytes received, or null if would block.
     /// Returns 0 on orderly shutdown (though UDP doesn't really have this).
     pub fn tryRecv(self: *UdpSocket, buf: []u8) !?usize {
-        const n = posix.recv(self.fd, buf, 0) catch |err| switch (err) {
+        const n = xplat.recv(self.fd, buf, 0) catch |err| switch (err) {
             error.WouldBlock => return null,
             else => return err,
         };
@@ -259,7 +260,7 @@ pub const UdpSocket = struct {
         var addr: Address = undefined;
         addr.len = @sizeOf(posix.sockaddr.storage);
 
-        const n = posix.recvfrom(self.fd, buf, 0, addr.sockaddrMut(), &addr.len) catch |err| switch (err) {
+        const n = xplat.recvfrom(self.fd, buf, 0, addr.sockaddrMut(), &addr.len) catch |err| switch (err) {
             error.WouldBlock => return null,
             else => return err,
         };
@@ -274,7 +275,7 @@ pub const UdpSocket = struct {
     /// Peek at data without removing it from the queue.
     /// Returns null if would block.
     pub fn tryPeek(self: *UdpSocket, buf: []u8) !?usize {
-        const n = posix.recv(self.fd, buf, posix.MSG.PEEK) catch |err| switch (err) {
+        const n = xplat.recv(self.fd, buf, posix.MSG.PEEK) catch |err| switch (err) {
             error.WouldBlock => return null,
             else => return err,
         };
@@ -286,7 +287,7 @@ pub const UdpSocket = struct {
         var addr: Address = undefined;
         addr.len = @sizeOf(posix.sockaddr.storage);
 
-        const n = posix.recvfrom(self.fd, buf, posix.MSG.PEEK, addr.sockaddrMut(), &addr.len) catch |err| switch (err) {
+        const n = xplat.recvfrom(self.fd, buf, posix.MSG.PEEK, addr.sockaddrMut(), &addr.len) catch |err| switch (err) {
             error.WouldBlock => return null,
             else => return err,
         };
@@ -393,7 +394,7 @@ pub const UdpSocket = struct {
             .multiaddr = .{ .s_addr = @bitCast(multicast_addr) },
             .interface = .{ .s_addr = @bitCast(interface_addr) },
         };
-        try posix.setsockopt(self.fd, posix.IPPROTO.IP, IP.ADD_MEMBERSHIP, std.mem.asBytes(&mreq));
+        try xplat.setsockopt(self.fd, posix.IPPROTO.IP, IP.ADD_MEMBERSHIP, std.mem.asBytes(&mreq));
     }
 
     /// Leave an IPv4 multicast group.
@@ -402,7 +403,7 @@ pub const UdpSocket = struct {
             .multiaddr = .{ .s_addr = @bitCast(multicast_addr) },
             .interface = .{ .s_addr = @bitCast(interface_addr) },
         };
-        try posix.setsockopt(self.fd, posix.IPPROTO.IP, IP.DROP_MEMBERSHIP, std.mem.asBytes(&mreq));
+        try xplat.setsockopt(self.fd, posix.IPPROTO.IP, IP.DROP_MEMBERSHIP, std.mem.asBytes(&mreq));
     }
 
     /// Join an IPv6 multicast group.
@@ -411,7 +412,7 @@ pub const UdpSocket = struct {
             .multiaddr = multicast_addr,
             .interface = interface_index,
         };
-        try posix.setsockopt(self.fd, posix.IPPROTO.IPV6, IPV6.JOIN_GROUP, std.mem.asBytes(&mreq));
+        try xplat.setsockopt(self.fd, posix.IPPROTO.IPV6, IPV6.JOIN_GROUP, std.mem.asBytes(&mreq));
     }
 
     /// Leave an IPv6 multicast group.
@@ -420,7 +421,7 @@ pub const UdpSocket = struct {
             .multiaddr = multicast_addr,
             .interface = interface_index,
         };
-        try posix.setsockopt(self.fd, posix.IPPROTO.IPV6, IPV6.LEAVE_GROUP, std.mem.asBytes(&mreq));
+        try xplat.setsockopt(self.fd, posix.IPPROTO.IPV6, IPV6.LEAVE_GROUP, std.mem.asBytes(&mreq));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -639,7 +640,7 @@ pub const UdpSocket = struct {
 
     fn udpReadFn(ctx: *anyopaque, buffer: []u8) io.Error!usize {
         const self: *UdpSocket = @ptrCast(@alignCast(ctx));
-        const n = posix.recv(self.fd, buffer, 0) catch |err| switch (err) {
+        const n = xplat.recv(self.fd, buffer, 0) catch |err| switch (err) {
             error.WouldBlock => return error.WouldBlock,
             error.ConnectionRefused => return error.ConnectionRefused,
             error.ConnectionResetByPeer => return error.ConnectionReset,
@@ -651,7 +652,7 @@ pub const UdpSocket = struct {
 
     fn udpWriteFn(ctx: *anyopaque, data: []const u8) io.Error!usize {
         const self: *UdpSocket = @ptrCast(@alignCast(ctx));
-        const n = posix.send(self.fd, data, 0) catch |err| switch (err) {
+        const n = xplat.send(self.fd, data, 0) catch |err| switch (err) {
             error.WouldBlock => return error.WouldBlock,
             error.ConnectionRefused => return error.ConnectionRefused,
             error.ConnectionResetByPeer => return error.ConnectionReset,
@@ -677,7 +678,7 @@ pub const ReadableFuture = struct {
     /// Poll the future.
     pub fn poll(self: *ReadableFuture, ctx: *FutureContext) FuturePollResult(Output) {
         // Try a zero-length peek to check readiness
-        _ = posix.recv(self.socket.fd, &[_]u8{}, posix.MSG.PEEK | posix.MSG.DONTWAIT) catch |err| switch (err) {
+        _ = xplat.recv(self.socket.fd, &[_]u8{}, posix.MSG.PEEK | posix.MSG.DONTWAIT) catch |err| switch (err) {
             error.WouldBlock => {
                 // Register waker for read readiness
                 updateStoredWaker(&self.stored_waker, ctx);
@@ -782,7 +783,7 @@ pub const SendFuture = struct {
 
     /// Poll the future.
     pub fn poll(self: *SendFuture, ctx: *FutureContext) FuturePollResult(Output) {
-        const n = posix.send(self.socket.fd, self.data, 0) catch |err| switch (err) {
+        const n = xplat.send(self.socket.fd, self.data, 0) catch |err| switch (err) {
             error.WouldBlock => {
                 updateStoredWaker(&self.stored_waker, ctx);
                 if (self.socket.scheduled_io) |sio| {
@@ -810,7 +811,7 @@ pub const RecvFuture = struct {
 
     /// Poll the future.
     pub fn poll(self: *RecvFuture, ctx: *FutureContext) FuturePollResult(Output) {
-        const n = posix.recv(self.socket.fd, self.buf, 0) catch |err| switch (err) {
+        const n = xplat.recv(self.socket.fd, self.buf, 0) catch |err| switch (err) {
             error.WouldBlock => {
                 updateStoredWaker(&self.stored_waker, ctx);
                 if (self.socket.scheduled_io) |sio| {
@@ -839,7 +840,7 @@ pub const SendToFuture = struct {
 
     /// Poll the future.
     pub fn poll(self: *SendToFuture, ctx: *FutureContext) FuturePollResult(Output) {
-        const n = posix.sendto(self.socket.fd, self.data, 0, self.addr.sockaddr(), self.addr.len) catch |err| switch (err) {
+        const n = xplat.sendto(self.socket.fd, self.data, 0, self.addr.sockaddr(), self.addr.len) catch |err| switch (err) {
             error.WouldBlock => {
                 updateStoredWaker(&self.stored_waker, ctx);
                 if (self.socket.scheduled_io) |sio| {
@@ -870,7 +871,7 @@ pub const RecvFromFuture = struct {
         var addr: Address = undefined;
         addr.len = @sizeOf(posix.sockaddr.storage);
 
-        const n = posix.recvfrom(self.socket.fd, self.buf, 0, addr.sockaddrMut(), &addr.len) catch |err| switch (err) {
+        const n = xplat.recvfrom(self.socket.fd, self.buf, 0, addr.sockaddrMut(), &addr.len) catch |err| switch (err) {
             error.WouldBlock => {
                 updateStoredWaker(&self.stored_waker, ctx);
                 if (self.socket.scheduled_io) |sio| {
@@ -898,7 +899,7 @@ pub const PeekFuture = struct {
 
     /// Poll the future.
     pub fn poll(self: *PeekFuture, ctx: *FutureContext) FuturePollResult(Output) {
-        const n = posix.recv(self.socket.fd, self.buf, posix.MSG.PEEK) catch |err| switch (err) {
+        const n = xplat.recv(self.socket.fd, self.buf, posix.MSG.PEEK) catch |err| switch (err) {
             error.WouldBlock => {
                 updateStoredWaker(&self.stored_waker, ctx);
                 if (self.socket.scheduled_io) |sio| {
@@ -962,24 +963,24 @@ fn bridgeWakeFn(ctx: *anyopaque) void {
 
 fn setBoolOption(fd: posix.socket_t, level: i32, opt: u32, value: bool) !void {
     const val: u32 = if (value) 1 else 0;
-    try posix.setsockopt(fd, @intCast(level), opt, std.mem.asBytes(&val));
+    try xplat.setsockopt(fd, @intCast(level), opt, std.mem.asBytes(&val));
 }
 
 fn getBoolOption(fd: posix.socket_t, level: i32, opt: u32) !bool {
     var val: u32 = 0;
     const bytes = std.mem.asBytes(&val);
-    _ = try posix.getsockopt(fd, @intCast(level), opt, bytes);
+    _ = try xplat.getsockopt(fd, @intCast(level), opt, bytes);
     return val != 0;
 }
 
 fn setU32Option(fd: posix.socket_t, level: i32, opt: u32, value: u32) !void {
-    try posix.setsockopt(fd, @intCast(level), opt, std.mem.asBytes(&value));
+    try xplat.setsockopt(fd, @intCast(level), opt, std.mem.asBytes(&value));
 }
 
 fn getU32Option(fd: posix.socket_t, level: i32, opt: u32) !u32 {
     var val: u32 = 0;
     const bytes = std.mem.asBytes(&val);
-    _ = try posix.getsockopt(fd, @intCast(level), opt, bytes);
+    _ = try xplat.getsockopt(fd, @intCast(level), opt, bytes);
     return val;
 }
 

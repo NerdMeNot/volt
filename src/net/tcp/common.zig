@@ -46,24 +46,127 @@ pub fn isValidSocket(fd: posix.socket_t) bool {
 // Socket Helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Cross-platform getsockopt. On Windows, uses ws2_32 directly to avoid libc dependency.
+pub fn getsockopt(fd: posix.socket_t, level: i32, opt: u32, buf: []u8) !void {
+    if (comptime builtin.os.tag == .windows) {
+        const ws2 = std.os.windows.ws2_32;
+        var optlen: i32 = @intCast(buf.len);
+        const rc = ws2.getsockopt(fd, level, @intCast(opt), buf.ptr, &optlen);
+        if (rc != 0) return error.Unexpected;
+    } else {
+        try posix.getsockopt(fd, level, opt, buf);
+    }
+}
+
+/// Cross-platform recvfrom. On Windows, uses ws2_32 directly to avoid libc dependency.
+pub fn recvfrom(fd: posix.socket_t, buf: []u8, flags: u32, src_addr: *posix.sockaddr, addrlen: *posix.socklen_t) !usize {
+    if (comptime builtin.os.tag == .windows) {
+        const ws2 = std.os.windows.ws2_32;
+        const rc = ws2.recvfrom(fd, buf.ptr, @intCast(buf.len), @intCast(flags), src_addr, @ptrCast(addrlen));
+        if (rc < 0) {
+            const err = ws2.WSAGetLastError();
+            return switch (err) {
+                .WSAEWOULDBLOCK => error.WouldBlock,
+                else => error.Unexpected,
+            };
+        }
+        return @intCast(rc);
+    } else {
+        return posix.recvfrom(fd, buf, flags, src_addr, addrlen);
+    }
+}
+
+/// Cross-platform recv. On Windows, uses ws2_32 directly to avoid libc dependency.
+/// Returns the same error set as posix.recv for caller compatibility.
+pub fn recv(fd: posix.socket_t, buf: []u8, flags: u32) posix.RecvFromError!usize {
+    if (comptime builtin.os.tag == .windows) {
+        const ws2 = std.os.windows.ws2_32;
+        const rc = ws2.recv(fd, buf.ptr, @intCast(buf.len), @intCast(flags));
+        if (rc < 0) {
+            const err = ws2.WSAGetLastError();
+            return switch (err) {
+                .WSAEWOULDBLOCK => error.WouldBlock,
+                .WSAECONNRESET => error.ConnectionResetByPeer,
+                .WSAECONNREFUSED => error.ConnectionRefused,
+                .WSAECONNABORTED => error.ConnectionResetByPeer,
+                else => error.Unexpected,
+            };
+        }
+        return @intCast(rc);
+    } else {
+        return posix.recv(fd, buf, flags);
+    }
+}
+
+/// Cross-platform send. On Windows, uses ws2_32 directly to avoid libc dependency.
+/// Returns the same error set as posix.send for caller compatibility.
+pub fn send(fd: posix.socket_t, buf: []const u8, flags: u32) posix.SendError!usize {
+    if (comptime builtin.os.tag == .windows) {
+        const ws2 = std.os.windows.ws2_32;
+        const rc = ws2.send(fd, buf.ptr, @intCast(buf.len), @intCast(flags));
+        if (rc < 0) {
+            const err = ws2.WSAGetLastError();
+            return switch (err) {
+                .WSAEWOULDBLOCK => error.WouldBlock,
+                .WSAECONNRESET => error.ConnectionResetByPeer,
+                .WSAECONNABORTED => error.BrokenPipe,
+                else => error.Unexpected,
+            };
+        }
+        return @intCast(rc);
+    } else {
+        return posix.send(fd, buf, flags);
+    }
+}
+
+/// Cross-platform sendto. On Windows, uses ws2_32 directly to avoid libc dependency.
+pub fn sendto(fd: posix.socket_t, buf: []const u8, flags: u32, dest_addr: *const posix.sockaddr, addrlen: posix.socklen_t) !usize {
+    if (comptime builtin.os.tag == .windows) {
+        const ws2 = std.os.windows.ws2_32;
+        const rc = ws2.sendto(fd, buf.ptr, @intCast(buf.len), @intCast(flags), dest_addr, @intCast(addrlen));
+        if (rc < 0) {
+            const err = ws2.WSAGetLastError();
+            return switch (err) {
+                .WSAEWOULDBLOCK => error.WouldBlock,
+                .WSAECONNRESET => error.ConnectionResetByPeer,
+                else => error.Unexpected,
+            };
+        }
+        return @intCast(rc);
+    } else {
+        return posix.sendto(fd, buf, flags, dest_addr, addrlen);
+    }
+}
+
+/// Cross-platform setsockopt. On Windows, uses ws2_32 directly to avoid libc dependency.
+pub fn setsockopt(fd: posix.socket_t, level: i32, opt: u32, value: []const u8) !void {
+    if (comptime builtin.os.tag == .windows) {
+        const ws2 = std.os.windows.ws2_32;
+        const rc = ws2.setsockopt(fd, level, @intCast(opt), value.ptr, @intCast(value.len));
+        if (rc != 0) return error.Unexpected;
+    } else {
+        try posix.setsockopt(fd, level, opt, value);
+    }
+}
+
 pub fn setBoolOption(fd: posix.socket_t, level: i32, opt: u32, value: bool) !void {
     const v: u32 = if (value) 1 else 0;
-    try posix.setsockopt(fd, level, opt, &mem.toBytes(v));
+    try setsockopt(fd, level, opt, &mem.toBytes(v));
 }
 
 pub fn getBoolOption(fd: posix.socket_t, level: i32, opt: u32) !bool {
     var buf: [4]u8 = undefined;
-    try posix.getsockopt(fd, level, opt, &buf);
+    try getsockopt(fd, level, opt, &buf);
     return mem.readInt(u32, &buf, .little) != 0;
 }
 
 pub fn setIntOption(fd: posix.socket_t, level: i32, opt: u32, value: u32) !void {
-    try posix.setsockopt(fd, level, opt, &mem.toBytes(value));
+    try setsockopt(fd, level, opt, &mem.toBytes(value));
 }
 
 pub fn getIntOption(fd: posix.socket_t, level: i32, opt: u32) !u32 {
     var buf: [4]u8 = undefined;
-    try posix.getsockopt(fd, level, opt, &buf);
+    try getsockopt(fd, level, opt, &buf);
     return mem.readInt(u32, &buf, .little);
 }
 
@@ -89,7 +192,7 @@ pub fn waitForConnect(sock_fd: posix.socket_t) !void {
         // Windows: use select() for connect completion
         // For now, connect is synchronous on Windows (IOCP handles async)
         var err_buf: [4]u8 = undefined;
-        posix.getsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.ERROR, &err_buf) catch return;
+        getsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.ERROR, &err_buf) catch return;
         const err = mem.readInt(u32, &err_buf, .little);
         if (err != 0) return error.ConnectionRefused;
     } else {
@@ -109,7 +212,7 @@ pub fn waitForConnect(sock_fd: posix.socket_t) !void {
 
         // Check for connection error
         var err_buf: [4]u8 = undefined;
-        try posix.getsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.ERROR, &err_buf);
+        try getsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.ERROR, &err_buf);
         const err = mem.readInt(u32, &err_buf, .little);
 
         if (err != 0) {
