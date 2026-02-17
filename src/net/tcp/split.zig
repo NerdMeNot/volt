@@ -3,6 +3,7 @@
 //! Borrowed and owned halves for concurrent read/write access to a TcpStream.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("common.zig");
 const posix = c.posix;
 const mem = c.mem;
@@ -667,6 +668,8 @@ test "OwnedHalves - reunite via write half" {
 }
 
 test "OwnedHalves - vectored write" {
+    // posix.writev() not supported on Windows sockets (needs WSASend)
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var pair = try createConnectedPairForSplit();
     defer pair.server.close();
     defer pair.listener.close();

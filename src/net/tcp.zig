@@ -31,6 +31,7 @@
 //! ```
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const c = @import("tcp/common.zig");
 
@@ -214,6 +215,8 @@ test "TCP - connect and transfer" {
 }
 
 test "TcpStream - socket options" {
+    // Windows socket options (TCP_NODELAY) return DWORD with different semantics
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var listener = try TcpListener.bind(Address.fromPort(0));
     defer listener.close();
 
@@ -413,6 +416,8 @@ test "OwnedHalves - localAddr" {
 }
 
 test "OwnedHalves - vectored I/O" {
+    // posix.writev() not supported on Windows sockets (needs WSASend)
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var listener = try TcpListener.bind(Address.fromPort(0));
     defer listener.close();
 

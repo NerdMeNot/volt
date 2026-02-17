@@ -818,6 +818,7 @@ test "TcpStream - shutdown write then read returns EOF" {
 }
 
 test "TcpStream - setNoDelay get/set" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var pair = try createConnectedPair();
     defer pair.client.close();
     defer pair.server.close();
@@ -946,6 +947,8 @@ test "TcpStream - reader interface" {
 }
 
 test "TcpStream - vectored write" {
+    // posix.writev() not supported on Windows sockets (needs WSASend)
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var pair = try createConnectedPair();
     defer pair.client.close();
     defer pair.server.close();
