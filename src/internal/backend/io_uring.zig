@@ -985,8 +985,9 @@ test "IoUringBackend - user_data preserved" {
     var backend = try IoUringBackend.init(std.testing.allocator, Config{});
     defer backend.deinit();
 
-    // Submit operations with distinct user_data values
-    const user_data_values = [_]u64{ 0xDEADBEEF, 0xCAFEBABE, 0x12345678, std.math.maxInt(u64) };
+    // Submit operations with distinct user_data values (must fit in 32 bits
+    // since the encoding scheme uses upper 32 bits for slab_key)
+    const user_data_values = [_]u64{ 0xDEADBEEF, 0xCAFEBABE, 0x12345678, std.math.maxInt(u32) };
 
     for (user_data_values) |ud| {
         _ = try backend.submit(.{

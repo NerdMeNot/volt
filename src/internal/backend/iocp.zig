@@ -401,6 +401,24 @@ pub const IocpBackend = struct {
             return submission_id;
         }
 
+        // Handle NOP separately - no handle association needed, just post a completion
+        if (op.op == .nop) {
+            const slab_key = try self.operations.insert(TrackedOp.init(op, submission_id, windows.INVALID_HANDLE_VALUE));
+            errdefer _ = self.operations.remove(slab_key);
+            const tracked = self.operations.get(slab_key) orelse return error.InvalidArgument;
+            const posted = windows.kernel32.PostQueuedCompletionStatus(
+                self.iocp,
+                0,
+                user_data,
+                &tracked.overlapped,
+            ) == windows.TRUE;
+            if (!posted) {
+                _ = self.operations.remove(slab_key);
+                return error.SystemResources;
+            }
+            return submission_id;
+        }
+
         // Get handle from operation
         const handle = getHandleFromOp(op) orelse {
             return error.InvalidArgument;
@@ -420,15 +438,7 @@ pub const IocpBackend = struct {
         const success = switch (op.op) {
             .read => |r| self.issueRead(handle, r.buffer, &tracked.overlapped),
             .write => |w| self.issueWrite(handle, w.buffer, &tracked.overlapped),
-            .nop => blk: {
-                // Use PostQueuedCompletionStatus for NOP
-                break :blk windows.kernel32.PostQueuedCompletionStatus(
-                    self.iocp,
-                    0,
-                    user_data,
-                    &tracked.overlapped,
-                ) == windows.TRUE;
-            },
+            .nop => unreachable, // Handled above
             .timeout => unreachable, // Handled above
             else => {
                 _ = self.operations.remove(slab_key);
@@ -693,14 +703,12 @@ pub const IocpBackend = struct {
 };
 
 /// Convert an fd_t to a Windows HANDLE.
+/// On Windows, fd_t is *anyopaque (same as HANDLE) — return directly.
 /// On non-Windows (stub path), fd_t is an integer, so we convert via @ptrFromInt.
-/// On Windows, std.posix.fd_t is void, so callers must use fdToHandleFromInt
-/// or pass a HANDLE directly. This function is only valid on non-Windows.
 inline fn fdToHandle(fd: std.posix.fd_t) windows.HANDLE {
     if (builtin.os.tag == .windows) {
-        // fd_t is void on Windows -- this path should never be reached.
-        // Operations on Windows carry HANDLE values, not POSIX fds.
-        unreachable;
+        // On Windows, std.posix.fd_t is *anyopaque (HANDLE)
+        return fd;
     } else {
         // Non-Windows stub: fd_t is an integer
         return @ptrFromInt(@as(usize, @intCast(fd)));

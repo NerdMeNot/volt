@@ -275,5 +275,5 @@ test "Backend - init and deinit" {
     };
     defer backend.deinit();
 
-    try std.testing.expect(backend.fd() != null or backend.backendType() == .poll);
+    try std.testing.expect(backend.fd() != null or backend.backendType() == .poll or backend.backendType() == .iocp);
 }
