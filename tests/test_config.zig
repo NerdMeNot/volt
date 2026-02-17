@@ -5,6 +5,30 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const native_os = builtin.os.tag;
+
+/// Cross-platform check for whether an environment variable is set.
+fn hasEnv(comptime name: []const u8) bool {
+    if (native_os == .windows) {
+        const w_name = std.unicode.utf8ToUtf16LeStringLiteral(name);
+        return std.process.getenvW(w_name) != null;
+    } else {
+        return std.posix.getenv(name) != null;
+    }
+}
+
+/// Cross-platform getenv. Returns the value as a UTF-8 slice, or null.
+/// On Windows, writes into the provided buffer to convert from UTF-16.
+fn getenv(comptime name: []const u8, buf: []u8) ?[]const u8 {
+    if (native_os == .windows) {
+        const w_name = std.unicode.utf8ToUtf16LeStringLiteral(name);
+        const w_value = std.process.getenvW(w_name) orelse return null;
+        const len = std.unicode.utf16LeToUtf8(buf, w_value) catch return null;
+        return buf[0..len];
+    } else {
+        return std.posix.getenv(name);
+    }
+}
 
 /// Test intensity levels
 pub const Intensity = enum {
@@ -18,7 +42,8 @@ pub const Intensity = enum {
     exhaustive,
 
     pub fn fromEnv() Intensity {
-        const env = std.posix.getenv("VOLT_TEST_INTENSITY") orelse return .standard;
+        var buf: [64]u8 = undefined;
+        const env = getenv("VOLT_TEST_INTENSITY", &buf) orelse return .standard;
         return std.meta.stringToEnum(Intensity, env) orelse .standard;
     }
 };
@@ -103,8 +128,7 @@ pub const is_debug = builtin.mode == .Debug;
 
 /// Check if running in CI
 pub fn isCI() bool {
-    return std.posix.getenv("CI") != null or
-        std.posix.getenv("GITHUB_ACTIONS") != null;
+    return hasEnv("CI") or hasEnv("GITHUB_ACTIONS");
 }
 
 /// Get appropriate config for current environment.
@@ -126,7 +150,7 @@ pub fn stressAutoConfig() Config {
     }
     const intensity = Intensity.fromEnv();
     // If user didn't explicitly set intensity, default to stress
-    if (std.posix.getenv("VOLT_TEST_INTENSITY") == null) {
+    if (!hasEnv("VOLT_TEST_INTENSITY")) {
         return StandardConfigs.stress;
     }
     return getConfig(intensity);
