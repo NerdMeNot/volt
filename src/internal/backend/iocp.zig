@@ -600,9 +600,15 @@ pub const IocpBackend = struct {
     }
 
     /// Calculate IOCP wait timeout considering pending timers.
+    /// Uses ceiling division (round up) for ns→ms conversion, matching
+    /// mio/Tokio's approach (mio PR #1642). Truncation turns sub-ms
+    /// remainders into 0ms, causing busy-loops.
     fn calculateTimeout(self: *Self, user_timeout_ns: ?u64) windows.DWORD {
         var timeout_ms: windows.DWORD = if (user_timeout_ns) |ns|
-            @intCast(@min(ns / std.time.ns_per_ms, std.math.maxInt(windows.DWORD) - 1))
+            @intCast(@min(
+                (ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms,
+                std.math.maxInt(windows.DWORD) - 1,
+            ))
         else
             windows.INFINITE;
 
@@ -617,10 +623,15 @@ pub const IocpBackend = struct {
                 }
             }
 
-            // Calculate remaining time (saturating subtraction)
+            // Calculate remaining time (saturating subtraction), rounding UP to
+            // the next millisecond. Without the +1 rounding, sub-millisecond
+            // remainders truncate to 0, causing GetQueuedCompletionStatusEx to
+            // return instantly — but only microseconds pass, so the timer is
+            // still not expired, creating a busy-loop that never advances
+            // enough time for the deadline to be reached.
             const remaining_ns = if (min_deadline > now) min_deadline - now else 0;
             const timer_ms: windows.DWORD = @intCast(@min(
-                remaining_ns / std.time.ns_per_ms,
+                (remaining_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms,
                 std.math.maxInt(windows.DWORD) - 1,
             ));
 
@@ -937,26 +948,26 @@ test "IOCP - timeout registration and completion" {
     var backend = try IocpBackend.init(std.testing.allocator, .{});
     defer backend.deinit();
 
-    // Register a short timeout
+    // Register a timeout (50ms — generous for CI)
     const op = Operation{
-        .op = .{ .timeout = .{ .ns = 10_000_000 } }, // 10ms
+        .op = .{ .timeout = .{ .ns = 50_000_000 } }, // 50ms
         .user_data = 999,
     };
 
     const sub_id = try backend.submit(op);
     try std.testing.expectEqual(@as(u64, 999), sub_id.value);
 
-    // Wait for timeout to fire -- use generous timeout for slow CI runners
+    // Wait for timeout to fire
     var completions: [8]Completion = undefined;
     var total: usize = 0;
-    for (0..10) |_| {
-        total += try backend.wait(&completions, 500_000_000); // 500ms per attempt
+    for (0..20) |_| {
+        total += try backend.wait(&completions[total..], 500_000_000); // 500ms per attempt
         if (total >= 1) break;
     }
 
     try std.testing.expectEqual(@as(usize, 1), total);
     try std.testing.expectEqual(@as(u64, 999), completions[0].user_data);
-    try std.testing.expectEqual(@as(i32, 0), completions[0].result); // Timeout success
+    try std.testing.expectEqual(@as(i32, 0), completions[0].result);
 }
 
 test "IOCP - cancel timeout" {
@@ -1032,17 +1043,17 @@ test "IOCP - multiple timeouts ordering" {
     var backend = try IocpBackend.init(std.testing.allocator, .{});
     defer backend.deinit();
 
-    // Register multiple timeouts
+    // Register three timeouts with generous durations for CI
     _ = try backend.submit(Operation{
-        .op = .{ .timeout = .{ .ns = 30_000_000 } }, // 30ms
+        .op = .{ .timeout = .{ .ns = 100_000_000 } }, // 100ms
         .user_data = 3,
     });
     _ = try backend.submit(Operation{
-        .op = .{ .timeout = .{ .ns = 10_000_000 } }, // 10ms
+        .op = .{ .timeout = .{ .ns = 50_000_000 } }, // 50ms
         .user_data = 1,
     });
     _ = try backend.submit(Operation{
-        .op = .{ .timeout = .{ .ns = 20_000_000 } }, // 20ms
+        .op = .{ .timeout = .{ .ns = 75_000_000 } }, // 75ms
         .user_data = 2,
     });
 
@@ -1052,8 +1063,8 @@ test "IOCP - multiple timeouts ordering" {
     var completions: [8]Completion = undefined;
     var total_completed: usize = 0;
 
-    for (0..10) |_| {
-        const count = try backend.wait(&completions, 50_000_000); // 50ms
+    for (0..20) |_| {
+        const count = try backend.wait(&completions[total_completed..], 500_000_000);
         total_completed += count;
         if (total_completed >= 3) break;
     }
