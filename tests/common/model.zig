@@ -12,9 +12,34 @@
 //! Reference: tokio/tokio/src/loom/
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const Atomic = std.atomic.Value;
 const ThreadRng = @import("concurrency.zig").ThreadRng;
+const native_os = builtin.os.tag;
+
+/// Cross-platform check for whether an environment variable is set.
+fn hasEnv(comptime name: []const u8) bool {
+    if (native_os == .windows) {
+        const w_name = std.unicode.utf8ToUtf16LeStringLiteral(name);
+        return std.process.getenvW(w_name) != null;
+    } else {
+        return std.posix.getenv(name) != null;
+    }
+}
+
+/// Cross-platform getenv. Returns the value as a UTF-8 slice, or null.
+/// On Windows, writes into the provided buffer to convert from UTF-16.
+fn getenv(comptime name: []const u8, buf: []u8) ?[]const u8 {
+    if (native_os == .windows) {
+        const w_name = std.unicode.utf8ToUtf16LeStringLiteral(name);
+        const w_value = std.process.getenvW(w_name) orelse return null;
+        const len = std.unicode.utf16LeToUtf8(buf, w_value) catch return null;
+        return buf[0..len];
+    } else {
+        return std.posix.getenv(name);
+    }
+}
 
 /// Model checker state for systematic exploration
 pub const Model = struct {
@@ -47,7 +72,7 @@ pub const Model = struct {
             .yield_probability = computeYieldProbability(iteration, max_iterations),
             .yield_count = Atomic(usize).init(0),
             .interleaving_count = Atomic(usize).init(0),
-            .verbose = std.posix.getenv("LOOM_VERBOSE") != null,
+            .verbose = hasEnv("LOOM_VERBOSE"),
         };
     }
 
@@ -187,8 +212,8 @@ fn loomModelInternal(
 /// keep iteration count reasonable to avoid excessive runtime.
 pub fn loomRun(comptime testFn: fn (*Model) anyerror!void) !void {
     const iterations = blk: {
-        const env = std.posix.getenv("LOOM_ITERATIONS");
-        if (env) |val| {
+        var buf: [64]u8 = undefined;
+        if (getenv("LOOM_ITERATIONS", &buf)) |val| {
             break :blk std.fmt.parseInt(usize, val, 10) catch 50;
         }
         break :blk 50; // Reduced from 500 - real thread spawning is expensive
