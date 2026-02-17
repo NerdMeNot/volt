@@ -29,11 +29,11 @@ jobs:
         run: zig fmt --check src/ tests/ bench/
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # Unit Tests - All Platforms
+  # Full Test Suite - All stages in one job per platform
   # ═══════════════════════════════════════════════════════════════════════════
 
-  unit-tests:
-    name: Unit Tests (${{ matrix.name }})
+  test:
+    name: Test (${{ matrix.name }})
     needs: format
     strategy:
       fail-fast: false
@@ -66,117 +66,30 @@ jobs:
           echo "Runner: ${{ matrix.os }}"
           uname -a || ver
 
-      - name: Run unit tests
+      # ── Unit Tests ──────────────────────────────────────────────────────
+      - name: Unit tests
         run: zig build test
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # Extended Tests - Concurrency + Stress + Robustness (single job per platform)
-  # Memory ordering bugs manifest differently on ARM vs x86
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  extended-tests:
-    name: Extended (${{ matrix.name }})
-    needs: unit-tests
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: linux-x86_64
-          - os: ubuntu-22.04-arm
-            name: linux-arm64
-          - os: macos-latest
-            name: macos-arm64
-          - os: macos-15-intel
-            name: macos-x86_64
-          - os: windows-latest
-            name: windows-x86_64
-
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-
-      - name: Run concurrency tests
+      # ── Extended Tests (concurrency, stress, robustness) ────────────────
+      - name: Concurrency tests
         run: zig build test-concurrency
 
-      - name: Run stress tests
+      - name: Stress tests
         run: zig build test-stress
 
-      - name: Run robustness tests
+      - name: Robustness tests
         run: zig build test-robustness
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # Release Build Verification
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  release-build:
-    name: Release (${{ matrix.name }})
-    needs: extended-tests
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: linux-x86_64
-          - os: ubuntu-22.04-arm
-            name: linux-arm64
-          - os: macos-latest
-            name: macos-arm64
-          - os: macos-15-intel
-            name: macos-x86_64
-          - os: windows-latest
-            name: windows-x86_64
-
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-
+      # ── Release Build + Tests ───────────────────────────────────────────
       - name: Build release
         run: zig build -Doptimize=ReleaseFast
 
-      - name: Test in release mode
+      - name: Release mode tests
         run: zig build test -Doptimize=ReleaseFast
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # Benchmarks (build only - Linux/macOS, no Windows -- needs Rust for Tokio)
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  benchmarks:
-    name: Benchmarks (${{ matrix.name }})
-    needs: unit-tests
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: linux-x86_64
-          - os: ubuntu-22.04-arm
-            name: linux-arm64
-          - os: macos-latest
-            name: macos-arm64
-          - os: macos-15-intel
-            name: macos-x86_64
-
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-
+      # ── Benchmarks (build only, skip Windows — needs Rust for Tokio) ───
       - name: Build benchmarks
+        if: runner.os != 'Windows'
         run: zig build bench
 
   # ═══════════════════════════════════════════════════════════════════════════
@@ -185,29 +98,16 @@ jobs:
 
   ci-success:
     name: CI Success
-    needs:
-      - unit-tests
-      - extended-tests
-      - release-build
+    needs: test
     runs-on: ubuntu-latest
     if: always()
     steps:
       - name: Check all required jobs passed
         run: |
-          echo "Unit tests: ${{ needs.unit-tests.result }}"
-          echo "Extended tests: ${{ needs.extended-tests.result }}"
-          echo "Release build: ${{ needs.release-build.result }}"
+          echo "Test results: ${{ needs.test.result }}"
 
-          if [[ "${{ needs.unit-tests.result }}" != "success" ]]; then
-            echo "Unit tests failed"
-            exit 1
-          fi
-          if [[ "${{ needs.extended-tests.result }}" != "success" ]]; then
-            echo "Extended tests failed"
-            exit 1
-          fi
-          if [[ "${{ needs.release-build.result }}" != "success" ]]; then
-            echo "Release build failed"
+          if [[ "${{ needs.test.result }}" != "success" ]]; then
+            echo "Tests failed"
             exit 1
           fi
 
