@@ -138,6 +138,59 @@ pub fn sendto(fd: posix.socket_t, buf: []const u8, flags: u32, dest_addr: *const
     }
 }
 
+/// Cross-platform writev (gather write). On Windows, uses WSASend.
+pub fn writev(fd: posix.socket_t, iovs: []const posix.iovec_const) !usize {
+    if (comptime builtin.os.tag == .windows) {
+        const ws2 = std.os.windows.ws2_32;
+        var wsabufs: [16]ws2.WSABUF = undefined;
+        const count: u32 = @intCast(@min(iovs.len, 16));
+        for (0..count) |i| {
+            wsabufs[i] = .{ .len = @intCast(iovs[i].len), .buf = @constCast(iovs[i].base) };
+        }
+        var bytes_sent: u32 = 0;
+        const rc = ws2.WSASend(fd, &wsabufs, count, &bytes_sent, 0, null, null);
+        if (rc != 0) {
+            const err = ws2.WSAGetLastError();
+            return switch (err) {
+                .WSAEWOULDBLOCK => error.WouldBlock,
+                .WSAECONNRESET => error.ConnectionResetByPeer,
+                .WSAECONNABORTED => error.BrokenPipe,
+                else => error.Unexpected,
+            };
+        }
+        return bytes_sent;
+    } else {
+        return posix.writev(fd, iovs);
+    }
+}
+
+/// Cross-platform readv (scatter read). On Windows, uses WSARecv.
+pub fn readv(fd: posix.socket_t, iovs: []const posix.iovec) !usize {
+    if (comptime builtin.os.tag == .windows) {
+        const ws2 = std.os.windows.ws2_32;
+        var wsabufs: [16]ws2.WSABUF = undefined;
+        const count: u32 = @intCast(@min(iovs.len, 16));
+        for (0..count) |i| {
+            wsabufs[i] = .{ .len = @intCast(iovs[i].len), .buf = iovs[i].base };
+        }
+        var bytes_recv: u32 = 0;
+        var flags: u32 = 0;
+        const rc = ws2.WSARecv(fd, &wsabufs, count, &bytes_recv, &flags, null, null);
+        if (rc != 0) {
+            const err = ws2.WSAGetLastError();
+            return switch (err) {
+                .WSAEWOULDBLOCK => error.WouldBlock,
+                .WSAECONNRESET => error.ConnectionResetByPeer,
+                .WSAECONNABORTED => error.ConnectionResetByPeer,
+                else => error.Unexpected,
+            };
+        }
+        return bytes_recv;
+    } else {
+        return posix.readv(fd, iovs);
+    }
+}
+
 /// Cross-platform setsockopt. On Windows, uses ws2_32 directly to avoid libc dependency.
 pub fn setsockopt(fd: posix.socket_t, level: i32, opt: u32, value: []const u8) !void {
     if (comptime builtin.os.tag == .windows) {

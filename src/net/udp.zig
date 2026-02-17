@@ -997,8 +997,6 @@ test "UdpSocket - bind and close" {
 }
 
 test "UdpSocket - send and receive" {
-    // Windows UDP sendto/recvfrom has different address handling requirements
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     // Create two sockets
     var server = try UdpSocket.bind(Address.fromPort(0));
     defer server.close();
@@ -1006,7 +1004,8 @@ test "UdpSocket - send and receive" {
     var client = try UdpSocket.bind(Address.fromPort(0));
     defer client.close();
 
-    const server_addr = server.localAddr();
+    // Use 127.0.0.1 as destination (0.0.0.0 is not a valid sendto target on Windows)
+    const server_addr = Address.loopbackV4(server.localAddr().port());
 
     // Send from client to server
     const msg = "hello udp";
@@ -1028,15 +1027,14 @@ test "UdpSocket - send and receive" {
 }
 
 test "UdpSocket - connect and send/recv" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var server = try UdpSocket.bind(Address.fromPort(0));
     defer server.close();
 
     var client = try UdpSocket.bind(Address.fromPort(0));
     defer client.close();
 
-    // Connect client to server
-    try client.connect(server.localAddr());
+    // Connect client to server (use 127.0.0.1, not 0.0.0.0)
+    try client.connect(Address.loopbackV4(server.localAddr().port()));
     try std.testing.expect(client.peerAddr() != null);
 
     // Send using connected send
@@ -1133,15 +1131,14 @@ test "UdpSocket - multicast TTL option" {
 }
 
 test "UdpSocket - disconnect" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var socket = try UdpSocket.bind(Address.fromPort(0));
     defer socket.close();
 
     var server = try UdpSocket.bind(Address.fromPort(0));
     defer server.close();
 
-    // Connect to server
-    try socket.connect(server.localAddr());
+    // Connect to server (use 127.0.0.1, not 0.0.0.0)
+    try socket.connect(Address.loopbackV4(server.localAddr().port()));
     try std.testing.expect(socket.peerAddr() != null);
 
     // Disconnect
@@ -1159,16 +1156,15 @@ test "UdpSocket - takeError" {
 }
 
 test "UdpSocket - peek" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var server = try UdpSocket.bind(Address.fromPort(0));
     defer server.close();
 
     var client = try UdpSocket.bind(Address.fromPort(0));
     defer client.close();
 
-    // Send message
+    // Send message (use 127.0.0.1, not 0.0.0.0)
     const msg = "peek test";
-    _ = client.trySendTo(msg, server.localAddr()) catch |err| {
+    _ = client.trySendTo(msg, Address.loopbackV4(server.localAddr().port())) catch |err| {
         // CI VMs may not have full IPv4 networking
         if (err == error.NetworkUnreachable) return error.SkipZigTest;
         return err;
@@ -1209,15 +1205,14 @@ test "UdpSocket - async futures creation" {
 }
 
 test "UdpSocket - reader/writer interfaces" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var socket = try UdpSocket.bind(Address.fromPort(0));
     defer socket.close();
 
     var server = try UdpSocket.bind(Address.fromPort(0));
     defer server.close();
 
-    // Connect for reader/writer usage
-    try socket.connect(server.localAddr());
+    // Connect for reader/writer usage (use 127.0.0.1, not 0.0.0.0)
+    try socket.connect(Address.loopbackV4(server.localAddr().port()));
 
     // Get reader and writer - just verify we can get them
     _ = socket.reader();

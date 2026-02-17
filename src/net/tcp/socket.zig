@@ -149,6 +149,15 @@ pub const TcpSocket = struct {
             } else if (comptime builtin.os.tag == .macos or builtin.os.tag == .freebsd) {
                 // macOS uses TCP_KEEPALIVE for the idle time
                 try setIntOption(self.fd, posix.IPPROTO.TCP, @import("std").posix.TCP.KEEPALIVE, @intCast(ka.time.asSeconds()));
+            } else if (comptime builtin.os.tag == .windows) {
+                const ws2_tcp = @import("std").os.windows.ws2_32.TCP;
+                try setIntOption(self.fd, posix.IPPROTO.TCP, ws2_tcp.KEEPALIVE, @intCast(ka.time.asSeconds()));
+                if (ka.interval) |interval| {
+                    try setIntOption(self.fd, posix.IPPROTO.TCP, ws2_tcp.KEEPINTVL, @intCast(interval.asSeconds()));
+                }
+                if (ka.retries) |retries| {
+                    try setIntOption(self.fd, posix.IPPROTO.TCP, ws2_tcp.KEEPCNT, retries);
+                }
             }
         } else {
             // Disable keepalive
@@ -175,6 +184,14 @@ pub const TcpSocket = struct {
         } else if (comptime builtin.os.tag == .macos or builtin.os.tag == .freebsd) {
             const idle = try getIntOption(self.fd, posix.IPPROTO.TCP, @import("std").posix.TCP.KEEPALIVE);
             ka.time = Duration.fromSecs(idle);
+        } else if (comptime builtin.os.tag == .windows) {
+            const ws2_tcp = @import("std").os.windows.ws2_32.TCP;
+            const idle = try getIntOption(self.fd, posix.IPPROTO.TCP, ws2_tcp.KEEPALIVE);
+            ka.time = Duration.fromSecs(idle);
+            const interval = try getIntOption(self.fd, posix.IPPROTO.TCP, ws2_tcp.KEEPINTVL);
+            ka.interval = Duration.fromSecs(interval);
+            const retries = try getIntOption(self.fd, posix.IPPROTO.TCP, ws2_tcp.KEEPCNT);
+            ka.retries = retries;
         }
 
         return ka;
@@ -458,8 +475,6 @@ test "TcpSocket - setRecvBufferSize get/set" {
 }
 
 test "TcpSocket - setKeepalive get/set" {
-    // Windows keepalive uses different API (SIO_KEEPALIVE_VALS), not yet implemented
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var socket = try TcpSocket.newV4();
     defer socket.close();
 

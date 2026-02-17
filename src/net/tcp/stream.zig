@@ -137,7 +137,7 @@ pub const TcpStream = struct {
 
     /// Try to read vectored (scatter I/O).
     pub fn tryReadVectored(self: *TcpStream, iovs: []posix.iovec) !?usize {
-        const n = posix.readv(self.fd, iovs) catch |err| switch (err) {
+        const n = c.readv(self.fd, iovs) catch |err| switch (err) {
             error.WouldBlock => return null,
             error.ConnectionResetByPeer => return 0,
             else => return err,
@@ -147,7 +147,7 @@ pub const TcpStream = struct {
 
     /// Try to write vectored (gather I/O).
     pub fn tryWriteVectored(self: *TcpStream, iovs: []const posix.iovec_const) !?usize {
-        const n = posix.writev(self.fd, iovs) catch |err| switch (err) {
+        const n = c.writev(self.fd, iovs) catch |err| switch (err) {
             error.WouldBlock => return null,
             error.BrokenPipe, error.ConnectionResetByPeer => return 0,
             else => return err,
@@ -818,7 +818,6 @@ test "TcpStream - shutdown write then read returns EOF" {
 }
 
 test "TcpStream - setNoDelay get/set" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var pair = try createConnectedPair();
     defer pair.client.close();
     defer pair.server.close();
@@ -947,8 +946,6 @@ test "TcpStream - reader interface" {
 }
 
 test "TcpStream - vectored write" {
-    // posix.writev() not supported on Windows sockets (needs WSASend)
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var pair = try createConnectedPair();
     defer pair.client.close();
     defer pair.server.close();

@@ -145,7 +145,7 @@ pub const OwnedReadHalf = struct {
     }
 
     pub fn tryReadVectored(self: *OwnedReadHalf, iovs: []posix.iovec) !?usize {
-        const n = posix.readv(self.inner.fd, iovs) catch |err| switch (err) {
+        const n = c.readv(self.inner.fd, iovs) catch |err| switch (err) {
             error.WouldBlock => return null,
             error.ConnectionResetByPeer => return 0,
             else => return err,
@@ -230,7 +230,7 @@ pub const OwnedWriteHalf = struct {
     }
 
     pub fn tryWriteVectored(self: *OwnedWriteHalf, iovs: []const posix.iovec_const) !?usize {
-        const n = posix.writev(self.inner.fd, iovs) catch |err| switch (err) {
+        const n = c.writev(self.inner.fd, iovs) catch |err| switch (err) {
             error.WouldBlock => return null,
             error.BrokenPipe, error.ConnectionResetByPeer => return 0,
             else => return err,
@@ -668,8 +668,6 @@ test "OwnedHalves - reunite via write half" {
 }
 
 test "OwnedHalves - vectored write" {
-    // posix.writev() not supported on Windows sockets (needs WSASend)
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var pair = try createConnectedPairForSplit();
     defer pair.server.close();
     defer pair.listener.close();
