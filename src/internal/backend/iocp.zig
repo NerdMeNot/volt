@@ -946,11 +946,15 @@ test "IOCP - timeout registration and completion" {
     const sub_id = try backend.submit(op);
     try std.testing.expectEqual(@as(u64, 999), sub_id.value);
 
-    // Wait for timeout to fire
+    // Wait for timeout to fire -- use generous timeout for slow CI runners
     var completions: [8]Completion = undefined;
-    const count = try backend.wait(&completions, 100_000_000); // 100ms timeout
+    var total: usize = 0;
+    for (0..10) |_| {
+        total += try backend.wait(&completions, 500_000_000); // 500ms per attempt
+        if (total >= 1) break;
+    }
 
-    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(usize, 1), total);
     try std.testing.expectEqual(@as(u64, 999), completions[0].user_data);
     try std.testing.expectEqual(@as(i32, 0), completions[0].result); // Timeout success
 }

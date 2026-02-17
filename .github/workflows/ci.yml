@@ -70,12 +70,12 @@ jobs:
         run: zig build test
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # Concurrency Tests (Loom-style) - All Platforms
-  # Memory ordering bugs often manifest differently on ARM vs x86
+  # Extended Tests - Concurrency + Stress + Robustness (single job per platform)
+  # Memory ordering bugs manifest differently on ARM vs x86
   # ═══════════════════════════════════════════════════════════════════════════
 
-  concurrency-tests:
-    name: Concurrency (${{ matrix.name }})
+  extended-tests:
+    name: Extended (${{ matrix.name }})
     needs: unit-tests
     strategy:
       fail-fast: false
@@ -104,68 +104,8 @@ jobs:
       - name: Run concurrency tests
         run: zig build test-concurrency
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # Stress Tests - Linux and macOS (need more resources)
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  stress-tests:
-    name: Stress (${{ matrix.name }})
-    needs: unit-tests
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: linux-x86_64
-          - os: ubuntu-24.04-arm
-            name: linux-arm64
-          - os: macos-latest
-            name: macos-arm64
-          - os: macos-15-intel
-            name: macos-x86_64
-
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-
       - name: Run stress tests
         run: zig build test-stress
-
-  # ═══════════════════════════════════════════════════════════════════════════
-  # Robustness Tests - Edge cases and boundary conditions
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  robustness-tests:
-    name: Robustness (${{ matrix.name }})
-    needs: unit-tests
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: linux-x86_64
-          - os: ubuntu-24.04-arm
-            name: linux-arm64
-          - os: macos-latest
-            name: macos-arm64
-          - os: macos-15-intel
-            name: macos-x86_64
-          - os: windows-latest
-            name: windows-x86_64
-
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
 
       - name: Run robustness tests
         run: zig build test-robustness
@@ -176,7 +116,7 @@ jobs:
 
   release-build:
     name: Release (${{ matrix.name }})
-    needs: [concurrency-tests, stress-tests]
+    needs: extended-tests
     strategy:
       fail-fast: false
       matrix:
@@ -208,7 +148,7 @@ jobs:
         run: zig build test -Doptimize=ReleaseFast
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # Benchmarks (build only - verify compilation)
+  # Benchmarks (build only - Linux/macOS, no Windows -- needs Rust for Tokio)
   # ═══════════════════════════════════════════════════════════════════════════
 
   benchmarks:
@@ -247,9 +187,7 @@ jobs:
     name: CI Success
     needs:
       - unit-tests
-      - concurrency-tests
-      - stress-tests
-      - robustness-tests
+      - extended-tests
       - release-build
     runs-on: ubuntu-latest
     if: always()
@@ -257,30 +195,20 @@ jobs:
       - name: Check all required jobs passed
         run: |
           echo "Unit tests: ${{ needs.unit-tests.result }}"
-          echo "Concurrency tests: ${{ needs.concurrency-tests.result }}"
-          echo "Stress tests: ${{ needs.stress-tests.result }}"
-          echo "Robustness tests: ${{ needs.robustness-tests.result }}"
+          echo "Extended tests: ${{ needs.extended-tests.result }}"
           echo "Release build: ${{ needs.release-build.result }}"
 
           if [[ "${{ needs.unit-tests.result }}" != "success" ]]; then
-            echo "❌ Unit tests failed"
+            echo "Unit tests failed"
             exit 1
           fi
-          if [[ "${{ needs.concurrency-tests.result }}" != "success" ]]; then
-            echo "❌ Concurrency tests failed"
-            exit 1
-          fi
-          if [[ "${{ needs.stress-tests.result }}" != "success" ]]; then
-            echo "❌ Stress tests failed"
-            exit 1
-          fi
-          if [[ "${{ needs.robustness-tests.result }}" != "success" ]]; then
-            echo "❌ Robustness tests failed"
+          if [[ "${{ needs.extended-tests.result }}" != "success" ]]; then
+            echo "Extended tests failed"
             exit 1
           fi
           if [[ "${{ needs.release-build.result }}" != "success" ]]; then
-            echo "❌ Release build failed"
+            echo "Release build failed"
             exit 1
           fi
 
-          echo "✅ All CI checks passed!"
+          echo "All CI checks passed!"
