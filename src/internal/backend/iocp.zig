@@ -961,7 +961,7 @@ test "IOCP - timeout registration and completion" {
     var completions: [8]Completion = undefined;
     var total: usize = 0;
     for (0..20) |_| {
-        total += try backend.wait(&completions[total..], 500_000_000); // 500ms per attempt
+        total += try backend.wait(completions[total..], 500_000_000); // 500ms per attempt
         if (total >= 1) break;
     }
 
@@ -1064,7 +1064,7 @@ test "IOCP - multiple timeouts ordering" {
     var total_completed: usize = 0;
 
     for (0..20) |_| {
-        const count = try backend.wait(&completions[total_completed..], 500_000_000);
+        const count = try backend.wait(completions[total_completed..], 500_000_000);
         total_completed += count;
         if (total_completed >= 3) break;
     }
