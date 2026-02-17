@@ -41,8 +41,12 @@ jobs:
         include:
           - os: ubuntu-latest
             name: linux-x86_64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
           - os: macos-latest
             name: macos-arm64
+          - os: macos-15-intel
+            name: macos-x86_64
           - os: windows-latest
             name: windows-x86_64
 
@@ -79,8 +83,12 @@ jobs:
         include:
           - os: ubuntu-latest
             name: linux-x86_64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
           - os: macos-latest
             name: macos-arm64
+          - os: macos-15-intel
+            name: macos-x86_64
           - os: windows-latest
             name: windows-x86_64
 
@@ -109,8 +117,12 @@ jobs:
         include:
           - os: ubuntu-latest
             name: linux-x86_64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
           - os: macos-latest
             name: macos-arm64
+          - os: macos-15-intel
+            name: macos-x86_64
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -137,8 +149,12 @@ jobs:
         include:
           - os: ubuntu-latest
             name: linux-x86_64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
           - os: macos-latest
             name: macos-arm64
+          - os: macos-15-intel
+            name: macos-x86_64
           - os: windows-latest
             name: windows-x86_64
 
@@ -167,8 +183,12 @@ jobs:
         include:
           - os: ubuntu-latest
             name: linux-x86_64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
           - os: macos-latest
             name: macos-arm64
+          - os: macos-15-intel
+            name: macos-x86_64
           - os: windows-latest
             name: windows-x86_64
 
@@ -200,8 +220,12 @@ jobs:
         include:
           - os: ubuntu-latest
             name: linux-x86_64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
           - os: macos-latest
             name: macos-arm64
+          - os: macos-15-intel
+            name: macos-x86_64
 
     runs-on: ${{ matrix.os }}
     steps:
