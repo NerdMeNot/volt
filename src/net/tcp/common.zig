@@ -208,7 +208,9 @@ pub fn setBoolOption(fd: posix.socket_t, level: i32, opt: u32, value: bool) !voi
 }
 
 pub fn getBoolOption(fd: posix.socket_t, level: i32, opt: u32) !bool {
-    var buf: [4]u8 = undefined;
+    // Zero-init: Windows getsockopt may write fewer than 4 bytes for BOOL options,
+    // leaving upper bytes as garbage (0xaa in debug mode) which corrupts the u32 read.
+    var buf: [4]u8 = .{ 0, 0, 0, 0 };
     try getsockopt(fd, level, opt, &buf);
     return mem.readInt(u32, &buf, .little) != 0;
 }
@@ -218,7 +220,7 @@ pub fn setIntOption(fd: posix.socket_t, level: i32, opt: u32, value: u32) !void 
 }
 
 pub fn getIntOption(fd: posix.socket_t, level: i32, opt: u32) !u32 {
-    var buf: [4]u8 = undefined;
+    var buf: [4]u8 = .{ 0, 0, 0, 0 };
     try getsockopt(fd, level, opt, &buf);
     return mem.readInt(u32, &buf, .little);
 }
