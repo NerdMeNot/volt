@@ -105,7 +105,14 @@ const windows = if (builtin.os.tag == .windows) struct {
     pub const ws2_32 = struct {
         pub const WSARecv = w.ws2_32.WSARecv;
         pub const WSASend = w.ws2_32.WSASend;
-        pub const socket = w.ws2_32.socket;
+
+        /// Wrapper around ws2_32.socket that returns null on INVALID_SOCKET.
+        pub fn socket(af: i32, sock_type: i32, protocol: i32) ?SOCKET {
+            const raw = w.ws2_32.socket(af, sock_type, protocol);
+            // INVALID_SOCKET == (SOCKET)(~0)
+            if (@intFromPtr(raw) == std.math.maxInt(usize)) return null;
+            return raw;
+        }
     };
 
     pub const mswsock = struct {
@@ -623,7 +630,8 @@ pub const IocpBackend = struct {
 
         const listen_socket: windows.SOCKET = @ptrCast(handle);
         // AcceptEx requires a pre-created socket for the incoming connection
-        const accept_socket = windows.ws2_32.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) orelse return false;
+        // AF_INET=2, SOCK_STREAM=1 — use raw constants to avoid type coercion issues
+        const accept_socket = windows.ws2_32.socket(2, 1, 0) orelse return false;
         tracked.accept_socket = @ptrCast(accept_socket);
 
         var bytes_received: windows.DWORD = 0;
