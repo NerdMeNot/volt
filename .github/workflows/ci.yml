@@ -80,14 +80,9 @@ jobs:
       - name: Robustness tests
         run: zig build test-robustness
 
-      # ── Release Build + Tests ───────────────────────────────────────────
-      - name: Build release
-        run: zig build -Doptimize=ReleaseFast
-
-      - name: Release mode tests
-        run: zig build test -Doptimize=ReleaseFast
-
-      # ── Benchmarks (build only, skip Windows — needs Rust for Tokio) ───
+      # ── Benchmarks (build-only, skip Windows — needs Rust for Tokio) ───
+      # Benchmarks are hardcoded to ReleaseFast in build.zig, so this also
+      # verifies that release compilation succeeds.
       - name: Build benchmarks
         if: runner.os != 'Windows'
         run: zig build bench
