@@ -97,6 +97,39 @@ const windows = if (builtin.os.tag == .windows) struct {
             lpOverlapped: ?*OVERLAPPED,
         ) callconv(.winapi) BOOL;
     };
+
+    // Winsock types and functions for socket operations
+    pub const SOCKET = w.ws2_32.SOCKET;
+    pub const WSABUF = w.ws2_32.WSABUF;
+
+    pub const ws2_32 = struct {
+        pub const WSARecv = w.ws2_32.WSARecv;
+        pub const WSASend = w.ws2_32.WSASend;
+        pub const socket = w.ws2_32.socket;
+    };
+
+    pub const mswsock = struct {
+        pub extern "mswsock" fn AcceptEx(
+            sListenSocket: SOCKET,
+            sAcceptSocket: SOCKET,
+            lpOutputBuffer: *anyopaque,
+            dwReceiveDataLength: DWORD,
+            dwLocalAddressLength: DWORD,
+            dwRemoteAddressLength: DWORD,
+            lpdwBytesReceived: *DWORD,
+            lpOverlapped: *OVERLAPPED,
+        ) callconv(.winapi) BOOL;
+
+        pub extern "mswsock" fn ConnectEx(
+            s: SOCKET,
+            name: *const std.posix.sockaddr,
+            namelen: c_int,
+            lpSendBuffer: ?*anyopaque,
+            dwSendDataLength: DWORD,
+            lpdwBytesSent: ?*DWORD,
+            lpOverlapped: *OVERLAPPED,
+        ) callconv(.winapi) BOOL;
+    };
 } else struct {
     // Stub types for non-Windows compilation
     pub const HANDLE = *anyopaque;
@@ -160,6 +193,34 @@ const windows = if (builtin.os.tag == .windows) struct {
         NOT_ENOUGH_MEMORY = 8,
         _,
     };
+
+    // Winsock stubs for non-Windows compilation
+    pub const SOCKET = *anyopaque;
+    pub const WSABUF = extern struct {
+        len: u32,
+        buf: ?[*]u8,
+    };
+
+    pub const ws2_32 = struct {
+        pub fn WSARecv(_: SOCKET, _: [*]WSABUF, _: DWORD, _: ?*DWORD, _: *DWORD, _: ?*OVERLAPPED, _: ?*anyopaque) callconv(.winapi) c_int {
+            return -1;
+        }
+        pub fn WSASend(_: SOCKET, _: [*]WSABUF, _: DWORD, _: ?*DWORD, _: DWORD, _: ?*OVERLAPPED, _: ?*anyopaque) callconv(.winapi) c_int {
+            return -1;
+        }
+        pub fn socket(_: u32, _: u32, _: u32) callconv(.winapi) ?SOCKET {
+            return null;
+        }
+    };
+
+    pub const mswsock = struct {
+        pub fn AcceptEx(_: SOCKET, _: SOCKET, _: *anyopaque, _: DWORD, _: DWORD, _: DWORD, _: *DWORD, _: *OVERLAPPED) callconv(.winapi) BOOL {
+            return FALSE;
+        }
+        pub fn ConnectEx(_: SOCKET, _: *const std.posix.sockaddr, _: c_int, _: ?*anyopaque, _: DWORD, _: ?*DWORD, _: *OVERLAPPED) callconv(.winapi) BOOL {
+            return FALSE;
+        }
+    };
 };
 
 /// Default batch size for completion dequeuing.
@@ -207,6 +268,11 @@ const TrackedOp = struct {
     buffer_ptr: ?[*]u8,
     buffer_len: usize,
 
+    /// Accept socket (for AcceptEx, which requires a pre-created socket).
+    accept_socket: ?windows.HANDLE,
+    /// Address buffer for AcceptEx (local + remote, each needs sockaddr_storage + 16 bytes).
+    accept_addr_buf: [2 * (@sizeOf(std.posix.sockaddr.storage) + 16)]u8,
+
     pub fn init(op: Operation, submission_id: SubmissionId, handle: windows.HANDLE) TrackedOp {
         var overlapped = std.mem.zeroes(windows.OVERLAPPED);
 
@@ -235,6 +301,8 @@ const TrackedOp = struct {
             .handle = handle,
             .buffer_ptr = null,
             .buffer_len = 0,
+            .accept_socket = null,
+            .accept_addr_buf = std.mem.zeroes([2 * (@sizeOf(std.posix.sockaddr.storage) + 16)]u8),
         };
     }
 };
@@ -246,6 +314,10 @@ const Timer = struct {
     deadline_ns: u64,
     user_data: u64,
 };
+
+/// Sentinel completion key for cross-thread wakeup.
+/// Distinguished from user completion keys by using maxInt.
+const WAKEUP_COMPLETION_KEY: usize = std.math.maxInt(usize);
 
 /// Windows IOCP Backend.
 pub const IocpBackend = struct {
@@ -279,6 +351,9 @@ pub const IocpBackend = struct {
 
     /// Start time for monotonic timer calculations.
     start_instant: std.time.Instant,
+
+    /// Tracks if a wakeup is pending (for coalescing multiple unpark calls).
+    wakeup_pending: std.atomic.Value(bool),
 
     const Self = @This();
 
@@ -335,6 +410,7 @@ pub const IocpBackend = struct {
                 else
                     .{ .sec = 0, .nsec = 0 },
             },
+            .wakeup_pending = std.atomic.Value(bool).init(false),
         };
     }
 
@@ -359,6 +435,25 @@ pub const IocpBackend = struct {
         self.allocator.free(self.completion_buffer);
         self.associated_handles.deinit();
         _ = windows.kernel32.CloseHandle(self.iocp);
+    }
+
+    /// Wake up the I/O driver from another thread.
+    /// Uses PostQueuedCompletionStatus with a sentinel key to wake
+    /// GetQueuedCompletionStatusEx. Safe to call from any thread.
+    /// Coalesces multiple calls.
+    pub fn unpark(self: *Self) void {
+        // Use swap to coalesce multiple unpark calls
+        if (self.wakeup_pending.swap(true, .acq_rel)) {
+            return; // Already pending
+        }
+
+        // Post a dummy completion to wake GetQueuedCompletionStatusEx
+        _ = windows.kernel32.PostQueuedCompletionStatus(
+            self.iocp,
+            0,
+            WAKEUP_COMPLETION_KEY,
+            null,
+        );
     }
 
     /// Associate a handle with the IOCP.
@@ -438,6 +533,10 @@ pub const IocpBackend = struct {
         const success = switch (op.op) {
             .read => |r| self.issueRead(handle, r.buffer, &tracked.overlapped),
             .write => |w| self.issueWrite(handle, w.buffer, &tracked.overlapped),
+            .recv => |r| self.issueRecv(handle, r.buffer, r.flags, &tracked.overlapped),
+            .send => |s| self.issueSend(handle, s.buffer, s.flags, &tracked.overlapped),
+            .accept => self.issueAccept(handle, tracked, &tracked.overlapped),
+            .connect => |c| self.issueConnect(handle, c.addr, c.addr_len, &tracked.overlapped),
             .nop => unreachable, // Handled above
             .timeout => unreachable, // Handled above
             else => {
@@ -489,6 +588,67 @@ pub const IocpBackend = struct {
             overlapped,
         );
         return result == windows.TRUE;
+    }
+
+    /// Issue an async recv (WSARecv).
+    fn issueRecv(self: *Self, handle: windows.HANDLE, buffer: []u8, flags: u32, overlapped: *windows.OVERLAPPED) bool {
+        _ = self;
+        if (builtin.os.tag != .windows) return false;
+
+        var wsabuf = windows.WSABUF{ .len = @intCast(buffer.len), .buf = buffer.ptr };
+        var bytes_recv: windows.DWORD = 0;
+        var recv_flags: windows.DWORD = flags;
+        const socket: windows.SOCKET = @ptrCast(handle);
+        const rc = windows.ws2_32.WSARecv(socket, @ptrCast(&wsabuf), 1, &bytes_recv, &recv_flags, overlapped, null);
+        return rc == 0;
+    }
+
+    /// Issue an async send (WSASend).
+    fn issueSend(self: *Self, handle: windows.HANDLE, buffer: []const u8, flags: u32, overlapped: *windows.OVERLAPPED) bool {
+        _ = self;
+        if (builtin.os.tag != .windows) return false;
+
+        var wsabuf = windows.WSABUF{ .len = @intCast(buffer.len), .buf = @constCast(buffer.ptr) };
+        var bytes_sent: windows.DWORD = 0;
+        const socket: windows.SOCKET = @ptrCast(handle);
+        const rc = windows.ws2_32.WSASend(socket, @ptrCast(&wsabuf), 1, &bytes_sent, flags, overlapped, null);
+        return rc == 0;
+    }
+
+    /// Issue an async accept (AcceptEx).
+    /// AcceptEx requires a pre-created accept socket and an address buffer.
+    fn issueAccept(self: *Self, handle: windows.HANDLE, tracked: *TrackedOp, overlapped: *windows.OVERLAPPED) bool {
+        _ = self;
+        if (builtin.os.tag != .windows) return false;
+
+        const listen_socket: windows.SOCKET = @ptrCast(handle);
+        // AcceptEx requires a pre-created socket for the incoming connection
+        const accept_socket = windows.ws2_32.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) orelse return false;
+        tracked.accept_socket = @ptrCast(accept_socket);
+
+        var bytes_received: windows.DWORD = 0;
+        const addr_len: windows.DWORD = @sizeOf(std.posix.sockaddr.storage) + 16;
+        const rc = windows.mswsock.AcceptEx(
+            listen_socket,
+            accept_socket,
+            @ptrCast(&tracked.accept_addr_buf),
+            0, // No initial data receive
+            addr_len,
+            addr_len,
+            &bytes_received,
+            overlapped,
+        );
+        return rc == windows.TRUE;
+    }
+
+    /// Issue an async connect (ConnectEx).
+    fn issueConnect(self: *Self, handle: windows.HANDLE, addr: *const std.posix.sockaddr, addr_len: std.posix.socklen_t, overlapped: *windows.OVERLAPPED) bool {
+        _ = self;
+        if (builtin.os.tag != .windows) return false;
+
+        const socket: windows.SOCKET = @ptrCast(handle);
+        const rc = windows.mswsock.ConnectEx(socket, addr, @intCast(addr_len), null, 0, null, overlapped);
+        return rc == windows.TRUE;
     }
 
     /// Register a timeout in the timer list.
@@ -551,18 +711,36 @@ pub const IocpBackend = struct {
         for (self.completion_buffer[0..entries_removed]) |entry| {
             if (count >= completions.len) break;
 
+            const user_data = entry.lpCompletionKey;
+
+            // Handle wakeup sentinel (cross-thread notification via unpark())
+            if (user_data == WAKEUP_COMPLETION_KEY) {
+                self.wakeup_pending.store(false, .release);
+                continue;
+            }
+
             // Find the tracked operation from the OVERLAPPED pointer
             const bytes_transferred = entry.dwNumberOfBytesTransferred;
-            const user_data = entry.lpCompletionKey;
 
             // Check if operation was successful
             // Internal contains the NTSTATUS
             const status = entry.Internal;
             const is_success = (status == 0); // STATUS_SUCCESS
 
+            // For AcceptEx completions, the result is the accepted socket handle
+            const op_result: i32 = if (!is_success)
+                mapNtStatusToErrno(status)
+            else if (self.findTrackedOp(entry.lpOverlapped)) |tracked|
+                if (tracked.op.op == .accept and tracked.accept_socket != null)
+                    @intCast(@intFromPtr(tracked.accept_socket.?))
+                else
+                    @intCast(bytes_transferred)
+            else
+                @intCast(bytes_transferred);
+
             completions[count] = Completion{
                 .user_data = user_data,
-                .result = if (is_success) @intCast(bytes_transferred) else mapNtStatusToErrno(status),
+                .result = op_result,
                 .flags = 0,
             };
             count += 1;
@@ -641,6 +819,19 @@ pub const IocpBackend = struct {
         }
 
         return timeout_ms;
+    }
+
+    /// Find a tracked operation by its OVERLAPPED pointer (without removing it).
+    fn findTrackedOp(self: *Self, overlapped: ?*windows.OVERLAPPED) ?*TrackedOp {
+        if (overlapped == null) return null;
+
+        var it = self.operations.iterator();
+        while (it.next()) |entry| {
+            if (&entry.value.overlapped == overlapped) {
+                return entry.value;
+            }
+        }
+        return null;
     }
 
     /// Clean up a completed operation.

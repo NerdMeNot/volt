@@ -242,12 +242,16 @@ pub const EpollBackend = struct {
         // Clamp timeout to safe maximum to prevent overflow
         const safe_ns = completion.clampTimeout(timeout_ns);
 
+        // timerfd_settime: it_value={0,0} DISARMS the timer (per man page).
+        // Ensure minimum 1ns so zero-timeout fires immediately instead of disarming.
+        const effective_ns = if (safe_ns == 0) @as(u64, 1) else safe_ns;
+
         // Set the timer
         const ts = linux.itimerspec{
             .it_interval = .{ .sec = 0, .nsec = 0 },
             .it_value = .{
-                .sec = @intCast(safe_ns / std.time.ns_per_s),
-                .nsec = @intCast(safe_ns % std.time.ns_per_s),
+                .sec = @intCast(effective_ns / std.time.ns_per_s),
+                .nsec = @intCast(effective_ns % std.time.ns_per_s),
             },
         };
 
@@ -330,6 +334,14 @@ pub const EpollBackend = struct {
                 -@as(i32, @intCast(@intFromEnum(linux.E.IO)))
             else
                 self.performOperation(reg.op);
+
+            // Spurious readiness: fd was reported ready but operation would block.
+            // Re-arm the fd with epoll (ONESHOT requires re-registration) and skip
+            // this event — don't remove the registration or emit a completion.
+            if (result == -@as(i32, @intCast(@intFromEnum(linux.E.AGAIN)))) {
+                self.registerWithEpoll(reg.op, token) catch {};
+                continue;
+            }
 
             completions[count] = Completion{
                 .user_data = reg.submission_id.value,

@@ -300,9 +300,11 @@ pub const KqueueBackend = struct {
                 const timer_id = self.next_timer_id;
                 self.next_timer_id +%= 1;
 
-                // Clamp timeout to safe maximum and convert to milliseconds for kqueue
+                // Clamp timeout to safe maximum and convert to milliseconds for kqueue.
+                // Minimum 1ms: 0ms would fire instantly anyway but some kernels
+                // may treat it as "no timeout" with EVFILT_TIMER.
                 const safe_ns = completion.clampTimeout(t.ns);
-                const timeout_ms: isize = @intCast(safe_ns / std.time.ns_per_ms);
+                const timeout_ms: isize = @intCast(@max(1, safe_ns / std.time.ns_per_ms));
 
                 const timer_ident = TOKEN_TIMER_BASE - timer_id;
 
@@ -368,9 +370,6 @@ pub const KqueueBackend = struct {
                 continue;
             }
 
-            // Skip timer tokens
-            if (token >= TOKEN_TIMER_BASE) continue;
-
             // Get registration from slab (O(1) lookup)
             const reg = self.registrations.get(token) orelse continue;
 
@@ -388,6 +387,16 @@ pub const KqueueBackend = struct {
                 -@as(i32, @intCast(event.data))
             else
                 self.performOperation(reg.op);
+
+            // Spurious readiness: fd was reported ready but operation would block.
+            // Re-arm with kqueue (ONESHOT requires re-registration) and skip
+            // this event — don't remove the registration or emit a completion.
+            if (result == -@as(i32, @intCast(@intFromEnum(posix.E.AGAIN)))) {
+                if (self.createKevent(reg.op, token) catch null) |kevent| {
+                    self.change_list.append(self.allocator, kevent) catch {};
+                }
+                continue;
+            }
 
             completions[count] = Completion{
                 .user_data = reg.submission_id.value,
