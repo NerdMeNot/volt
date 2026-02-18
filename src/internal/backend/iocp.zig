@@ -127,15 +127,9 @@ const windows = if (builtin.os.tag == .windows) struct {
             lpOverlapped: *OVERLAPPED,
         ) callconv(.winapi) BOOL;
 
-        pub extern "mswsock" fn ConnectEx(
-            s: SOCKET,
-            name: *const std.posix.sockaddr,
-            namelen: c_int,
-            lpSendBuffer: ?*anyopaque,
-            dwSendDataLength: DWORD,
-            lpdwBytesSent: ?*DWORD,
-            lpOverlapped: *OVERLAPPED,
-        ) callconv(.winapi) BOOL;
+        // Note: ConnectEx is NOT directly exported from mswsock.dll.
+        // It must be loaded dynamically via WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER).
+        // Connect operations fall back to OperationNotSupported on IOCP.
     };
 } else struct {
     // Stub types for non-Windows compilation
@@ -222,9 +216,6 @@ const windows = if (builtin.os.tag == .windows) struct {
 
     pub const mswsock = struct {
         pub fn AcceptEx(_: SOCKET, _: SOCKET, _: *anyopaque, _: DWORD, _: DWORD, _: DWORD, _: *DWORD, _: *OVERLAPPED) callconv(.winapi) BOOL {
-            return FALSE;
-        }
-        pub fn ConnectEx(_: SOCKET, _: *const std.posix.sockaddr, _: c_int, _: ?*anyopaque, _: DWORD, _: ?*DWORD, _: *OVERLAPPED) callconv(.winapi) BOOL {
             return FALSE;
         }
     };
@@ -543,7 +534,6 @@ pub const IocpBackend = struct {
             .recv => |r| self.issueRecv(handle, r.buffer, r.flags, &tracked.overlapped),
             .send => |s| self.issueSend(handle, s.buffer, s.flags, &tracked.overlapped),
             .accept => self.issueAccept(handle, tracked, &tracked.overlapped),
-            .connect => |c| self.issueConnect(handle, c.addr, c.addr_len, &tracked.overlapped),
             .nop => unreachable, // Handled above
             .timeout => unreachable, // Handled above
             else => {
@@ -646,16 +636,6 @@ pub const IocpBackend = struct {
             &bytes_received,
             overlapped,
         );
-        return rc == windows.TRUE;
-    }
-
-    /// Issue an async connect (ConnectEx).
-    fn issueConnect(self: *Self, handle: windows.HANDLE, addr: *const std.posix.sockaddr, addr_len: std.posix.socklen_t, overlapped: *windows.OVERLAPPED) bool {
-        _ = self;
-        if (builtin.os.tag != .windows) return false;
-
-        const socket: windows.SOCKET = @ptrCast(handle);
-        const rc = windows.mswsock.ConnectEx(socket, addr, @intCast(addr_len), null, 0, null, overlapped);
         return rc == windows.TRUE;
     }
 
