@@ -81,11 +81,7 @@ jobs:
         run: zig build test-robustness
 
       # ── Benchmarks (ReleaseFast — verifies release compilation) ─────────
-      # Skip Windows (needs Rust for Tokio comparison).
-      # Diagnostic: linux-arm64 hangs during benchmark execution (not compilation).
-      # Compilation completes in 14s; the runtime itself deadlocks.
       - name: Build and run benchmarks
-        if: runner.os != 'Windows'
         timeout-minutes: 5
         run: zig build bench
 
