@@ -55,10 +55,9 @@ const BroadcastChannel = volt.channel.BroadcastChannel;
 const Watch = volt.channel.Watch;
 
 fn print(comptime fmt: []const u8, args: anytype) void {
-    const stdout = std.posix.STDOUT_FILENO;
     var buf: [4096]u8 = undefined;
     const output = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = std.posix.write(stdout, output) catch return;
+    std.fs.File.stdout().writeAll(output) catch return;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
