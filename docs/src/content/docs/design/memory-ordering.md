@@ -310,6 +310,47 @@ and will find the work.
 This is the same pattern Tokio uses for its idle coordination, and for the
 same reason.
 
+### Channel Waiter Flags (Dekker Pattern)
+
+The MPMC channel's `has_recv_waiters` and `has_send_waiters` flags use
+SeqCst for all operations:
+
+```zig
+// Fast path (trySend) — after writing value to ring buffer:
+if (self.has_recv_waiters.load(.seq_cst)) {
+    self.wakeOneRecvWaiter();
+}
+
+// Slow path (recvWait) — under waiter_mutex, before re-checking buffer:
+self.has_recv_waiters.store(true, .seq_cst);
+const retry = self.tryRecv();  // Re-check under lock
+```
+
+**Why SeqCst here?**
+
+This is a **Dekker pattern**: the fast path writes the buffer (variable A)
+then reads the flag (variable B), while the slow path writes the flag
+(variable B) then reads the buffer (variable A). With acquire/release,
+these operations on different variables have no mutual ordering guarantee.
+On ARM64, both sides can see stale values simultaneously:
+
+```
+Producer: store buffer [release] → load flag [acquire] → false (STALE!)
+Consumer: store flag [release]   → load buffer [acquire] → empty (STALE!)
+// Both miss each other — lost wakeup, task orphaned forever
+```
+
+SeqCst establishes a total order: the flag store and flag load are ordered
+relative to each other, guaranteeing that at least one side sees the
+other's write. This is the same pattern crossbeam-channel uses for its
+`SyncWaker::is_empty` flag.
+
+This bug caused an intermittent deadlock on ARM64 (14 of 15 MPMC benchmark
+rounds passed, the 15th hung). On x86 (TSO), the bug was latent because
+the hardware provides near-sequential-consistency for stores. See
+[Channel Wakeup Protocol](/design/channel-wakeup-protocol/) for the full
+analysis.
+
 ### Bitmap Operations
 
 The parked worker bitmap uses SeqCst for claim operations:
@@ -580,6 +621,15 @@ Several ordering bugs were found during development:
    flags created a window where the waker set `notified` but the scheduler
    checked `waiting` first. Fixed by removing the `waiting` flag entirely
    -- only `notified` signals "poll again".
+
+4. **MPMC channel Dekker pattern (ARM64 deadlock):** The
+   `has_recv_waiters`/`has_send_waiters` flags used `.acquire`/`.release`,
+   but the fast path (buffer write → flag read) and slow path (flag write
+   → buffer read) form a Dekker pattern that requires `.seq_cst`. On
+   ARM64, both sides could see stale values, causing the producer to skip
+   the wakeup while the consumer saw an empty buffer — permanently
+   orphaning the task. Fixed by upgrading all 15 flag operations to
+   `.seq_cst`. See [Channel Wakeup Protocol](/design/channel-wakeup-protocol/).
 
 These bugs underscore why ordering choices must be deliberate and tested.
 A "just use SeqCst everywhere" approach would mask bugs at the cost of

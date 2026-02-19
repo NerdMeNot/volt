@@ -60,7 +60,9 @@ pub fn trySend(self: *Self, value: T) SendResult {
             self.buffer[idx] = value;
             slot.sequence.store(tail +% 1, .release);
 
-            if (self.has_recv_waiters.load(.acquire)) {
+            // seq_cst: Dekker protocol — pairs with seq_cst store
+            // in recvWait(). See design/channel-wakeup-protocol.
+            if (self.has_recv_waiters.load(.seq_cst)) {
                 self.wakeOneRecvWaiter();
             }
             return .ok;
@@ -106,7 +108,9 @@ pub fn tryRecv(self: *Self) RecvResult {
             const value = self.buffer[idx];
             slot.sequence.store(head +% self.buf_cap, .release);
 
-            if (self.has_send_waiters.load(.acquire)) {
+            // seq_cst: Dekker protocol — pairs with seq_cst store
+            // in sendWait(). See design/channel-wakeup-protocol.
+            if (self.has_send_waiters.load(.seq_cst)) {
                 self.wakeOneSendWaiter();
             }
             return .{ .value = value };
@@ -233,12 +237,30 @@ Fast path (lock-free):          Slow path (mutex-protected):
 The waiter system uses a "flag-before-check" protocol to prevent lost wakeups:
 
 1. Lock `waiter_mutex`.
-2. Set the `has_recv_waiters` (or `has_send_waiters`) flag.
+2. Set the `has_recv_waiters` (or `has_send_waiters`) flag with **seq_cst**.
 3. Re-check the ring buffer under lock (`trySend`/`tryRecv`).
 4. If the re-check succeeds, clear the flag and return immediately.
 5. If still blocked, add the waiter to the list and release the lock.
 
-After a successful `trySend`, the sender checks `has_recv_waiters` and wakes one receiver if set. After a successful `tryRecv`, the receiver checks `has_send_waiters` and wakes one sender. This ensures no waiter is stranded.
+After a successful `trySend`, the sender checks `has_recv_waiters` (seq_cst load) and wakes one receiver if set. After a successful `tryRecv`, the receiver checks `has_send_waiters` and wakes one sender. This ensures no waiter is stranded.
+
+### Why Sequential Consistency?
+
+The waiter flags implement a **Dekker pattern** — the fast path writes
+the buffer then reads the flag, while the slow path writes the flag then
+re-reads the buffer. These are two separate variables on different cache
+lines. With acquire/release, there is no cross-variable ordering
+guarantee: on ARM64, both sides can see stale values simultaneously,
+causing a lost wakeup that orphans a task forever.
+
+Sequential consistency (`.seq_cst`) provides a total order that prevents
+this: at least one side is guaranteed to see the other's write. This is
+the same approach used by crossbeam-channel's `SyncWaker::is_empty` flag.
+On x86 (TSO), the overhead is negligible (~1 cycle MFENCE on stores).
+On ARM64, it adds a DMB barrier that is essential for correctness.
+
+For a detailed walkthrough with step-by-step diagrams, see
+[Channel Wakeup Protocol](/design/channel-wakeup-protocol/).
 
 The wakeup avoids use-after-free by copying the waker function pointer and context **before** setting the `complete` flag:
 

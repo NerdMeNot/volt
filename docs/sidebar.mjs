@@ -91,6 +91,7 @@ export default [
 			{ label: 'Stackless vs Stackful', slug: 'design/stackless-vs-stackful' },
 			{ label: 'The Future Model', slug: 'design/future-model' },
 			{ label: 'Zero-Allocation Waiters', slug: 'design/zero-allocation-waiters' },
+			{ label: 'Channel Wakeup Protocol', slug: 'design/channel-wakeup-protocol' },
 			{ label: 'Memory Ordering', slug: 'design/memory-ordering' },
 		],
 	},
