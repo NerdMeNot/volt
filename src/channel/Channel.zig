@@ -245,8 +245,17 @@ pub fn Channel(comptime T: type) type {
         recv_waiters: RecvWaiterList,
 
         /// Fast-check flags: set under waiter_mutex, checked lock-free after buffer ops.
-        /// Protocol: waiter sets flag (seq_cst) BEFORE re-checking buffer to prevent
-        /// lost wakeups vs concurrent sender/receiver.
+        ///
+        /// These flags implement a Dekker-style protocol between the lock-free fast
+        /// path (trySend/tryRecv) and the blocking slow path (sendWait/recvWait):
+        ///   - Slow path: sets flag=true (seq_cst), THEN re-checks buffer
+        ///   - Fast path: writes buffer, THEN reads flag (seq_cst)
+        ///
+        /// Sequential consistency is REQUIRED here. With weaker orderings (acq/rel),
+        /// the fast path can see flag=false while the slow path sees buffer=empty,
+        /// causing both sides to miss each other (classic Dekker violation). This is
+        /// observable on ARM64 where stores to different cache lines can be reordered.
+        /// Reference: crossbeam-channel uses SeqCst for its SyncWaker::is_empty flag.
         has_recv_waiters: std.atomic.Value(bool),
         has_send_waiters: std.atomic.Value(bool),
 
@@ -348,8 +357,8 @@ pub fn Channel(comptime T: type) type {
                     self.buffer[idx] = value;
                     slot.sequence.store(tail +% 1, .release);
 
-                    // Wake a receiver if any are waiting
-                    if (self.has_recv_waiters.load(.acquire)) {
+                    // Wake a receiver if any are waiting (seq_cst: Dekker protocol)
+                    if (self.has_recv_waiters.load(.seq_cst)) {
                         self.wakeOneRecvWaiter();
                     }
 
@@ -389,15 +398,16 @@ pub fn Channel(comptime T: type) type {
                 return true;
             }
 
-            // Set flag BEFORE re-checking buffer (prevents lost wakeup)
-            self.has_send_waiters.store(true, .release);
+            // Set flag BEFORE re-checking buffer (seq_cst: Dekker protocol —
+            // ensures tryRecv on another core sees this flag after we see empty buffer)
+            self.has_send_waiters.store(true, .seq_cst);
 
             // Re-check buffer: a receiver may have freed a slot
             const retry = self.trySend(value);
             if (retry == .ok) {
                 // Clear flag if no other waiters
                 if (self.send_waiters.isEmpty()) {
-                    self.has_send_waiters.store(false, .release);
+                    self.has_send_waiters.store(false, .seq_cst);
                 }
                 self.waiter_mutex.unlock();
                 waiter.complete.store(true, .release);
@@ -405,7 +415,7 @@ pub fn Channel(comptime T: type) type {
             }
             if (retry == .closed) {
                 if (self.send_waiters.isEmpty()) {
-                    self.has_send_waiters.store(false, .release);
+                    self.has_send_waiters.store(false, .seq_cst);
                 }
                 self.waiter_mutex.unlock();
                 waiter.closed.store(true, .release);
@@ -439,7 +449,7 @@ pub fn Channel(comptime T: type) type {
 
             // Clear flag if no more waiters
             if (self.send_waiters.isEmpty()) {
-                self.has_send_waiters.store(false, .release);
+                self.has_send_waiters.store(false, .seq_cst);
             }
 
             self.waiter_mutex.unlock();
@@ -470,8 +480,8 @@ pub fn Channel(comptime T: type) type {
                     const value = self.buffer[idx];
                     slot.sequence.store(head +% self.buf_cap, .release);
 
-                    // Wake a sender if any are waiting
-                    if (self.has_send_waiters.load(.acquire)) {
+                    // Wake a sender if any are waiting (seq_cst: Dekker protocol)
+                    if (self.has_send_waiters.load(.seq_cst)) {
                         self.wakeOneSendWaiter();
                     }
 
@@ -507,15 +517,16 @@ pub fn Channel(comptime T: type) type {
             // Slow path: channel empty — register waiter under mutex
             self.waiter_mutex.lock();
 
-            // Set flag BEFORE re-checking buffer (prevents lost wakeup)
-            self.has_recv_waiters.store(true, .release);
+            // Set flag BEFORE re-checking buffer (seq_cst: Dekker protocol —
+            // ensures trySend on another core sees this flag after we see empty buffer)
+            self.has_recv_waiters.store(true, .seq_cst);
 
             // Re-check buffer: a sender may have added a value
             const retry = self.tryRecv();
             switch (retry) {
                 .value => |v| {
                     if (self.recv_waiters.isEmpty()) {
-                        self.has_recv_waiters.store(false, .release);
+                        self.has_recv_waiters.store(false, .seq_cst);
                     }
                     self.waiter_mutex.unlock();
                     waiter.complete.store(true, .release);
@@ -523,7 +534,7 @@ pub fn Channel(comptime T: type) type {
                 },
                 .closed => {
                     if (self.recv_waiters.isEmpty()) {
-                        self.has_recv_waiters.store(false, .release);
+                        self.has_recv_waiters.store(false, .seq_cst);
                     }
                     self.waiter_mutex.unlock();
                     waiter.closed.store(true, .release);
@@ -535,7 +546,7 @@ pub fn Channel(comptime T: type) type {
             // Check closed
             if (self.closed_flag.load(.acquire)) {
                 if (self.recv_waiters.isEmpty()) {
-                    self.has_recv_waiters.store(false, .release);
+                    self.has_recv_waiters.store(false, .seq_cst);
                 }
                 self.waiter_mutex.unlock();
                 waiter.closed.store(true, .release);
@@ -569,7 +580,7 @@ pub fn Channel(comptime T: type) type {
 
             // Clear flag if no more waiters
             if (self.recv_waiters.isEmpty()) {
-                self.has_recv_waiters.store(false, .release);
+                self.has_recv_waiters.store(false, .seq_cst);
             }
 
             self.waiter_mutex.unlock();
@@ -584,7 +595,7 @@ pub fn Channel(comptime T: type) type {
             self.waiter_mutex.lock();
             const waiter = self.recv_waiters.popFront();
             if (self.recv_waiters.isEmpty()) {
-                self.has_recv_waiters.store(false, .release);
+                self.has_recv_waiters.store(false, .seq_cst);
             }
             self.waiter_mutex.unlock();
 
@@ -607,7 +618,7 @@ pub fn Channel(comptime T: type) type {
             self.waiter_mutex.lock();
             const waiter = self.send_waiters.popFront();
             if (self.send_waiters.isEmpty()) {
-                self.has_send_waiters.store(false, .release);
+                self.has_send_waiters.store(false, .seq_cst);
             }
             self.waiter_mutex.unlock();
 
@@ -652,7 +663,7 @@ pub fn Channel(comptime T: type) type {
                     }
                 }
             }
-            self.has_send_waiters.store(false, .release);
+            self.has_send_waiters.store(false, .seq_cst);
 
             // Wake all recv waiters
             while (self.recv_waiters.popFront()) |w| {
@@ -665,7 +676,7 @@ pub fn Channel(comptime T: type) type {
                     }
                 }
             }
-            self.has_recv_waiters.store(false, .release);
+            self.has_recv_waiters.store(false, .seq_cst);
 
             self.waiter_mutex.unlock();
 
