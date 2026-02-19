@@ -80,11 +80,32 @@ jobs:
       - name: Robustness tests
         run: zig build test-robustness
 
-      # ── Benchmarks (build-only, skip Windows — needs Rust for Tokio) ───
-      # Benchmarks are hardcoded to ReleaseFast in build.zig, so this also
-      # verifies that release compilation succeeds.
-      - name: Build benchmarks
+      # ── Benchmarks (ReleaseFast — verifies release compilation) ─────────
+      # Skip Windows (needs Rust for Tokio comparison).
+      # Diagnostic: show runner resources to understand ARM compilation behavior.
+      - name: Runner resources
         if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          echo "=== CPU ==="
+          nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "unknown"
+          echo "=== Memory ==="
+          free -m 2>/dev/null || vm_stat 2>/dev/null || true
+          echo "=== Disk ==="
+          df -h . 2>/dev/null || true
+
+      # Compile-only step with timeout — isolates LLVM codegen from execution.
+      # If this times out on linux-arm64, the issue is LLVM compilation.
+      - name: Compile benchmarks (ReleaseFast)
+        if: runner.os != 'Windows'
+        timeout-minutes: 10
+        run: zig build bench-compile
+
+      # Run benchmarks only where compilation is known to succeed quickly.
+      # linux-arm64: LLVM ReleaseFast codegen is extremely slow on Arm partner
+      # runners (>6h observed). Compile-only step above verifies correctness.
+      - name: Run benchmarks
+        if: runner.os != 'Windows' && matrix.name != 'linux-arm64'
         run: zig build bench
 
   # ═══════════════════════════════════════════════════════════════════════════

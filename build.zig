@@ -134,6 +134,9 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run benchmarks");
     bench_step.dependOn(&run_bench.step);
 
+    const bench_compile_step = b.step("bench-compile", "Compile benchmarks (no run)");
+    bench_compile_step.dependOn(&install_bench.step);
+
     // I/O benchmark (TCP + timers)
     const io_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/io_bench.zig"),
