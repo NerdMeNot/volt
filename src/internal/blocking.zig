@@ -113,6 +113,13 @@ const Shared = struct {
 pub const BlockingPool = struct {
     const Self = @This();
 
+    /// Spin iterations a worker does after draining its queue, before
+    /// falling back to condvar park. Must outlast the caller's result
+    /// processing + resubmission time (~5-10µs) to catch sequential
+    /// spawn-await patterns without a condvar round-trip (~3-5µs).
+    /// ~32µs on ARM (YIELD ≈ 1ns), ~100-300µs on x86 (PAUSE ≈ 5-10ns).
+    const WORKER_SPIN_ITERS: u32 = 32768;
+
     allocator: Allocator,
 
     /// Synchronization.
@@ -128,6 +135,15 @@ pub const BlockingPool = struct {
 
     /// Metrics (atomic, readable without lock).
     metrics: Metrics = .{},
+
+    /// Atomic hint set by submit() after enqueuing a task.
+    /// Spinning workers poll this to catch fast resubmissions without
+    /// entering the condvar (avoiding ~3-5µs kernel round-trip).
+    task_available: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    /// Number of workers currently spinning (not yet parked in condvar).
+    /// Checked by submit() to avoid spawning new threads unnecessarily.
+    num_spinning: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     /// Initialize the blocking pool.
     pub fn init(allocator: Allocator, config: Config) Self {
@@ -183,10 +199,12 @@ pub const BlockingPool = struct {
 
     /// Submit a task to the blocking pool.
     pub fn submit(self: *Self, task: *Task) error{PoolShutdown}!void {
+        var should_signal = false;
+
         self.mutex.lock();
-        defer self.mutex.unlock();
 
         if (self.shared.shutdown) {
+            self.mutex.unlock();
             return error.PoolShutdown;
         }
 
@@ -200,38 +218,60 @@ pub const BlockingPool = struct {
         self.shared.queue_tail = task;
         self.metrics.incQueueDepth();
 
+        // Hint for spinning workers (set before unlock so the spin loop
+        // sees the flag after the enqueue is visible).
+        self.task_available.store(1, .release);
+
         // Spawn or notify
         if (self.metrics.numIdleThreads() == 0) {
-            // No idle threads - spawn a new one if under cap
-            if (self.metrics.numThreads() < self.thread_cap) {
+            if (self.num_spinning.load(.acquire) > 0) {
+                // A worker is spinning and will pick up the task via
+                // the task_available flag — no signal or spawn needed.
+                self.mutex.unlock();
+            } else if (self.metrics.numThreads() < self.thread_cap) {
+                // No idle or spinning threads — spawn a new one.
                 const id = self.shared.worker_thread_index;
                 self.shared.worker_thread_index += 1;
 
                 const thread = std.Thread.spawn(.{}, workerLoop, .{ self, id }) catch |err| {
-                    // If we have existing threads, they'll pick up the work
                     if (self.metrics.numThreads() > 0) {
+                        self.mutex.unlock();
                         return;
                     }
-                    // No threads and can't spawn - this is fatal
                     std.debug.panic("OS can't spawn worker thread: {}", .{err});
                 };
 
-                self.shared.worker_threads.put(self.allocator, id, thread) catch {
-                    // Thread is running but we can't track it - it will still work
-                };
+                self.shared.worker_threads.put(self.allocator, id, thread) catch {};
                 self.metrics.incNumThreads();
+                self.mutex.unlock();
+            } else {
+                // At max threads — a busy worker will pick up the task.
+                self.mutex.unlock();
             }
-            // At max threads - task will be picked up by a busy thread
         } else {
-            // Notify an idle thread
-            // Decrement idle count and increment notify count
+            // Wake an idle (condvar-parked) thread.
             _ = self.metrics.decNumIdleThreads();
             self.shared.num_notify += 1;
+            self.mutex.unlock();
+            // Signal OUTSIDE the lock — avoids the woken thread immediately
+            // contending on the mutex the signaler still holds.
+            should_signal = true;
+        }
+
+        if (should_signal) {
             self.condvar.signal();
         }
     }
 
     /// Worker thread main loop.
+    ///
+    /// Three phases per iteration:
+    /// 1. BUSY — drain the task queue under the mutex
+    /// 2. SPIN — release mutex, poll `task_available` for fast resubmissions
+    /// 3. PARK — re-acquire mutex, condvar.timedWait for slow arrivals
+    ///
+    /// The spin phase eliminates a condvar round-trip (~3-5µs on macOS)
+    /// when tasks are resubmitted quickly (e.g., sequential spawn-await loops).
     fn workerLoop(self: *Self, worker_id: usize) void {
         var shared = &self.shared;
         var join_on_thread: ?std.Thread = null;
@@ -239,7 +279,7 @@ pub const BlockingPool = struct {
         self.mutex.lock();
 
         main_loop: while (true) {
-            // BUSY: Process all available tasks
+            // ── BUSY: Process all available tasks ──
             while (shared.queue_head) |task| {
                 shared.queue_head = task.next;
                 if (shared.queue_head == null) {
@@ -253,7 +293,43 @@ pub const BlockingPool = struct {
                 self.mutex.lock();
             }
 
-            // IDLE: Wait for work or timeout
+            // Check for shutdown before spinning
+            if (shared.shutdown) {
+                break;
+            }
+
+            // ── SPIN: Try to catch fast resubmissions without condvar ──
+            // Register as spinning so submit() doesn't spawn unnecessarily.
+            _ = self.num_spinning.fetchAdd(1, .release);
+            self.mutex.unlock();
+
+            var caught = false;
+            var spin: u32 = 0;
+            while (spin < WORKER_SPIN_ITERS) : (spin += 1) {
+                if (self.task_available.load(.acquire) != 0) {
+                    self.task_available.store(0, .release);
+                    caught = true;
+                    break;
+                }
+                std.atomic.spinLoopHint();
+            }
+
+            _ = self.num_spinning.fetchSub(1, .release);
+
+            if (caught) {
+                self.mutex.lock();
+                continue :main_loop;
+            }
+
+            // ── PARK: Spin failed — fall back to condvar wait ──
+            self.mutex.lock();
+
+            // Re-check queue after re-acquiring lock (submit may have
+            // enqueued between our spin ending and lock acquisition).
+            if (shared.queue_head != null) {
+                continue :main_loop;
+            }
+
             self.metrics.incNumIdleThreads();
 
             while (!shared.shutdown) {
@@ -265,7 +341,7 @@ pub const BlockingPool = struct {
                 };
 
                 if (shared.num_notify != 0) {
-                    // Legitimate wakeup - acknowledge and go back to BUSY
+                    // Legitimate wakeup — acknowledge and go back to BUSY
                     shared.num_notify -= 1;
                     break;
                 }
@@ -281,7 +357,7 @@ pub const BlockingPool = struct {
                     break :main_loop;
                 }
 
-                // Spurious wakeup - go back to sleep
+                // Spurious wakeup — go back to sleep
             }
 
             if (shared.shutdown) {
@@ -303,7 +379,7 @@ pub const BlockingPool = struct {
                     self.mutex.lock();
                 }
 
-                // Undo the idle decrement that would have happened
+                // Undo the idle increment
                 self.metrics.incNumIdleThreads();
                 break;
             }
@@ -347,18 +423,23 @@ pub const BlockingPool = struct {
 
 /// Result handle for blocking operations.
 /// Allows waiting for the result of a blocking task.
+///
+/// Single-owner: created by `runBlocking()`, the caller uses `.wait()`
+/// which blocks on a futex, then frees the context.
 pub fn BlockingHandle(comptime T: type) type {
     return struct {
         const Self = @This();
+
+        pub const PENDING: u32 = 0;
+        pub const COMPLETED: u32 = 1;
 
         // Result storage
         result: ?T = null,
         err: ?anyerror = null,
 
-        // Synchronization
-        completed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-        mutex: std.Thread.Mutex = .{},
-        condition: std.Thread.Condition = .{},
+        // Synchronization — single futex word replaces mutex+condvar.
+        // Safe because BlockingHandle is single-waiter, single-waker, single-use.
+        state: std.atomic.Value(u32) = std.atomic.Value(u32).init(PENDING),
 
         // The task (embedded, no separate allocation)
         task: Task = .{ .func = undefined },
@@ -370,14 +451,16 @@ pub fn BlockingHandle(comptime T: type) type {
         /// Wait for result (blocking).
         /// Note: This frees the handle, do not use after calling.
         pub fn wait(self: *Self) !T {
-            // Wait for completion
-            {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+            // Spin briefly — task may complete very quickly
+            var spin: u32 = 0;
+            while (spin < 4) : (spin += 1) {
+                if (self.state.load(.acquire) == COMPLETED) break;
+                std.atomic.spinLoopHint();
+            }
 
-                while (!self.completed.load(.acquire)) {
-                    self.condition.wait(&self.mutex);
-                }
+            // Futex wait — blocks until state != PENDING
+            while (self.state.load(.acquire) == PENDING) {
+                std.Thread.Futex.wait(&self.state, PENDING);
             }
 
             // Copy results before freeing
@@ -397,27 +480,21 @@ pub fn BlockingHandle(comptime T: type) type {
 
         /// Check if complete (non-blocking).
         pub fn isComplete(self: *const Self) bool {
-            return self.completed.load(.acquire);
+            return self.state.load(.acquire) == COMPLETED;
         }
 
-        /// Signal completion with value (called by worker).
+        /// Signal completion with value (called by blocking worker thread).
         fn complete(self: *Self, value: T) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-
             self.result = value;
-            self.completed.store(true, .release);
-            self.condition.signal();
+            self.state.store(COMPLETED, .release);
+            std.Thread.Futex.wake(&self.state, 1);
         }
 
-        /// Signal error (called by worker).
+        /// Signal error (called by blocking worker thread).
         fn completeWithError(self: *Self, e: anyerror) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-
             self.err = e;
-            self.completed.store(true, .release);
-            self.condition.signal();
+            self.state.store(COMPLETED, .release);
+            std.Thread.Futex.wake(&self.state, 1);
         }
     };
 }

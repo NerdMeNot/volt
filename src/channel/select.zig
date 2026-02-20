@@ -151,7 +151,7 @@ pub fn Selector(comptime max_branches: usize) type {
                     ch.waiter_mutex.lock();
                     defer ch.waiter_mutex.unlock();
 
-                    if (ch.len() > 0 or ch.closed_flag.load(.acquire)) {
+                    if (ch.len() > 0 or ch.isClosed()) {
                         // Already ready - call waker directly
                         waker_fn(waiter_ptr);
                     } else {

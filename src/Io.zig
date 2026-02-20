@@ -43,6 +43,45 @@ const blocking_mod = @import("internal/blocking.zig");
 const combinators = @import("task/combinators.zig");
 pub const IoFuture = @import("io/Future.zig").Future;
 
+/// Lightweight future wrapping a `*BlockingHandle(T)`.
+///
+/// Uses a two-phase wait strategy: spin (1024 iterations) → futex.
+/// The spin catches tasks completed by a spinning blocking thread
+/// (~1µs on ARM), avoiding both kernel round-trips entirely. For
+/// tasks still in-flight, the futex provides efficient kernel-mediated
+/// sleep with precise wakeup.
+pub fn ConcurrentFuture(comptime T: type) type {
+    return struct {
+        handle: *blocking_mod.BlockingHandle(T),
+
+        /// Wait for the blocking task to complete.
+        /// Uses spin → futex to minimize latency.
+        pub fn @"await"(self: *@This(), _: Io) anyerror!T {
+            const h = self.handle;
+            const Handle = blocking_mod.BlockingHandle(T);
+
+            // Spin long enough to overlap with a spinning blocking thread's
+            // task execution (~300-500ns). 1024 iters ≈ 1µs on ARM, ~10µs
+            // on x86. If the blocking thread is spinning on task_available,
+            // it catches our submit almost instantly and completes within
+            // this window — avoiding BOTH kernel round-trips.
+            var spin: u32 = 0;
+            while (spin < 1024) : (spin += 1) {
+                if (h.state.load(.acquire) == Handle.COMPLETED) return h.wait();
+                std.atomic.spinLoopHint();
+            }
+
+            // Futex wait — blocks until woken by Futex.wake in complete().
+            return h.wait();
+        }
+
+        /// Check if the blocking task has completed (non-blocking).
+        pub fn isDone(self: *const @This()) bool {
+            return self.handle.isComplete();
+        }
+    };
+}
+
 const Io = @This();
 
 runtime: *runtime_mod.Runtime,
@@ -160,18 +199,31 @@ pub fn awaitFuture(self: Io, future: anytype) !IoFuture(@TypeOf(future).Output) 
     return .{ ._handle = handle };
 }
 
-/// Run a function on the blocking thread pool.
+/// Run a function on the blocking thread pool, returning a `ConcurrentFuture`.
 ///
-/// Use this for CPU-intensive or blocking I/O work that would starve
-/// the async I/O workers.
+/// The function executes on a dedicated blocking thread. The returned future
+/// uses spin-wait + yield + futex to efficiently wait for completion.
 ///
 /// ## Example
 ///
 /// ```zig
-/// const handle = try io.concurrent(computeHash, .{data});
-/// const hash = try handle.wait();
+/// var f = try io.concurrent(computeHash, .{data});
+/// const hash = try f.await(io);
 /// ```
 pub fn concurrent(
+    self: Io,
+    comptime func: anytype,
+    args: anytype,
+) !ConcurrentFuture(blocking_mod.ResultType(@TypeOf(func))) {
+    const handle = try self.runtime.spawnBlocking(func, args);
+    return .{ .handle = handle };
+}
+
+/// Blocking variant — returns raw handle with `.wait()` (for sync callers).
+///
+/// Prefer `concurrent()` for async code. This method blocks the calling
+/// worker thread with a futex until the blocking work completes.
+pub fn concurrentBlocking(
     self: Io,
     comptime func: anytype,
     args: anytype,
@@ -179,13 +231,8 @@ pub fn concurrent(
     return self.runtime.spawnBlocking(func, args);
 }
 
-/// Alias for `concurrent` (deprecated name).
-pub const spawnBlocking = concurrent;
-
-// Ensure deprecated alias is available
-comptime {
-    std.debug.assert(@TypeOf(spawnBlocking) == @TypeOf(concurrent));
-}
+/// Alias for `concurrentBlocking` (deprecated name).
+pub const spawnBlocking = concurrentBlocking;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Task Coordination

@@ -40,9 +40,6 @@ const DEFAULT_MAX_FDS: usize = 1024;
 /// Maximum number of timers to prevent unbounded memory growth.
 const MAX_TIMERS: usize = 65536;
 
-/// When timer capacity exceeds this multiple of count, shrink.
-const TIMER_SHRINK_THRESHOLD: usize = 4;
-
 /// Interest flags for poll operations.
 const Interest = struct {
     readable: bool = false,
@@ -429,15 +426,8 @@ pub const PollBackend = struct {
             }
         }
 
-        // Compact timer list if capacity is much larger than count
-        // This prevents memory from staying high after burst timer usage
-        if (self.timers.capacity > 64 and
-            self.timers.capacity > self.timers.items.len * TIMER_SHRINK_THRESHOLD)
-        {
-            // Shrink to 2x current count (or minimum 64)
-            const new_cap = @max(64, self.timers.items.len * 2);
-            self.timers.shrinkAndFree(self.allocator, new_cap);
-        }
+        // Note: timer list capacity is bounded by MAX_TIMERS (65536).
+        // No manual shrinking needed — swapRemove keeps items packed.
 
         return count;
     }

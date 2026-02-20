@@ -178,6 +178,12 @@ pub const IoUringBackend = struct {
     /// Tracks if a wakeup is pending.
     wakeup_pending: std.atomic.Value(bool),
 
+    /// Overflow queue for completions drained during handleSqFull/flush.
+    /// When the SQ or CQ is full, we must drain CQEs to make room. These
+    /// drained completions are stored here and returned at the start of
+    /// the next wait() call so the user never loses completions.
+    overflow_completions: std.ArrayList(Completion),
+
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, config: anytype) !Self {
@@ -243,11 +249,13 @@ pub const IoUringBackend = struct {
             .next_user_data = 1, // 0 is reserved for INVALID
             .wakeup_fd = wakeup_fd,
             .wakeup_pending = std.atomic.Value(bool).init(false),
+            .overflow_completions = .empty,
         };
     }
 
     pub fn deinit(self: *Self) void {
         posix.close(self.wakeup_fd);
+        self.overflow_completions.deinit(self.allocator);
         self.allocator.free(self.cqe_buffer);
         self.operations.deinit();
         self.ring.deinit();
@@ -341,10 +349,17 @@ pub const IoUringBackend = struct {
     }
 
     /// Handle SQ full condition: drain CQEs and flush.
+    /// Drained completions are stored in the overflow queue so the user
+    /// receives them on the next wait() call — never silently dropped.
     fn handleSqFull(self: *Self) !void {
-        // First, drain any pending completions to free SQ slots
+        // Drain pending completions to free SQ/CQ slots
         var temp_completions: [64]Completion = undefined;
-        _ = try self.drainCompletions(&temp_completions);
+        const drained = try self.drainCompletions(&temp_completions);
+
+        // Store drained completions in overflow queue for next wait()
+        for (temp_completions[0..drained]) |comp| {
+            try self.overflow_completions.append(self.allocator, comp);
+        }
 
         // Then flush pending submissions
         _ = try self.flush();
@@ -438,9 +453,13 @@ pub const IoUringBackend = struct {
                 return switch (err) {
                     error.SignalInterrupt => continue, // Retry on EINTR
                     error.CompletionQueueOvercommitted => {
-                        // CQ overcommitted - drain completions and retry
+                        // CQ overcommitted - drain completions to make room, then retry.
+                        // Store drained completions in overflow queue so user sees them.
                         var temp: [64]Completion = undefined;
-                        _ = try self.drainCompletions(&temp);
+                        const drained = try self.drainCompletions(&temp);
+                        for (temp[0..drained]) |comp| {
+                            self.overflow_completions.append(self.allocator, comp) catch {};
+                        }
                         continue;
                     },
                     else => err,
@@ -455,6 +474,28 @@ pub const IoUringBackend = struct {
     /// Wait for completions.
     /// Returns number of completions copied to buffer.
     pub fn wait(self: *Self, completions: []Completion, timeout_ns: ?u64) !usize {
+        // First, return any overflow completions from previous handleSqFull/flush drains.
+        // This ensures the user never loses completions that were drained internally.
+        if (self.overflow_completions.items.len > 0) {
+            const to_copy = @min(completions.len, self.overflow_completions.items.len);
+            @memcpy(completions[0..to_copy], self.overflow_completions.items[0..to_copy]);
+
+            // Remove copied items from overflow (shift remaining)
+            if (to_copy == self.overflow_completions.items.len) {
+                self.overflow_completions.clearRetainingCapacity();
+            } else {
+                // Remove first to_copy items by shifting
+                const remaining = self.overflow_completions.items.len - to_copy;
+                std.mem.copyForwards(
+                    Completion,
+                    self.overflow_completions.items[0..remaining],
+                    self.overflow_completions.items[to_copy..],
+                );
+                self.overflow_completions.items.len = remaining;
+            }
+            return to_copy;
+        }
+
         // Check if we were woken by unpark() - drain eventfd if so
         if (self.wakeup_pending.swap(false, .acq_rel)) {
             // Drain the eventfd counter

@@ -52,6 +52,7 @@ const FutureWaker = future_mod.Waker;
 const Context = future_mod.Context;
 const PollResult = future_mod.PollResult;
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Waiter
 // ─────────────────────────────────────────────────────────────────────────────
@@ -529,13 +530,17 @@ pub const AcquireFuture = struct {
     pub fn poll(self: *Self, ctx: *Context) PollResult(void) {
         switch (self.state) {
             .init => {
-                // First poll - try to acquire permits
-                self.stored_waker = ctx.getWaker().clone();
+                // Fast path: try lock-free acquire before waker/waiter setup.
+                // Skips 2 atomic ops (waker clone+deinit) when permits are available.
+                if (self.semaphore.tryAcquire(self.num_permits)) {
+                    self.state = .acquired;
+                    return .{ .ready = {} };
+                }
 
-                // Set up the waiter's callback to wake us via our stored waker
+                // Slow path: no permits available, set up waker and wait
+                self.stored_waker = ctx.getWaker().clone();
                 self.waiter.setWaker(@ptrCast(self), wakeCallback);
 
-                // Try to acquire
                 if (self.semaphore.acquireWait(&self.waiter)) {
                     self.state = .acquired;
                     if (self.stored_waker) |*w| {

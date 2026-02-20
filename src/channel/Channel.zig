@@ -226,11 +226,11 @@ pub fn Channel(comptime T: type) type {
         /// Consumer position — cache-line padded to avoid false sharing with tail
         head: std.atomic.Value(u64) align(CACHE_LINE_SIZE),
 
-        /// Producer position — cache-line padded to avoid false sharing with head
+        /// Producer position — cache-line padded to avoid false sharing with head.
+        /// Bit 63 (CLOSED_BIT) encodes closed state, eliminating a separate
+        /// atomic load from the send fast path. Matches concurrent_queue's
+        /// approach of encoding channel state in the tail position.
         tail: std.atomic.Value(u64) align(CACHE_LINE_SIZE),
-
-        /// Whether the channel is closed (lock-free)
-        closed_flag: std.atomic.Value(bool),
 
         /// Number of active senders
         sender_count: usize,
@@ -256,8 +256,38 @@ pub fn Channel(comptime T: type) type {
         /// causing both sides to miss each other (classic Dekker violation). This is
         /// observable on ARM64 where stores to different cache lines can be reordered.
         /// Reference: crossbeam-channel uses SeqCst for its SyncWaker::is_empty flag.
-        has_recv_waiters: std.atomic.Value(bool),
+        ///
+        /// Cache-line-aligned to avoid false sharing with waiter_mutex/waiter lists.
+        /// These flags are read on every send/recv fast path (read-mostly), while
+        /// the waiter lists/mutex are modified only on the slow path. Separating
+        /// them prevents slow-path mutex operations from invalidating the fast-path
+        /// cache line.
+        has_recv_waiters: std.atomic.Value(bool) align(CACHE_LINE_SIZE),
         has_send_waiters: std.atomic.Value(bool),
+
+        /// Spin iterations before falling back to waiter_mutex.
+        /// crossbeam-channel uses 4 spins before yielding. We use pure CAS spins
+        /// (no yield) since the Vyukov CAS is very cheap and we want to stay
+        /// on the same core for cache locality.
+        const SEND_SPIN_LIMIT: u32 = 4;
+        const RECV_SPIN_LIMIT: u32 = 4;
+
+        /// Closed state encoded as bit 63 of `tail`. The channel will never
+        /// process 2^63 messages in practice, so this bit is permanently free.
+        /// Encoding closed in tail eliminates a separate acquire load from the
+        /// send fast path — the closed check becomes a free bit test on the
+        /// already-loaded tail value. Matches concurrent_queue's approach.
+        const CLOSED_BIT: u64 = @as(u64, 1) << 63;
+
+        /// Extract the actual position from a raw tail value (strip CLOSED_BIT).
+        inline fn tailPosition(raw_tail: u64) u64 {
+            return raw_tail & ~CLOSED_BIT;
+        }
+
+        /// Check if a raw tail value has the closed bit set.
+        inline fn isClosedBit(raw_tail: u64) bool {
+            return raw_tail & CLOSED_BIT != 0;
+        }
 
         /// Send result
         pub const SendResult = enum {
@@ -305,7 +335,6 @@ pub fn Channel(comptime T: type) type {
                 .allocator = allocator,
                 .head = std.atomic.Value(u64).init(0),
                 .tail = std.atomic.Value(u64).init(0),
-                .closed_flag = std.atomic.Value(bool).init(false),
                 .sender_count = 1,
                 .waiter_mutex = .{},
                 .send_waiters = .{},
@@ -327,10 +356,10 @@ pub fn Channel(comptime T: type) type {
 
         /// Try to send without blocking. Lock-free CAS on tail.
         pub fn trySend(self: *Self, value: T) SendResult {
-            if (self.closed_flag.load(.acquire)) return .closed;
-
             var tail = self.tail.load(.monotonic);
             while (true) {
+                // Closed check is "free" — just a bit test on already-loaded tail
+                if (isClosedBit(tail)) return .closed;
                 // When buf_cap > capacity (capacity=1 case), we need an explicit
                 // capacity check since the sequence numbers alone can't distinguish
                 // full from empty. When buf_cap == capacity, the sequence check
@@ -388,11 +417,29 @@ pub fn Channel(comptime T: type) type {
                 return true;
             }
 
+            // Spin-retry: channel may become non-full momentarily
+            // (consumer about to read). Avoids waiter_mutex for transient fullness.
+            var spin: u32 = 0;
+            while (spin < SEND_SPIN_LIMIT) : (spin += 1) {
+                std.atomic.spinLoopHint();
+                switch (self.trySend(value)) {
+                    .ok => {
+                        waiter.complete.store(true, .release);
+                        return true;
+                    },
+                    .closed => {
+                        waiter.closed.store(true, .release);
+                        return true;
+                    },
+                    .full => {},
+                }
+            }
+
             // Slow path: channel full — register waiter under mutex
             self.waiter_mutex.lock();
 
-            // Re-check closed under lock
-            if (self.closed_flag.load(.acquire)) {
+            // Re-check closed under lock (via tail mark bit)
+            if (isClosedBit(self.tail.load(.acquire))) {
                 self.waiter_mutex.unlock();
                 waiter.closed.store(true, .release);
                 return true;
@@ -423,6 +470,47 @@ pub fn Channel(comptime T: type) type {
             }
 
             // Still full — add to wait list
+            waiter.complete.store(false, .release);
+            waiter.closed.store(false, .release);
+            self.send_waiters.pushBack(waiter);
+
+            self.waiter_mutex.unlock();
+            return false;
+        }
+
+        /// Send wait without initial try + spin. Used by SendFuture when
+        /// the caller already tried trySend() and it failed. Goes directly
+        /// to the mutex + Dekker recheck path.
+        fn sendWaitDirect(self: *Self, value: T, waiter: *SendWaiter) bool {
+            self.waiter_mutex.lock();
+
+            if (isClosedBit(self.tail.load(.acquire))) {
+                self.waiter_mutex.unlock();
+                waiter.closed.store(true, .release);
+                return true;
+            }
+
+            // Dekker: set flag BEFORE re-checking buffer
+            self.has_send_waiters.store(true, .seq_cst);
+
+            const retry = self.trySend(value);
+            if (retry == .ok) {
+                if (self.send_waiters.isEmpty()) {
+                    self.has_send_waiters.store(false, .seq_cst);
+                }
+                self.waiter_mutex.unlock();
+                waiter.complete.store(true, .release);
+                return true;
+            }
+            if (retry == .closed) {
+                if (self.send_waiters.isEmpty()) {
+                    self.has_send_waiters.store(false, .seq_cst);
+                }
+                self.waiter_mutex.unlock();
+                waiter.closed.store(true, .release);
+                return true;
+            }
+
             waiter.complete.store(false, .release);
             waiter.closed.store(false, .release);
             self.send_waiters.pushBack(waiter);
@@ -487,8 +575,8 @@ pub fn Channel(comptime T: type) type {
 
                     return .{ .value = value };
                 } else if (diff < 0) {
-                    // Queue is empty
-                    if (self.closed_flag.load(.acquire)) return .closed;
+                    // Queue is empty — check closed via tail's mark bit
+                    if (isClosedBit(self.tail.load(.acquire))) return .closed;
                     return .empty;
                 } else {
                     // Another receiver claimed this slot, reload head
@@ -512,6 +600,24 @@ pub fn Channel(comptime T: type) type {
                     return null;
                 },
                 .empty => {},
+            }
+
+            // Spin-retry: channel may become non-empty momentarily
+            // (producer about to write). Avoids waiter_mutex for transient emptiness.
+            var spin: u32 = 0;
+            while (spin < RECV_SPIN_LIMIT) : (spin += 1) {
+                std.atomic.spinLoopHint();
+                switch (self.tryRecv()) {
+                    .value => |v| {
+                        waiter.complete.store(true, .release);
+                        return v;
+                    },
+                    .closed => {
+                        waiter.closed.store(true, .release);
+                        return null;
+                    },
+                    .empty => {},
+                }
             }
 
             // Slow path: channel empty — register waiter under mutex
@@ -543,8 +649,8 @@ pub fn Channel(comptime T: type) type {
                 .empty => {},
             }
 
-            // Check closed
-            if (self.closed_flag.load(.acquire)) {
+            // Check closed via tail mark bit
+            if (isClosedBit(self.tail.load(.acquire))) {
                 if (self.recv_waiters.isEmpty()) {
                     self.has_recv_waiters.store(false, .seq_cst);
                 }
@@ -554,6 +660,53 @@ pub fn Channel(comptime T: type) type {
             }
 
             // Still empty — add to wait list
+            waiter.complete.store(false, .release);
+            waiter.closed.store(false, .release);
+            self.recv_waiters.pushBack(waiter);
+
+            self.waiter_mutex.unlock();
+            return null;
+        }
+
+        /// Recv wait without initial try + spin. Used by RecvFuture when
+        /// the caller already tried tryRecv() and it failed. Goes directly
+        /// to the mutex + Dekker recheck path.
+        fn recvWaitDirect(self: *Self, waiter: *RecvWaiter) ?T {
+            self.waiter_mutex.lock();
+
+            // Dekker: set flag BEFORE re-checking buffer
+            self.has_recv_waiters.store(true, .seq_cst);
+
+            const retry = self.tryRecv();
+            switch (retry) {
+                .value => |v| {
+                    if (self.recv_waiters.isEmpty()) {
+                        self.has_recv_waiters.store(false, .seq_cst);
+                    }
+                    self.waiter_mutex.unlock();
+                    waiter.complete.store(true, .release);
+                    return v;
+                },
+                .closed => {
+                    if (self.recv_waiters.isEmpty()) {
+                        self.has_recv_waiters.store(false, .seq_cst);
+                    }
+                    self.waiter_mutex.unlock();
+                    waiter.closed.store(true, .release);
+                    return null;
+                },
+                .empty => {},
+            }
+
+            if (isClosedBit(self.tail.load(.acquire))) {
+                if (self.recv_waiters.isEmpty()) {
+                    self.has_recv_waiters.store(false, .seq_cst);
+                }
+                self.waiter_mutex.unlock();
+                waiter.closed.store(true, .release);
+                return null;
+            }
+
             waiter.complete.store(false, .release);
             waiter.closed.store(false, .release);
             self.recv_waiters.pushBack(waiter);
@@ -645,8 +798,10 @@ pub fn Channel(comptime T: type) type {
             var send_wake_list: WakeList(32) = .{};
             var recv_wake_list: WakeList(32) = .{};
 
-            // Set closed flag first (lock-free visibility)
-            if (self.closed_flag.swap(true, .acq_rel)) {
+            // Set closed bit in tail (lock-free visibility). fetchOr is
+            // atomic RMW so it's safe against concurrent CAS from senders.
+            const prev_tail = self.tail.fetchOr(CLOSED_BIT, .acq_rel);
+            if (isClosedBit(prev_tail)) {
                 return; // Already closed
             }
 
@@ -687,12 +842,12 @@ pub fn Channel(comptime T: type) type {
 
         /// Check if channel is closed (lock-free).
         pub fn isClosed(self: *Self) bool {
-            return self.closed_flag.load(.acquire);
+            return isClosedBit(self.tail.load(.acquire));
         }
 
         /// Get approximate number of items in channel (lock-free).
         pub fn len(self: *Self) usize {
-            const tail = self.tail.load(.acquire);
+            const tail = tailPosition(self.tail.load(.acquire));
             const head = self.head.load(.acquire);
             const diff = tail -% head;
             return @intCast(@min(diff, self.capacity));
@@ -763,7 +918,9 @@ pub fn SendFuture(comptime T: type) type {
         /// The value we're trying to send
         value: T,
 
-        /// Our waiter node (embedded to avoid allocation)
+        /// Our waiter node (embedded to avoid allocation).
+        /// Left undefined until slow path — on the fast path (buffer has space),
+        /// the waiter is never used, saving initialization overhead per message.
         waiter: SendWaiter,
 
         /// State machine for the future
@@ -789,7 +946,7 @@ pub fn SendFuture(comptime T: type) type {
             return .{
                 .channel = channel,
                 .value = value,
-                .waiter = SendWaiter.init(),
+                .waiter = undefined, // Lazy: only init on slow path
                 .state = .init,
                 .stored_waker = null,
                 .value_sent = false,
@@ -800,11 +957,29 @@ pub fn SendFuture(comptime T: type) type {
         pub fn poll(self: *Self, ctx: *Context) PollResult(SendResult) {
             switch (self.state) {
                 .init => {
-                    // First poll - try to send the value
+                    // Fast path: try lock-free send before waker/waiter setup.
+                    // Skips 2 atomic ops (waker ref/unref) per message when buffer has space.
+                    switch (self.channel.trySend(self.value)) {
+                        .ok => {
+                            self.state = .ready;
+                            self.value_sent = true;
+                            return .{ .ready = .ok };
+                        },
+                        .closed => {
+                            self.state = .ready;
+                            return .{ .ready = .closed };
+                        },
+                        .full => {},
+                    }
+
+                    // Slow path: channel full, init waiter and set up waker
+                    self.waiter = SendWaiter.init();
                     self.stored_waker = ctx.getWaker().clone();
                     self.waiter.setWaker(@ptrCast(self), wakeCallback);
 
-                    if (self.channel.sendWait(self.value, &self.waiter)) {
+                    // Use sendWaitDirect: skip initial trySend + spin
+                    // (we already tried trySend above and it failed)
+                    if (self.channel.sendWaitDirect(self.value, &self.waiter)) {
                         self.state = .ready;
                         self.value_sent = true;
                         if (self.stored_waker) |*w| {
@@ -823,16 +998,64 @@ pub fn SendFuture(comptime T: type) type {
 
                 .waiting => {
                     if (self.waiter.isComplete()) {
-                        self.state = .ready;
-                        self.value_sent = true;
-                        if (self.stored_waker) |*w| {
-                            w.deinit();
-                            self.stored_waker = null;
-                        }
                         if (self.waiter.closed.load(.acquire)) {
+                            self.state = .ready;
+                            if (self.stored_waker) |*w| {
+                                w.deinit();
+                                self.stored_waker = null;
+                            }
                             return .{ .ready = .closed };
                         }
-                        return .{ .ready = .ok };
+                        // Woken — actually send the value now.
+                        // In MPMC, another producer may have filled the slot
+                        // (spurious wake), so we must retry.
+                        switch (self.channel.trySend(self.value)) {
+                            .ok => {
+                                self.state = .ready;
+                                self.value_sent = true;
+                                if (self.stored_waker) |*w| {
+                                    w.deinit();
+                                    self.stored_waker = null;
+                                }
+                                return .{ .ready = .ok };
+                            },
+                            .closed => {
+                                self.state = .ready;
+                                if (self.stored_waker) |*w| {
+                                    w.deinit();
+                                    self.stored_waker = null;
+                                }
+                                return .{ .ready = .closed };
+                            },
+                            .full => {
+                                // Spurious wake — another producer stole the slot.
+                                // Re-register waiter. Use sendWaitDirect to skip
+                                // redundant trySend (we just tried above).
+                                self.waiter.setWaker(@ptrCast(self), wakeCallback);
+                                if (self.channel.sendWaitDirect(self.value, &self.waiter)) {
+                                    self.state = .ready;
+                                    self.value_sent = true;
+                                    if (self.stored_waker) |*w| {
+                                        w.deinit();
+                                        self.stored_waker = null;
+                                    }
+                                    if (self.waiter.closed.load(.acquire)) {
+                                        return .{ .ready = .closed };
+                                    }
+                                    return .{ .ready = .ok };
+                                } else {
+                                    if (self.waiter.closed.load(.acquire)) {
+                                        self.state = .ready;
+                                        if (self.stored_waker) |*w| {
+                                            w.deinit();
+                                            self.stored_waker = null;
+                                        }
+                                        return .{ .ready = .closed };
+                                    }
+                                    return .pending;
+                                }
+                            },
+                        }
                     }
 
                     // Not yet - update waker in case it changed (task migration)
@@ -850,10 +1073,12 @@ pub fn SendFuture(comptime T: type) type {
                 },
 
                 .ready => {
-                    if (self.waiter.closed.load(.acquire)) {
-                        return .{ .ready = .closed };
+                    // Use value_sent flag instead of waiter.closed — waiter
+                    // may be uninitialized if we took the fast path.
+                    if (self.value_sent) {
+                        return .{ .ready = .ok };
                     }
-                    return .{ .ready = .ok };
+                    return .{ .ready = .closed };
                 },
             }
         }
@@ -899,7 +1124,9 @@ pub fn RecvFuture(comptime T: type) type {
         /// Reference to the channel we're receiving from
         channel: *Channel(T),
 
-        /// Our waiter node (embedded to avoid allocation)
+        /// Our waiter node (embedded to avoid allocation).
+        /// Left undefined until slow path — on the fast path (buffer has data),
+        /// the waiter is never used, saving initialization overhead per message.
         waiter: RecvWaiter,
 
         /// State machine for the future
@@ -924,7 +1151,7 @@ pub fn RecvFuture(comptime T: type) type {
         pub fn init(channel: *Channel(T)) Self {
             return .{
                 .channel = channel,
-                .waiter = RecvWaiter.init(),
+                .waiter = undefined, // Lazy: only init on slow path
                 .state = .init,
                 .stored_waker = null,
                 .received_value = null,
@@ -935,10 +1162,29 @@ pub fn RecvFuture(comptime T: type) type {
         pub fn poll(self: *Self, ctx: *Context) PollResult(?T) {
             switch (self.state) {
                 .init => {
+                    // Fast path: try lock-free recv before waker/waiter setup.
+                    // Skips 2 atomic ops (waker ref/unref) per message when buffer has data.
+                    switch (self.channel.tryRecv()) {
+                        .value => |v| {
+                            self.state = .ready;
+                            self.received_value = v;
+                            return .{ .ready = v };
+                        },
+                        .closed => {
+                            self.state = .ready;
+                            return .{ .ready = null };
+                        },
+                        .empty => {},
+                    }
+
+                    // Slow path: channel empty, init waiter and set up waker
+                    self.waiter = RecvWaiter.init();
                     self.stored_waker = ctx.getWaker().clone();
                     self.waiter.setWaker(@ptrCast(self), wakeCallback);
 
-                    if (self.channel.recvWait(&self.waiter)) |value| {
+                    // Use recvWaitDirect: skip initial tryRecv + spin
+                    // (we already tried tryRecv above and it was empty)
+                    if (self.channel.recvWaitDirect(&self.waiter)) |value| {
                         self.state = .ready;
                         self.received_value = value;
                         if (self.stored_waker) |*w| {
@@ -992,11 +1238,10 @@ pub fn RecvFuture(comptime T: type) type {
                             },
                             .empty => {
                                 // Spurious wake — another consumer stole the value.
-                                // Re-register waiter with the channel.
-                                // CRITICAL: Do NOT deinit stored_waker — we still
-                                // need it for the next wakeup callback.
+                                // Re-register waiter. Use recvWaitDirect to skip
+                                // redundant tryRecv (we just tried above).
                                 self.waiter.setWaker(@ptrCast(self), wakeCallback);
-                                if (self.channel.recvWait(&self.waiter)) |value| {
+                                if (self.channel.recvWaitDirect(&self.waiter)) |value| {
                                     self.state = .ready;
                                     self.received_value = value;
                                     if (self.stored_waker) |*w| {

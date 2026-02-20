@@ -81,15 +81,7 @@ jobs:
         run: zig build test-robustness
 
       # ── Benchmarks (ReleaseFast — verifies release compilation) ─────────
-      # Windows: async Tier 3 (MPMC, contended mutex/semaphore) hangs
-      # intermittently — scheduler/IOCP interaction issue under investigation.
-      # Compile-only on Windows to verify ReleaseFast builds; full run elsewhere.
-      - name: Compile benchmarks (Windows)
-        if: runner.os == 'Windows'
-        run: zig build bench-compile
-
       - name: Build and run benchmarks
-        if: runner.os != 'Windows'
         timeout-minutes: 5
         run: zig build bench
 

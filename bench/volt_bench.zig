@@ -866,11 +866,9 @@ fn benchChannelMPMC() BenchResult {
 }
 
 fn runMPMCAsync(allocator: Allocator, io: Io, msgs_per_producer: usize) void {
-    std.debug.print("[mpmc-run] init channel buf={d}...\n", .{MPMC_BUFFER});
     var ch = Channel(u64).init(allocator, MPMC_BUFFER) catch return;
 
     // Spawn producers
-    std.debug.print("[mpmc-run] spawning {d} producers ({d} msgs each)...\n", .{ MPMC_PRODUCERS, msgs_per_producer });
     var prod_handles: [MPMC_PRODUCERS]volt.Future(void) = undefined;
     var prod_count: usize = 0;
     for (0..MPMC_PRODUCERS) |p| {
@@ -880,10 +878,8 @@ fn runMPMCAsync(allocator: Allocator, io: Io, msgs_per_producer: usize) void {
         ) catch continue;
         prod_count += 1;
     }
-    std.debug.print("[mpmc-run] spawned {d} producers\n", .{prod_count});
 
     // Spawn consumers
-    std.debug.print("[mpmc-run] spawning {d} consumers...\n", .{MPMC_CONSUMERS});
     var cons_handles: [MPMC_CONSUMERS]volt.Future(void) = undefined;
     var cons_count: usize = 0;
     for (0..MPMC_CONSUMERS) |_| {
@@ -892,24 +888,17 @@ fn runMPMCAsync(allocator: Allocator, io: Io, msgs_per_producer: usize) void {
         ) catch continue;
         cons_count += 1;
     }
-    std.debug.print("[mpmc-run] spawned {d} consumers\n", .{cons_count});
 
     // Wait for producers to finish sending
-    std.debug.print("[mpmc-run] joining producers...\n", .{});
     for (prod_handles[0..prod_count]) |*h| _ = h.await(io);
-    std.debug.print("[mpmc-run] producers done\n", .{});
 
     // Close channel so consumers see .closed and exit
-    std.debug.print("[mpmc-run] closing channel...\n", .{});
     ch.close();
 
     // Wait for consumers
-    std.debug.print("[mpmc-run] joining consumers...\n", .{});
     for (cons_handles[0..cons_count]) |*h| _ = h.await(io);
-    std.debug.print("[mpmc-run] consumers done\n", .{});
 
     ch.deinit();
-    std.debug.print("[mpmc-run] complete\n", .{});
 }
 
 fn benchMutexContended() BenchResult {
@@ -1126,13 +1115,14 @@ fn benchTaskSpawnBatch() BenchResult {
 }
 
 /// Inner loop for blocking spawn, runs on a worker thread.
+/// Uses async path: concurrent() returns IoFuture, waker callback via scheduler.
 fn benchBlockingSpawnInner(io: Io) BenchResult {
     var stats = Stats{};
 
     for (0..WARMUP) |_| {
         for (0..ASYNC_OPS) |_| {
-            const h = io.concurrent(noopFn, .{}) catch continue;
-            h.wait() catch {};
+            var f = io.concurrent(noopFn, .{}) catch continue;
+            _ = f.await(io) catch {};
         }
     }
 
@@ -1140,8 +1130,8 @@ fn benchBlockingSpawnInner(io: Io) BenchResult {
         alloc_counter.reset();
         const start = std.time.nanoTimestamp();
         for (0..ASYNC_OPS) |_| {
-            const h = io.concurrent(noopFn, .{}) catch continue;
-            h.wait() catch {};
+            var f = io.concurrent(noopFn, .{}) catch continue;
+            _ = f.await(io) catch {};
         }
         stats.add(@intCast(std.time.nanoTimestamp() - start));
     }

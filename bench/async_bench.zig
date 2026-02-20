@@ -19,7 +19,7 @@ const volt = @import("volt");
 
 // Runtime handle
 const Io = volt.Io;
-// BlockingHandle is the return type of io.concurrent() — no public alias yet
+// BlockingHandle is the return type of io.concurrentBlocking()
 const BlockingHandle = volt.internal.BlockingHandle;
 
 // Sync primitives
@@ -165,7 +165,7 @@ fn runMutexIteration(io: Io, mutex: *Mutex, counter: *Atomic(u64)) !void {
     var handles: [TASKS_PER_ITERATION]*BlockingHandle(void) = undefined;
 
     for (&handles) |*h| {
-        h.* = try io.concurrent(mutexTask, .{ mutex, counter });
+        h.* = try io.concurrentBlocking(mutexTask, .{ mutex, counter });
     }
 
     // Wait for all tasks
@@ -223,7 +223,7 @@ fn runSemaphoreIteration(io: Io, semaphore: *Semaphore, counter: *Atomic(u64)) !
     var handles: [TASKS_PER_ITERATION]*BlockingHandle(void) = undefined;
 
     for (&handles) |*h| {
-        h.* = try io.concurrent(semaphoreTask, .{ semaphore, counter });
+        h.* = try io.concurrentBlocking(semaphoreTask, .{ semaphore, counter });
     }
 
     for (handles) |h| {
@@ -284,10 +284,10 @@ fn runRwLockIteration(io: Io, rwlock: *RwLock, read_counter: *Atomic(u64), write
     const num_readers = TASKS_PER_ITERATION * 8 / 10;
 
     for (handles[0..num_readers]) |*h| {
-        h.* = try io.concurrent(readerTask, .{ rwlock, read_counter });
+        h.* = try io.concurrentBlocking(readerTask, .{ rwlock, read_counter });
     }
     for (handles[num_readers..]) |*h| {
-        h.* = try io.concurrent(writerTask, .{ rwlock, write_counter });
+        h.* = try io.concurrentBlocking(writerTask, .{ rwlock, write_counter });
     }
 
     for (handles) |h| {

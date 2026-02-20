@@ -40,10 +40,10 @@ To send a value at position `tail`:
 
 ```zig
 pub fn trySend(self: *Self, value: T) SendResult {
-    if (self.closed_flag.load(.acquire)) return .closed;
-
     var tail = self.tail.load(.monotonic);
     while (true) {
+        // Closed state encoded in tail bit 63 — free check on already-loaded value
+        if (isClosedBit(tail)) return .closed;
         const idx: usize = @intCast(tail % self.buf_cap);
         const slot = &self.slots[idx];
         const seq = slot.sequence.load(.acquire);
@@ -115,7 +115,7 @@ pub fn tryRecv(self: *Self) RecvResult {
             }
             return .{ .value = value };
         } else if (diff < 0) {
-            if (self.closed_flag.load(.acquire)) return .closed;
+            if (isClosedBit(self.tail.load(.acquire))) return .closed;
             return .empty;
         } else {
             head = self.head.load(.monotonic);

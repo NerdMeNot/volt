@@ -1060,6 +1060,11 @@ pub const Scheduler = struct {
     /// Top-level Runtime pointer (for setting threadlocal context on workers)
     runtime_ptr: ?*anyopaque = null,
 
+    /// Round-robin counter for distributing externally-spawned tasks when
+    /// no parked workers are available. Ensures consistent task-to-worker
+    /// assignment instead of having workers race on the global queue.
+    next_spawn_worker: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
     /// Statistics
     total_spawned: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     timers_processed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -1177,11 +1182,46 @@ pub const Scheduler = struct {
         task.ref();
         _ = self.total_spawned.fetchAdd(1, .monotonic);
 
-        // Push to global queue
-        self.global_queue.push(task);
+        // Direct assignment: if a parked worker is available, place the task
+        // in its LIFO slot and wake it. This gives deterministic task-to-worker
+        // mapping instead of having workers race on the global queue. Each
+        // spawn claims a DIFFERENT parked worker (claimParkedWorker uses bitmap),
+        // so N tasks wake N workers (up to num_workers).
+        //
+        // This bypasses the "only wake if num_searching == 0" throttle because
+        // we know we have real work for each worker. Tokio achieves similar
+        // behavior by spawning from within async context (worker thread), where
+        // tasks go to the current worker's LIFO and work-stealing distributes.
+        if (self.idle_state.claimParkedWorker()) |worker_id| {
+            if (worker_id < self.workers.len) {
+                // Place task in worker's LIFO before waking — worker finds it immediately.
+                // Parked workers have LIFO = null (flushed during parking), so swap
+                // returns null. If somehow occupied, evict to global queue.
+                if (self.workers[worker_id].lifo_slot.swap(task, .acq_rel)) |prev| {
+                    self.global_queue.push(prev);
+                }
+                self.workers[worker_id].wake();
+            } else {
+                self.global_queue.push(task);
+            }
+        } else {
+            // No parked workers — distribute round-robin to active workers'
+            // LIFO slots for consistent task-to-worker assignment. Using LIFO
+            // swap (not tryScheduleLocal) because we may not own the worker's
+            // run_queue. Evicted tasks go to global queue (thread-safe).
+            const n_workers: u32 = @intCast(self.workers.len);
+            const idx = self.next_spawn_worker.fetchAdd(1, .monotonic) % n_workers;
+            const worker = &self.workers[idx];
 
-        // Wake a worker if needed (using bitmap for O(1) lookup)
-        self.wakeWorkerIfNeeded();
+            if (!worker.transitioning_to_park.load(.acquire)) {
+                if (worker.lifo_slot.swap(task, .acq_rel)) |prev| {
+                    self.global_queue.push(prev);
+                }
+            } else {
+                self.global_queue.push(task);
+            }
+            self.wakeWorkerIfNeeded();
+        }
     }
 
     /// Enqueue an already-scheduled task.
@@ -1288,30 +1328,66 @@ pub const Scheduler = struct {
     }
 
     /// Block the calling (non-worker) thread until a target task completes,
-    /// executing tasks from the global queue to make progress.
+    /// executing tasks from any queue to make progress.
+    ///
+    /// This is a full work participant: it steals from worker LIFO slots and
+    /// run queues, not just the global queue. This prevents hangs when waker
+    /// callbacks push tasks to worker-local queues and all workers are parked
+    /// (observed on Windows where all warmup iterations pass but the final
+    /// join hangs because tasks are stranded in worker LIFO slots).
     pub fn blockOnComplete(self: *Self, target: *Header) void {
         var spins: u32 = 0;
         while (!target.isComplete()) {
-            // Try global queue FIRST — the target task likely just landed there
+            // 1. Try global queue first
             if (self.global_queue.pop()) |task| {
                 self.executeInline(task);
                 spins = 0;
                 continue;
             }
 
-            // Service I/O and timers so wakeups can fire
+            // 2. Steal from worker queues (LIFO slots + run queues)
+            if (self.stealForInline()) |task| {
+                self.executeInline(task);
+                spins = 0;
+                continue;
+            }
+
+            // 3. Service I/O and timers so wakeups can fire
             _ = self.pollIo();
             _ = self.pollTimers();
 
+            // 4. Escalating backoff with worker wake
             if (spins < 6) {
                 std.atomic.spinLoopHint();
             } else if (spins < 12) {
                 std.Thread.yield() catch {};
             } else {
+                // Wake a parked worker to help make progress.
+                // Even if we can't find work, a woken worker can
+                // steal from other workers' local queues.
+                self.wakeWorkerIfNeeded();
                 std.Thread.sleep(1_000); // 1us
             }
             spins +|= 1;
         }
+    }
+
+    /// Steal a task from any worker's LIFO slot or run queue.
+    /// Called by non-worker threads (main thread in blockOnComplete).
+    fn stealForInline(self: *Self) ?*Header {
+        // Try each worker's LIFO slot first (most cache-hot)
+        for (self.workers) |*worker| {
+            if (worker.lifo_slot.swap(null, .acquire)) |task| {
+                return task;
+            }
+        }
+        // Then try each worker's run queue
+        for (self.workers) |*worker| {
+            if (worker.run_queue.pop()) |task| {
+                return task;
+            }
+        }
+        return null;
     }
 
     // ─────────────────────────────────────────────────────────────────────────

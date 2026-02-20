@@ -1,14 +1,15 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 56 58" fill="none">
-  <!-- Lightning bolt — centered on circle (28,33) -->
+  <!-- Lightning bolt -->
   <polygon points="16,8 40,30 26,36 40,56 16,36 30,30" fill="#F0A020"/>
 
-  <!-- Circle arc — power-button "o", open at top -->
-  <path d="M 37 17.5 A 18 18 0 1 1 19 17.5"
-        stroke="#2B6CB0" stroke-width="3.5" fill="none" stroke-linecap="round"/>
+  <!-- Circle arc — power-button "o", open at top (filled ring, not stroke) -->
+  <path d="M 37 17.5 A 18 18 0 1 1 19 17.5
+           L 17.3 19.5 A 15 15 0 1 0 38.7 19.5 Z"
+        fill="#1D4ED8"/>
 
-  <!-- "i" stem -->
-  <line x1="28" y1="5" x2="28" y2="17" stroke="#2B6CB0" stroke-width="3.5" stroke-linecap="round"/>
+  <!-- "i" stem (filled rect instead of stroke) -->
+  <rect x="26.25" y="5" width="3.5" height="12" rx="1.75" fill="#1D4ED8"/>
 
   <!-- "i" dot -->
-  <circle cx="28" cy="2.5" r="3" fill="#2B6CB0"/>
+  <circle cx="28" cy="2.5" r="3" fill="#1D4ED8"/>
 </svg>
