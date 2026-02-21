@@ -22,6 +22,7 @@ jobs:
 
   exhaustive-concurrency:
     name: Exhaustive Concurrency (${{ matrix.name }})
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -58,6 +59,7 @@ jobs:
 
   integration:
     name: Integration (${{ matrix.name }})
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -91,6 +93,7 @@ jobs:
 
   exhaustive-stress:
     name: Exhaustive Stress (${{ matrix.name }})
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -123,6 +126,7 @@ jobs:
 
   soak-test:
     name: Soak Test (${{ matrix.name }})
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -141,10 +145,8 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Build soak test
-        run: zig build test-soak -Doptimize=ReleaseFast 2>/dev/null || echo "Soak test target not yet configured"
-
       - name: Run soak test (30 minutes default)
+        shell: bash
         run: |
           DURATION="${{ github.event.inputs.soak_duration_minutes || '30' }}"
           echo "Running soak test for ${DURATION} minutes..."
@@ -174,6 +176,7 @@ jobs:
 
   memory-check:
     name: Memory Check (Valgrind)
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -191,8 +194,13 @@ jobs:
 
       - name: Run memory check
         run: |
-          # Find test binary
-          TEST_BIN=$(find .zig-cache -name "test" -type f -executable 2>/dev/null | head -1)
+          # Find test binary — Zig 0.15.x puts it under .zig-cache/o/<hash>/test
+          TEST_BIN=$(find .zig-cache -type f -executable -name "test" 2>/dev/null | head -1)
+          if [ -z "$TEST_BIN" ]; then
+            # Fallback: look for any executable test binary
+            TEST_BIN=$(find .zig-cache -type f -executable 2>/dev/null | grep -E '/test$' | head -1)
+          fi
+
           if [ -n "$TEST_BIN" ]; then
             echo "Running valgrind on $TEST_BIN"
             valgrind --leak-check=full \
@@ -208,9 +216,7 @@ jobs:
             fi
             echo "No memory leaks detected"
           else
-            echo "Test binary not found, building differently..."
-            # Alternative approach
-            zig build test 2>&1 || true
+            echo "::warning::Test binary not found in .zig-cache — skipping valgrind"
           fi
         continue-on-error: true  # Valgrind may have issues with Zig runtime
 
@@ -243,6 +249,7 @@ jobs:
       - exhaustive-stress
       - soak-test
       - memory-check
+      - cross-arch-consistency
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -257,28 +264,29 @@ jobs:
           echo "| Exhaustive Stress | ${{ needs.exhaustive-stress.result }} |"
           echo "| Soak Test | ${{ needs.soak-test.result }} |"
           echo "| Memory Check | ${{ needs.memory-check.result }} |"
+          echo "| Cross-Arch Consistency | ${{ needs.cross-arch-consistency.result }} |"
           echo ""
 
           FAILED=0
           if [[ "${{ needs.exhaustive-concurrency.result }}" == "failure" ]]; then
-            echo "❌ Exhaustive concurrency tests failed"
+            echo "Exhaustive concurrency tests failed"
             FAILED=1
           fi
           if [[ "${{ needs.integration.result }}" == "failure" ]]; then
-            echo "❌ Integration tests failed"
+            echo "Integration tests failed"
             FAILED=1
           fi
           if [[ "${{ needs.exhaustive-stress.result }}" == "failure" ]]; then
-            echo "❌ Exhaustive stress tests failed"
+            echo "Exhaustive stress tests failed"
             FAILED=1
           fi
           if [[ "${{ needs.soak-test.result }}" == "failure" ]]; then
-            echo "❌ Soak test failed"
+            echo "Soak test failed"
             FAILED=1
           fi
 
           if [[ $FAILED -eq 0 ]]; then
-            echo "✅ All nightly tests passed!"
+            echo "All nightly tests passed!"
           else
             exit 1
           fi
