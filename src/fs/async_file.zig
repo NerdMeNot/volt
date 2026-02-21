@@ -561,10 +561,27 @@ pub const AsyncFile = struct {
     }
 
     /// Close the file.
+    /// On Linux with io_uring, submits an async close SQE to avoid blocking
+    /// the event loop on slow filesystems (e.g. NFS). Falls back to sync
+    /// close on other platforms or if io_uring submission fails.
     pub fn close(self: *Self) void {
-        // TODO: Could use io_uring close for true async close
+        if (comptime builtin.os.tag == .linux) {
+            if (self.tryCloseIoUring()) return;
+        }
         posix.close(self.handle);
         self.handle = -1;
+    }
+
+    /// Try to close via io_uring. Returns true on success.
+    fn tryCloseIoUring(self: *Self) bool {
+        const scheduler = self.runtime.getScheduler();
+        const op = Operation{
+            .op = .{ .close = .{ .fd = self.handle } },
+            .user_data = 0, // Fire-and-forget, no task to wake
+        };
+        _ = scheduler.submitIo(op) catch return false;
+        self.handle = -1;
+        return true;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

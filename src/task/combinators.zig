@@ -27,6 +27,8 @@
 //! They provide a more ergonomic interface for common patterns.
 
 const std = @import("std");
+const scheduler_mod = @import("../internal/scheduler/Scheduler.zig");
+const Header = @import("../internal/scheduler/Header.zig").Header;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Join All - Wait for all tasks
@@ -210,10 +212,8 @@ fn HandleErrorType(comptime HandleType: type) type {
 /// const result = try volt.task.race(.{h1, h2});
 /// ```
 ///
-/// ## Note
-///
-/// This is a simplified implementation that polls in order.
-/// For true concurrent racing, use the async combinators directly.
+/// Uses concurrent waiting — blocks on ALL handles simultaneously so the
+/// first to complete (regardless of position) returns immediately.
 pub fn race(handles: anytype) RaceResult(@TypeOf(handles)) {
     const T = @TypeOf(handles);
     const info = @typeInfo(T);
@@ -222,38 +222,59 @@ pub fn race(handles: anytype) RaceResult(@TypeOf(handles)) {
         @compileError("race expects a tuple of JoinHandles");
     }
 
-    // Simple implementation: try each in order
-    // TODO: Use async combinators for true concurrent racing
+    var mutable_handles = handles;
+
+    // Fast path: check if any are already complete
     inline for (info.@"struct".fields) |field| {
-        var handle = @field(handles, field.name);
-        if (handle.tryJoin()) |result| {
-            // Cancel remaining handles
-            inline for (info.@"struct".fields) |other_field| {
-                if (!std.mem.eql(u8, other_field.name, field.name)) {
-                    var other = @field(handles, other_field.name);
-                    other.cancel();
-                }
-            }
+        const handle = &@field(mutable_handles, field.name);
+        if (handle.header.isComplete()) {
+            const result = handle.join() catch |err| {
+                cancelOthers(T, &mutable_handles, field.name);
+                return err;
+            };
+            cancelOthers(T, &mutable_handles, field.name);
             return result;
         }
     }
 
-    // None ready yet - wait for first one
-    var mutable_handles = handles;
+    // Slow path: wait for ANY handle to complete concurrently
+    var headers: [info.fields.len]*Header = undefined;
+    inline for (info.@"struct".fields, 0..) |field, i| {
+        headers[i] = @field(mutable_handles, field.name).header;
+    }
+
+    if (!scheduler_mod.helpUntilAnyComplete(&headers)) {
+        // Not on a worker thread — get scheduler from first handle's runtime
+        const rt_field = info.@"struct".fields[0];
+        const first_handle = &@field(mutable_handles, rt_field.name);
+        first_handle.runtime.scheduler.blockOnAnyComplete(&headers);
+    }
+
+    // Find which completed and return its result
     inline for (info.@"struct".fields) |field| {
-        var handle = &@field(mutable_handles, field.name);
-        const result = handle.join() catch |err| return err;
-        // Cancel remaining
-        inline for (info.@"struct".fields) |other_field| {
-            if (!std.mem.eql(u8, other_field.name, field.name)) {
-                var other = &@field(mutable_handles, other_field.name);
-                other.cancel();
-            }
+        const handle = &@field(mutable_handles, field.name);
+        if (handle.header.isComplete()) {
+            const result = handle.join() catch |err| {
+                cancelOthers(T, &mutable_handles, field.name);
+                return err;
+            };
+            cancelOthers(T, &mutable_handles, field.name);
+            return result;
         }
-        return result;
     }
 
     unreachable;
+}
+
+/// Cancel all handles except the one with the given field name.
+fn cancelOthers(comptime T: type, mutable_handles: anytype, comptime winner_name: []const u8) void {
+    const info = @typeInfo(T).@"struct";
+    inline for (info.fields) |other_field| {
+        if (!std.mem.eql(u8, other_field.name, winner_name)) {
+            var other = &@field(mutable_handles.*, other_field.name);
+            other.cancel();
+        }
+    }
 }
 
 pub fn RaceResult(comptime T: type) type {
@@ -279,6 +300,9 @@ pub fn RaceResult(comptime T: type) type {
 /// const result, const index = try volt.task.select(.{h1, h2});
 /// // Other task is still running
 /// ```
+///
+/// Uses concurrent waiting — blocks on ALL handles simultaneously so the
+/// first to complete (regardless of position) returns immediately.
 pub fn select(handles: anytype) SelectResult(@TypeOf(handles)) {
     const T = @TypeOf(handles);
     const info = @typeInfo(T);
@@ -287,20 +311,36 @@ pub fn select(handles: anytype) SelectResult(@TypeOf(handles)) {
         @compileError("select expects a tuple of JoinHandles");
     }
 
-    // Simple implementation: try each in order
+    var mutable_handles = handles;
+
+    // Fast path: check if any are already complete
     inline for (info.@"struct".fields, 0..) |field, i| {
-        var handle = @field(handles, field.name);
-        if (handle.tryJoin()) |result| {
+        const handle = &@field(mutable_handles, field.name);
+        if (handle.header.isComplete()) {
+            const result = handle.join() catch |err| return err;
             return .{ result, i };
         }
     }
 
-    // None ready yet - wait for first one
-    var mutable_handles = handles;
+    // Slow path: wait for ANY handle to complete concurrently
+    var headers: [info.fields.len]*Header = undefined;
     inline for (info.@"struct".fields, 0..) |field, i| {
-        var handle = &@field(mutable_handles, field.name);
-        const result = handle.join() catch |err| return err;
-        return .{ result, i };
+        headers[i] = @field(mutable_handles, field.name).header;
+    }
+
+    if (!scheduler_mod.helpUntilAnyComplete(&headers)) {
+        const rt_field = info.@"struct".fields[0];
+        const first_handle = &@field(mutable_handles, rt_field.name);
+        first_handle.runtime.scheduler.blockOnAnyComplete(&headers);
+    }
+
+    // Find which completed and return its result + index
+    inline for (info.@"struct".fields, 0..) |field, i| {
+        const handle = &@field(mutable_handles, field.name);
+        if (handle.header.isComplete()) {
+            const result = handle.join() catch |err| return err;
+            return .{ result, i };
+        }
     }
 
     unreachable;

@@ -413,6 +413,9 @@ pub fn GetOrInitFuture(comptime T: type, comptime init_fn: fn () T) type {
         pub fn poll(self: *Self, ctx: *Context) PollResult(*T) {
             switch (self.state) {
                 .init => {
+                    // Cooperative budgeting: yield if this task has consumed its budget
+                    if (!ctx.pollProceed()) return .pending;
+
                     // First poll - try to get or initialize
                     // Store the waker so we can be woken when initialization completes
                     self.stored_waker = ctx.getWaker().clone();

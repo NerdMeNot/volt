@@ -29,13 +29,13 @@ When a worker needs a task, it searches in this order:
 1. Global batch buffer   -- Already-fetched tasks (no lock needed)
        |
        v (empty)
-2. LIFO slot             -- Newest scheduled task (cache-hot)
+2. Global queue          -- Periodic batch fetch (adaptive interval)
+       |                    Checked BEFORE local queue to prevent starvation
+       v (not this tick / empty)
+3. LIFO slot             -- Newest scheduled task (cache-hot)
        |
        v (empty)
-3. Local queue           -- Own ring buffer (FIFO pop)
-       |
-       v (empty)
-4. Global queue          -- Periodic batch fetch (adaptive interval)
+4. Local queue           -- Own ring buffer (FIFO pop)
        |
        v (empty)
 5. Work stealing         -- Steal half from another worker's queue
@@ -47,11 +47,13 @@ When a worker needs a task, it searches in this order:
 7. Park                  -- Sleep with 10ms timeout until woken
 ```
 
+The periodic global queue check (step 2) runs before the local queue (steps 3-4). This prevents starvation: fast-cycling tasks in the LIFO slot (e.g., channel producer/consumer ping-pong) can keep local work perpetually available, starving tasks in the global queue. Checking the global queue first on periodic ticks ensures all tasks get serviced. This matches Tokio's injector queue priority.
+
 ```mermaid
 graph TD
-    A["Global batch buffer"] -->|empty| B["LIFO slot"]
-    B -->|empty| C["Local queue"]
-    C -->|empty| D["Global queue"]
+    A["Global batch buffer"] -->|empty| B["Global queue (periodic)"]
+    B -->|"not this tick / empty"| C["LIFO slot"]
+    C -->|empty| D["Local queue"]
     D -->|empty| E["Work stealing"]
     E -->|nothing| F["Global queue (final)"]
     F -->|empty| G["Park (sleep 10ms)"]
@@ -64,9 +66,9 @@ graph TD
     F -->|found| X
 
     style A fill:#22c55e,color:#000
-    style B fill:#22c55e,color:#000
+    style B fill:#3b82f6,color:#fff
     style C fill:#22c55e,color:#000
-    style D fill:#3b82f6,color:#fff
+    style D fill:#22c55e,color:#000
     style E fill:#3b82f6,color:#fff
     style F fill:#6b7280,color:#fff
     style G fill:#6b7280,color:#fff
@@ -281,7 +283,29 @@ Park timeout is 10ms. Worker 0 may use a shorter timeout based on the next timer
 
 ## Cooperative budgeting
 
-### Budget per tick
+Volt has two layers of cooperative budgeting, matching Tokio's design:
+
+### Budget per task (Context.pollProceed)
+
+Each task gets a budget of 128 operations per poll. Futures that loop internally (e.g., lock → unlock → lock in a tight loop) call `ctx.pollProceed()` before each operation. When the budget reaches zero, `pollProceed()` returns false and the future returns `.pending`.
+
+Budget-exhausted tasks produce a `.yield` poll result (distinct from `.pending`). The scheduler routes yielded tasks to the **global queue** instead of the LIFO slot, ensuring they don't immediately re-consume the same worker and starve other tasks.
+
+```zig
+// In Context (src/future/Waker.zig):
+pub fn pollProceed(self: *Context) bool {
+    if (self.budget == 0) {
+        self.budget_exhausted = true;
+        return false;
+    }
+    self.budget -= 1;
+    return true;
+}
+```
+
+Users writing custom tight-loop futures should call `ctx.pollProceed()` on each iteration -- this is equivalent to Tokio's `consume_budget().await`.
+
+### Budget per tick (worker level)
 
 Each worker has a budget of 128 polls per tick. After exhausting the budget:
 
@@ -350,7 +374,7 @@ Per-worker stats include `tasks_polled`, `tasks_stolen`, `times_parked`, `lifo_h
 | LIFO slot | Yes (with eviction) | Yes |
 | Local queue | 256-slot lock-free ring | 256-slot lock-free ring |
 | Global batch | 32-task buffer | Batch fetch |
-| Cooperative budget | 128 polls/tick | 128 polls/tick |
+| Cooperative budget | 128 ops/task + 128 polls/tick | 128 ops/task + budget/tick |
 | Adaptive interval | EWMA-based | Fixed interval |
 | Searcher limiting | ~50% cap | ~50% cap |
 | Park mechanism | Futex with timeout | Condvar |
@@ -369,6 +393,10 @@ Because `Runtime.spawn()` detects worker context and calls `spawnFromWorker()` t
 ### Non-worker threads: `blockOnComplete`
 
 When `join()` is called from a non-worker thread (e.g., the main thread), `blockOnComplete(target)` pulls tasks from the global injection queue and executes them inline. This ensures progress even when no worker thread is free to run the target task.
+
+### Multi-target waiting: `helpUntilAnyComplete` / `blockOnAnyComplete`
+
+The `race()` and `select()` combinators need to wait for **any one** of multiple tasks to complete. These variants accept a `[]const *Header` slice and check all targets each iteration, returning as soon as any target's `isComplete()` returns true. The same work-finding loop (LIFO slot, local queue, global queue, work stealing, I/O polling) runs between checks, ensuring all tasks make progress concurrently.
 
 ### Performance impact
 

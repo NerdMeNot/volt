@@ -550,8 +550,13 @@ pub const Worker = struct {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// Find work from any source using the defined priority order.
+    ///
+    /// Matches Tokio's pattern: global queue is checked BEFORE local queue
+    /// on periodic ticks. This prevents starvation when LIFO-cycling tasks
+    /// (e.g., channel send/recv, notify ping-pong) monopolize the worker
+    /// and starve tasks that yielded to the global queue.
     fn findWork(self: *Self) ?*Header {
-        // 1. Check buffered global queue batch first
+        // 1. Check buffered global queue batch first (free, no lock)
         if (self.pollGlobalBatch()) |task| {
             if (debug_scheduler) {
                 std.debug.print("[WORKER {d}] findWork: found in batch buffer\n", .{self.index});
@@ -559,15 +564,12 @@ pub const Worker = struct {
             return task;
         }
 
-        // 2. Check local queue with LIFO limiting
-        if (self.pollLocalQueue()) |task| {
-            if (debug_scheduler) {
-                std.debug.print("[WORKER {d}] findWork: found in local queue\n", .{self.index});
-            }
-            return task;
-        }
-
-        // 3. Check global queue periodically (adaptive interval)
+        // 2. PERIODIC: Check global queue BEFORE local queue.
+        //    This is the key to preventing starvation: when LIFO-cycling
+        //    tasks keep the local queue full, global queue tasks (from
+        //    cooperative yield or external spawns) would never get polled
+        //    if we always checked local first. By checking global first
+        //    on periodic ticks, we guarantee all tasks get CPU time.
         if (self.tick % self.global_queue_interval == 0) {
             if (self.fetchGlobalBatch()) |task| {
                 if (debug_scheduler) {
@@ -575,6 +577,14 @@ pub const Worker = struct {
                 }
                 return task;
             }
+        }
+
+        // 3. Check local queue with LIFO limiting
+        if (self.pollLocalQueue()) |task| {
+            if (debug_scheduler) {
+                std.debug.print("[WORKER {d}] findWork: found in local queue\n", .{self.index});
+            }
+            return task;
         }
 
         // 4. Try stealing from other workers (with searcher limiting)
@@ -761,6 +771,43 @@ pub const Worker = struct {
         setCurrentHeader(saved_header);
     }
 
+    /// Execute tasks from this worker's queues while waiting for ANY of the
+    /// target tasks to complete. Used by race()/select() on worker threads.
+    pub fn helpUntilAnyComplete(self: *Self, targets: []const *Header) void {
+        const saved_header = getCurrentHeader();
+
+        var spins: u32 = 0;
+        while (true) {
+            // Check if any target is complete
+            for (targets) |target| {
+                if (target.isComplete()) {
+                    setCurrentHeader(saved_header);
+                    return;
+                }
+            }
+
+            // Service I/O and timers so wakeups can fire
+            _ = self.scheduler.pollIo();
+            if (self.index == 0) {
+                _ = self.scheduler.pollTimers();
+            }
+
+            if (self.findWork()) |task| {
+                self.executeTask(task);
+                spins = 0;
+            } else {
+                if (spins < 6) {
+                    std.atomic.spinLoopHint();
+                } else if (spins < 12) {
+                    std.Thread.yield() catch {};
+                } else {
+                    std.Thread.sleep(1_000); // 1us
+                }
+                spins +|= 1;
+            }
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Adaptive Interval Tuning
     // ─────────────────────────────────────────────────────────────────────────
@@ -870,10 +917,32 @@ pub const Worker = struct {
 
         switch (result) {
             .complete => {
-                task.transitionToComplete();
+                const prev = task.transitionToComplete();
+                if (prev.join_interest) task.notifyJoiner();
                 if (task.unref()) {
                     task.drop();
                 }
+            },
+            .yield => {
+                // Cooperative budget exhausted - reschedule via global queue.
+                // MUST NOT use LIFO slot: the task just ran 128 operations and
+                // needs to give other tasks a chance. LIFO would re-poll it
+                // immediately, starving other tasks on this worker.
+                const prev = task.transitionToIdle();
+
+                // Schedule to global queue regardless of notified state.
+                // The budget exhaustion IS the reason to reschedule.
+                if (task.transitionToScheduled()) {
+                    self.scheduler.global_queue.push(task);
+                    self.scheduler.wakeWorkerIfNeeded();
+                }
+
+                // Also handle any external wakeup that arrived during the poll
+                // (already handled by the transitionToScheduled above since
+                // notified would have been set, making transitionToIdle return
+                // prev.notified=true, but transitionToScheduled already moved
+                // us to SCHEDULED state).
+                _ = prev;
             },
             .pending => {
                 // Task yielded - transition back to idle
@@ -1319,9 +1388,18 @@ pub const Scheduler = struct {
 
         switch (result) {
             .complete => {
-                task.transitionToComplete();
+                const prev = task.transitionToComplete();
+                if (prev.join_interest) task.notifyJoiner();
                 if (task.unref()) {
                     task.drop();
+                }
+            },
+            .yield => {
+                // Budget exhausted - reschedule via global queue
+                _ = task.transitionToIdle();
+                if (task.transitionToScheduled()) {
+                    self.global_queue.push(task);
+                    self.wakeWorkerIfNeeded();
                 }
             },
             .pending => {
@@ -1376,6 +1454,43 @@ pub const Scheduler = struct {
                 // steal from other workers' local queues.
                 self.wakeWorkerIfNeeded();
                 std.Thread.sleep(1_000); // 1us
+            }
+            spins +|= 1;
+        }
+    }
+
+    /// Block the calling (non-worker) thread until ANY of the target tasks
+    /// completes, executing tasks from any queue to make progress.
+    /// Used by race()/select() from non-worker threads.
+    pub fn blockOnAnyComplete(self: *Self, targets: []const *Header) void {
+        var spins: u32 = 0;
+        while (true) {
+            for (targets) |target| {
+                if (target.isComplete()) return;
+            }
+
+            if (self.global_queue.pop()) |task| {
+                self.executeInline(task);
+                spins = 0;
+                continue;
+            }
+
+            if (self.stealForInline()) |task| {
+                self.executeInline(task);
+                spins = 0;
+                continue;
+            }
+
+            _ = self.pollIo();
+            _ = self.pollTimers();
+
+            if (spins < 6) {
+                std.atomic.spinLoopHint();
+            } else if (spins < 12) {
+                std.Thread.yield() catch {};
+            } else {
+                self.wakeWorkerIfNeeded();
+                std.Thread.sleep(1_000);
             }
             spins +|= 1;
         }
@@ -1717,6 +1832,16 @@ pub fn helpUntilComplete(target: *Header) bool {
     const scheduler = getCurrentScheduler() orelse return false;
     if (worker_idx >= scheduler.workers.len) return false;
     scheduler.workers[worker_idx].helpUntilComplete(target);
+    return true;
+}
+
+/// Try work-stealing wait for any of multiple targets. Returns true if on
+/// a worker thread (helped), false otherwise (caller should use blockOnAnyComplete).
+pub fn helpUntilAnyComplete(targets: []const *Header) bool {
+    const worker_idx = getCurrentWorkerIndex() orelse return false;
+    const scheduler = getCurrentScheduler() orelse return false;
+    if (worker_idx >= scheduler.workers.len) return false;
+    scheduler.workers[worker_idx].helpUntilAnyComplete(targets);
     return true;
 }
 

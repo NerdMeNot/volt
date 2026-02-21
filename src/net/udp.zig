@@ -783,6 +783,7 @@ pub const SendFuture = struct {
 
     /// Poll the future.
     pub fn poll(self: *SendFuture, ctx: *FutureContext) FuturePollResult(Output) {
+        if (!ctx.pollProceed()) return .pending;
         const n = xplat.send(self.socket.fd, self.data, 0) catch |err| switch (err) {
             error.WouldBlock => {
                 updateStoredWaker(&self.stored_waker, ctx);
@@ -811,6 +812,7 @@ pub const RecvFuture = struct {
 
     /// Poll the future.
     pub fn poll(self: *RecvFuture, ctx: *FutureContext) FuturePollResult(Output) {
+        if (!ctx.pollProceed()) return .pending;
         const n = xplat.recv(self.socket.fd, self.buf, 0) catch |err| switch (err) {
             error.WouldBlock => {
                 updateStoredWaker(&self.stored_waker, ctx);
@@ -840,6 +842,7 @@ pub const SendToFuture = struct {
 
     /// Poll the future.
     pub fn poll(self: *SendToFuture, ctx: *FutureContext) FuturePollResult(Output) {
+        if (!ctx.pollProceed()) return .pending;
         const n = xplat.sendto(self.socket.fd, self.data, 0, self.addr.sockaddr(), self.addr.len) catch |err| switch (err) {
             error.WouldBlock => {
                 updateStoredWaker(&self.stored_waker, ctx);
@@ -868,6 +871,7 @@ pub const RecvFromFuture = struct {
 
     /// Poll the future.
     pub fn poll(self: *RecvFromFuture, ctx: *FutureContext) FuturePollResult(Output) {
+        if (!ctx.pollProceed()) return .pending;
         var addr: Address = undefined;
         addr.len = @sizeOf(posix.sockaddr.storage);
 
@@ -899,6 +903,7 @@ pub const PeekFuture = struct {
 
     /// Poll the future.
     pub fn poll(self: *PeekFuture, ctx: *FutureContext) FuturePollResult(Output) {
+        if (!ctx.pollProceed()) return .pending;
         const n = xplat.recv(self.socket.fd, self.buf, posix.MSG.PEEK) catch |err| switch (err) {
             error.WouldBlock => {
                 updateStoredWaker(&self.stored_waker, ctx);

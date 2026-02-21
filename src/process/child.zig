@@ -719,8 +719,25 @@ test "WaitWaiter - basic" {
 
 test "ChildStdin/ChildStdout - basic operations" {
     if (builtin.os.tag == .windows) {
-        // TODO: Add Windows pipe test using CreatePipe
-        return error.SkipZigTest;
+        // Windows: create pipe via kernel32
+        var read_handle: windows.HANDLE = undefined;
+        var write_handle: windows.HANDLE = undefined;
+        if (windows.kernel32.CreatePipe(&read_handle, &write_handle, null, 0) == 0) {
+            return error.SkipZigTest; // CreatePipe not available
+        }
+
+        var stdin_handle = ChildStdin.init(write_handle);
+        var stdout_handle = ChildStdout.init(read_handle);
+
+        try stdin_handle.writeAll("hello");
+        stdin_handle.close();
+
+        var buf: [10]u8 = undefined;
+        const n = try stdout_handle.read(&buf);
+        try std.testing.expectEqualStrings("hello", buf[0..n]);
+
+        stdout_handle.close();
+        return;
     }
 
     // Create a pipe (Unix)

@@ -462,6 +462,7 @@ pub const ReadFuture = struct {
     stored_waker: ?FutureWaker = null,
 
     pub fn poll(self: *ReadFuture, ctx: *FutureContext) FuturePollResult(Output) {
+        if (!ctx.pollProceed()) return .pending;
         if (self.stream.tryRead(self.buf)) |n_opt| {
             if (n_opt) |n| {
                 return .{ .ready = n };
@@ -492,6 +493,7 @@ pub const WriteFuture = struct {
     stored_waker: ?FutureWaker = null,
 
     pub fn poll(self: *WriteFuture, ctx: *FutureContext) FuturePollResult(Output) {
+        if (!ctx.pollProceed()) return .pending;
         if (self.stream.tryWrite(self.data)) |n_opt| {
             if (n_opt) |n| {
                 return .{ .ready = n };
@@ -615,6 +617,7 @@ pub const PeekFuture = struct {
     stored_waker: ?FutureWaker = null,
 
     pub fn poll(self: *PeekFuture, ctx: *FutureContext) FuturePollResult(Output) {
+        if (!ctx.pollProceed()) return .pending;
         // Try to peek
         const n = c.recv(self.stream.fd, self.buf, posix.MSG.PEEK) catch |err| switch (err) {
             error.WouldBlock => {
@@ -650,6 +653,7 @@ pub const WriteAllFuture = struct {
 
     pub fn poll(self: *WriteAllFuture, ctx: *FutureContext) FuturePollResult(Output) {
         while (self.written < self.data.len) {
+            if (!ctx.pollProceed()) return .pending;
             if (self.stream.tryWrite(self.data[self.written..])) |n_opt| {
                 if (n_opt) |n| {
                     if (n == 0) return .{ .ready = error.BrokenPipe };

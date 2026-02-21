@@ -135,6 +135,33 @@ pub fn build(b: *std.Build) void {
     test_all_step.dependOn(ta_integration);
 
     // ========================================================================
+    // Soak Test (long-running executable — NOT wired into test-all)
+    // ========================================================================
+    const soak_mod = b.createModule(.{
+        .root_source_file = b.path("tests/soak/soak_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    soak_mod.addImport("volt", volt_mod);
+
+    const soak_exe = b.addExecutable(.{
+        .name = "soak_test",
+        .root_module = soak_mod,
+    });
+
+    const install_soak = b.addInstallArtifact(soak_exe, .{
+        .dest_dir = .{ .override = .{ .custom = "test" } },
+    });
+
+    const run_soak = b.addRunArtifact(soak_exe);
+    if (b.args) |args| {
+        run_soak.addArgs(args);
+    }
+    run_soak.step.dependOn(&install_soak.step);
+
+    b.step("test-soak", "Run long-running soak test").dependOn(&run_soak.step);
+
+    // ========================================================================
     // Benchmarks
     // ========================================================================
 
@@ -240,8 +267,8 @@ pub fn build(b: *std.Build) void {
 
     const install_docs = b.addInstallDirectory(.{
         .source_dir = docs_obj.getEmittedDocs(),
-        .install_dir = .prefix,
-        .install_subdir = "docs",
+        .install_dir = .{ .custom = "docs/api-reference" },
+        .install_subdir = "",
     });
 
     const docs_step = b.step("docs", "Generate documentation");

@@ -34,10 +34,10 @@ findWork() priority:
 1. Pre-fetched Global Batch    No lock needed, already local
        |
        v (empty)
-2. Local Queue                 LIFO slot (cap 3/tick), then FIFO ring buffer
+2. Global Queue (periodic)     Every N ticks, batch-pull up to 64 tasks
        |
-       v (empty)
-3. Global Queue (periodic)     Every N ticks, batch-pull up to 64 tasks
+       v (not this tick / empty)
+3. Local Queue                 LIFO slot (cap 3/tick), then FIFO ring buffer
        |
        v (empty)
 4. Work Stealing               Random victim, steal half of their queue
@@ -49,22 +49,29 @@ findWork() priority:
 6. Park                        Futex sleep with 10ms timeout
 ```
 
-Steps 1-2 require no synchronization at all. Step 3 takes a mutex but amortizes it across up to 64 tasks. Step 4 uses lock-free CAS operations. Step 6 uses a futex for efficient OS-level sleep.
+Step 1 requires no synchronization. Step 2 takes a mutex but amortizes it across up to 64 tasks -- crucially, it runs **before** the local queue to prevent starvation (see below). Step 3 has no synchronization. Step 4 uses lock-free CAS operations. Step 6 uses a futex for efficient OS-level sleep.
+
+### Why global queue checks before local queue
+
+The periodic global queue check (step 2) must run before the local queue check (step 3). Without this ordering, fast-cycling tasks in the LIFO slot (e.g., channel producer wakes consumer, consumer wakes producer) create a perpetual local work supply. The worker never reaches the global queue check, and tasks routed to the global queue (such as budget-yielded tasks or externally spawned tasks) starve indefinitely.
+
+This matches Tokio's design where the injector queue is checked before local work on periodic ticks.
 
 The corresponding implementation in `Scheduler.zig`:
 
 ```zig
 fn findWork(self: *Self) ?*Header {
-    // 1. Check buffered global queue batch first
+    // 1. Check buffered global queue batch first (free, no lock)
     if (self.pollGlobalBatch()) |task| return task;
 
-    // 2. Check local queue with LIFO limiting
-    if (self.pollLocalQueue()) |task| return task;
-
-    // 3. Check global queue periodically (adaptive interval)
+    // 2. PERIODIC: Check global queue BEFORE local queue.
+    //    Prevents starvation when LIFO-cycling tasks keep local queue full.
     if (self.tick % self.global_queue_interval == 0) {
         if (self.fetchGlobalBatch()) |task| return task;
     }
+
+    // 3. Check local queue with LIFO limiting
+    if (self.pollLocalQueue()) |task| return task;
 
     // 4. Try stealing from other workers
     if (self.scheduler.config.enable_stealing) {
@@ -233,7 +240,7 @@ num_searching=0 -> num_searching=1 -> num_searching=0     -> num_searching=1
 | Local queue | 256-slot Chase-Lev deque | 256-slot Chase-Lev deque |
 | Global batch pull | Adaptive size (4-64), 32-task buffer | Batch fetch |
 | PRNG | xorshift64+ with Lemire modulo | Same |
-| Cooperative budget | 128 polls/tick | 128 polls/tick |
+| Cooperative budget | 128 ops/task + 128 polls/tick | 128 ops/task + budget/tick |
 | Searcher limiting | ~50% cap via atomic counter | ~50% cap |
 | Park mechanism | Futex with 10ms timeout | Condvar-based |
 | Adaptive interval | EWMA-based (0.1 alpha) | Fixed interval (61) |

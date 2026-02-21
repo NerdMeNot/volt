@@ -420,6 +420,9 @@ pub const ReadLockFuture = struct {
     pub fn poll(self: *Self, ctx: *Context) PollResult(void) {
         switch (self.state) {
             .init => {
+                // Cooperative budgeting: yield if this task has consumed its budget
+                if (!ctx.pollProceed()) return .pending;
+
                 self.stored_waker = ctx.getWaker().clone();
 
                 // Set the user waker on the ReadWaiter (will be wrapped by readLockWait)
@@ -530,6 +533,9 @@ pub const WriteLockFuture = struct {
     pub fn poll(self: *Self, ctx: *Context) PollResult(void) {
         switch (self.state) {
             .init => {
+                // Cooperative budgeting: yield if this task has consumed its budget
+                if (!ctx.pollProceed()) return .pending;
+
                 self.stored_waker = ctx.getWaker().clone();
 
                 // Set the user waker on the WriteWaiter (will be wrapped by writeLockWait)

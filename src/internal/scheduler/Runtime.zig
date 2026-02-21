@@ -161,7 +161,11 @@ pub fn JoinHandle(comptime T: type) type {
         /// This is the async way to await a spawned task.
         pub fn poll(self: *Self, ctx: *Context) PollResult(Output) {
             if (self.header.isComplete()) {
-                // Clean up waker
+                // Clean up wakers
+                if (self.header.join_waker) |*jw| {
+                    jw.deinit();
+                    self.header.join_waker = null;
+                }
                 if (self.stored_waker) |*w| {
                     w.deinit();
                     self.stored_waker = null;
@@ -194,9 +198,8 @@ pub fn JoinHandle(comptime T: type) type {
                 }
             }
 
-            // Not complete - store/update waker
-            // TODO: Register waker with Header for proper notification
-            // For now, the scheduler will re-poll periodically
+            // Not complete - register waker with the target task's Header
+            // so we get notified when it transitions to COMPLETE.
             const new_waker = ctx.getWaker();
             if (self.stored_waker) |*old| {
                 if (!old.willWakeSame(new_waker)) {
@@ -205,6 +208,26 @@ pub fn JoinHandle(comptime T: type) type {
                 }
             } else {
                 self.stored_waker = new_waker.clone();
+            }
+
+            // Register a clone of our waker on the target Header.
+            // When the target completes, notifyJoiner() will call wake().
+            if (self.header.join_waker) |*old_jw| {
+                old_jw.deinit();
+            }
+            self.header.join_waker = self.stored_waker.?.clone();
+
+            // Set join_interest flag (acq_rel CAS) — establishes
+            // happens-before with transitionToComplete's acq_rel CAS.
+            self.header.setJoinInterest();
+
+            // Double-check: task may have completed between our first
+            // isComplete() check and setJoinInterest(). If so, wake
+            // ourselves to avoid missing the completion.
+            if (self.header.isComplete()) {
+                if (self.stored_waker) |*w| {
+                    w.wakeByRef();
+                }
             }
 
             return .pending;
@@ -226,6 +249,11 @@ pub fn JoinHandle(comptime T: type) type {
 
         /// Detach the handle (task continues running, result is discarded).
         pub fn detach(self: *Self) void {
+            // Clean up join_waker on the target header
+            if (self.header.join_waker) |*jw| {
+                jw.deinit();
+                self.header.join_waker = null;
+            }
             if (self.stored_waker) |*w| {
                 w.deinit();
                 self.stored_waker = null;
@@ -238,6 +266,10 @@ pub fn JoinHandle(comptime T: type) type {
 
         /// Clean up resources
         pub fn deinit(self: *Self) void {
+            if (self.header.join_waker) |*jw| {
+                jw.deinit();
+                self.header.join_waker = null;
+            }
             if (self.stored_waker) |*w| {
                 w.deinit();
                 self.stored_waker = null;

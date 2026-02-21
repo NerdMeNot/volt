@@ -660,6 +660,9 @@ pub const AcquireFuture = struct {
     pub fn poll(self: *Self, ctx: *Context) PollResult(void) {
         switch (self.state) {
             .init => {
+                // Cooperative budgeting: yield if this task has consumed its budget
+                if (!ctx.pollProceed()) return .pending;
+
                 // Fast path: try lock-free acquire before waker/waiter setup.
                 // Skips 2 atomic ops (waker clone+deinit) when permits are available.
                 if (self.semaphore.tryAcquire(self.num_permits)) {

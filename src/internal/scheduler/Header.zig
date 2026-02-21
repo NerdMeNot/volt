@@ -160,6 +160,11 @@ pub const Header = struct {
     /// VTable for type-erased operations
     vtable: *const VTable,
 
+    /// Waker for JoinHandle notification.
+    /// Set by JoinFuture.poll() so the joiner gets woken when this task completes.
+    /// Protected by the happens-before from setJoinInterest CAS → transitionToComplete CAS.
+    join_waker: ?Waker = null,
+
     pub const VTable = struct {
         /// Run one step of the task (poll the future)
         poll: *const fn (*Header) PollResult_,
@@ -177,6 +182,10 @@ pub const Header = struct {
         pending,
         /// Task completed
         complete,
+        /// Task yielded due to cooperative budget exhaustion.
+        /// Scheduler should route to global queue, not LIFO slot,
+        /// to prevent the yielding task from starving others.
+        yield,
     };
 
     /// Initialize header with vtable
@@ -292,8 +301,9 @@ pub const Header = struct {
         }
     }
 
-    /// Mark task as complete
-    pub fn transitionToComplete(self: *Header) void {
+    /// Mark task as complete. Returns the previous state so the caller
+    /// can check join_interest and notify the joiner if needed.
+    pub fn transitionToComplete(self: *Header) State {
         var current = State.fromU64(self.state.load(.acquire));
 
         while (true) {
@@ -304,7 +314,33 @@ pub const Header = struct {
                 current = State.fromU64(updated);
                 continue;
             }
+            return current; // Return previous state
+        }
+    }
+
+    /// Set the join_interest flag atomically. Called by JoinFuture.poll()
+    /// after storing the join_waker. The acq_rel CAS establishes a
+    /// happens-before with transitionToComplete's acq_rel CAS.
+    pub fn setJoinInterest(self: *Header) void {
+        var current = State.fromU64(self.state.load(.acquire));
+        while (true) {
+            if (current.join_interest) return; // Already set
+            var new = current;
+            new.join_interest = true;
+            if (self.state.cmpxchgWeak(current.toU64(), new.toU64(), .acq_rel, .acquire)) |updated| {
+                current = State.fromU64(updated);
+                continue;
+            }
             return;
+        }
+    }
+
+    /// Wake the joiner (if any). Called after transitionToComplete when
+    /// the previous state had join_interest set. Consumes the join_waker.
+    pub fn notifyJoiner(self: *Header) void {
+        if (self.join_waker) |w| {
+            self.join_waker = null;
+            w.wake(); // Consumes waker, schedules JoinFuture's parent task
         }
     }
 
@@ -569,6 +605,11 @@ pub fn FutureTask(comptime F: type) type {
                     self.result = poll_result.unwrap();
                 }
                 return .complete;
+            } else if (ctx.budget_exhausted) {
+                // Cooperative budget exhausted - signal yield so the scheduler
+                // routes this task to the global queue instead of the LIFO slot.
+                // This prevents a budget-yielding task from monopolizing the worker.
+                return .yield;
             } else {
                 // Future is pending.
                 // No need to set any flag - the scheduler will:

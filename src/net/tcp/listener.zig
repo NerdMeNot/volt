@@ -237,6 +237,7 @@ pub const AcceptFuture = struct {
 
     /// Poll for a new connection.
     pub fn poll(self: *AcceptFuture, ctx: *FutureContext) FuturePollResult(Output) {
+        if (!ctx.pollProceed()) return .pending;
         // Try non-blocking accept
         if (self.listener.tryAccept()) |result| {
             return .{ .ready = result };

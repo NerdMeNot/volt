@@ -355,6 +355,9 @@ pub fn Watch(comptime T: type) type {
             pub fn poll(self: *FutureSelf, ctx: *Context) PollResult(ChangedResult) {
                 switch (self.state) {
                     .init => {
+                        // Cooperative budgeting: yield if this task has consumed its budget
+                        if (!ctx.pollProceed()) return .pending;
+
                         // First poll - try to detect change
                         // Store the waker so we can be woken when send()/close() happens
                         self.stored_waker = ctx.getWaker().clone();

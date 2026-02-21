@@ -1193,6 +1193,9 @@ pub fn SendFuture(comptime T: type) type {
         pub fn poll(self: *Self, ctx: *Context) PollResult(SendResult) {
             switch (self.state) {
                 .init => {
+                    // Cooperative budgeting: yield if this task has consumed its budget
+                    if (!ctx.pollProceed()) return .pending;
+
                     // Fast path: try lock-free send before waker/waiter setup.
                     // Skips 2 atomic ops (waker ref/unref) per message when buffer has space.
                     switch (self.channel.trySend(self.value)) {
@@ -1399,6 +1402,9 @@ pub fn RecvFuture(comptime T: type) type {
         pub fn poll(self: *Self, ctx: *Context) PollResult(?T) {
             switch (self.state) {
                 .init => {
+                    // Cooperative budgeting: yield if this task has consumed its budget
+                    if (!ctx.pollProceed()) return .pending;
+
                     // Fast path: try lock-free recv before waker/waiter setup.
                     // Skips 2 atomic ops (waker ref/unref) per message when buffer has data.
                     switch (self.channel.tryRecv()) {

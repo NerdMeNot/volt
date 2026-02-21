@@ -382,6 +382,9 @@ pub fn BroadcastChannel(comptime T: type) type {
             pub fn poll(self: *FutureSelf, ctx: *Context) PollResult(Receiver.RecvResult) {
                 switch (self.state) {
                     .init => {
+                        // Cooperative budgeting: yield if this task has consumed its budget
+                        if (!ctx.pollProceed()) return .pending;
+
                         // First poll - try to receive
                         // Store the waker so we can be woken when send() provides a value
                         self.stored_waker = ctx.getWaker().clone();

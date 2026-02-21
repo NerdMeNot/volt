@@ -306,6 +306,7 @@ pub const OwnedReadFuture = struct {
     stored_waker: ?FutureWaker = null,
 
     pub fn poll(self: *OwnedReadFuture, ctx: *FutureContext) FuturePollResult(Output) {
+        if (!ctx.pollProceed()) return .pending;
         if (self.half.tryRead(self.buf)) |n_opt| {
             if (n_opt) |n| {
                 return .{ .ready = n };
@@ -336,6 +337,7 @@ pub const OwnedWriteFuture = struct {
     stored_waker: ?FutureWaker = null,
 
     pub fn poll(self: *OwnedWriteFuture, ctx: *FutureContext) FuturePollResult(Output) {
+        if (!ctx.pollProceed()) return .pending;
         if (self.half.tryWrite(self.data)) |n_opt| {
             if (n_opt) |n| {
                 return .{ .ready = n };
@@ -372,6 +374,7 @@ pub const OwnedWriteAllFuture = struct {
 
     pub fn poll(self: *OwnedWriteAllFuture, ctx: *FutureContext) FuturePollResult(Output) {
         while (self.written < self.data.len) {
+            if (!ctx.pollProceed()) return .pending;
             if (self.half.tryWrite(self.data[self.written..])) |n_opt| {
                 if (n_opt) |n| {
                     if (n == 0) return .{ .ready = error.BrokenPipe };

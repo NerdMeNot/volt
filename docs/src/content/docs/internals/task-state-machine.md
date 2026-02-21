@@ -175,13 +175,13 @@ The caller inspects `prev.notified`. If true, the task must be immediately resch
 
 ### transitionToComplete
 
-Called when `poll()` returns `.complete`.
+Called when `poll()` returns `.complete`. Returns the **previous** `State` so the caller can inspect `join_interest`.
 
 ```
-RUNNING -> COMPLETE
+RUNNING -> COMPLETE  (returns prev State)
 ```
 
-If `join_interest` is set, the `Future(T)` handle (internally `JoinHandle`) is woken. If `detached` is set, the task can be freed immediately.
+If `prev.join_interest` is set, the caller invokes `notifyJoiner()` which consumes the `join_waker` stored on the Header and wakes the `JoinFuture`. If `detached` is set, the task can be freed immediately.
 
 ## The wakeup protocol
 
@@ -292,6 +292,28 @@ defer header.removeShieldAtomic();
 // ... critical section that must complete atomically ...
 ```
 
+## Poll results and cooperative yield
+
+`pollImpl` returns a `PollResult_` enum with three variants:
+
+```zig
+pub const PollResult_ = enum {
+    pending,   // Task is waiting for an external event
+    complete,  // Future returned .ready, result is stored
+    yield,     // Cooperative budget exhausted
+};
+```
+
+The `.yield` variant is produced when a task's per-poll budget (128 operations) is exhausted. The scheduler handles it differently from `.pending`:
+
+| Result | Scheduler action |
+|--------|-----------------|
+| `.pending` | Transition to IDLE. If `prev.notified`, reschedule via LIFO or local queue. |
+| `.complete` | Transition to COMPLETE. Drop ref. Wake JoinHandle if interested. |
+| `.yield` | Transition to IDLE, then reschedule via **global queue** (not LIFO). |
+
+Routing yielded tasks to the global queue is critical. If they went to the LIFO slot, the same worker would re-poll them immediately, defeating the purpose of yielding. The global queue ensures other workers can pick up different tasks first.
+
 ## Type erasure
 
 Tasks are type-erased through a vtable so the scheduler only handles `*Header` pointers:
@@ -364,6 +386,7 @@ pub const Header = struct {
     next: ?*Header = null,
     prev: ?*Header = null,
     vtable: *const VTable,
+    join_waker: ?Waker = null,
 };
 ```
 
@@ -371,7 +394,7 @@ These are used by the global injection queue (singly-linked) and sync primitive 
 
 ## Work-stealing join and the state machine
 
-When `JoinHandle.join()` is called, the runtime uses `helpUntilComplete` (on worker threads) or `blockOnComplete` (on non-worker threads) to execute other tasks while waiting. This interacts with the state machine as follows:
+When `JoinHandle.join()` is called, the runtime uses `helpUntilComplete` (on worker threads) or `blockOnComplete` (on non-worker threads) to execute other tasks while waiting. For async joins via `JoinFuture.poll()`, the future registers a waker on the target Header's `join_waker` field and sets `join_interest` via CAS. When the target completes, `notifyJoiner()` wakes the future. A double-check after registration prevents lost wakeups if the target completed between the initial check and registration. This interacts with the state machine as follows:
 
 1. The worker saves the current `current_header` thread-local (the calling task's header).
 2. The worker enters a loop that calls `findWork()` and `executeTask()` -- the same path as the normal run loop. Each executed task goes through the full IDLE -> SCHEDULED -> RUNNING -> (IDLE or COMPLETE) lifecycle.

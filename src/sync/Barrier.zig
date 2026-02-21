@@ -356,6 +356,9 @@ pub const WaitFuture = struct {
     pub fn poll(self: *Self, ctx: *Context) PollResult(BarrierWaitResult) {
         switch (self.state) {
             .init => {
+                // Cooperative budgeting: yield if this task has consumed its budget
+                if (!ctx.pollProceed()) return .pending;
+
                 // First poll - try to wait at the barrier
                 // Store the waker so we can be woken when barrier releases
                 self.stored_waker = ctx.getWaker().clone();

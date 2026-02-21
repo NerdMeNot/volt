@@ -7,9 +7,22 @@ Volt's scheduler does not use fixed parameters for all workloads. It adapts seve
 
 ## Cooperative Budgeting
 
-An async runtime must prevent any single task from monopolizing a worker thread. If a task returns `.pending` in a tight loop (e.g., polling a channel that keeps getting refilled), it could starve I/O completions, timer processing, and other tasks.
+An async runtime must prevent any single task from monopolizing a worker thread. Volt has two budget layers:
 
-Volt uses a **budget** system: each worker is allowed 128 task polls per **tick** before yielding for maintenance.
+### Per-task budget (Context.pollProceed)
+
+Each task gets a budget of 128 operations per poll. Futures that loop internally (lock → unlock → lock, or channel send → recv in a tight loop) call `ctx.pollProceed()` before each iteration. When the budget hits zero, the future returns `.pending` and the task is routed to the **global queue** via a `.yield` poll result -- not the LIFO slot. This prevents a single task from hogging a worker indefinitely.
+
+```zig
+// Every sync primitive and channel future calls this in .init state:
+if (!ctx.pollProceed()) return .pending;
+```
+
+The `.yield` path is distinct from `.pending`: yielded tasks bypass the LIFO slot and go directly to the global injection queue, ensuring other tasks get a chance to run before the yielded task is re-polled.
+
+### Per-worker budget (tick-level)
+
+Each worker is allowed 128 task polls per **tick** before yielding for maintenance.
 
 ```
 BUDGET_PER_TICK = 128

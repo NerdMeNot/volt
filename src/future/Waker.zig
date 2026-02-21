@@ -104,9 +104,39 @@ pub const Waker = struct {
 
 /// Context passed to Future.poll()
 ///
-/// Contains the waker that should be used to signal readiness.
+/// Contains the waker that should be used to signal readiness,
+/// and a cooperative budget that limits how many operations a
+/// single task can perform before yielding.
 pub const Context = struct {
     waker: *const Waker,
+
+    /// Cooperative budget: decremented by each resource poll.
+    /// When exhausted, primitives return .pending to yield the worker.
+    /// Reset to COOP_BUDGET each time the scheduler polls the task.
+    budget: u32 = COOP_BUDGET,
+
+    /// Set by pollProceed() when budget is exhausted.
+    /// Checked by pollImpl() to return .yield instead of .pending,
+    /// which routes the task to the global queue (not LIFO slot).
+    budget_exhausted: bool = false,
+
+    /// Default cooperative budget per task poll (matches Tokio).
+    pub const COOP_BUDGET: u32 = 128;
+
+    /// Check if cooperative budget remains. If exhausted, signals yield
+    /// and returns false. Caller should return .pending.
+    ///
+    /// Unlike calling wakeByRef() directly, this sets a flag that tells
+    /// the scheduler to route the task through the global queue instead of
+    /// the LIFO slot, preventing the yielding task from starving others.
+    pub fn pollProceed(self: *Context) bool {
+        if (self.budget == 0) {
+            self.budget_exhausted = true;
+            return false;
+        }
+        self.budget -= 1;
+        return true;
+    }
 
     /// Get the waker from this context
     pub fn getWaker(self: *const Context) *const Waker {
