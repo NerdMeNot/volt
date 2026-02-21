@@ -17,8 +17,11 @@ const PollResult = volt.future.PollResult;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Future that records which OS thread executed it.
+/// Yields once (returns .pending) to force a reschedule, then completes.
+/// This creates real scheduler backpressure so work-stealing can kick in.
 const ThreadIdFuture = struct {
     result: *Atomic(usize),
+    yielded: bool = false,
 
     pub const Output = void;
 
@@ -26,9 +29,17 @@ const ThreadIdFuture = struct {
         return .{ .result = result };
     }
 
-    pub fn poll(self: *ThreadIdFuture, _: *Context) PollResult(void) {
-        const tid = std.Thread.getCurrentId();
-        self.result.store(@intCast(tid), .release);
+    pub fn poll(self: *ThreadIdFuture, ctx: *Context) PollResult(void) {
+        if (!self.yielded) {
+            // First poll: record tid, request reschedule, return pending.
+            // This creates backpressure — tasks sit in queues long enough
+            // for the second worker to steal some.
+            const tid = std.Thread.getCurrentId();
+            self.result.store(@intCast(tid), .release);
+            self.yielded = true;
+            ctx.waker.wakeByRef();
+            return .pending;
+        }
         return .{ .ready = {} };
     }
 };
