@@ -21,6 +21,8 @@ const runWithModel = common.runWithModel;
 const ConcurrentCounter = common.ConcurrentCounter;
 const Barrier = common.Barrier;
 
+const busyWaitYield = common.busyWaitYield;
+
 const sync = @import("volt").sync;
 const Mutex = sync.Mutex;
 const Waiter = sync.mutex.Waiter;
@@ -230,7 +232,7 @@ test "Mutex loom - lock with waiters delivers wakeups" {
                         if (!m.lockWait(&waiter)) {
                             // Wait for acquisition
                             while (!waiter.isAcquired()) {
-                                std.Thread.yield() catch {};
+                                busyWaitYield();
                             }
                         }
                         check.acquire();
@@ -300,7 +302,7 @@ test "Mutex loom - cancel doesn't corrupt state" {
                     if (!m.lockWait(&waiter)) {
                         // Queued — spin until granted
                         while (!waiter.isAcquired()) {
-                            std.Thread.yield() catch {};
+                            busyWaitYield();
                         }
                     }
                     // We hold the lock — release it
@@ -309,7 +311,7 @@ test "Mutex loom - cancel doesn't corrupt state" {
             }.run, .{&mutex}) catch {
                 // If spawn fails, still need to unlock so canceller can finish
                 while (!canceller_queued.load(.acquire)) {
-                    std.Thread.yield() catch {};
+                    busyWaitYield();
                 }
                 mutex.unlock();
                 threads[0].join();
@@ -320,7 +322,7 @@ test "Mutex loom - cancel doesn't corrupt state" {
             // Wait for the canceller to be queued before unlocking.
             // The flag is set AFTER lockWait returns false (waiter is on queue).
             while (!canceller_queued.load(.acquire)) {
-                std.Thread.yield() catch {};
+                busyWaitYield();
             }
 
             // Unlock: canceller already cancelled (or will cancel), so the

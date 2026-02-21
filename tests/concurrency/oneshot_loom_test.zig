@@ -18,6 +18,8 @@ const loomRun = common.loomRun;
 const loomQuick = common.loomQuick;
 const runWithModel = common.runWithModel;
 
+const busyWaitYield = common.busyWaitYield;
+
 const channel_mod = @import("volt").channel;
 const Oneshot = channel_mod.Oneshot;
 const OneshotState = channel_mod.oneshot_mod.State;
@@ -55,7 +57,7 @@ fn concurrentSendRecvWork(ctx: ConcurrentSendRecvContext, m: *Model, tid: usize)
             }
         } else {
             while (!waiter.isComplete()) {
-                std.Thread.yield() catch {};
+                busyWaitYield();
             }
             if (ctx.shared.value) |v| {
                 ctx.receiver_value.store(v, .release);

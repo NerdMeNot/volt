@@ -19,6 +19,8 @@ const runWithModel = common.runWithModel;
 const ConcurrentCounter = common.ConcurrentCounter;
 const Latch = common.Latch;
 
+const busyWaitYield = common.busyWaitYield;
+
 const sync = @import("volt").sync;
 const Barrier = sync.Barrier;
 const Waiter = sync.barrier.Waiter;
@@ -40,7 +42,7 @@ fn leaderTestWork(ctx: LeaderTestContext, m: *Model, _: usize) void {
 
     if (!is_leader) {
         while (!waiter.isReleased()) {
-            std.Thread.yield() catch {};
+            busyWaitYield();
         }
     }
 
@@ -63,7 +65,7 @@ fn releaseTestWork(ctx: ReleaseTestContext, m: *Model, _: usize) void {
 
     if (!immediate) {
         while (!waiter.isReleased()) {
-            std.Thread.yield() catch {};
+            busyWaitYield();
         }
     }
 
@@ -85,7 +87,7 @@ fn reuseTestWork(ctx: ReuseTestContext, m: *Model, _: usize) void {
 
         if (!immediate) {
             while (!waiter.isReleased()) {
-                std.Thread.yield() catch {};
+                busyWaitYield();
             }
         }
 
@@ -117,7 +119,7 @@ test "Barrier loom - exactly one leader per generation" {
 
             // Wait for all to complete
             while (arrived.load(.acquire) < num_tasks) {
-                std.Thread.yield() catch {};
+                busyWaitYield();
             }
 
             // Exactly one leader
@@ -148,7 +150,7 @@ test "Barrier loom - all waiters released together" {
 
             // All should be released
             while (released_count.load(.acquire) < num_tasks) {
-                std.Thread.yield() catch {};
+                busyWaitYield();
             }
             try testing.expectEqual(num_tasks, released_count.load(.acquire));
         }
@@ -232,7 +234,7 @@ test "Barrier loom - large task count" {
 
                         if (!immediate) {
                             while (!waiter.isReleased()) {
-                                std.Thread.yield() catch {};
+                                busyWaitYield();
                             }
                         }
 
@@ -289,7 +291,7 @@ test "Barrier loom - waiters are woken via callback" {
                             // Leader - waker won't be called for leader
                         } else {
                             while (!waiter.isReleased()) {
-                                std.Thread.yield() catch {};
+                                busyWaitYield();
                             }
                         }
                     }

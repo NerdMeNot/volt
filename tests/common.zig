@@ -22,6 +22,7 @@ pub const ThreadRng = concurrency.ThreadRng;
 pub const ContentionTracker = concurrency.ContentionTracker;
 pub const runConcurrent = concurrency.runConcurrent;
 pub const runConcurrentDynamic = concurrency.runConcurrentDynamic;
+pub const busyWaitYield = concurrency.busyWaitYield;
 pub const yieldThread = concurrency.yieldThread;
 pub const spinBriefly = concurrency.spinBriefly;
 

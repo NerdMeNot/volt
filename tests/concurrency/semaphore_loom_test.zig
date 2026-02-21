@@ -18,6 +18,8 @@ const loomQuick = common.loomQuick;
 const runWithModel = common.runWithModel;
 const ConcurrentCounter = common.ConcurrentCounter;
 
+const busyWaitYield = common.busyWaitYield;
+
 const sync = @import("volt").sync;
 const Semaphore = sync.Semaphore;
 const Waiter = sync.semaphore.Waiter;
@@ -188,7 +190,7 @@ test "Semaphore loom - FIFO waiter ordering" {
                         var waiter = Waiter.initWithWaker(1, undefined, Waker.wake);
                         if (!s.acquireWait(&waiter)) {
                             while (!waiter.isComplete()) {
-                                std.Thread.yield() catch {};
+                                busyWaitYield();
                             }
                         }
                         const my_order = counter.fetchAdd(1, .acq_rel);
@@ -342,7 +344,7 @@ test "Semaphore loom - waiters woken on release" {
                         // Signal that we're queued
                         q.store(true, .release);
                         while (!waiter.isComplete()) {
-                            std.Thread.yield() catch {};
+                            busyWaitYield();
                         }
                     } else {
                         // Got permit immediately
@@ -354,7 +356,7 @@ test "Semaphore loom - waiters woken on release" {
 
             // Wait for waiter to actually queue
             while (!queued.load(.acquire)) {
-                std.Thread.yield() catch {};
+                busyWaitYield();
             }
 
             // Release should wake waiter

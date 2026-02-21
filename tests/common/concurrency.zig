@@ -4,6 +4,7 @@
 //! concurrent code. Inspired by Tokio's loom testing infrastructure.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const Atomic = std.atomic.Value;
 
@@ -268,6 +269,21 @@ pub const ContentionTracker = struct {
         };
     }
 };
+
+/// Yield in a busy-wait loop with cross-platform reliability.
+///
+/// On Windows, `std.Thread.yield()` maps to `SwitchToThread()`, which only
+/// yields to threads on the **same processor**. On multi-core systems, the
+/// target thread may be running on a different core, so yield returns
+/// immediately and the loop burns CPU without making progress.
+/// A short sleep forces the OS scheduler to consider all threads.
+pub fn busyWaitYield() void {
+    if (builtin.os.tag == .windows) {
+        std.Thread.sleep(1_000_000); // 1ms — triggers Windows scheduler rebalancing
+    } else {
+        std.Thread.yield() catch {};
+    }
+}
 
 /// Yield control to other threads
 pub fn yieldThread() void {

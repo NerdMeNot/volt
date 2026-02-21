@@ -18,6 +18,8 @@ const loomQuick = common.loomQuick;
 const runWithModel = common.runWithModel;
 const ConcurrentCounter = common.ConcurrentCounter;
 
+const busyWaitYield = common.busyWaitYield;
+
 const sync = @import("volt").sync;
 const OnceCell = sync.OnceCell;
 const InitWaiter = sync.once_cell.InitWaiter;
@@ -88,7 +90,7 @@ fn allWaitersSeeValueWork(ctx: AllWaitersSeeValueContext, m: *Model, tid: usize)
     } else {
         // Wait for initialization
         while (!waiter.isComplete()) {
-            std.Thread.yield() catch {};
+            busyWaitYield();
         }
         if (ctx.cell.get()) |p| {
             ctx.values_seen[tid].store(p.*, .release);
@@ -177,7 +179,7 @@ test "OnceCell loom - concurrent getOrInitWith" {
                         } else {
                             // Wait for init
                             while (!c.isInitialized()) {
-                                std.Thread.yield() catch {};
+                                busyWaitYield();
                             }
                             waiter.complete.store(true, .seq_cst);
                         }
@@ -236,7 +238,7 @@ test "OnceCell loom - cancel pending wait" {
                 fn run(c: *U32OnceCell, started: *Atomic(bool), done: *Atomic(bool)) void {
                     // Wait for initializer to start
                     while (!started.load(.acquire)) {
-                        std.Thread.yield() catch {};
+                        busyWaitYield();
                     }
 
                     var waiter = InitWaiter.init();

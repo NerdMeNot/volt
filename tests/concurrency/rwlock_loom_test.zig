@@ -17,6 +17,7 @@ const loomRun = common.loomRun;
 const loomQuick = common.loomQuick;
 const runWithModel = common.runWithModel;
 const ConcurrentCounter = common.ConcurrentCounter;
+const busyWaitYield = common.busyWaitYield;
 
 const sync = @import("volt").sync;
 const RwLock = sync.RwLock;
@@ -296,7 +297,7 @@ test "RwLock loom - writer priority blocks new readers" {
 
             // Wait for writer to acquire
             while (!write_waiter.isAcquired()) {
-                std.Thread.yield() catch {};
+                busyWaitYield();
             }
 
             try testing.expect(rwlock.isWriteLocked());
