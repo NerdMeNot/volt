@@ -104,6 +104,11 @@ const NotifyWaiterFuture = struct {
 };
 
 /// Notifier that calls notifyOne() N times, yielding cooperatively between each.
+///
+/// CRITICAL: Only fires notifyOne() when a waiter is actually registered.
+/// Notify's permit is a single bit (doesn't accumulate), so firing faster
+/// than waiters register causes permanent starvation on slow CI machines
+/// where the main thread executes the notifier before workers poll waiters.
 const NotifierFuture = struct {
     notify: *Notify,
     remaining: usize,
@@ -118,10 +123,18 @@ const NotifierFuture = struct {
         if (self.remaining == 0) {
             return .{ .ready = {} };
         }
-        self.notify.notifyOne();
-        self.remaining -= 1;
+
+        // Only notify when a waiter is actually in the queue.
+        // Without this check, notifyOne() with no waiters stores one
+        // non-accumulating permit — subsequent calls are no-ops, and
+        // all but one waiter starve forever.
+        if (self.notify.waiterCount() > 0) {
+            self.notify.notifyOne();
+            self.remaining -= 1;
+        }
+
+        // Always yield to give waiters a chance to register
         if (self.remaining > 0) {
-            // Yield to let waiter process notification before sending next
             ctx.getWaker().wakeByRef();
             return .pending;
         }
@@ -129,21 +142,33 @@ const NotifierFuture = struct {
     }
 };
 
-/// Notifier that calls notifyAll() once.
+/// Notifier that calls notifyAll() once, after all expected waiters register.
+///
+/// CRITICAL: notifyAll() with no waiters is a no-op (no permit stored).
+/// Must wait until all expected waiters are in the queue before firing.
 const NotifyAllFuture = struct {
     notify: *Notify,
+    expected: usize,
     called: bool = false,
 
     pub const Output = void;
 
-    pub fn init(notify: *Notify) NotifyAllFuture {
-        return .{ .notify = notify };
+    pub fn init(notify: *Notify, expected_waiters: usize) NotifyAllFuture {
+        return .{ .notify = notify, .expected = expected_waiters };
     }
 
-    pub fn poll(self: *NotifyAllFuture, _: *Context) PollResult(void) {
+    pub fn poll(self: *NotifyAllFuture, ctx: *Context) PollResult(void) {
         if (!self.called) {
-            self.notify.notifyAll();
-            self.called = true;
+            // Wait until all expected waiters are registered.
+            // notifyAll() with no waiters is a no-op (doesn't store a permit),
+            // so firing before waiters register loses the notification forever.
+            if (self.notify.waiterCount() >= self.expected) {
+                self.notify.notifyAll();
+                self.called = true;
+            } else {
+                ctx.getWaker().wakeByRef();
+                return .pending;
+            }
         }
         return .{ .ready = {} };
     }
@@ -231,8 +256,8 @@ test "Async Notify - notifyAll" {
         waiter_handles[i] = try io.awaitFuture(NotifyWaiterFuture.init(&notify, &done));
     }
 
-    // Spawn notifyAll
-    var notifier_handle = try io.awaitFuture(NotifyAllFuture.init(&notify));
+    // Spawn notifyAll (waits until all 4 waiters are registered before firing)
+    var notifier_handle = try io.awaitFuture(NotifyAllFuture.init(&notify, num_waiters));
 
     _ = notifier_handle.await(io);
     for (&waiter_handles) |*h| _ = h.await(io);
