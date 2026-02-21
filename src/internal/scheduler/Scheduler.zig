@@ -942,6 +942,13 @@ pub const Worker = struct {
             self.scheduler.notifyIfWorkPending();
         }
 
+        // Check shutdown before parking — closes the window between
+        // the main loop's shutdown check and the actual futex wait
+        if (self.scheduler.shutdown.load(.acquire)) {
+            self.transitioning_to_park.store(false, .release);
+            return;
+        }
+
         // Calculate park timeout: use timer expiration or default
         // Worker 0 must wake to process timers, others can sleep longer
         const park_timeout: u64 = if (self.index == 0)
@@ -1146,16 +1153,18 @@ pub const Scheduler = struct {
 
     /// Signal shutdown and wait for all workers
     pub fn shutdownAndWait(self: *Self) void {
-        self.shutdown.store(true, .release);
+        self.shutdown.store(true, .seq_cst);
 
         // Wake all workers
         for (self.workers) |*worker| {
             worker.wake();
         }
 
-        // Join all threads
+        // Join all threads — re-wake each worker before joining to handle
+        // the case where a worker re-parked between the initial wake and now
         for (self.workers) |*worker| {
             if (worker.thread) |thread| {
+                worker.wake();
                 thread.join();
                 worker.thread = null;
             }
@@ -1381,7 +1390,7 @@ pub const Scheduler = struct {
                 return task;
             }
         }
-        // Then try each worker's run queue
+        // Then try each worker's run queue (pop uses CAS, safe for non-owner)
         for (self.workers) |*worker| {
             if (worker.run_queue.pop()) |task| {
                 return task;
