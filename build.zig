@@ -117,12 +117,22 @@ pub fn build(b: *std.Build) void {
     // ========================================================================
     // All Tests
     // ========================================================================
+    // Run test suites sequentially to avoid thread oversubscription.
+    // Each suite spawns many threads; running all 5 in parallel causes
+    // hundreds of threads across 5 processes, leading to futex timeouts
+    // and shutdown hangs. Dedicated run steps keep individual commands
+    // (e.g. `zig build test-stress`) independent.
     const test_all_step = b.step("test-all", "Run all tests");
-    test_all_step.dependOn(test_step);
-    test_all_step.dependOn(stress_step);
-    test_all_step.dependOn(robustness_step);
-    test_all_step.dependOn(concurrency_step);
-    test_all_step.dependOn(integration_step);
+    const ta_unit = &b.addRunArtifact(unit_tests).step;
+    const ta_stress = &b.addRunArtifact(stress_tests).step;
+    const ta_robust = &b.addRunArtifact(robustness_tests).step;
+    const ta_concurrency = &b.addRunArtifact(concurrency_tests).step;
+    const ta_integration = &b.addRunArtifact(integration_tests).step;
+    ta_stress.dependOn(ta_unit);
+    ta_robust.dependOn(ta_stress);
+    ta_concurrency.dependOn(ta_robust);
+    ta_integration.dependOn(ta_concurrency);
+    test_all_step.dependOn(ta_integration);
 
     // ========================================================================
     // Benchmarks
