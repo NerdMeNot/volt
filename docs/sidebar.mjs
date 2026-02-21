@@ -74,11 +74,6 @@ export default [
 			{ label: 'Time API', slug: 'api/time-api' },
 			{ label: 'Task API', slug: 'api/task-api' },
 			{ label: 'Filesystem API', slug: 'api/fs-api' },
-			{
-				label: 'Zig Autodocs',
-				link: '/api-reference/',
-				attrs: { target: '_blank' },
-			},
 		],
 	},
 	{
