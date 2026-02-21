@@ -203,10 +203,10 @@ pub const internal = @import("internal.zig");
 // ═══════════════════════════════════════════════════════════════════════════════
 
 pub const version = struct {
-    pub const major = 0;
-    pub const minor = 3;
+    pub const major = 1;
+    pub const minor = 0;
     pub const patch = 0;
-    pub const string = "0.3.0";
+    pub const string = "1.0.0";
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════

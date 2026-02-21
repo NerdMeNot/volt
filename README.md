@@ -67,6 +67,7 @@ fn echo(stream: volt.net.TcpStream) void {
 - [Architecture](#architecture)
 - [Best Practices](#best-practices)
 - [Limitations](#limitations)
+- [Contributing](#contributing)
 - [Documentation](#documentation)
 - [Acknowledgments](#acknowledgments)
 
@@ -89,8 +90,8 @@ Add to your `build.zig.zon`:
 
     .dependencies = .{
         .volt = .{
-            .url = "https://github.com/NerdMeNot/volt/archive/refs/tags/v0.1.0.tar.gz",
-            .hash = "volt-0.1.0-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            .url = "https://github.com/NerdMeNot/volt/archive/refs/tags/v1.0.0-zig0.15.2.tar.gz",
+            .hash = "volt-1.0.0-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
             // Run `zig build` to get the correct hash
         },
     },
@@ -534,14 +535,20 @@ switch (ch.trySend(item)) {
 
 ## Contributing
 
-Contributions are welcome. Please read [CLAUDE.md](CLAUDE.md) for development guidelines, architecture details, and the implementation roadmap.
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide. Here's the short version:
 
-```bash
-zig build test         # Unit tests
-zig build test-stress  # Stress tests (real threads)
-zig build test-all     # Everything
-zig build compare      # Volt vs Tokio benchmark comparison
-```
+1. Fork and create a branch from `main`
+2. Make your changes following the [code style guidelines](CONTRIBUTING.md#code-style)
+3. Run the tests:
+   ```bash
+   zig build test              # Unit tests (588+)
+   zig build test-concurrency  # Loom-style concurrency tests (83)
+   zig build test-all          # Everything
+   ```
+4. Commit with [Conventional Commits](https://www.conventionalcommits.org/) style (`feat:`, `fix:`, `docs:`, etc.)
+5. Open a pull request with a clear description
+
+For concurrency or lock-free contributions, add tests in `tests/concurrency/` that exercise interleavings systematically. See [CONTRIBUTING.md](CONTRIBUTING.md) for details on test filtering, intensity configuration, and bug reporting.
 
 ## License
 

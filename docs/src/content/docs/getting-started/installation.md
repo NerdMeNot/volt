@@ -32,8 +32,8 @@ Add Volt to your `build.zig.zon`:
 
     .dependencies = .{
         .volt = .{
-            .url = "https://github.com/NerdMeNot/volt/archive/refs/tags/v0.3.0.tar.gz",
-            .hash = "volt-0.3.0-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            .url = "https://github.com/NerdMeNot/volt/archive/refs/tags/v1.0.0-zig0.15.2.tar.gz",
+            .hash = "volt-1.0.0-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
             // Run `zig build` once to get the correct hash from the error message
         },
     },
@@ -108,7 +108,7 @@ zig build run
 Expected output:
 
 ```
-Volt v0.3.0 loaded
+Volt v1.0.0 loaded
 Runtime, sync, channel, net, time modules available.
 ```
 

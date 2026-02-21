@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0xb2bb3dcf10d2de94,
     .name = .volt,
-    .version = "0.3.0",
+    .version = "1.0.0",
     .minimum_zig_version = "0.15.0",
 
     .dependencies = .{
