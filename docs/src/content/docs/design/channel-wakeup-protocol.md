@@ -175,7 +175,7 @@ pub fn trySend(self: *Self, value: T) SendResult {
     // ... CAS loop to claim slot ...
 
     // Publish value (acquire/release with slot sequence)
-    self.buffer[idx] = value;
+    slot.value = value;
     slot.sequence.store(tail +% 1, .release);
 
     // Dekker check: seq_cst load pairs with seq_cst store in recvWait
@@ -205,14 +205,20 @@ pub fn recvWait(self: *Self, waiter: *RecvWaiter) ?T {
     // and our flag store. This closes the race window.
     if (self.tryRecv()) |v| {
         // Got value — clear flag if no other waiters
-        if (self.recv_waiters.isEmpty()) {
+        // (checks both the fast slot and the linked list)
+        if (self.noRecvWaiters()) {
             self.has_recv_waiters.store(false, .seq_cst);
         }
         self.waiter_mutex.unlock();
         return v;
     }
 
-    // Still empty — add waiter to list
+    // Still empty — try single-waiter fast slot first, then linked list
+    waiter.status.store(WAITER_PENDING, .release);
+    if (self.fast_recv_waiter.cmpxchgStrong(0, @intFromPtr(waiter), .release, .monotonic) == null) {
+        self.waiter_mutex.unlock();
+        return null;
+    }
     self.recv_waiters.pushBack(waiter);
     self.waiter_mutex.unlock();
     return null;  // Caller will yield

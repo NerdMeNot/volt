@@ -109,12 +109,22 @@ pub fn build(b: *std.Build) void {
     // ========================================================================
     // Benchmarks
     // ========================================================================
+
+    // Separate ReleaseFast volt module for benchmarks — ensures library code
+    // (Channel.zig trySend/tryRecv, Scheduler, etc.) is fully optimized even
+    // when the user doesn't pass -Doptimize=ReleaseFast.
+    const volt_bench_mod = b.addModule("volt_bench", .{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/volt_bench.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
-    bench_mod.addImport("volt", volt_mod);
+    bench_mod.addImport("volt", volt_bench_mod);
 
     const bench_exe = b.addExecutable(.{
         .name = "volt_bench",
@@ -143,7 +153,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
-    io_bench_mod.addImport("volt", volt_mod);
+    io_bench_mod.addImport("volt", volt_bench_mod);
 
     const io_bench_exe = b.addExecutable(.{
         .name = "io_bench",
@@ -169,7 +179,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
-    mpmc_mod.addImport("volt", volt_mod);
+    mpmc_mod.addImport("volt", volt_bench_mod);
     const mpmc_exe = b.addExecutable(.{
         .name = "mpmc_test",
         .root_module = mpmc_mod,

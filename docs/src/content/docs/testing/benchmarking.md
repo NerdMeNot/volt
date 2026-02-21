@@ -17,7 +17,7 @@ zig build bench
 zig build bench -- --json
 ```
 
-The benchmark binary is compiled with `ReleaseFast` optimization regardless of the build mode you specify.
+Both the benchmark binary and the Volt library module it imports are compiled with `ReleaseFast` optimization regardless of the build mode you specify. The library uses a dedicated `volt_bench_mod` with hardcoded `.optimize = .ReleaseFast` to ensure the channel and scheduler hot paths are fully optimized.
 
 ### Available build steps
 
@@ -65,7 +65,7 @@ Full async runtime with multiple workers. Measures real-world contention: schedu
 
 | Benchmark | Operation |
 |-----------|-----------|
-| MPMC | 4 producers + 4 consumers, buffer=1000 |
+| MPMC | 4 producers + 4 consumers, buffer=1024 |
 | Mutex contended | 4 tasks contending on one mutex |
 | RwLock contended | 4 readers + 2 writers |
 | Semaphore contended | 8 tasks, 2 permits |

@@ -127,7 +127,8 @@ For custom scheduler integration:
 var waiter = volt.channel.channel_mod.RecvWaiter.init();
 waiter.setWaker(@ptrCast(&my_ctx), myWakeCallback);
 ch.recvWait(&waiter);
-// Yield to scheduler. When woken, check waiter.complete / waiter.closed.
+// Yield to scheduler. When woken, check waiter.status.load(.acquire):
+// WAITER_COMPLETE (1) = success, WAITER_CLOSED (2) = channel closed.
 
 // Send with waiter
 var send_waiter = volt.channel.channel_mod.SendWaiter.init();

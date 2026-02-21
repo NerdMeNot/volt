@@ -162,7 +162,7 @@ const NUM_WORKERS: usize = 4;
 // MPMC config
 const MPMC_PRODUCERS: usize = 4;
 const MPMC_CONSUMERS: usize = 4;
-const MPMC_BUFFER: usize = 1_000; // << ASYNC_OPS to force backpressure
+const MPMC_BUFFER: usize = 1_024; // Power-of-2 for optimal bitmask indexing
 
 // Contended config
 const CONTENDED_MUTEX_TASKS: usize = 4;
@@ -598,16 +598,26 @@ fn benchWatch() BenchResult {
 // and awaited with volt.Future.@"await"(io) — the public async API.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// MPMC producer: sends msgs_count values to channel via send() future.
-/// Equivalent to Tokio: for i in 0..n { tx.send(i).await.unwrap(); }
+/// MPMC producer: sends msgs_count values to channel.
+/// Equivalent to Rust: for i in 0..n { tx.send(i).await.unwrap(); }
+///
+/// Calls trySend() directly (matching Rust's zero-cost async/await).
+/// Falls back to SendFuture with waiter when queue is full.
+/// Yields after COOP_BUDGET sends to match Tokio's cooperative scheduling
+/// (each .await in Rust is a yield point; Tokio's budget is 128 polls/task).
 fn MpmcSendFuture(comptime T: type) type {
     return struct {
         const Self = @This();
         pub const Output = void;
 
+        /// Cooperative budget: yield after this many sends to let
+        /// consumers run. Matches Tokio's 128-poll cooperative budget.
+        const COOP_BUDGET: usize = 128;
+
         channel: *Channel(T),
         msgs_remaining: usize,
         next_value: T,
+        /// Only created when queue is full
         send_future: ?SendFuture(T) = null,
 
         pub fn init(channel: *Channel(T), msgs_count: usize, start_value: T) Self {
@@ -615,10 +625,8 @@ fn MpmcSendFuture(comptime T: type) type {
         }
 
         pub fn poll(self: *Self, ctx: *Context) PollResult(void) {
-            while (self.msgs_remaining > 0) {
-                if (self.send_future == null) {
-                    self.send_future = self.channel.sendFuture(self.next_value);
-                }
+            // Resume pending send future if we were waiting on a full queue
+            if (self.send_future != null) {
                 switch (self.send_future.?.poll(ctx)) {
                     .pending => return .pending,
                     .ready => {
@@ -628,19 +636,54 @@ fn MpmcSendFuture(comptime T: type) type {
                     },
                 }
             }
+
+            // Hot path: direct trySend loop with cooperative yielding
+            var budget: usize = COOP_BUDGET;
+            while (self.msgs_remaining > 0) {
+                if (budget == 0) {
+                    ctx.getWaker().wakeByRef();
+                    return .pending;
+                }
+                switch (self.channel.trySend(self.next_value)) {
+                    .ok => {
+                        self.next_value += 1;
+                        self.msgs_remaining -= 1;
+                        budget -= 1;
+                    },
+                    .closed => return .{ .ready = {} },
+                    .full => {
+                        // Cold path: queue full, use SendFuture with waiter
+                        self.send_future = self.channel.sendFuture(self.next_value);
+                        switch (self.send_future.?.poll(ctx)) {
+                            .pending => return .pending,
+                            .ready => {
+                                self.send_future = null;
+                                self.next_value += 1;
+                                self.msgs_remaining -= 1;
+                            },
+                        }
+                    },
+                }
+            }
             return .{ .ready = {} };
         }
     };
 }
 
-/// MPMC consumer: receives until channel closed via recv() future.
-/// Equivalent to Tokio: while rx.recv().await.is_ok() {}
+/// MPMC consumer: receives until channel closed.
+/// Equivalent to Rust: while rx.recv().await.is_ok() {}
+///
+/// Same optimization: tryRecv() in tight loop, RecvFuture when empty.
+/// Cooperative yielding after COOP_BUDGET receives.
 fn MpmcRecvFuture(comptime T: type) type {
     return struct {
         const Self = @This();
         pub const Output = void;
 
+        const COOP_BUDGET: usize = 128;
+
         channel: *Channel(T),
+        /// Only created when queue is empty
         recv_future: ?RecvFuture(T) = null,
 
         pub fn init(channel: *Channel(T)) Self {
@@ -648,17 +691,38 @@ fn MpmcRecvFuture(comptime T: type) type {
         }
 
         pub fn poll(self: *Self, ctx: *Context) PollResult(void) {
-            while (true) {
-                if (self.recv_future == null) {
-                    self.recv_future = self.channel.recvFuture();
-                }
+            // Resume pending recv future if we were waiting on an empty queue
+            if (self.recv_future != null) {
                 switch (self.recv_future.?.poll(ctx)) {
                     .pending => return .pending,
                     .ready => |val| {
                         self.recv_future = null;
-                        if (val == null) {
-                            // Channel closed
-                            return .{ .ready = {} };
+                        if (val == null) return .{ .ready = {} };
+                    },
+                }
+            }
+
+            // Hot path: direct tryRecv loop with cooperative yielding
+            var budget: usize = COOP_BUDGET;
+            while (true) {
+                if (budget == 0) {
+                    ctx.getWaker().wakeByRef();
+                    return .pending;
+                }
+                switch (self.channel.tryRecv()) {
+                    .value => {
+                        budget -= 1;
+                    },
+                    .closed => return .{ .ready = {} },
+                    .empty => {
+                        // Cold path: queue empty, use RecvFuture with waiter
+                        self.recv_future = self.channel.recvFuture();
+                        switch (self.recv_future.?.poll(ctx)) {
+                            .pending => return .pending,
+                            .ready => |val| {
+                                self.recv_future = null;
+                                if (val == null) return .{ .ready = {} };
+                            },
                         }
                     },
                 }
@@ -845,17 +909,14 @@ fn benchChannelMPMC() BenchResult {
     const msgs_per_producer = ASYNC_OPS / MPMC_PRODUCERS;
     const allocator = alloc_counter.allocator();
 
-    std.debug.print("[mpmc] init runtime...\n", .{});
     var io = Io.init(allocator, .{ .num_workers = NUM_WORKERS }) catch return .{};
     defer io.deinit();
 
-    for (0..WARMUP) |w| {
-        std.debug.print("[mpmc] warmup {d}...\n", .{w});
+    for (0..WARMUP) |_| {
         runMPMCAsync(allocator, io, msgs_per_producer);
     }
 
-    for (0..ITERATIONS) |i| {
-        std.debug.print("[mpmc] iter {d}...\n", .{i});
+    for (0..ITERATIONS) |_| {
         alloc_counter.reset();
         const start = std.time.nanoTimestamp();
         runMPMCAsync(allocator, io, msgs_per_producer);

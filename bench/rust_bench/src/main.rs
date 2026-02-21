@@ -90,7 +90,7 @@ const NUM_WORKERS: usize = 4;
 // MPMC config
 const MPMC_PRODUCERS: usize = 4;
 const MPMC_CONSUMERS: usize = 4;
-const MPMC_BUFFER: usize = 1_000; // << ASYNC_OPS to force backpressure
+const MPMC_BUFFER: usize = 1_024; // Power-of-2 for optimal bitmask indexing
 
 // Contended config
 const CONTENDED_MUTEX_TASKS: usize = 4;

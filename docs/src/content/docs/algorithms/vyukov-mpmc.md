@@ -30,7 +30,7 @@ Initially, each slot's sequence equals its index. This means all slots are "writ
 To send a value at position `tail`:
 
 1. Load the current `tail` position.
-2. Compute `idx = tail % capacity`.
+2. Compute `idx = tail & buf_mask` (bitmask — buffer is always power-of-2).
 3. Load `slot[idx].sequence`.
 4. Compare `sequence` with `tail`:
    - If `sequence == tail`: The slot is writable. CAS `tail` to `tail + 1` to claim it.
@@ -44,7 +44,9 @@ pub fn trySend(self: *Self, value: T) SendResult {
     while (true) {
         // Closed state encoded in tail bit 63 — free check on already-loaded value
         if (isClosedBit(tail)) return .closed;
-        const idx: usize = @intCast(tail % self.buf_cap);
+
+        // Bitmask index: 1 cycle vs ~20 for modulo on ARM64
+        const idx: usize = @intCast(tail & self.buf_mask);
         const slot = &self.slots[idx];
         const seq = slot.sequence.load(.acquire);
 
@@ -57,7 +59,7 @@ pub fn trySend(self: *Self, value: T) SendResult {
                 continue;
             }
             // Claimed! Write value and publish
-            self.buffer[idx] = value;
+            slot.value = value;
             slot.sequence.store(tail +% 1, .release);
 
             // seq_cst: Dekker protocol — pairs with seq_cst store
@@ -80,7 +82,7 @@ pub fn trySend(self: *Self, value: T) SendResult {
 To receive a value at position `head`:
 
 1. Load the current `head` position.
-2. Compute `idx = head % capacity`.
+2. Compute `idx = head & buf_mask` (bitmask — buffer is always power-of-2).
 3. Load `slot[idx].sequence`.
 4. Compare `sequence` with `head + 1`:
    - If `sequence == head + 1`: The slot has data. CAS `head` to `head + 1` to claim it.
@@ -92,7 +94,8 @@ To receive a value at position `head`:
 pub fn tryRecv(self: *Self) RecvResult {
     var head = self.head.load(.monotonic);
     while (true) {
-        const idx: usize = @intCast(head % self.buf_cap);
+        // Bitmask index: 1 cycle vs ~20 for modulo on ARM64
+        const idx: usize = @intCast(head & self.buf_mask);
         const slot = &self.slots[idx];
         const seq = slot.sequence.load(.acquire);
 
@@ -105,7 +108,7 @@ pub fn tryRecv(self: *Self) RecvResult {
                 continue;
             }
             // Claimed! Read value and release slot
-            const value = self.buffer[idx];
+            const value = slot.value;
             slot.sequence.store(head +% self.buf_cap, .release);
 
             // seq_cst: Dekker protocol — pairs with seq_cst store
@@ -176,7 +179,7 @@ head=1, tail=2
 The classic ABA problem in lock-free data structures occurs when a CAS succeeds even though the value was changed and then changed back. The Vyukov queue is immune to ABA because sequence numbers monotonically increase.
 
 Consider the scenario:
-1. Thread A reads `head=5`, `slot[5 % C].seq = 6` (data ready, `6 == 5+1`).
+1. Thread A reads `head=5`, `slot[5 & mask].seq = 6` (data ready, `6 == 5+1`).
 2. Thread A is preempted.
 3. Thread B receives from head=5, advances head to 6. Slot 5's seq becomes `5 + C`.
 4. Thread B sends again, slot wraps, seq becomes `5 + C + 1`.
@@ -195,26 +198,33 @@ tail: std.atomic.Value(u64) align(CACHE_LINE_SIZE),
 
 Without this padding, every CAS on `head` would invalidate the cache line containing `tail` on other cores, and vice versa. Since producers write `tail` and consumers write `head`, false sharing would cause severe performance degradation under contention.
 
-The slot metadata (sequence counters) and value storage are separate arrays:
+Each slot interleaves its sequence counter and value in a single struct:
 
 ```zig
-slots: []Slot,      // Sequence counters only (small, cache-friendly)
-buffer: []T,        // Values (potentially large)
+const Slot = struct {
+    sequence: std.atomic.Value(u64),
+    value: T = undefined,
+};
+slots: []Slot,  // Interleaved sequence + value (crossbeam layout)
 ```
 
-This separation improves cache utilization because the hot path (checking sequence numbers) only touches the compact `slots` array.
+This interleaved layout gives spatial locality: the sequence check and value read/write hit the same cache line instead of bouncing between two separate arrays. This matches crossbeam-channel's slot layout.
 
-## Minimum Buffer Size
+## Power-of-2 Buffer Size
 
-The internal buffer size is always at least 2, even if the user requests capacity 1:
+The internal buffer size is always rounded up to the next power of 2 (minimum 2):
 
 ```zig
-const buf_cap: u64 = @max(cap, 2);
+const buf_cap: u64 = nextPow2(@max(cap, 2));
 ```
 
-This is required for correctness. With a single slot (buf_cap=1), the sequence number after a send would be `tail + 1 = 1`, and after a receive it would be `head + capacity = 0 + 1 = 1`. The "has data" state and "writable" state would have the same sequence number, making them indistinguishable.
+This serves two purposes:
 
-For capacity-1 channels with buf_cap=2, an explicit capacity check ensures the channel does not exceed the user-requested capacity:
+1. **Bitmask indexing**: `tail & buf_mask` (1 cycle on ARM64) replaces `tail % buf_cap` (~20 cycles on ARM64). The mask is simply `buf_cap - 1`.
+
+2. **Minimum 2 slots for correctness**: With a single slot (buf_cap=1), the sequence number after a send would be `tail + 1 = 1`, and after a receive it would be `head + capacity = 0 + 1 = 1`. The "has data" state and "writable" state would have the same sequence number, making them indistinguishable.
+
+For non-power-of-2 user capacities (e.g., capacity=100 with buf_cap=128), an explicit capacity check ensures the channel does not exceed the user-requested limit:
 
 ```zig
 if (self.buf_cap != self.capacity) {
@@ -222,6 +232,8 @@ if (self.buf_cap != self.capacity) {
     if (tail -% head >= self.capacity) return .full;
 }
 ```
+
+This check is skipped when `buf_cap == capacity` (already power-of-2), so the common case of power-of-2 capacities pays no extra cost.
 
 ## Waiter Integration for Async Operations
 
@@ -262,25 +274,33 @@ On ARM64, it adds a DMB barrier that is essential for correctness.
 For a detailed walkthrough with step-by-step diagrams, see
 [Channel Wakeup Protocol](/design/channel-wakeup-protocol/).
 
-The wakeup avoids use-after-free by copying the waker function pointer and context **before** setting the `complete` flag:
+The wakeup avoids use-after-free by copying the waker function pointer and context **before** setting the `status` flag. A lock-free single-waiter fast slot (`fast_recv_waiter`) avoids the mutex entirely for the common case of one blocked consumer:
 
 ```zig
 fn wakeOneRecvWaiter(self: *Self) void {
+    // Fast path: atomic swap on single-waiter slot (avoids mutex)
+    const fast_ptr = self.fast_recv_waiter.swap(0, .acq_rel);
+    if (fast_ptr != 0) {
+        const w: *RecvWaiter = @ptrFromInt(fast_ptr);
+        const waker_fn = w.waker;
+        const waker_ctx = w.waker_ctx;
+        w.status.store(WAITER_COMPLETE, .release); // Owner may destroy after this
+        // ... clear flag under mutex if no list waiters remain ...
+        if (waker_fn) |wf| if (waker_ctx) |ctx| wf(ctx);
+        return;
+    }
+
+    // Slow path: pop from linked list under mutex
     self.waiter_mutex.lock();
     const waiter = self.recv_waiters.popFront();
-    // ...
+    // ... clear has_recv_waiters flag if no waiters remain ...
     self.waiter_mutex.unlock();
 
     if (waiter) |w| {
-        // Copy waker info BEFORE setting complete (avoids use-after-free)
         const waker_fn = w.waker;
         const waker_ctx = w.waker_ctx;
-        w.complete.store(true, .release);  // Owner may destroy waiter after this
-        if (waker_fn) |wf| {
-            if (waker_ctx) |ctx| {
-                wf(ctx);
-            }
-        }
+        w.status.store(WAITER_COMPLETE, .release); // Owner may destroy after this
+        if (waker_fn) |wf| if (waker_ctx) |ctx| wf(ctx);
     }
 }
 ```

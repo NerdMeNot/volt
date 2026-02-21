@@ -65,17 +65,21 @@ const PollResult = future_mod.PollResult;
 /// Function pointer type for waking
 pub const WakerFn = *const fn (*anyopaque) void;
 
+/// Waiter status: single atomic replaces separate complete + closed fields.
+/// Halves atomic loads in isComplete() (1 load instead of 2).
+pub const WAITER_PENDING: u8 = 0;
+pub const WAITER_COMPLETE: u8 = 1;
+pub const WAITER_CLOSED: u8 = 2;
+
 /// Waiter for send operation
 pub const SendWaiter = struct {
     /// Waker to invoke when slot is available
     waker: ?WakerFn = null,
     waker_ctx: ?*anyopaque = null,
 
-    /// Whether send completed (atomic for cross-thread visibility)
-    complete: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    /// Whether channel was closed (atomic for cross-thread visibility)
-    closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Combined complete/closed status (atomic for cross-thread visibility).
+    /// 0=pending, 1=complete, 2=closed. Single load replaces two in isComplete().
+    status: std.atomic.Value(u8) = std.atomic.Value(u8).init(WAITER_PENDING),
 
     /// Intrusive list pointers
     pointers: Pointers(SendWaiter) = .{},
@@ -103,7 +107,7 @@ pub const SendWaiter = struct {
     }
 
     pub fn isComplete(self: *const Self) bool {
-        return self.complete.load(.acquire) or self.closed.load(.acquire);
+        return self.status.load(.acquire) != WAITER_PENDING;
     }
 
     /// Get invocation token (for debug tracking)
@@ -118,8 +122,7 @@ pub const SendWaiter = struct {
 
     /// Reset for reuse (generates new invocation ID)
     pub fn reset(self: *Self) void {
-        self.complete.store(false, .release);
-        self.closed.store(false, .release);
+        self.status.store(WAITER_PENDING, .release);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
@@ -133,11 +136,9 @@ pub const RecvWaiter = struct {
     waker: ?WakerFn = null,
     waker_ctx: ?*anyopaque = null,
 
-    /// Whether receive completed (value ready or closed) - atomic for cross-thread visibility
-    complete: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    /// Whether channel was closed with no more values - atomic for cross-thread visibility
-    closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Combined complete/closed status (atomic for cross-thread visibility).
+    /// 0=pending, 1=complete, 2=closed. Single load replaces two in isComplete().
+    status: std.atomic.Value(u8) = std.atomic.Value(u8).init(WAITER_PENDING),
 
     /// Intrusive list pointers
     pointers: Pointers(RecvWaiter) = .{},
@@ -165,7 +166,7 @@ pub const RecvWaiter = struct {
     }
 
     pub fn isComplete(self: *const Self) bool {
-        return self.complete.load(.acquire) or self.closed.load(.acquire);
+        return self.status.load(.acquire) != WAITER_PENDING;
     }
 
     /// Get invocation token (for debug tracking)
@@ -180,8 +181,7 @@ pub const RecvWaiter = struct {
 
     /// Reset for reuse (generates new invocation ID)
     pub fn reset(self: *Self) void {
-        self.complete.store(false, .release);
-        self.closed.store(false, .release);
+        self.status.store(WAITER_PENDING, .release);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
@@ -193,6 +193,19 @@ const SendWaiterList = LinkedList(SendWaiter, "pointers");
 const RecvWaiterList = LinkedList(RecvWaiter, "pointers");
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Round up to the next power of 2 (minimum 2).
+/// Used by Channel.init to enable bitmask indexing.
+fn nextPow2(v: u64) u64 {
+    if (v <= 2) return 2;
+    // Bit trick: round up to next power of 2
+    const shift: u6 = @intCast(64 - @clz(v - 1));
+    return @as(u64, 1) << shift;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Channel
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -202,23 +215,30 @@ pub fn Channel(comptime T: type) type {
         const Self = @This();
 
         /// Per-slot sequence number for lock-free protocol.
+        /// Interleaved sequence + value per slot (crossbeam layout).
         /// Sequence tracks slot state: writable when seq == expected_tail,
         /// readable when seq == expected_head + 1.
+        /// Interleaving gives spatial locality: sequence check + value read/write
+        /// hit the same cache line instead of two separate arrays.
         const Slot = struct {
             sequence: std.atomic.Value(u64),
+            value: T = undefined,
         };
 
-        /// Slot metadata array (sequence counters)
+        /// Slot array (interleaved sequence + value)
         slots: []Slot,
 
-        /// Value storage (separate from slots for cache efficiency)
-        buffer: []T,
-
-        /// User-requested channel capacity (max items in flight)
+        /// User-requested channel capacity (for isFull/len API).
         capacity: u64,
 
-        /// Internal buffer size (>= capacity, >= 2 for Vyukov algorithm correctness)
+        /// Internal buffer size (power-of-2, >= capacity, >= 2).
+        /// Power-of-2 enables `& buf_mask` instead of `% buf_cap`,
+        /// saving ~20 cycles per CAS attempt on ARM64 (udiv → and).
         buf_cap: u64,
+
+        /// Bitmask for fast index: buf_cap - 1. `index = pos & buf_mask`
+        /// replaces `pos % buf_cap` (1 cycle vs ~20 cycles on ARM64).
+        buf_mask: u64,
 
         /// Allocator used for buffer+slots
         allocator: Allocator,
@@ -265,6 +285,30 @@ pub fn Channel(comptime T: type) type {
         has_recv_waiters: std.atomic.Value(bool) align(CACHE_LINE_SIZE),
         has_send_waiters: std.atomic.Value(bool),
 
+        /// Lock-free single-waiter slots. When exactly one consumer/producer is
+        /// waiting, it can be stored here instead of the linked list. The wake
+        /// path consumes the slot via atomic swap (no mutex needed), saving
+        /// ~20-30ns per wake. When multiple waiters exist, the first gets the
+        /// fast slot and the rest go to the linked list.
+        ///
+        /// Value: 0 = empty, non-zero = pointer to waiter.
+        /// Registration: CAS 0→ptr under waiter_mutex (Dekker protocol preserved).
+        /// Wake: swap to 0 outside mutex (lock-free).
+        fast_recv_waiter: std.atomic.Value(usize) align(CACHE_LINE_SIZE),
+        fast_send_waiter: std.atomic.Value(usize),
+
+        /// Check if there are NO recv waiters in either the fast slot or the
+        /// linked list. Must be called under waiter_mutex (list access not atomic).
+        inline fn noRecvWaiters(self: *Self) bool {
+            return self.recv_waiters.isEmpty() and self.fast_recv_waiter.load(.acquire) == 0;
+        }
+
+        /// Check if there are NO send waiters in either the fast slot or the
+        /// linked list. Must be called under waiter_mutex (list access not atomic).
+        inline fn noSendWaiters(self: *Self) bool {
+            return self.send_waiters.isEmpty() and self.fast_send_waiter.load(.acquire) == 0;
+        }
+
         /// Spin iterations before falling back to waiter_mutex.
         /// crossbeam-channel uses 4 spins before yielding. We use pure CAS spins
         /// (no yield) since the Vyukov CAS is very cheap and we want to stay
@@ -310,11 +354,15 @@ pub fn Channel(comptime T: type) type {
         };
 
         /// Create a new channel with the given capacity.
+        /// Buffer is rounded up to next power-of-2 (minimum 2) for bitmask indexing.
+        /// The Vyukov sequence numbers naturally enforce the buffer size.
+        /// For non-power-of-2 capacities, an explicit check ensures the user's
+        /// requested limit is honored (only costs 1 extra load per send).
         pub fn init(allocator: Allocator, capacity: usize) !Self {
             const cap: u64 = @intCast(@max(1, capacity));
-            // Internal buffer must be >= 2 for Vyukov sequence numbers to
-            // distinguish "has data" from "writable" states.
-            const buf_cap: u64 = @max(cap, 2);
+            // Round up to power-of-2 for bitmask indexing.
+            // Replaces `% buf_cap` (~20 cycles on ARM64) with `& buf_mask` (1 cycle).
+            const buf_cap: u64 = nextPow2(@max(cap, 2));
 
             const slots = try allocator.alloc(Slot, @intCast(buf_cap));
             errdefer allocator.free(slots);
@@ -322,16 +370,14 @@ pub fn Channel(comptime T: type) type {
             // Initialize each slot's sequence to its index
             for (slots, 0..) |*slot, i| {
                 slot.sequence = std.atomic.Value(u64).init(@intCast(i));
+                slot.value = undefined;
             }
-
-            const buffer = try allocator.alloc(T, @intCast(buf_cap));
-            errdefer allocator.free(buffer);
 
             return .{
                 .slots = slots,
-                .buffer = buffer,
                 .capacity = cap,
                 .buf_cap = buf_cap,
+                .buf_mask = buf_cap - 1,
                 .allocator = allocator,
                 .head = std.atomic.Value(u64).init(0),
                 .tail = std.atomic.Value(u64).init(0),
@@ -341,13 +387,14 @@ pub fn Channel(comptime T: type) type {
                 .recv_waiters = .{},
                 .has_recv_waiters = std.atomic.Value(bool).init(false),
                 .has_send_waiters = std.atomic.Value(bool).init(false),
+                .fast_recv_waiter = std.atomic.Value(usize).init(0),
+                .fast_send_waiter = std.atomic.Value(usize).init(0),
             };
         }
 
         /// Destroy the channel.
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.slots);
-            self.allocator.free(self.buffer);
         }
 
         // ═══════════════════════════════════════════════════════════════════
@@ -356,20 +403,31 @@ pub fn Channel(comptime T: type) type {
 
         /// Try to send without blocking. Lock-free CAS on tail.
         pub fn trySend(self: *Self, value: T) SendResult {
+            return self.trySendImpl(value, true);
+        }
+
+        /// Try to send without waking waiters. Caller must call
+        /// `notifyRecvWaiters()` periodically to avoid starving blocked receivers.
+        /// Use this in tight loops where amortized wakeup is acceptable.
+        pub fn trySendNoWake(self: *Self, value: T) SendResult {
+            return self.trySendImpl(value, false);
+        }
+
+        inline fn trySendImpl(self: *Self, value: T, comptime wake: bool) SendResult {
             var tail = self.tail.load(.monotonic);
             while (true) {
                 // Closed check is "free" — just a bit test on already-loaded tail
                 if (isClosedBit(tail)) return .closed;
-                // When buf_cap > capacity (capacity=1 case), we need an explicit
-                // capacity check since the sequence numbers alone can't distinguish
-                // full from empty. When buf_cap == capacity, the sequence check
-                // below handles it, so we skip this extra cache-line read.
+
+                // Capacity check: when buf_cap > capacity (power-of-2 rounding),
+                // enforce the user's limit. Skipped when buf_cap == capacity.
                 if (self.buf_cap != self.capacity) {
                     const head = self.head.load(.acquire);
                     if (tail -% head >= self.capacity) return .full;
                 }
 
-                const idx: usize = @intCast(tail % self.buf_cap);
+                // Bitmask index: 1 cycle vs ~20 for modulo on ARM64
+                const idx: usize = @intCast(tail & self.buf_mask);
                 const slot = &self.slots[idx];
                 const seq = slot.sequence.load(.acquire);
 
@@ -383,12 +441,14 @@ pub fn Channel(comptime T: type) type {
                         continue;
                     }
                     // Claimed! Write value and publish
-                    self.buffer[idx] = value;
+                    slot.value = value;
                     slot.sequence.store(tail +% 1, .release);
 
                     // Wake a receiver if any are waiting (seq_cst: Dekker protocol)
-                    if (self.has_recv_waiters.load(.seq_cst)) {
-                        self.wakeOneRecvWaiter();
+                    if (wake) {
+                        if (self.has_recv_waiters.load(.seq_cst)) {
+                            self.wakeOneRecvWaiter();
+                        }
                     }
 
                     return .ok;
@@ -409,11 +469,11 @@ pub fn Channel(comptime T: type) type {
             // Fast path: lock-free try
             const result = self.trySend(value);
             if (result == .ok) {
-                waiter.complete.store(true, .release);
+                waiter.status.store(WAITER_COMPLETE, .release);
                 return true;
             }
             if (result == .closed) {
-                waiter.closed.store(true, .release);
+                waiter.status.store(WAITER_CLOSED, .release);
                 return true;
             }
 
@@ -424,11 +484,11 @@ pub fn Channel(comptime T: type) type {
                 std.atomic.spinLoopHint();
                 switch (self.trySend(value)) {
                     .ok => {
-                        waiter.complete.store(true, .release);
+                        waiter.status.store(WAITER_COMPLETE, .release);
                         return true;
                     },
                     .closed => {
-                        waiter.closed.store(true, .release);
+                        waiter.status.store(WAITER_CLOSED, .release);
                         return true;
                     },
                     .full => {},
@@ -441,7 +501,7 @@ pub fn Channel(comptime T: type) type {
             // Re-check closed under lock (via tail mark bit)
             if (isClosedBit(self.tail.load(.acquire))) {
                 self.waiter_mutex.unlock();
-                waiter.closed.store(true, .release);
+                waiter.status.store(WAITER_CLOSED, .release);
                 return true;
             }
 
@@ -453,25 +513,30 @@ pub fn Channel(comptime T: type) type {
             const retry = self.trySend(value);
             if (retry == .ok) {
                 // Clear flag if no other waiters
-                if (self.send_waiters.isEmpty()) {
+                if (self.noSendWaiters()) {
                     self.has_send_waiters.store(false, .seq_cst);
                 }
                 self.waiter_mutex.unlock();
-                waiter.complete.store(true, .release);
+                waiter.status.store(WAITER_COMPLETE, .release);
                 return true;
             }
             if (retry == .closed) {
-                if (self.send_waiters.isEmpty()) {
+                if (self.noSendWaiters()) {
                     self.has_send_waiters.store(false, .seq_cst);
                 }
                 self.waiter_mutex.unlock();
-                waiter.closed.store(true, .release);
+                waiter.status.store(WAITER_CLOSED, .release);
                 return true;
             }
 
-            // Still full — add to wait list
-            waiter.complete.store(false, .release);
-            waiter.closed.store(false, .release);
+            // Still full — register waiter
+            waiter.status.store(WAITER_PENDING, .release);
+            // Try single-waiter fast slot (avoids mutex on wake path)
+            if (self.fast_send_waiter.cmpxchgStrong(0, @intFromPtr(waiter), .release, .monotonic) == null) {
+                self.waiter_mutex.unlock();
+                return false;
+            }
+            // Fast slot taken — use linked list
             self.send_waiters.pushBack(waiter);
 
             self.waiter_mutex.unlock();
@@ -486,7 +551,7 @@ pub fn Channel(comptime T: type) type {
 
             if (isClosedBit(self.tail.load(.acquire))) {
                 self.waiter_mutex.unlock();
-                waiter.closed.store(true, .release);
+                waiter.status.store(WAITER_CLOSED, .release);
                 return true;
             }
 
@@ -495,24 +560,28 @@ pub fn Channel(comptime T: type) type {
 
             const retry = self.trySend(value);
             if (retry == .ok) {
-                if (self.send_waiters.isEmpty()) {
+                if (self.noSendWaiters()) {
                     self.has_send_waiters.store(false, .seq_cst);
                 }
                 self.waiter_mutex.unlock();
-                waiter.complete.store(true, .release);
+                waiter.status.store(WAITER_COMPLETE, .release);
                 return true;
             }
             if (retry == .closed) {
-                if (self.send_waiters.isEmpty()) {
+                if (self.noSendWaiters()) {
                     self.has_send_waiters.store(false, .seq_cst);
                 }
                 self.waiter_mutex.unlock();
-                waiter.closed.store(true, .release);
+                waiter.status.store(WAITER_CLOSED, .release);
                 return true;
             }
 
-            waiter.complete.store(false, .release);
-            waiter.closed.store(false, .release);
+            waiter.status.store(WAITER_PENDING, .release);
+            // Try single-waiter fast slot
+            if (self.fast_send_waiter.cmpxchgStrong(0, @intFromPtr(waiter), .release, .monotonic) == null) {
+                self.waiter_mutex.unlock();
+                return false;
+            }
             self.send_waiters.pushBack(waiter);
 
             self.waiter_mutex.unlock();
@@ -523,6 +592,18 @@ pub fn Channel(comptime T: type) type {
         pub fn cancelSend(self: *Self, waiter: *SendWaiter) void {
             if (waiter.isComplete()) return;
 
+            // Try to cancel from fast slot (lock-free)
+            if (self.fast_send_waiter.cmpxchgStrong(@intFromPtr(waiter), 0, .acq_rel, .monotonic) == null) {
+                // Removed from fast slot — clear flag under mutex if no list waiters
+                self.waiter_mutex.lock();
+                if (self.noSendWaiters()) {
+                    self.has_send_waiters.store(false, .seq_cst);
+                }
+                self.waiter_mutex.unlock();
+                return;
+            }
+
+            // Not in fast slot — try linked list
             self.waiter_mutex.lock();
 
             if (waiter.isComplete()) {
@@ -536,7 +617,7 @@ pub fn Channel(comptime T: type) type {
             }
 
             // Clear flag if no more waiters
-            if (self.send_waiters.isEmpty()) {
+            if (self.noSendWaiters()) {
                 self.has_send_waiters.store(false, .seq_cst);
             }
 
@@ -549,9 +630,21 @@ pub fn Channel(comptime T: type) type {
 
         /// Try to receive without blocking. Lock-free CAS on head.
         pub fn tryRecv(self: *Self) RecvResult {
+            return self.tryRecvImpl(true);
+        }
+
+        /// Try to receive without waking waiters. Caller must call
+        /// `notifySendWaiters()` periodically to avoid starving blocked senders.
+        /// Use this in tight loops where amortized wakeup is acceptable.
+        pub fn tryRecvNoWake(self: *Self) RecvResult {
+            return self.tryRecvImpl(false);
+        }
+
+        inline fn tryRecvImpl(self: *Self, comptime wake: bool) RecvResult {
             var head = self.head.load(.monotonic);
             while (true) {
-                const idx: usize = @intCast(head % self.buf_cap);
+                // Bitmask index: 1 cycle vs ~20 for modulo on ARM64
+                const idx: usize = @intCast(head & self.buf_mask);
                 const slot = &self.slots[idx];
                 const seq = slot.sequence.load(.acquire);
 
@@ -565,12 +658,14 @@ pub fn Channel(comptime T: type) type {
                         continue;
                     }
                     // Claimed! Read value and release slot
-                    const value = self.buffer[idx];
+                    const value = slot.value;
                     slot.sequence.store(head +% self.buf_cap, .release);
 
                     // Wake a sender if any are waiting (seq_cst: Dekker protocol)
-                    if (self.has_send_waiters.load(.seq_cst)) {
-                        self.wakeOneSendWaiter();
+                    if (wake) {
+                        if (self.has_send_waiters.load(.seq_cst)) {
+                            self.wakeOneSendWaiter();
+                        }
                     }
 
                     return .{ .value = value };
@@ -585,6 +680,22 @@ pub fn Channel(comptime T: type) type {
             }
         }
 
+        /// Check and wake one blocked receiver. Call periodically after
+        /// `trySendNoWake()` to avoid starving blocked consumers.
+        pub fn notifyRecvWaiters(self: *Self) void {
+            if (self.has_recv_waiters.load(.seq_cst)) {
+                self.wakeOneRecvWaiter();
+            }
+        }
+
+        /// Check and wake one blocked sender. Call periodically after
+        /// `tryRecvNoWake()` to avoid starving blocked producers.
+        pub fn notifySendWaiters(self: *Self) void {
+            if (self.has_send_waiters.load(.seq_cst)) {
+                self.wakeOneSendWaiter();
+            }
+        }
+
         /// Receive, potentially waiting if empty. Prefer `recvFuture()` which returns a Future.
         /// Returns value if received immediately, null if waiter was added or closed.
         pub fn recvWait(self: *Self, waiter: *RecvWaiter) ?T {
@@ -592,11 +703,11 @@ pub fn Channel(comptime T: type) type {
             const result = self.tryRecv();
             switch (result) {
                 .value => |v| {
-                    waiter.complete.store(true, .release);
+                    waiter.status.store(WAITER_COMPLETE, .release);
                     return v;
                 },
                 .closed => {
-                    waiter.closed.store(true, .release);
+                    waiter.status.store(WAITER_CLOSED, .release);
                     return null;
                 },
                 .empty => {},
@@ -609,11 +720,11 @@ pub fn Channel(comptime T: type) type {
                 std.atomic.spinLoopHint();
                 switch (self.tryRecv()) {
                     .value => |v| {
-                        waiter.complete.store(true, .release);
+                        waiter.status.store(WAITER_COMPLETE, .release);
                         return v;
                     },
                     .closed => {
-                        waiter.closed.store(true, .release);
+                        waiter.status.store(WAITER_CLOSED, .release);
                         return null;
                     },
                     .empty => {},
@@ -631,19 +742,19 @@ pub fn Channel(comptime T: type) type {
             const retry = self.tryRecv();
             switch (retry) {
                 .value => |v| {
-                    if (self.recv_waiters.isEmpty()) {
+                    if (self.noRecvWaiters()) {
                         self.has_recv_waiters.store(false, .seq_cst);
                     }
                     self.waiter_mutex.unlock();
-                    waiter.complete.store(true, .release);
+                    waiter.status.store(WAITER_COMPLETE, .release);
                     return v;
                 },
                 .closed => {
-                    if (self.recv_waiters.isEmpty()) {
+                    if (self.noRecvWaiters()) {
                         self.has_recv_waiters.store(false, .seq_cst);
                     }
                     self.waiter_mutex.unlock();
-                    waiter.closed.store(true, .release);
+                    waiter.status.store(WAITER_CLOSED, .release);
                     return null;
                 },
                 .empty => {},
@@ -651,17 +762,22 @@ pub fn Channel(comptime T: type) type {
 
             // Check closed via tail mark bit
             if (isClosedBit(self.tail.load(.acquire))) {
-                if (self.recv_waiters.isEmpty()) {
+                if (self.noRecvWaiters()) {
                     self.has_recv_waiters.store(false, .seq_cst);
                 }
                 self.waiter_mutex.unlock();
-                waiter.closed.store(true, .release);
+                waiter.status.store(WAITER_CLOSED, .release);
                 return null;
             }
 
             // Still empty — add to wait list
-            waiter.complete.store(false, .release);
-            waiter.closed.store(false, .release);
+            waiter.status.store(WAITER_PENDING, .release);
+            // Try single-waiter fast slot (avoids mutex on wake path)
+            if (self.fast_recv_waiter.cmpxchgStrong(0, @intFromPtr(waiter), .release, .monotonic) == null) {
+                self.waiter_mutex.unlock();
+                return null;
+            }
+            // Fast slot taken — use linked list
             self.recv_waiters.pushBack(waiter);
 
             self.waiter_mutex.unlock();
@@ -680,35 +796,39 @@ pub fn Channel(comptime T: type) type {
             const retry = self.tryRecv();
             switch (retry) {
                 .value => |v| {
-                    if (self.recv_waiters.isEmpty()) {
+                    if (self.noRecvWaiters()) {
                         self.has_recv_waiters.store(false, .seq_cst);
                     }
                     self.waiter_mutex.unlock();
-                    waiter.complete.store(true, .release);
+                    waiter.status.store(WAITER_COMPLETE, .release);
                     return v;
                 },
                 .closed => {
-                    if (self.recv_waiters.isEmpty()) {
+                    if (self.noRecvWaiters()) {
                         self.has_recv_waiters.store(false, .seq_cst);
                     }
                     self.waiter_mutex.unlock();
-                    waiter.closed.store(true, .release);
+                    waiter.status.store(WAITER_CLOSED, .release);
                     return null;
                 },
                 .empty => {},
             }
 
             if (isClosedBit(self.tail.load(.acquire))) {
-                if (self.recv_waiters.isEmpty()) {
+                if (self.noRecvWaiters()) {
                     self.has_recv_waiters.store(false, .seq_cst);
                 }
                 self.waiter_mutex.unlock();
-                waiter.closed.store(true, .release);
+                waiter.status.store(WAITER_CLOSED, .release);
                 return null;
             }
 
-            waiter.complete.store(false, .release);
-            waiter.closed.store(false, .release);
+            waiter.status.store(WAITER_PENDING, .release);
+            // Try single-waiter fast slot
+            if (self.fast_recv_waiter.cmpxchgStrong(0, @intFromPtr(waiter), .release, .monotonic) == null) {
+                self.waiter_mutex.unlock();
+                return null;
+            }
             self.recv_waiters.pushBack(waiter);
 
             self.waiter_mutex.unlock();
@@ -719,6 +839,18 @@ pub fn Channel(comptime T: type) type {
         pub fn cancelRecv(self: *Self, waiter: *RecvWaiter) void {
             if (waiter.isComplete()) return;
 
+            // Try to cancel from fast slot (lock-free)
+            if (self.fast_recv_waiter.cmpxchgStrong(@intFromPtr(waiter), 0, .acq_rel, .monotonic) == null) {
+                // Removed from fast slot — clear flag under mutex if no list waiters
+                self.waiter_mutex.lock();
+                if (self.noRecvWaiters()) {
+                    self.has_recv_waiters.store(false, .seq_cst);
+                }
+                self.waiter_mutex.unlock();
+                return;
+            }
+
+            // Not in fast slot — try linked list
             self.waiter_mutex.lock();
 
             if (waiter.isComplete()) {
@@ -732,7 +864,7 @@ pub fn Channel(comptime T: type) type {
             }
 
             // Clear flag if no more waiters
-            if (self.recv_waiters.isEmpty()) {
+            if (self.noRecvWaiters()) {
                 self.has_recv_waiters.store(false, .seq_cst);
             }
 
@@ -745,19 +877,43 @@ pub fn Channel(comptime T: type) type {
 
         /// Wake one recv waiter (called after successful send).
         fn wakeOneRecvWaiter(self: *Self) void {
+            // Fast path: try atomic swap on single-waiter slot (avoids mutex entirely)
+            const fast_ptr = self.fast_recv_waiter.swap(0, .acq_rel);
+            if (fast_ptr != 0) {
+                const w: *RecvWaiter = @ptrFromInt(fast_ptr);
+                // CRITICAL: Copy waker info BEFORE setting status to avoid use-after-free.
+                const waker_fn = w.waker;
+                const waker_ctx = w.waker_ctx;
+                w.status.store(WAITER_COMPLETE, .release);
+                // Clear flag if no list waiters remain
+                if (self.recv_waiters.isEmpty()) {
+                    // Need mutex to safely clear flag (Dekker protocol)
+                    self.waiter_mutex.lock();
+                    if (self.noRecvWaiters()) {
+                        self.has_recv_waiters.store(false, .seq_cst);
+                    }
+                    self.waiter_mutex.unlock();
+                }
+                if (waker_fn) |wf| {
+                    if (waker_ctx) |ctx| {
+                        wf(ctx);
+                    }
+                }
+                return;
+            }
+
+            // Slow path: pop from linked list under mutex
             self.waiter_mutex.lock();
             const waiter = self.recv_waiters.popFront();
-            if (self.recv_waiters.isEmpty()) {
+            if (self.noRecvWaiters()) {
                 self.has_recv_waiters.store(false, .seq_cst);
             }
             self.waiter_mutex.unlock();
 
             if (waiter) |w| {
-                // CRITICAL: Copy waker info BEFORE setting complete flag to avoid use-after-free.
-                // Once complete is set, the waiter's owner may immediately destroy it.
                 const waker_fn = w.waker;
                 const waker_ctx = w.waker_ctx;
-                w.complete.store(true, .release);
+                w.status.store(WAITER_COMPLETE, .release);
                 if (waker_fn) |wf| {
                     if (waker_ctx) |ctx| {
                         wf(ctx);
@@ -768,9 +924,32 @@ pub fn Channel(comptime T: type) type {
 
         /// Wake one send waiter (called after successful recv).
         fn wakeOneSendWaiter(self: *Self) void {
+            // Fast path: try atomic swap on single-waiter slot (avoids mutex entirely)
+            const fast_ptr = self.fast_send_waiter.swap(0, .acq_rel);
+            if (fast_ptr != 0) {
+                const w: *SendWaiter = @ptrFromInt(fast_ptr);
+                const waker_fn = w.waker;
+                const waker_ctx = w.waker_ctx;
+                w.status.store(WAITER_COMPLETE, .release);
+                if (self.send_waiters.isEmpty()) {
+                    self.waiter_mutex.lock();
+                    if (self.noSendWaiters()) {
+                        self.has_send_waiters.store(false, .seq_cst);
+                    }
+                    self.waiter_mutex.unlock();
+                }
+                if (waker_fn) |wf| {
+                    if (waker_ctx) |ctx| {
+                        wf(ctx);
+                    }
+                }
+                return;
+            }
+
+            // Slow path: pop from linked list under mutex
             self.waiter_mutex.lock();
             const waiter = self.send_waiters.popFront();
-            if (self.send_waiters.isEmpty()) {
+            if (self.noSendWaiters()) {
                 self.has_send_waiters.store(false, .seq_cst);
             }
             self.waiter_mutex.unlock();
@@ -778,7 +957,7 @@ pub fn Channel(comptime T: type) type {
             if (waiter) |w| {
                 const waker_fn = w.waker;
                 const waker_ctx = w.waker_ctx;
-                w.complete.store(true, .release);
+                w.status.store(WAITER_COMPLETE, .release);
                 if (waker_fn) |wf| {
                     if (waker_ctx) |ctx| {
                         wf(ctx);
@@ -807,11 +986,25 @@ pub fn Channel(comptime T: type) type {
 
             self.waiter_mutex.lock();
 
-            // Wake all send waiters
+            // Drain fast slots under mutex
+            const fast_send = self.fast_send_waiter.swap(0, .acq_rel);
+            if (fast_send != 0) {
+                const w: *SendWaiter = @ptrFromInt(fast_send);
+                const waker_fn = w.waker;
+                const waker_ctx = w.waker_ctx;
+                w.status.store(WAITER_CLOSED, .release);
+                if (waker_fn) |wf| {
+                    if (waker_ctx) |ctx| {
+                        send_wake_list.push(.{ .context = ctx, .wake_fn = wf });
+                    }
+                }
+            }
+
+            // Wake all send waiters from linked list
             while (self.send_waiters.popFront()) |w| {
                 const waker_fn = w.waker;
                 const waker_ctx = w.waker_ctx;
-                w.closed.store(true, .release);
+                w.status.store(WAITER_CLOSED, .release);
                 if (waker_fn) |wf| {
                     if (waker_ctx) |ctx| {
                         send_wake_list.push(.{ .context = ctx, .wake_fn = wf });
@@ -820,11 +1013,24 @@ pub fn Channel(comptime T: type) type {
             }
             self.has_send_waiters.store(false, .seq_cst);
 
-            // Wake all recv waiters
+            const fast_recv = self.fast_recv_waiter.swap(0, .acq_rel);
+            if (fast_recv != 0) {
+                const w: *RecvWaiter = @ptrFromInt(fast_recv);
+                const waker_fn = w.waker;
+                const waker_ctx = w.waker_ctx;
+                w.status.store(WAITER_CLOSED, .release);
+                if (waker_fn) |wf| {
+                    if (waker_ctx) |ctx| {
+                        recv_wake_list.push(.{ .context = ctx, .wake_fn = wf });
+                    }
+                }
+            }
+
+            // Wake all recv waiters from linked list
             while (self.recv_waiters.popFront()) |w| {
                 const waker_fn = w.waker;
                 const waker_ctx = w.waker_ctx;
-                w.closed.store(true, .release);
+                w.status.store(WAITER_CLOSED, .release);
                 if (waker_fn) |wf| {
                     if (waker_ctx) |ctx| {
                         recv_wake_list.push(.{ .context = ctx, .wake_fn = wf });
@@ -986,7 +1192,7 @@ pub fn SendFuture(comptime T: type) type {
                             w.deinit();
                             self.stored_waker = null;
                         }
-                        if (self.waiter.closed.load(.acquire)) {
+                        if (self.waiter.status.load(.acquire) == WAITER_CLOSED) {
                             return .{ .ready = .closed };
                         }
                         return .{ .ready = .ok };
@@ -997,40 +1203,41 @@ pub fn SendFuture(comptime T: type) type {
                 },
 
                 .waiting => {
-                    if (self.waiter.isComplete()) {
-                        if (self.waiter.closed.load(.acquire)) {
+                    // Fast path: try channel op directly before checking waiter status.
+                    // In steady state, the channel has space and we skip the isComplete
+                    // atomic load entirely (saves 1 atomic per message).
+                    switch (self.channel.trySend(self.value)) {
+                        .ok => {
+                            self.state = .ready;
+                            self.value_sent = true;
+                            if (self.stored_waker) |*w| {
+                                w.deinit();
+                                self.stored_waker = null;
+                            }
+                            return .{ .ready = .ok };
+                        },
+                        .closed => {
                             self.state = .ready;
                             if (self.stored_waker) |*w| {
                                 w.deinit();
                                 self.stored_waker = null;
                             }
                             return .{ .ready = .closed };
-                        }
-                        // Woken — actually send the value now.
-                        // In MPMC, another producer may have filled the slot
-                        // (spurious wake), so we must retry.
-                        switch (self.channel.trySend(self.value)) {
-                            .ok => {
-                                self.state = .ready;
-                                self.value_sent = true;
-                                if (self.stored_waker) |*w| {
-                                    w.deinit();
-                                    self.stored_waker = null;
+                        },
+                        .full => {
+                            // Channel still full — check if we were actually woken
+                            const status = self.waiter.status.load(.acquire);
+                            if (status != WAITER_PENDING) {
+                                if (status == WAITER_CLOSED) {
+                                    self.state = .ready;
+                                    if (self.stored_waker) |*w| {
+                                        w.deinit();
+                                        self.stored_waker = null;
+                                    }
+                                    return .{ .ready = .closed };
                                 }
-                                return .{ .ready = .ok };
-                            },
-                            .closed => {
-                                self.state = .ready;
-                                if (self.stored_waker) |*w| {
-                                    w.deinit();
-                                    self.stored_waker = null;
-                                }
-                                return .{ .ready = .closed };
-                            },
-                            .full => {
                                 // Spurious wake — another producer stole the slot.
-                                // Re-register waiter. Use sendWaitDirect to skip
-                                // redundant trySend (we just tried above).
+                                // Re-register waiter via sendWaitDirect (skips redundant trySend).
                                 self.waiter.setWaker(@ptrCast(self), wakeCallback);
                                 if (self.channel.sendWaitDirect(self.value, &self.waiter)) {
                                     self.state = .ready;
@@ -1039,12 +1246,12 @@ pub fn SendFuture(comptime T: type) type {
                                         w.deinit();
                                         self.stored_waker = null;
                                     }
-                                    if (self.waiter.closed.load(.acquire)) {
+                                    if (self.waiter.status.load(.acquire) == WAITER_CLOSED) {
                                         return .{ .ready = .closed };
                                     }
                                     return .{ .ready = .ok };
                                 } else {
-                                    if (self.waiter.closed.load(.acquire)) {
+                                    if (self.waiter.status.load(.acquire) == WAITER_CLOSED) {
                                         self.state = .ready;
                                         if (self.stored_waker) |*w| {
                                             w.deinit();
@@ -1054,22 +1261,22 @@ pub fn SendFuture(comptime T: type) type {
                                     }
                                     return .pending;
                                 }
-                            },
-                        }
-                    }
+                            }
 
-                    // Not yet - update waker in case it changed (task migration)
-                    const new_waker = ctx.getWaker();
-                    if (self.stored_waker) |*old| {
-                        if (!old.willWakeSame(new_waker)) {
-                            old.deinit();
-                            self.stored_waker = new_waker.clone();
-                        }
-                    } else {
-                        self.stored_waker = new_waker.clone();
-                    }
+                            // Not yet woken — update waker in case it changed (task migration)
+                            const new_waker = ctx.getWaker();
+                            if (self.stored_waker) |*old| {
+                                if (!old.willWakeSame(new_waker)) {
+                                    old.deinit();
+                                    self.stored_waker = new_waker.clone();
+                                }
+                            } else {
+                                self.stored_waker = new_waker.clone();
+                            }
 
-                    return .pending;
+                            return .pending;
+                        },
+                    }
                 },
 
                 .ready => {
@@ -1193,7 +1400,7 @@ pub fn RecvFuture(comptime T: type) type {
                         }
                         return .{ .ready = value };
                     } else {
-                        if (self.waiter.closed.load(.acquire)) {
+                        if (self.waiter.status.load(.acquire) == WAITER_CLOSED) {
                             self.state = .ready;
                             if (self.stored_waker) |*w| {
                                 w.deinit();
@@ -1207,39 +1414,41 @@ pub fn RecvFuture(comptime T: type) type {
                 },
 
                 .waiting => {
-                    if (self.waiter.isComplete()) {
-                        if (self.waiter.closed.load(.acquire)) {
+                    // Fast path: try channel op directly before checking waiter status.
+                    // In steady state, the channel has data and we skip the isComplete
+                    // atomic load entirely (saves 1 atomic per message).
+                    switch (self.channel.tryRecv()) {
+                        .value => |v| {
+                            self.state = .ready;
+                            self.received_value = v;
+                            if (self.stored_waker) |*w| {
+                                w.deinit();
+                                self.stored_waker = null;
+                            }
+                            return .{ .ready = v };
+                        },
+                        .closed => {
                             self.state = .ready;
                             if (self.stored_waker) |*w| {
                                 w.deinit();
                                 self.stored_waker = null;
                             }
                             return .{ .ready = null };
-                        }
-                        // Value should be ready
-                        const result = self.channel.tryRecv();
-                        switch (result) {
-                            .value => |v| {
-                                self.state = .ready;
-                                self.received_value = v;
-                                if (self.stored_waker) |*w| {
-                                    w.deinit();
-                                    self.stored_waker = null;
+                        },
+                        .empty => {
+                            // Channel still empty — check if we were actually woken
+                            const status = self.waiter.status.load(.acquire);
+                            if (status != WAITER_PENDING) {
+                                if (status == WAITER_CLOSED) {
+                                    self.state = .ready;
+                                    if (self.stored_waker) |*w| {
+                                        w.deinit();
+                                        self.stored_waker = null;
+                                    }
+                                    return .{ .ready = null };
                                 }
-                                return .{ .ready = v };
-                            },
-                            .closed => {
-                                self.state = .ready;
-                                if (self.stored_waker) |*w| {
-                                    w.deinit();
-                                    self.stored_waker = null;
-                                }
-                                return .{ .ready = null };
-                            },
-                            .empty => {
                                 // Spurious wake — another consumer stole the value.
-                                // Re-register waiter. Use recvWaitDirect to skip
-                                // redundant tryRecv (we just tried above).
+                                // Re-register waiter via recvWaitDirect (skips redundant tryRecv).
                                 self.waiter.setWaker(@ptrCast(self), wakeCallback);
                                 if (self.channel.recvWaitDirect(&self.waiter)) |value| {
                                     self.state = .ready;
@@ -1250,7 +1459,7 @@ pub fn RecvFuture(comptime T: type) type {
                                     }
                                     return .{ .ready = value };
                                 } else {
-                                    if (self.waiter.closed.load(.acquire)) {
+                                    if (self.waiter.status.load(.acquire) == WAITER_CLOSED) {
                                         self.state = .ready;
                                         if (self.stored_waker) |*w| {
                                             w.deinit();
@@ -1260,22 +1469,22 @@ pub fn RecvFuture(comptime T: type) type {
                                     }
                                     return .pending;
                                 }
-                            },
-                        }
-                    }
+                            }
 
-                    // Not yet - update waker in case it changed (task migration)
-                    const new_waker = ctx.getWaker();
-                    if (self.stored_waker) |*old| {
-                        if (!old.willWakeSame(new_waker)) {
-                            old.deinit();
-                            self.stored_waker = new_waker.clone();
-                        }
-                    } else {
-                        self.stored_waker = new_waker.clone();
-                    }
+                            // Not yet woken — update waker in case it changed (task migration)
+                            const new_waker = ctx.getWaker();
+                            if (self.stored_waker) |*old| {
+                                if (!old.willWakeSame(new_waker)) {
+                                    old.deinit();
+                                    self.stored_waker = new_waker.clone();
+                                }
+                            } else {
+                                self.stored_waker = new_waker.clone();
+                            }
 
-                    return .pending;
+                            return .pending;
+                        },
+                    }
                 },
 
                 .ready => {
@@ -1396,7 +1605,7 @@ test "Channel - close wakes waiters" {
     // Close should wake receiver
     ch.close();
     try std.testing.expect(recv_woken);
-    try std.testing.expect(recv_waiter.closed.load(.acquire));
+    try std.testing.expect(recv_waiter.status.load(.acquire) == WAITER_CLOSED);
 }
 
 test "Channel - closed channel rejects sends" {

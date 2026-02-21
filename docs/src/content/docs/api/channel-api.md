@@ -245,7 +245,7 @@ var recv_waiter = RecvWaiter.init();
 recv_waiter.setWaker(@ptrCast(&ctx), wakeFn);
 ```
 
-Completion check: `waiter.isComplete()` returns `true` when the operation succeeded or the channel closed. Check `waiter.closed.load(.acquire)` to distinguish.
+Completion check: `waiter.isComplete()` returns `true` when the operation succeeded or the channel closed. Check `waiter.status.load(.acquire)` to distinguish — `WAITER_COMPLETE` (1) means success, `WAITER_CLOSED` (2) means the channel was closed.
 
 ### Example: Three-Stage Processing Pipeline
 

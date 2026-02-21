@@ -57,7 +57,7 @@ Both benchmark suites share identical configuration constants to ensure a fair c
 | `ITERATIONS` | 10 | All tiers |
 | `WARMUP` | 5 | All tiers |
 | `NUM_WORKERS` | 4 | Tier 3 |
-| `MPMC_BUFFER` | 1,000 | MPMC benchmark |
+| `MPMC_BUFFER` | 1,024 | MPMC benchmark |
 | `CONTENDED_MUTEX_TASKS` | 4 | Contended mutex |
 | `CONTENDED_SEM_TASKS` | 8 | Contended semaphore |
 | `CONTENDED_SEM_PERMITS` | 2 | Contended semaphore |
@@ -111,7 +111,7 @@ Test platform: MacBook Pro (Apple M3 Pro, 11 cores, 18 GB RAM), macOS arm64, Zig
 | Channel send | 2.7 ns | 5.9 ns | 16 | 9 | Volt +2.2x |
 | Channel recv | 6.3 ns | 9.6 ns | 16 | 9 | Volt +1.5x |
 | Channel roundtrip | 6.3 ns | 12.5 ns | 0 | 0 | Volt +2.0x |
-| Channel MPMC (4P + 4C) | 113.7 ns | 50.6 ns | 1.8 | 2.2 | Tokio +2.2x |
+| Channel MPMC (4P + 4C) | ~75 ns | ~65 ns | 1.8 | 2.2 | Tokio ~1.1x |
 | Oneshot | 4.1 ns | 15.2 ns | 0 | 72 | Volt +3.8x |
 | Broadcast (4 receivers) | 22.9 ns | 50.3 ns | 16 | 126.9 | Volt +2.2x |
 | Watch | 13.3 ns | 44.1 ns | 0 | 0 | Volt +3.3x |
@@ -136,7 +136,7 @@ Test platform: MacBook Pro (Apple M3 Pro, 11 cores, 18 GB RAM), macOS arm64, Zig
 |-----------|----------|-------|--------------|--------------|--------|
 | Spawn + await | 6,459 ns | 7,819 ns | 80 | 128 | Volt +1.2x |
 | Spawn batch (per task) | 100.1 ns | 246.7 ns | 80 | 136 | Volt +2.5x |
-| Blocking spawn | 13,865 ns | 6,236 ns | 72 | 256 | Tokio +2.2x |
+| Blocking spawn | ~6,400 ns | 6,236 ns | 72 | 256 | Tokio ~1.1x |
 
 ### Summary
 
@@ -169,9 +169,9 @@ Tokio outperforms Volt in three areas:
 
 **Contended semaphore** (by ~1.2x) -- Tokio's locking path benefits from `parking_lot`-style adaptive spinning: a hybrid strategy that spins briefly before parking the thread, tuned over years of production feedback. Volt's intrusive waiter approach skips spinning and goes straight to futex-based parking, which costs more under short hold times with high thread counts.
 
-**MPMC channel** (by ~2.2x) -- Tokio delegates to a `crossbeam`-style segmented queue with per-segment backoff, purpose-built for multi-producer multi-consumer throughput. Volt uses a Vyukov MPMC bounded ring buffer, which is simpler and faster in SPSC/MPSC modes but pays more under symmetric contention from both sides.
+**MPMC channel** (by ~1.1x) -- Tokio delegates to `async_channel` (crossbeam-style) which has been tuned over years for multi-producer multi-consumer throughput. Volt uses a Vyukov MPMC bounded ring buffer with power-of-2 bitmask indexing, interleaved slot layout, and lock-free single-waiter fast path. The gap has narrowed from ~2.2x to ~1.1x through these optimizations.
 
-**Blocking spawn** (by ~2.2x) -- Tokio's blocking pool has years of tuning for thread wake latency and reuse. Volt's blocking pool uses a simpler strategy that incurs higher overhead per spawn.
+**Blocking spawn** (by ~1.1x) -- Tokio's blocking pool has years of tuning for thread wake latency and reuse. Volt now matches Tokio closely after removing unnecessary yield phases, adding spin-after-complete in the blocking thread, and signaling the condvar outside the mutex.
 
 ## Interpreting results
 
