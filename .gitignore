@@ -3,15 +3,7 @@ zig-out/
 .zig-cache/
 libroot.a
 
-# Reference implementations (not part of this project)
-tokio/
-tigerbeetle/
-zio/
-
 # Test and benchmark binaries (Mach-O / ELF executables)
-test_bounded
-blitz_bench_test
-mpmc_test
 *.exe
 
 # Rust build artifacts (entire target directory)
