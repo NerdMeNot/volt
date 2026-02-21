@@ -108,42 +108,45 @@ All measurements on Apple M3 Pro, nanoseconds per operation, 4 worker threads.
 
 <Tabs>
   <TabItem label="Channels">
-    | Benchmark | Volt | Tokio | Speedup |
-    |-----------|----------|-------|---------|
-    | Channel send | 2.7 ns | 5.9 ns | 2.2x |
-    | Channel recv | 6.3 ns | 9.6 ns | 1.5x |
-    | Channel roundtrip | 6.3 ns | 12.5 ns | 2.0x |
-    | Oneshot | 4.1 ns | 15.2 ns | 3.8x |
-    | Broadcast (4 recv) | 22.9 ns | 50.3 ns | 2.2x |
-    | Watch | 13.3 ns | 44.1 ns | 3.3x |
-  </TabItem>
-  <TabItem label="Coordination">
-    | Benchmark | Volt | Tokio | Speedup |
-    |-----------|----------|-------|---------|
-    | OnceCell get | 0.4 ns | 0.6 ns | 1.4x |
-    | OnceCell set | 9.6 ns | 29.2 ns | 3.0x |
-    | Barrier | 15.6 ns | 359.2 ns | 23.1x |
-    | Notify | 9.8 ns | 9.3 ns | Tie |
+    | Benchmark | Volt | Tokio | Winner |
+    |-----------|----------|-------|--------|
+    | Channel send | 11.1 ns | 16.3 ns | Volt +1.5x |
+    | Channel recv | 11.4 ns | 22.3 ns | Volt +2.0x |
+    | Channel roundtrip | 23.1 ns | 37.8 ns | Volt +1.6x |
+    | Channel MPMC (4P + 4C) | 73.3 ns | 132.8 ns | Volt +1.8x |
+    | Oneshot | 27.1 ns | 51.5 ns | Volt +1.9x |
+    | Broadcast (4 recv) | 95.2 ns | 143.8 ns | Volt +1.5x |
+    | Watch | 45.7 ns | 145.4 ns | Volt +3.2x |
   </TabItem>
   <TabItem label="Synchronization">
-    | Benchmark | Volt | Tokio | Speedup |
-    |-----------|----------|-------|---------|
-    | Mutex (uncontended) | 6.6 ns | 7.9 ns | 1.2x |
-    | RwLock read | 6.7 ns | 7.8 ns | 1.2x |
-    | RwLock write | 6.4 ns | 8.1 ns | 1.3x |
-    | Semaphore | 6.4 ns | 7.5 ns | 1.2x |
-    | Mutex contended (4 tasks) | 53.5 ns | 76.9 ns | 1.4x |
-    | RwLock contended (4R+2W) | 50.0 ns | 97.2 ns | 1.9x |
+    | Benchmark | Volt | Tokio | Winner |
+    |-----------|----------|-------|--------|
+    | Mutex (uncontended) | 31.8 ns | 28.2 ns | **Tokio +1.1x** |
+    | RwLock read | 25.3 ns | 27.1 ns | Volt +1.1x |
+    | RwLock write | 20.7 ns | 25.2 ns | Volt +1.2x |
+    | Semaphore | 22.7 ns | 33.7 ns | Volt +1.5x |
+    | Mutex contended (4 tasks) | 91.7 ns | 207.9 ns | Volt +2.3x |
+    | RwLock contended (4R + 2W) | 149.5 ns | 247.4 ns | Volt +1.7x |
+    | Semaphore contended (8T, 2 permits) | 139.4 ns | 323.0 ns | Volt +2.3x |
+  </TabItem>
+  <TabItem label="Coordination">
+    | Benchmark | Volt | Tokio | Winner |
+    |-----------|----------|-------|--------|
+    | OnceCell get | 2.0 ns | 1.0 ns | **Tokio +2.0x** |
+    | OnceCell set | 41.8 ns | 90.8 ns | Volt +2.2x |
+    | Barrier | 50.9 ns | 1,312.8 ns | Volt +25.8x |
+    | Notify | 15.6 ns | 18.9 ns | Volt +1.2x |
   </TabItem>
   <TabItem label="Task Scheduling">
-    | Benchmark | Volt | Tokio | Speedup |
-    |-----------|----------|-------|---------|
-    | Spawn + await | 6,459 ns | 7,819 ns | 1.2x |
-    | Spawn batch (100) | 100.1 ns | 246.7 ns | 2.5x |
+    | Benchmark | Volt | Tokio | Winner |
+    |-----------|----------|-------|--------|
+    | Spawn + await | 29,597 ns | 18,946 ns | **Tokio +1.6x** |
+    | Spawn batch (per task) | 601.0 ns | 611.4 ns | Tie |
+    | Blocking spawn | 25,037 ns | 12,483 ns | **Tokio +2.0x** |
   </TabItem>
 </Tabs>
 
-**Overall: Volt leads on 17 of 21 benchmarks** (3 Tokio wins, 1 tie). Memory: 282 B/op total vs Tokio's 1,868 B/op -- **6.6x less**. Allocations: 3.0/op vs 17.1/op. Volt's architecture is [derived from Tokio](https://github.com/NerdMeNot/volt/blob/main/BENCHMARKS.md#standing-on-tokios-shoulders) -- we would not be here without their work. See [Comparing with Tokio](/testing/comparing-with-tokio/) for methodology and [full results](https://github.com/NerdMeNot/volt/blob/main/BENCHMARKS.md).
+**Overall: Volt wins 16 of 21 benchmarks.** Tokio wins 4 (mutex uncontended, OnceCell get, spawn+await, blocking spawn), 1 tie. Memory: 284 B/op total vs Tokio's 1,868 B/op -- **6.6x less**. Allocations: 3.0/op vs 17.1/op. Volt's architecture is [derived from Tokio](https://github.com/NerdMeNot/volt/blob/main/BENCHMARKS.md#standing-on-tokios-shoulders) -- we would not be here without their work. See [Comparing with Tokio](/testing/comparing-with-tokio/) for methodology and [full results](https://github.com/NerdMeNot/volt/blob/main/BENCHMARKS.md).
 
 ## Module Overview
 
