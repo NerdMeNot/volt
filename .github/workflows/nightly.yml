@@ -52,6 +52,40 @@ jobs:
           VOLT_TEST_INTENSITY: exhaustive
 
   # ═══════════════════════════════════════════════════════════════════════════
+  # Integration Tests - Async Runtime Correctness
+  # Tests Future/Poll/Waker state machines through the real scheduler
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  integration:
+    name: Integration (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+          - os: macos-latest
+            name: macos-arm64
+          - os: macos-13
+            name: macos-x86_64
+          - os: windows-latest
+            name: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Run integration tests
+        run: zig build test-integration
+
+  # ═══════════════════════════════════════════════════════════════════════════
   # Exhaustive Stress Tests
   # ═══════════════════════════════════════════════════════════════════════════
 
@@ -205,6 +239,7 @@ jobs:
     name: Nightly Summary
     needs:
       - exhaustive-concurrency
+      - integration
       - exhaustive-stress
       - soak-test
       - memory-check
@@ -218,6 +253,7 @@ jobs:
           echo "| Test Suite | Result |"
           echo "|------------|--------|"
           echo "| Exhaustive Concurrency | ${{ needs.exhaustive-concurrency.result }} |"
+          echo "| Integration | ${{ needs.integration.result }} |"
           echo "| Exhaustive Stress | ${{ needs.exhaustive-stress.result }} |"
           echo "| Soak Test | ${{ needs.soak-test.result }} |"
           echo "| Memory Check | ${{ needs.memory-check.result }} |"
@@ -226,6 +262,10 @@ jobs:
           FAILED=0
           if [[ "${{ needs.exhaustive-concurrency.result }}" == "failure" ]]; then
             echo "❌ Exhaustive concurrency tests failed"
+            FAILED=1
+          fi
+          if [[ "${{ needs.integration.result }}" == "failure" ]]; then
+            echo "❌ Integration tests failed"
             FAILED=1
           fi
           if [[ "${{ needs.exhaustive-stress.result }}" == "failure" ]]; then

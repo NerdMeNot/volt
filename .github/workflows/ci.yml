@@ -80,6 +80,9 @@ jobs:
       - name: Robustness tests
         run: zig build test-robustness
 
+      - name: Integration tests
+        run: zig build test-integration
+
       # ── Benchmarks (ReleaseFast — verifies release compilation) ─────────
       - name: Build and run benchmarks
         timeout-minutes: 5
