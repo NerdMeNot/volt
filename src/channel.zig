@@ -6,7 +6,7 @@
 //!
 //! | Channel | Description |
 //! |---------|-------------|
-//! | `Channel` | Bounded MPSC (multi-producer, single-consumer) |
+//! | `Channel` | Bounded MPMC (multi-producer, multi-consumer) |
 //! | `Oneshot` | Single-value delivery (one send, one recv) |
 //! | `BroadcastChannel` | Multi-consumer pub/sub (all receivers get all messages) |
 //! | `Watch` | Single value with change notification |
@@ -21,7 +21,7 @@
 //! ## Usage
 //!
 //! ```zig
-//! // Bounded MPSC
+//! // Bounded MPMC
 //! var ch = try io.channel.bounded(Task, allocator, 100);
 //! defer ch.deinit();
 //!
@@ -59,7 +59,7 @@
 //!
 //! | Need | Use |
 //! |------|-----|
-//! | Work queue with backpressure | `Channel` (bounded MPSC) |
+//! | Work queue with backpressure | `Channel` (bounded MPMC) |
 //! | Return a single result | `Oneshot` |
 //! | Config that changes at runtime | `Watch` |
 //! | Event fan-out to multiple consumers | `BroadcastChannel` |
@@ -71,7 +71,7 @@ const Allocator = std.mem.Allocator;
 // Primary API
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Bounded MPSC (multi-producer, single-consumer) channel.
+/// Bounded MPMC (multi-producer, multi-consumer) channel.
 pub const Channel = channel_mod.Channel;
 
 /// Single-value channel. Send exactly one value from producer to consumer.
@@ -79,6 +79,9 @@ pub const Oneshot = oneshot_mod.Oneshot;
 
 /// Broadcast channel. All receivers get every message (fan-out pattern).
 pub const BroadcastChannel = broadcast_mod.BroadcastChannel;
+
+/// Alias for `BroadcastChannel` — shorter name for `channel.Broadcast`.
+pub const Broadcast = BroadcastChannel;
 
 /// Watch channel. Holds a single value; receivers wait for changes.
 pub const Watch = watch_mod.Watch;

@@ -200,8 +200,8 @@ pub fn main() !void {
 
 fn app(io: volt.Io) !void {
     // Launch concurrent async operations
-    const user_f = try io.@"async"(fetchUser, .{@as(u64, 42)});
-    const posts_f = try io.@"async"(fetchPosts, .{@as(u64, 42)});
+    var user_f = try io.@"async"(fetchUser, .{@as(u64, 42)});
+    var posts_f = try io.@"async"(fetchPosts, .{@as(u64, 42)});
 
     // Await both results
     const user = user_f.@"await"(io);

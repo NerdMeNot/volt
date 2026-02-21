@@ -1074,6 +1074,10 @@ pub fn Channel(comptime T: type) type {
         // ═══════════════════════════════════════════════════════════════════
 
         /// Send a value, blocking the current task if the channel is full.
+        ///
+        /// NOTE: Returns without sending if the runtime cannot spawn the
+        /// internal task (e.g., out of memory or shutting down). Use
+        /// `sendFuture(value)` for explicit error handling in production code.
         pub fn send(self: *Self, io: @import("../Io.zig"), value: T) void {
             var f = io.awaitFuture(self.sendFuture(value)) catch return;
             _ = f.await(io);
@@ -1081,6 +1085,10 @@ pub fn Channel(comptime T: type) type {
 
         /// Receive a value, blocking the current task until one is available.
         /// Returns null if the channel is closed and empty.
+        ///
+        /// NOTE: Returns null if the runtime cannot spawn the internal task
+        /// (e.g., out of memory or shutting down). Use `recvFuture()` for
+        /// explicit error handling in production code.
         pub fn recv(self: *Self, io: @import("../Io.zig")) ?T {
             var f = io.awaitFuture(self.recvFuture()) catch return null;
             return f.await(io) catch null;

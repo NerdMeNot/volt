@@ -50,7 +50,9 @@ pub const WakerFn = *const fn (*anyopaque) void;
 pub const IntervalWaiter = struct {
     waker: ?WakerFn = null,
     waker_ctx: ?*anyopaque = null,
-    complete: bool = false,
+    /// Whether the tick has completed (atomic for cross-thread visibility).
+    /// Set by timer driver thread, read by the waiting task.
+    complete: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pointers: Pointers(IntervalWaiter) = .{},
 
     const Self = @This();
@@ -73,11 +75,11 @@ pub const IntervalWaiter = struct {
     }
 
     pub fn isComplete(self: *const Self) bool {
-        return self.complete;
+        return self.complete.load(.acquire);
     }
 
     pub fn reset(self: *Self) void {
-        self.complete = false;
+        self.complete.store(false, .release);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
@@ -212,12 +214,12 @@ pub const Interval = struct {
         // Check if tick is ready
         if (self.checkAndAdvance()) {
             self.mutex.unlock();
-            waiter.complete = true;
+            waiter.complete.store(true, .release);
             return true;
         }
 
         // Not ready - add waiter
-        waiter.complete = false;
+        waiter.complete.store(false, .release);
         self.waiters.pushBack(waiter);
 
         self.mutex.unlock();
@@ -251,7 +253,7 @@ pub const Interval = struct {
         if (self.checkAndAdvance()) {
             // Wake one waiter (one tick = one wake)
             if (self.waiters.popFront()) |w| {
-                w.complete = true;
+                w.complete.store(true, .release);
                 self.mutex.unlock();
                 w.wake();
                 return;
@@ -375,7 +377,7 @@ pub fn tickWithDriverEntry(
 /// Waker function for IntervalWaiter.
 fn intervalWakerFn(ctx: *anyopaque) void {
     const waiter: *IntervalWaiter = @ptrCast(@alignCast(ctx));
-    waiter.complete = true;
+    waiter.complete.store(true, .release);
     waiter.wake();
 }
 

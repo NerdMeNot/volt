@@ -20,6 +20,8 @@ export default [
 			{ label: 'Channels', slug: 'usage/channels' },
 			{ label: 'Networking', slug: 'usage/networking' },
 			{ label: 'Timers', slug: 'usage/timers' },
+			{ label: 'Filesystem', slug: 'usage/filesystem' },
+			{ label: 'Process Management', slug: 'usage/process' },
 			{ label: 'Signals & Shutdown', slug: 'usage/signals-shutdown' },
 			{ label: 'Select', slug: 'usage/select' },
 		],

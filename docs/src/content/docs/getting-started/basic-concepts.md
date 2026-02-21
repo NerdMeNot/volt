@@ -19,7 +19,7 @@ const volt = @import("volt");
 
 fn app(io: volt.Io) !void {
     // Launch an async task
-    const f = try io.@"async"(fetchUser, .{@as(u64, 42)});
+    var f = try io.@"async"(fetchUser, .{@as(u64, 42)});
 
     // Await the result
     const user = f.@"await"(io);
@@ -45,8 +45,8 @@ When you need to run several operations concurrently, launch them all before awa
 ```zig
 fn app(io: volt.Io) !void {
     // Launch both concurrently
-    const user_f = try io.@"async"(fetchUser, .{@as(u64, 42)});
-    const posts_f = try io.@"async"(fetchPosts, .{@as(u64, 42)});
+    var user_f = try io.@"async"(fetchUser, .{@as(u64, 42)});
+    var posts_f = try io.@"async"(fetchPosts, .{@as(u64, 42)});
 
     // Await both results
     const user = user_f.@"await"(io);
@@ -84,7 +84,7 @@ Individual futures can be cancelled:
 
 ```zig
 fn app(io: volt.Io) !void {
-    const f = try io.@"async"(longRunningTask, .{});
+    var f = try io.@"async"(longRunningTask, .{});
 
     // ... decide we don't need the result ...
     f.cancel(io);
@@ -128,8 +128,8 @@ CPU-intensive or blocking operations must not run on I/O worker threads (they wo
 ```zig
 // Offload CPU-heavy work to the blocking pool
 fn processData(io: volt.Io, data: []const u8) !Hash {
-    const handle = try io.concurrent(computeExpensiveHash, .{data});
-    const result = try handle.wait();
+    var f = try io.concurrent(computeExpensiveHash, .{data});
+    const result = try f.@"await"(io);
     return result;
 }
 ```
@@ -189,19 +189,19 @@ pub fn main() !void {
 
 fn myApp(io: volt.Io) !void {
     // 1. Async: launch a function as a concurrent task (most common)
-    const f = try io.@"async"(myFunc, .{arg1, arg2});
+    var f = try io.@"async"(myFunc, .{arg1, arg2});
     const result = f.@"await"(io);
 
     // 2. Concurrent: offload to the blocking thread pool (for CPU-bound work)
-    const handle = try io.concurrent(heavyCompute, .{data});
-    const result2 = try handle.wait();
+    var f2 = try io.concurrent(heavyCompute, .{data});
+    const result2 = try f2.@"await"(io);
 }
 ```
 
 | Function | Use case | Runs on |
 |----------|----------|---------|
 | `io.@"async"(fn, args)` | General async work | Scheduler workers |
-| `io.concurrent(fn, args)` | CPU-heavy or blocking I/O | Blocking pool threads |
+| `io.concurrent(fn, args)` | CPU-heavy or blocking I/O | Blocking pool threads (use `.@"await"(io)` for result) |
 
 ### Future(T)
 
@@ -213,7 +213,7 @@ pub fn main() !void {
 }
 
 fn myApp(io: volt.Io) !void {
-    const f = try io.@"async"(compute, .{@as(i32, 5)});
+    var f = try io.@"async"(compute, .{@as(i32, 5)});
 
     // Await the result (suspends this task, not the thread)
     const result = f.@"await"(io);
@@ -274,13 +274,14 @@ while (i < 1_000_000) : (i += 1) {
 Good alternatives:
 
 ```zig
-// GOOD: Async sleep (yields to scheduler, doesn't block the worker)
-const sleep_future = volt.time.sleep(volt.Duration.fromSecs(1));
-_ = sleep_future; // In real code, poll this future to completion
+// GOOD: Async sleep (register with timer driver inside the runtime)
+var slp = volt.time.sleep(volt.Duration.fromSecs(1));
+// In an async context, register with the timer driver for automatic wakeup.
+// For blocking contexts, use volt.time.blockingSleep(duration).
 
 // GOOD: Offload to blocking pool
-const handle = try io.concurrent(batchCompute, .{data});
-const result = try handle.wait();
+var f = try io.concurrent(batchCompute, .{data});
+const result = try f.@"await"(io);
 ```
 
 ### Cooperative Budget
@@ -328,13 +329,13 @@ fn myApp(io: volt.Io) !void {
 // BAD: Blocks the worker thread -- other tasks on this worker can't run
 std.Thread.sleep(1_000_000_000);
 
-// GOOD: Async sleep -- suspends only this task
-const sleep_future = volt.time.sleep(volt.Duration.fromSecs(1));
-_ = sleep_future; // Poll this future to completion
+// GOOD: Async sleep -- create and register with timer driver
+var slp = volt.time.sleep(volt.Duration.fromSecs(1));
+_ = slp; // Register with timer driver in async context
 
 // GOOD: Offload CPU-heavy work to the blocking pool
-const handle = try io.concurrent(expensiveComputation, .{data});
-const result = try handle.wait();
+var f = try io.concurrent(expensiveComputation, .{data});
+const result = try f.@"await"(io);
 ```
 
 ### 3. Using `const` instead of `var` for futures

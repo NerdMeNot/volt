@@ -1,0 +1,24 @@
+#!/bin/sh
+# Pre-commit hook: format check + unit tests
+# Install: git config core.hooksPath .githooks
+
+set -e
+
+echo "==> Checking zig fmt..."
+if ! zig fmt --check src/ tests/ bench/ build.zig 2>/dev/null; then
+    echo ""
+    echo "ERROR: Zig formatting check failed."
+    echo "Run: zig fmt src/ tests/ bench/ build.zig"
+    echo ""
+    exit 1
+fi
+
+echo "==> Running unit tests..."
+if ! zig build test 2>&1 | tail -5; then
+    echo ""
+    echo "ERROR: Unit tests failed."
+    echo ""
+    exit 1
+fi
+
+echo "==> All checks passed."

@@ -140,12 +140,12 @@ If it takes `io: volt.Io`, it yields the task. If it doesn't take `io`, check wh
 const addr = try volt.net.resolveFirst(allocator, "example.com", 443);
 
 // GOOD: runs on the blocking pool
-const handle = try io.concurrent(struct {
+var f = try io.concurrent(struct {
     fn resolve() !volt.net.Address {
         return volt.net.resolveFirst(std.heap.page_allocator, "example.com", 443);
     }
 }.resolve, .{});
-const addr = try handle.wait();
+const addr = try f.@"await"(io);
 ```
 
 Note: `volt.net.connectHost()` already handles this internally. Prefer it for simple client connections:
@@ -222,9 +222,9 @@ Worker threads run the cooperative scheduler. If you block one, every task assig
 // BAD: blocks the worker for 1 second
 std.Thread.sleep(1_000_000_000);
 
-// GOOD: yields the task, worker runs other tasks
-const sleep_future = volt.time.sleep(volt.Duration.fromSecs(1));
-_ = sleep_future; // Poll to completion in your async context
+// GOOD: create a sleep and register with timer driver
+var slp = volt.time.sleep(volt.Duration.fromSecs(1));
+_ = slp; // Register with timer driver in async context
 ```
 
 ---

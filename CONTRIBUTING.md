@@ -61,6 +61,32 @@ zig build test-stress
 zig build test-all
 ```
 
+### Running a Single Test
+
+Use `--test-filter` to run a specific test by name:
+
+```bash
+# Run only tests matching "Mutex"
+zig build test -- --test-filter "Mutex"
+
+# Run a specific concurrency test
+zig build test-concurrency -- --test-filter "channel_close"
+```
+
+### Test Intensity
+
+Some test suites support intensity configuration via environment variables:
+
+```bash
+# Increase loom-style iteration count (default varies by test)
+LOOM_ITERATIONS=10000 zig build test-concurrency
+
+# Increase stress test intensity
+VOLT_TEST_INTENSITY=high zig build test-stress
+```
+
+### New Test Guidelines
+
 New code should include tests covering:
 
 - Happy path

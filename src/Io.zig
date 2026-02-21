@@ -56,7 +56,7 @@ pub fn ConcurrentFuture(comptime T: type) type {
 
         /// Wait for the blocking task to complete.
         /// Uses spin → futex to minimize latency.
-        pub fn @"await"(self: *@This(), _: Io) anyerror!T {
+        pub fn await(self: *@This(), _: Io) anyerror!T {
             const h = self.handle;
             const Handle = blocking_mod.BlockingHandle(T);
 
@@ -231,7 +231,8 @@ pub fn concurrentBlocking(
     return self.runtime.spawnBlocking(func, args);
 }
 
-/// Alias for `concurrentBlocking` (deprecated name).
+/// Alias for `concurrentBlocking` — the Tokio-equivalent name.
+/// Fully supported; use whichever name fits your codebase.
 pub const spawnBlocking = concurrentBlocking;
 
 // ═══════════════════════════════════════════════════════════════════════════

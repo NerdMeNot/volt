@@ -220,7 +220,7 @@ pub fn main() !void {
 }
 
 fn myApp(io: volt.Io) !void {
-    const f = try io.@"async"(myFunc, .{});  // can't be called without io
+    var f = try io.@"async"(myFunc, .{});  // can't be called without io
     const result = f.@"await"(io);
 }
 ```

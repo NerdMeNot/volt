@@ -151,6 +151,10 @@ pub const Mutex = struct {
     /// This is the primary API. Internally spawns the lock future on the
     /// runtime and waits for completion.
     ///
+    /// NOTE: Returns without acquiring if the runtime cannot spawn the
+    /// internal task (e.g., out of memory or shutting down). Use
+    /// `lockFuture()` for explicit error handling in production code.
+    ///
     /// ```zig
     /// mutex.lock(io);
     /// defer mutex.unlock();

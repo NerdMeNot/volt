@@ -57,7 +57,9 @@ pub const WakerFn = *const fn (*anyopaque) void;
 pub const SleepWaiter = struct {
     waker: ?WakerFn = null,
     waker_ctx: ?*anyopaque = null,
-    complete: bool = false,
+    /// Whether the sleep has completed (atomic for cross-thread visibility).
+    /// Set by timer driver thread, read by the waiting task.
+    complete: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pointers: Pointers(SleepWaiter) = .{},
 
     const Self = @This();
@@ -80,11 +82,11 @@ pub const SleepWaiter = struct {
     }
 
     pub fn isComplete(self: *const Self) bool {
-        return self.complete;
+        return self.complete.load(.acquire);
     }
 
     pub fn reset(self: *Self) void {
-        self.complete = false;
+        self.complete.store(false, .release);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
@@ -183,7 +185,7 @@ pub const Sleep = struct {
         // Check if already elapsed
         if (self.elapsed) {
             self.mutex.unlock();
-            waiter.complete = true;
+            waiter.complete.store(true, .release);
             return true;
         }
 
@@ -191,12 +193,12 @@ pub const Sleep = struct {
         if (!Instant.now().isBefore(self.deadline)) {
             self.elapsed = true;
             self.mutex.unlock();
-            waiter.complete = true;
+            waiter.complete.store(true, .release);
             return true;
         }
 
         // Not yet - add waiter
-        waiter.complete = false;
+        waiter.complete.store(false, .release);
         self.waiters.pushBack(waiter);
 
         self.mutex.unlock();
@@ -235,7 +237,7 @@ pub const Sleep = struct {
 
             // Wake all waiters
             while (self.waiters.popFront()) |w| {
-                w.complete = true;
+                w.complete.store(true, .release);
                 w.wake();
             }
         }
@@ -382,7 +384,7 @@ const WaiterBridge = struct {
 
     fn wake(ctx: *anyopaque) void {
         const self: *WaiterBridge = @ptrCast(@alignCast(ctx));
-        self.waiter.complete = true;
+        self.waiter.complete.store(true, .release);
         self.waiter.wake();
     }
 };
@@ -432,7 +434,7 @@ pub fn sleepUntilWithDriverEntry(
 /// Waker function for SleepWaiter.
 fn waiterWakeFn(ctx: *anyopaque) void {
     const waiter: *SleepWaiter = @ptrCast(@alignCast(ctx));
-    waiter.complete = true;
+    waiter.complete.store(true, .release);
     waiter.wake();
 }
 
@@ -542,7 +544,7 @@ test "SleepManager - basic" {
 
 test "SleepWaiter - reset" {
     var waiter = SleepWaiter.init();
-    waiter.complete = true;
+    waiter.complete.store(true, .release);
 
     try std.testing.expect(waiter.isComplete());
 

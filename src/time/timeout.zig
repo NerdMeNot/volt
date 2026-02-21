@@ -59,7 +59,9 @@ pub const WakerFn = *const fn (*anyopaque) void;
 pub const DeadlineWaiter = struct {
     waker: ?WakerFn = null,
     waker_ctx: ?*anyopaque = null,
-    expired: bool = false,
+    /// Whether the deadline has expired (atomic for cross-thread visibility).
+    /// Set by timer driver thread, read by the waiting task.
+    expired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pointers: Pointers(DeadlineWaiter) = .{},
 
     const Self = @This();
@@ -82,11 +84,11 @@ pub const DeadlineWaiter = struct {
     }
 
     pub fn isComplete(self: *const Self) bool {
-        return self.expired;
+        return self.expired.load(.acquire);
     }
 
     pub fn reset(self: *Self) void {
-        self.expired = false;
+        self.expired.store(false, .release);
         self.waker = null;
         self.waker_ctx = null;
         self.pointers.reset();
@@ -203,19 +205,19 @@ pub const Deadline = struct {
 
         if (self.expired) {
             self.mutex.unlock();
-            waiter.expired = true;
+            waiter.expired.store(true, .release);
             return true;
         }
 
         if (!Instant.now().isBefore(self.expires_at)) {
             self.expired = true;
             self.mutex.unlock();
-            waiter.expired = true;
+            waiter.expired.store(true, .release);
             return true;
         }
 
         // Not expired - add waiter
-        waiter.expired = false;
+        waiter.expired.store(false, .release);
         self.waiters.pushBack(waiter);
 
         self.mutex.unlock();
@@ -250,7 +252,7 @@ pub const Deadline = struct {
 
             // Wake all waiters
             while (self.waiters.popFront()) |w| {
-                w.expired = true;
+                w.expired.store(true, .release);
                 w.wake();
             }
         }
@@ -512,7 +514,7 @@ pub fn waitExpiryWithDriverEntry(
 /// Waker function for DeadlineWaiter.
 fn deadlineWakerFn(ctx: *anyopaque) void {
     const waiter: *DeadlineWaiter = @ptrCast(@alignCast(ctx));
-    waiter.expired = true;
+    waiter.expired.store(true, .release);
     waiter.wake();
 }
 
@@ -602,7 +604,7 @@ test "Deadline - poll wakes waiters" {
 
     // If deadline already expired, waiter is complete
     if (immediate) {
-        try std.testing.expect(waiter.expired);
+        try std.testing.expect(waiter.expired.load(.acquire));
         return;
     }
 
@@ -611,12 +613,12 @@ test "Deadline - poll wakes waiters" {
     dl.poll();
 
     try std.testing.expect(woken);
-    try std.testing.expect(waiter.expired);
+    try std.testing.expect(waiter.expired.load(.acquire));
 }
 
 test "DeadlineWaiter - reset" {
     var waiter = DeadlineWaiter.init();
-    waiter.expired = true;
+    waiter.expired.store(true, .release);
 
     try std.testing.expect(waiter.isComplete());
 

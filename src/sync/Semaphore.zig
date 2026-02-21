@@ -52,7 +52,6 @@ const FutureWaker = future_mod.Waker;
 const Context = future_mod.Context;
 const PollResult = future_mod.PollResult;
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Waiter
 // ─────────────────────────────────────────────────────────────────────────────
@@ -559,6 +558,10 @@ pub const Semaphore = struct {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Acquire permits, blocking the current task until acquired.
+    ///
+    /// NOTE: Returns without acquiring if the runtime cannot spawn the
+    /// internal task (e.g., out of memory or shutting down). Use
+    /// `acquireFuture(n)` for explicit error handling in production code.
     pub fn acquire(self: *Self, io: @import("../Io.zig"), num: usize) void {
         var f = io.awaitFuture(self.acquireFuture(num)) catch return;
         _ = f.await(io);

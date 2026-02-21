@@ -118,8 +118,8 @@ The `io` handle lets the primitive yield to the scheduler when contended and res
 CPU-intensive or legacy blocking I/O should run on the blocking pool so the async workers stay responsive:
 
 ```zig
-const handle = try io.concurrent(computeHash, .{data});
-const hash = try handle.wait();
+var f = try io.concurrent(computeHash, .{data});
+const hash = try f.@"await"(io);
 ```
 
 Blocking pool threads are created on demand (up to `max_blocking_threads`) and reclaimed after the keep-alive timeout.
@@ -182,7 +182,7 @@ Zig reserves `async` and `await` as keywords. The `@"async"` and `@"await"` synt
 |----------|---------|-------------|
 | `io.@"async"(func, args)` | `volt.Future(T)` | Spawn async task, returns a future |
 | `f.@"await"(io)` | `T` | Await a future's result |
-| `io.concurrent(func, args)` | `!*BlockingHandle(T)` | Run on the blocking thread pool, call `.wait()` for result |
+| `io.concurrent(func, args)` | `!ConcurrentFuture(T)` | Run on the blocking thread pool, call `.@"await"(io)` for result |
 
 ## Shutdown and cleanup
 

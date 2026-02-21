@@ -148,6 +148,12 @@ pub fn Watch(comptime T: type) type {
             }
 
             /// Borrow the current value (read-only reference).
+            ///
+            /// WARNING: Not thread-safe. The returned pointer is not protected
+            /// by any lock. Only safe when no concurrent `send()` calls are
+            /// possible (e.g., single-writer scenarios or after the sender is
+            /// dropped). For thread-safe access, use `get()` which holds the
+            /// mutex, or `getAndUpdate()` which also marks the value as seen.
             pub fn borrow(self: *const Receiver) *const T {
                 return &self.watch.value;
             }

@@ -46,7 +46,7 @@ fn myApp(io: volt.Io) void {
 |---------|------|
 | Spawn + await | `var f = try io.@"async"(fn, .{args}); const result = f.@"await"(io);` |
 | Fire-and-forget | `_ = try io.@"async"(fn, .{args});` |
-| Blocking pool | `const h = try io.concurrent(fn, .{args}); const result = try h.wait();` |
+| Blocking pool | `var f = try io.concurrent(fn, .{args}); const result = try f.@"await"(io);` |
 | Group (structured) | `var g = volt.Group.init(io); _ = g.spawn(fn, .{args}); g.wait();` |
 | Cancel | `f.cancel(io);` or `g.cancel();` |
 
@@ -143,9 +143,10 @@ const d1 = volt.Duration.fromSecs(5);
 const d2 = volt.Duration.fromMillis(100);
 const d3 = volt.Duration.fromNanos(1000);
 
-// Async sleep (yields to scheduler)
-const sleep_f = volt.time.sleep(volt.Duration.fromSecs(1));
-_ = sleep_f; // poll to completion
+// Create a sleep (use with timer driver or poll manually)
+var slp = volt.time.sleep(volt.Duration.fromSecs(1));
+// For blocking contexts (non-async):
+volt.time.blockingSleep(volt.Duration.fromSecs(1));
 
 // Instant (monotonic clock)
 const start = volt.time.Instant.now();

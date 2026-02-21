@@ -173,21 +173,6 @@ pub fn build(b: *std.Build) void {
     const io_bench_step = b.step("bench-io", "Run TCP and timer benchmarks");
     io_bench_step.dependOn(&run_io_bench.step);
 
-    // MPMC test (temporary - for debugging scheduler wakeup bug)
-    const mpmc_mod = b.createModule(.{
-        .root_source_file = b.path("bench/mpmc_test.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    mpmc_mod.addImport("volt", volt_bench_mod);
-    const mpmc_exe = b.addExecutable(.{
-        .name = "mpmc_test",
-        .root_module = mpmc_mod,
-    });
-    const run_mpmc = b.addRunArtifact(mpmc_exe);
-    const mpmc_step = b.step("mpmc-test", "Run MPMC wakeup test");
-    mpmc_step.dependOn(&run_mpmc.step);
-
     // Comparison benchmark (Volt vs Tokio)
     const compare_mod = b.createModule(.{
         .root_source_file = b.path("bench/compare.zig"),
@@ -206,7 +191,7 @@ pub fn build(b: *std.Build) void {
 
     const run_compare = b.addRunArtifact(compare_exe);
     run_compare.step.dependOn(&install_compare.step);
-    run_compare.step.dependOn(&install_bench.step); // Ensure blitz_bench is built first
+    run_compare.step.dependOn(&install_bench.step); // Ensure volt_bench is built first
 
     const compare_step = b.step("compare", "Run Volt vs Tokio comparison benchmark");
     compare_step.dependOn(&run_compare.step);
