@@ -509,14 +509,19 @@ pub fn Channel(comptime T: type) type {
             // ensures tryRecv on another core sees this flag after we see empty buffer)
             self.has_send_waiters.store(true, .seq_cst);
 
-            // Re-check buffer: a receiver may have freed a slot
-            const retry = self.trySend(value);
+            // Re-check buffer: a receiver may have freed a slot.
+            // Use NoWake: we hold waiter_mutex, wakeOneRecvWaiter() would deadlock.
+            const retry = self.trySendNoWake(value);
             if (retry == .ok) {
                 // Clear flag if no other waiters
                 if (self.noSendWaiters()) {
                     self.has_send_waiters.store(false, .seq_cst);
                 }
                 self.waiter_mutex.unlock();
+                // Wake recv waiter outside mutex (Dekker protocol)
+                if (self.has_recv_waiters.load(.seq_cst)) {
+                    self.wakeOneRecvWaiter();
+                }
                 waiter.status.store(WAITER_COMPLETE, .release);
                 return true;
             }
@@ -558,12 +563,18 @@ pub fn Channel(comptime T: type) type {
             // Dekker: set flag BEFORE re-checking buffer
             self.has_send_waiters.store(true, .seq_cst);
 
-            const retry = self.trySend(value);
+            // Use NoWake variant: we hold waiter_mutex, and wakeOneRecvWaiter()
+            // would try to re-acquire it → deadlock. Wake after unlock instead.
+            const retry = self.trySendNoWake(value);
             if (retry == .ok) {
                 if (self.noSendWaiters()) {
                     self.has_send_waiters.store(false, .seq_cst);
                 }
                 self.waiter_mutex.unlock();
+                // Wake recv waiter outside mutex (Dekker protocol)
+                if (self.has_recv_waiters.load(.seq_cst)) {
+                    self.wakeOneRecvWaiter();
+                }
                 waiter.status.store(WAITER_COMPLETE, .release);
                 return true;
             }
@@ -738,14 +749,19 @@ pub fn Channel(comptime T: type) type {
             // ensures trySend on another core sees this flag after we see empty buffer)
             self.has_recv_waiters.store(true, .seq_cst);
 
-            // Re-check buffer: a sender may have added a value
-            const retry = self.tryRecv();
+            // Re-check buffer: a sender may have added a value.
+            // Use NoWake: we hold waiter_mutex, wakeOneSendWaiter() would deadlock.
+            const retry = self.tryRecvNoWake();
             switch (retry) {
                 .value => |v| {
                     if (self.noRecvWaiters()) {
                         self.has_recv_waiters.store(false, .seq_cst);
                     }
                     self.waiter_mutex.unlock();
+                    // Wake send waiter outside mutex (Dekker protocol)
+                    if (self.has_send_waiters.load(.seq_cst)) {
+                        self.wakeOneSendWaiter();
+                    }
                     waiter.status.store(WAITER_COMPLETE, .release);
                     return v;
                 },
@@ -793,13 +809,19 @@ pub fn Channel(comptime T: type) type {
             // Dekker: set flag BEFORE re-checking buffer
             self.has_recv_waiters.store(true, .seq_cst);
 
-            const retry = self.tryRecv();
+            // Use NoWake variant: we hold waiter_mutex, and wakeOneSendWaiter()
+            // would try to re-acquire it → deadlock. Wake after unlock instead.
+            const retry = self.tryRecvNoWake();
             switch (retry) {
                 .value => |v| {
                     if (self.noRecvWaiters()) {
                         self.has_recv_waiters.store(false, .seq_cst);
                     }
                     self.waiter_mutex.unlock();
+                    // Wake send waiter outside mutex (Dekker protocol)
+                    if (self.has_send_waiters.load(.seq_cst)) {
+                        self.wakeOneSendWaiter();
+                    }
                     waiter.status.store(WAITER_COMPLETE, .release);
                     return v;
                 },

@@ -98,6 +98,23 @@ pub fn build(b: *std.Build) void {
     concurrency_step.dependOn(&b.addRunArtifact(concurrency_tests).step);
 
     // ========================================================================
+    // Integration Tests (async Future/Poll/Waker through real scheduler)
+    // ========================================================================
+    const integration_step = b.step("test-integration", "Run async integration tests");
+
+    const integration_mod = b.createModule(.{
+        .root_source_file = b.path("tests/integration/all.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    integration_mod.addImport("volt", volt_mod);
+    integration_mod.addImport("test_config", test_config_mod);
+    integration_mod.addImport("common", common_mod);
+
+    const integration_tests = b.addTest(.{ .root_module = integration_mod });
+    integration_step.dependOn(&b.addRunArtifact(integration_tests).step);
+
+    // ========================================================================
     // All Tests
     // ========================================================================
     const test_all_step = b.step("test-all", "Run all tests");
@@ -105,6 +122,7 @@ pub fn build(b: *std.Build) void {
     test_all_step.dependOn(stress_step);
     test_all_step.dependOn(robustness_step);
     test_all_step.dependOn(concurrency_step);
+    test_all_step.dependOn(integration_step);
 
     // ========================================================================
     // Benchmarks

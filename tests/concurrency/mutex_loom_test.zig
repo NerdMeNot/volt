@@ -261,74 +261,77 @@ test "Mutex loom - cancel doesn't corrupt state" {
             _ = model;
             var mutex = Mutex.init();
 
-            var holder_done = Atomic(bool).init(false);
-            var waiter_queued = Atomic(bool).init(false);
+            // Main thread grabs the lock BEFORE spawning threads.
+            // This is single-threaded here, so tryLock is guaranteed to succeed.
+            testing.expect(mutex.tryLock()) catch unreachable;
+
+            var canceller_queued = Atomic(bool).init(false);
 
             const TestWaker = struct {
                 fn wake(_: *anyopaque) void {}
             };
 
-            var threads: [3]std.Thread = undefined;
+            var threads: [2]std.Thread = undefined;
             var spawned: usize = 0;
 
-            // Holder thread
+            // Canceller thread: queues as waiter, signals ready, then cancels.
+            // lockWait must return false (lock is held by main), so waiter IS queued.
             threads[0] = std.Thread.spawn(.{}, struct {
-                fn run(m: *Mutex, done: *Atomic(bool), queued: *Atomic(bool)) void {
-                    _ = m.tryLock();
-                    // Wait for waiter to queue
-                    while (!queued.load(.acquire)) {
-                        std.Thread.yield() catch {};
-                    }
-                    std.Thread.yield() catch {};
-                    m.unlock();
-                    done.store(true, .release);
+                fn run(m: *Mutex, queued: *Atomic(bool)) void {
+                    var waiter = Waiter.initWithWaker(undefined, TestWaker.wake);
+                    const acquired = m.lockWait(&waiter);
+                    // Lock is held by main → must be queued, not acquired
+                    std.debug.assert(!acquired);
+                    // Signal that we're on the wait queue
+                    queued.store(true, .release);
+                    // Cancel our pending acquisition
+                    m.cancelLock(&waiter);
                 }
-            }.run, .{ &mutex, &holder_done, &waiter_queued }) catch {
+            }.run, .{ &mutex, &canceller_queued }) catch {
+                mutex.unlock();
                 return;
             };
             spawned += 1;
 
-            // Waiter that cancels
+            // Normal waiter: queues and waits for lock grant.
             threads[1] = std.Thread.spawn(.{}, struct {
-                fn run(m: *Mutex, queued: *Atomic(bool)) void {
+                fn run(m: *Mutex) void {
                     var waiter = Waiter.initWithWaker(undefined, TestWaker.wake);
-                    _ = m.lockWait(&waiter);
-                    queued.store(true, .release);
-                    // Cancel immediately
-                    m.cancelLock(&waiter);
+                    if (!m.lockWait(&waiter)) {
+                        // Queued — spin until granted
+                        while (!waiter.isAcquired()) {
+                            std.Thread.yield() catch {};
+                        }
+                    }
+                    // We hold the lock — release it
+                    m.unlock();
                 }
-            }.run, .{ &mutex, &waiter_queued }) catch {
+            }.run, .{&mutex}) catch {
+                // If spawn fails, still need to unlock so canceller can finish
+                while (!canceller_queued.load(.acquire)) {
+                    std.Thread.yield() catch {};
+                }
+                mutex.unlock();
                 threads[0].join();
                 return;
             };
             spawned += 1;
 
-            // Normal waiter
-            threads[2] = std.Thread.spawn(.{}, struct {
-                fn run(m: *Mutex, done: *Atomic(bool)) void {
-                    var waiter = Waiter.initWithWaker(undefined, TestWaker.wake);
-                    if (!m.lockWait(&waiter)) {
-                        while (!waiter.isAcquired() and !done.load(.acquire)) {
-                            std.Thread.yield() catch {};
-                        }
-                    }
-                    if (waiter.isAcquired()) {
-                        m.unlock();
-                    }
-                }
-            }.run, .{ &mutex, &holder_done }) catch {
-                for (threads[0..spawned]) |t| {
-                    t.join();
-                }
-                return;
-            };
-            spawned += 1;
+            // Wait for the canceller to be queued before unlocking.
+            // The flag is set AFTER lockWait returns false (waiter is on queue).
+            while (!canceller_queued.load(.acquire)) {
+                std.Thread.yield() catch {};
+            }
+
+            // Unlock: canceller already cancelled (or will cancel), so the
+            // normal waiter should receive the lock grant.
+            mutex.unlock();
 
             for (threads[0..spawned]) |t| {
                 t.join();
             }
 
-            // Final state should be unlocked
+            // Final state: both threads done, mutex should be unlocked
             try testing.expect(!mutex.isLocked());
         }
     }.run);
