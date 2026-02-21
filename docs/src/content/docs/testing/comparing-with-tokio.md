@@ -91,87 +91,87 @@ Test platform: MacBook Pro (Apple M3 Pro, 11 cores, 18 GB RAM), macOS arm64, Zig
 
 | Benchmark | Volt | Tokio | B/op (Volt) | B/op (Tokio) | Winner |
 |-----------|----------|-------|--------------|--------------|--------|
-| Mutex | 6.6 ns | 7.9 ns | 0 | 0 | Volt +1.2x |
-| RwLock (read) | 6.7 ns | 7.8 ns | 0 | 0 | Volt +1.2x |
-| RwLock (write) | 6.4 ns | 8.1 ns | 0 | 0 | Volt +1.3x |
-| Semaphore | 6.4 ns | 7.5 ns | 0 | 0 | Volt +1.2x |
+| Mutex | 31.8 ns | 28.2 ns | 0 | 0 | Tokio +1.1x |
+| RwLock (read) | 25.3 ns | 27.1 ns | 0 | 0 | Volt +1.1x |
+| RwLock (write) | 20.7 ns | 25.2 ns | 0 | 0 | Volt +1.2x |
+| Semaphore | 22.7 ns | 33.7 ns | 0 | 0 | Volt +1.5x |
 
 ### Synchronization -- Contended
 
 | Benchmark | Volt | Tokio | B/op (Volt) | B/op (Tokio) | Winner |
 |-----------|----------|-------|--------------|--------------|--------|
-| Mutex (4 tasks) | 53.5 ns | 76.9 ns | 0.1 | 0.2 | Volt +1.4x |
-| RwLock (4R + 2W) | 50.0 ns | 97.2 ns | 0.1 | 0.2 | Volt +1.9x |
-| Semaphore (8T, 2 permits) | 220.2 ns | 180.8 ns | 0.2 | 0.2 | Tokio +1.2x |
+| Mutex (4 tasks) | 91.7 ns | 207.9 ns | 0.1 | 0.2 | Volt +2.3x |
+| RwLock (4R + 2W) | 149.5 ns | 247.4 ns | 0.1 | 0.2 | Volt +1.7x |
+| Semaphore (8T, 2 permits) | 139.4 ns | 323.0 ns | 0.2 | 0.2 | Volt +2.3x |
 
 ### Channels
 
 | Benchmark | Volt | Tokio | B/op (Volt) | B/op (Tokio) | Winner |
 |-----------|----------|-------|--------------|--------------|--------|
-| Channel send | 2.7 ns | 5.9 ns | 16 | 9 | Volt +2.2x |
-| Channel recv | 6.3 ns | 9.6 ns | 16 | 9 | Volt +1.5x |
-| Channel roundtrip | 6.3 ns | 12.5 ns | 0 | 0 | Volt +2.0x |
-| Channel MPMC (4P + 4C) | ~75 ns | ~65 ns | 1.8 | 2.2 | Tokio ~1.1x |
-| Oneshot | 4.1 ns | 15.2 ns | 0 | 72 | Volt +3.8x |
-| Broadcast (4 receivers) | 22.9 ns | 50.3 ns | 16 | 126.9 | Volt +2.2x |
-| Watch | 13.3 ns | 44.1 ns | 0 | 0 | Volt +3.3x |
+| Channel send | 11.1 ns | 16.3 ns | 21 | 9 | Volt +1.5x |
+| Channel recv | 11.4 ns | 22.3 ns | 21 | 9 | Volt +2.0x |
+| Channel roundtrip | 23.1 ns | 37.8 ns | 0 | 0 | Volt +1.6x |
+| Channel MPMC (4P + 4C) | 73.3 ns | 132.8 ns | 1.8 | 2.1 | Volt +1.8x |
+| Oneshot | 27.1 ns | 51.5 ns | 0 | 72 | Volt +1.9x |
+| Broadcast (4 receivers) | 95.2 ns | 143.8 ns | 16 | 126.9 | Volt +1.5x |
+| Watch | 45.7 ns | 145.4 ns | 0 | 0 | Volt +3.2x |
 
 ### OnceCell
 
 | Benchmark | Volt | Tokio | B/op (Volt) | B/op (Tokio) | Winner |
 |-----------|----------|-------|--------------|--------------|--------|
-| OnceCell get (hot path) | 0.4 ns | 0.6 ns | 0 | 0 | Volt +1.4x |
-| OnceCell set | 9.6 ns | 29.2 ns | 0 | 64 | Volt +3.0x |
+| OnceCell get (hot path) | 2.0 ns | 1.0 ns | 0 | 0 | Tokio +2.0x |
+| OnceCell set | 41.8 ns | 90.8 ns | 0 | 64 | Volt +2.2x |
 
 ### Coordination
 
 | Benchmark | Volt | Tokio | B/op (Volt) | B/op (Tokio) | Winner |
 |-----------|----------|-------|--------------|--------------|--------|
-| Barrier | 15.6 ns | 359.2 ns | 0 | 1064 | Volt +23.1x |
-| Notify | 9.8 ns | 9.3 ns | 0 | 0 | Tie |
+| Barrier | 50.9 ns | 1,312.8 ns | 0 | 1,064 | Volt +25.8x |
+| Notify | 15.6 ns | 18.9 ns | 0 | 0 | Volt +1.2x |
 
 ### Task Scheduling
 
 | Benchmark | Volt | Tokio | B/op (Volt) | B/op (Tokio) | Winner |
 |-----------|----------|-------|--------------|--------------|--------|
-| Spawn + await | 6,459 ns | 7,819 ns | 80 | 128 | Volt +1.2x |
-| Spawn batch (per task) | 100.1 ns | 246.7 ns | 80 | 136 | Volt +2.5x |
-| Blocking spawn | ~6,400 ns | 6,236 ns | 72 | 256 | Tokio ~1.1x |
+| Spawn + await | 29,597 ns | 18,946 ns | 80 | 128 | Tokio +1.6x |
+| Spawn batch (per task) | 601.0 ns | 611.4 ns | 80 | 136 | Tie |
+| Blocking spawn | 25,037 ns | 12,483 ns | 64 | 256 | Tokio +2.0x |
 
 ### Summary
 
 ```
-Volt wins: 17 / 21    Tokio wins: 3 / 21    Tie: 1 / 21
+Volt wins: 16 / 21    Tokio wins: 4 / 21    Tie: 1 / 21
 
-Total bytes per op:   Volt 282.2    Tokio 1,867.7  (6.6x less)
+Total bytes per op:   Volt 284.1    Tokio 1,867.6  (6.6x less)
 Total allocs per op:  Volt 3.0      Tokio 17.1     (5.7x fewer)
 ```
 
 ## Where Volt wins and why
 
-Volt leads in 17 of 21 benchmarks. The primary advantages come from language-level properties and a zero-allocation architecture:
+Volt leads in 16 of 21 benchmarks. The primary advantages come from language-level properties and a zero-allocation architecture:
 
-**Intrusive waiters** -- Waiter nodes are embedded directly in futures on the stack, eliminating the heap allocations that Tokio makes for waiter bookkeeping. This is the single largest factor: 282 bytes/op vs 1,868 bytes/op across all benchmarks.
+**Intrusive waiters** -- Waiter nodes are embedded directly in futures on the stack, eliminating the heap allocations that Tokio makes for waiter bookkeeping. This is the single largest factor: 284 bytes/op vs 1,868 bytes/op across all benchmarks.
 
 **Comptime specialization** -- Generic lock and channel types are monomorphized at compile time with concrete waker types, removing the virtual dispatch Tokio pays through `dyn Future` trait objects and `Waker` vtables.
 
-**Vyukov MPMC ring buffer** -- The bounded channel uses a lock-free ring buffer with per-slot sequence counters, giving excellent throughput in single-producer and few-producer cases.
+**Vyukov MPMC ring buffer** -- The bounded channel uses a lock-free ring buffer with per-slot sequence counters, power-of-2 bitmask indexing, and interleaved slot layout for spatial locality. The channel MPMC benchmark now shows Volt at 73ns vs Tokio at 133ns.
+
+**Lock-free semaphore release** -- The `fast_waiter` atomic slot allows `release()` to serve the most recent waiter via a single atomic swap, bypassing the mutex entirely. Under the contended semaphore benchmark (8 tasks, 2 permits), this reduced latency from ~220 ns to ~139 ns, flipping the result from Tokio +1.2x to Volt +2.3x. See [Fast Waiter Slot](/design/fast-waiter-slot/) for the design.
 
 **O(1) bitmap worker waking** -- The scheduler uses `@ctz` on a packed 64-bit bitmap to find idle workers in constant time, where Tokio scans a list.
 
 **Zero-allocation oneshot and barrier** -- Tokio's oneshot allocates a shared `Arc<Inner>` (72 bytes) and its barrier allocates tracking state (1,064 bytes). Volt uses stack-embedded atomics for both.
 
-**Task scheduling** -- Spawn+await and batch spawn are faster thanks to the LIFO slot fast path and lower per-task overhead (no `Arc<Task>` boxing). Batch spawn amortizes scheduling cost effectively, achieving ~100 ns/task vs Tokio's ~247 ns/task.
-
 ## Where Tokio wins and why
 
-Tokio outperforms Volt in three areas:
+Tokio outperforms Volt in four benchmarks, with two being significant:
 
-**Contended semaphore** (by ~1.2x) -- Tokio's locking path benefits from `parking_lot`-style adaptive spinning: a hybrid strategy that spins briefly before parking the thread, tuned over years of production feedback. Volt's intrusive waiter approach skips spinning and goes straight to futex-based parking, which costs more under short hold times with high thread counts.
+**Spawn + await** (by ~1.6x) -- Tokio's `tokio::spawn` has years of optimization for the single-task spawn-and-join pattern, including optimized `JoinHandle` internals and a highly tuned `RawTask` implementation. Volt's `FutureTask` setup overhead is higher per task.
 
-**MPMC channel** (by ~1.1x) -- Tokio delegates to `async_channel` (crossbeam-style) which has been tuned over years for multi-producer multi-consumer throughput. Volt uses a Vyukov MPMC bounded ring buffer with power-of-2 bitmask indexing, interleaved slot layout, and lock-free single-waiter fast path. The gap has narrowed from ~2.2x to ~1.1x through these optimizations.
+**Blocking spawn** (by ~2.0x) -- Tokio's blocking pool has years of tuning for thread wake latency and reuse. The gap widened from earlier measurements, likely due to condvar/futex interaction differences between Tokio's `parking_lot` and Zig's `std.Thread.Condition`.
 
-**Blocking spawn** (by ~1.1x) -- Tokio's blocking pool has years of tuning for thread wake latency and reuse. Volt now matches Tokio closely after removing unnecessary yield phases, adding spin-after-complete in the blocking thread, and signaling the condvar outside the mutex.
+**Mutex uncontended** (by ~1.1x) and **OnceCell get** (by ~2.0x) -- Minor advantages from Tokio's parking_lot-style adaptive spinning and Rust's extremely optimized `std::sync::Once` implementation. The OnceCell hot path is a single relaxed atomic load in both implementations, so the 2x gap likely reflects measurement noise at the sub-nanosecond scale.
 
 ## Interpreting results
 

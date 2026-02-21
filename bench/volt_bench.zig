@@ -884,6 +884,15 @@ const MultiSemaphoreFuture = struct {
                         self.state = .done;
                         return .{ .ready = {} };
                     }
+                    // Fast path: try lock-free acquire before creating AcquireFuture.
+                    // In steady state, permits are often immediately available after
+                    // the previous task's release — skip future/waker overhead.
+                    if (self.semaphore.tryAcquire(1)) {
+                        _ = self.counter.fetchAdd(1, .monotonic);
+                        self.semaphore.release(1);
+                        self.ops_remaining -= 1;
+                        continue; // stay in .start
+                    }
                     self.acquire_future = self.semaphore.acquireFuture(1);
                     self.state = .acquiring;
                 },

@@ -1,5 +1,9 @@
 <p align="center">
-  <strong>Volt</strong>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/src/assets/logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/src/assets/logo-light.png">
+    <img alt="Volt" src="docs/src/assets/logo-dark.png" height="80">
+  </picture>
 </p>
 
 <p align="center">
@@ -9,6 +13,7 @@
 <p align="center">
   <a href="https://github.com/NerdMeNot/volt/actions/workflows/ci.yml"><img src="https://github.com/NerdMeNot/volt/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
+  <a href="https://volt.nerdmenot.in"><img src="https://img.shields.io/badge/docs-volt.nerdmenot.in-blue" alt="Docs"></a>
 </p>
 
 Volt is an async I/O runtime for Zig. It provides a work-stealing task scheduler, synchronization primitives, channels, networking, filesystem, timers, and process management -- everything you need to build concurrent servers and services.
@@ -18,7 +23,7 @@ Volt follows the architecture of [Tokio](https://tokio.rs/), adapted for Zig's v
 - **Work-stealing scheduler**: LIFO slot + local ring buffer + global injection, cooperative budgeting (128 polls/tick), O(1) bitmap worker waking
 - **Cross-platform I/O**: io_uring (Linux), kqueue (macOS), IOCP (Windows), epoll (fallback) -- auto-detected at startup
 - **Zero-allocation primitives**: Mutex, RwLock, Semaphore, Barrier, Notify, OnceCell -- intrusive waiters embedded in futures, no heap per wait
-- **Lock-free channels**: MPSC/MPMC (Vyukov ring buffer), Oneshot, Broadcast, Watch, Select -- 48 B/op total vs 217 B/op (Tokio) across channel benchmarks
+- **Lock-free channels**: MPSC/MPMC (Vyukov ring buffer), Oneshot, Broadcast, Watch, Select -- 284 B/op total vs 1,868 B/op (Tokio) across all benchmarks
 
 ```zig
 const volt = @import("volt");
@@ -62,6 +67,7 @@ fn echo(stream: volt.net.TcpStream) void {
 - [Architecture](#architecture)
 - [Best Practices](#best-practices)
 - [Limitations](#limitations)
+- [Documentation](#documentation)
 - [Acknowledgments](#acknowledgments)
 
 ## Installation
@@ -328,59 +334,49 @@ const elapsed = start.elapsed();
 
 ## Performance
 
-Benchmarks on Apple M3 Pro, comparing Volt to Tokio (Rust). All measurements in nanoseconds per operation, 4 worker threads.
+Benchmarks on Apple M3 Pro, comparing Volt to Tokio (Rust). All measurements: median of 10 iterations, 5 warmup discarded, 4 worker threads. Run `zig build compare` to reproduce.
 
-### Uncontended Synchronization
+### Synchronization
 
-| Benchmark | Volt (ns) | Tokio (ns) | Winner |
-|-----------|-----------|------------|--------|
-| Mutex | 6.6 | 7.9 | Volt +1.2x |
-| RwLock (read) | 6.7 | 7.8 | Volt +1.2x |
-| RwLock (write) | 6.4 | 8.1 | Volt +1.3x |
-| Semaphore | 6.4 | 7.5 | Volt +1.2x |
+| Benchmark | Volt | Tokio | Winner |
+|-----------|------|-------|--------|
+| Mutex (uncontended) | 31.8 ns | 28.2 ns | Tokio +1.1x |
+| RwLock read (uncontended) | 25.3 ns | 27.1 ns | Volt +1.1x |
+| RwLock write (uncontended) | 20.7 ns | 25.2 ns | Volt +1.2x |
+| Semaphore (uncontended) | 22.7 ns | 33.7 ns | Volt +1.5x |
+| Mutex (4 tasks) | 91.7 ns | 207.9 ns | Volt +2.3x |
+| RwLock (4R + 2W) | 149.5 ns | 247.4 ns | Volt +1.7x |
+| Semaphore (8T, 2 permits) | 139.4 ns | 323.0 ns | Volt +2.3x |
 
 ### Channels
 
-| Benchmark | Volt (ns) | Tokio (ns) | Winner |
-|-----------|-----------|------------|--------|
-| Channel send | 2.7 | 5.9 | Volt +2.2x |
-| Channel recv | 6.3 | 9.6 | Volt +1.5x |
-| Channel roundtrip | 6.3 | 12.5 | Volt +2.0x |
-| Oneshot | 4.1 | 15.2 | Volt +3.8x |
-| Broadcast (4 recv) | 22.9 | 50.3 | Volt +2.2x |
-| Watch | 13.3 | 44.1 | Volt +3.3x |
+| Benchmark | Volt | Tokio | Winner |
+|-----------|------|-------|--------|
+| Channel send | 11.1 ns | 16.3 ns | Volt +1.5x |
+| Channel recv | 11.4 ns | 22.3 ns | Volt +2.0x |
+| Channel roundtrip | 23.1 ns | 37.8 ns | Volt +1.6x |
+| MPMC (4P + 4C) | 73.3 ns | 132.8 ns | Volt +1.8x |
+| Oneshot | 27.1 ns | 51.5 ns | Volt +1.9x |
+| Broadcast (4 recv) | 95.2 ns | 143.8 ns | Volt +1.5x |
+| Watch | 45.7 ns | 145.4 ns | Volt +3.2x |
 
-### Coordination
+### Coordination and Scheduling
 
-| Benchmark | Volt (ns) | Tokio (ns) | Winner |
-|-----------|-----------|------------|--------|
-| OnceCell get | 0.4 | 0.6 | Volt +1.4x |
-| OnceCell set | 9.6 | 29.2 | Volt +3.0x |
-| Barrier | 15.6 | 359.2 | Volt +23.1x |
-| Notify | 9.8 | 9.3 | Tie |
-
-### Contended (Async, Multi-Task)
-
-| Benchmark | Volt (ns) | Tokio (ns) | Winner |
-|-----------|-----------|------------|--------|
-| Mutex (4 tasks) | 53.5 | 76.9 | Volt +1.4x |
-| RwLock (4R + 2W) | 50.0 | 97.2 | Volt +1.9x |
-| Semaphore (8T, 2 permits) | 220.2 | 180.8 | Tokio +1.2x |
-| Channel MPMC (4P + 4C) | 113.7 | 50.6 | Tokio +2.2x |
-
-### Task Scheduling
-
-| Benchmark | Volt (ns) | Tokio (ns) | Winner |
-|-----------|-----------|------------|--------|
-| Spawn + await (noop) | 6,459 | 7,819 | Volt +1.2x |
-| Spawn batch (100) | 100.1 | 246.7 | Volt +2.5x |
-| Blocking spawn + wait | 13,865 | 6,236 | Tokio +2.2x |
+| Benchmark | Volt | Tokio | Winner |
+|-----------|------|-------|--------|
+| OnceCell get | 2.0 ns | 1.0 ns | Tokio +2.0x |
+| OnceCell set | 41.8 ns | 90.8 ns | Volt +2.2x |
+| Barrier | 50.9 ns | 1,312.8 ns | Volt +25.8x |
+| Notify | 15.6 ns | 18.9 ns | Volt +1.2x |
+| Spawn + await | 29,597 ns | 18,946 ns | Tokio +1.6x |
+| Spawn batch (per task) | 601.0 ns | 611.4 ns | Tie |
+| Blocking spawn | 25,037 ns | 12,483 ns | Tokio +2.0x |
 
 ### Summary
 
-**Volt wins 17/21 benchmarks, Tokio wins 3/21, 1 tie.**
+**Volt wins 16/21 benchmarks, Tokio wins 4/21, 1 tie.**
 
-Memory: Volt **282 B/op** total vs Tokio's **1,868 B/op** -- 6.6x less. See [BENCHMARKS.md](BENCHMARKS.md) for full analysis.
+Memory: Volt **284 B/op** total vs Tokio's **1,868 B/op** -- 6.6x less allocation overhead. See [BENCHMARKS.md](BENCHMARKS.md) for full analysis.
 
 ## Architecture
 
@@ -522,7 +518,7 @@ switch (ch.trySend(item)) {
 
 5. **Single runtime per process**: The runtime uses thread-local state. Running multiple `Runtime` instances concurrently is not supported.
 
-6. **Contended semaphore, MPMC, and blocking pool**: Tokio's contended semaphore (1.2x), MPMC channel (2.2x), and blocking pool spawn (2.2x) are faster due to adaptive spinning, crossbeam-style segmented queues, and years of thread pool tuning respectively.
+6. **Task scheduling overhead**: Tokio's spawn + await (1.6x) and blocking pool spawn (2.0x) are faster due to years of `RawTask` optimization and thread pool tuning respectively.
 
 ### Platform-Specific Notes
 
@@ -532,8 +528,9 @@ switch (ch.trySend(item)) {
 
 ## Documentation
 
-- Source-level documentation: every public module has doc comments with usage examples
-- Tests: `zig build test-all` runs all test suites (588+ unit, 83 concurrency, 35+ robustness)
+- **Website**: [volt.nerdmenot.in](https://volt.nerdmenot.in) -- guides, API reference, cookbook, architecture internals
+- **Benchmarks**: [BENCHMARKS.md](BENCHMARKS.md) -- full Volt vs Tokio comparison with analysis
+- **Tests**: `zig build test-all` runs all test suites (588+ unit, 83 concurrency, 35+ robustness)
 
 ## Contributing
 
@@ -543,6 +540,7 @@ Contributions are welcome. Please read [CLAUDE.md](CLAUDE.md) for development gu
 zig build test         # Unit tests
 zig build test-stress  # Stress tests (real threads)
 zig build test-all     # Everything
+zig build compare      # Volt vs Tokio benchmark comparison
 ```
 
 ## License
@@ -553,7 +551,7 @@ Apache 2.0. See [LICENSE](LICENSE).
 
 Volt would not exist without the work of the teams and individuals behind these projects:
 
-- [Tokio](https://github.com/tokio-rs/tokio) -- Volt's architecture is directly derived from Tokio's. The work-stealing scheduler, the ScheduledIo state machine, the sync primitive designs, cooperative budgeting, and the task state protocol were all learned by studying Tokio's source code and documentation. Where Volt is fast, it's because Tokio's team figured out the right architecture first and we applied it in a language with different tradeoffs. Where Tokio is faster (contended semaphore, MPMC, blocking pool), it's because of years of production tuning we haven't done yet. Thank you to the Tokio team for building the runtime that showed us how async I/O should work.
+- [Tokio](https://github.com/tokio-rs/tokio) -- Volt's architecture is inspired by Tokio's. The work-stealing scheduler, the sync primitive designs, cooperative budgeting, and the task state protocol were all informed by studying Tokio's source code and documentation. Where Volt is fast, it's because Tokio's team figured out the right architecture first and we applied it in a language with different tradeoffs. Where Tokio is faster (task scheduling, blocking pool), it's because of years of production tuning we haven't done yet. Thank you to the Tokio team for building the runtime that showed us how async I/O should work.
 - [Mio](https://github.com/tokio-rs/mio) -- Platform I/O abstraction that informed our backend implementations.
 - [Crossbeam](https://github.com/crossbeam-rs/crossbeam) -- Lock-free channel designs and the epoch-based memory reclamation patterns.
 - [parking_lot](https://github.com/Amanieu/parking_lot) -- Adaptive locking strategies that inspired our contention handling.

@@ -62,6 +62,40 @@ Volt is a production-grade async I/O runtime for Zig, modeled after Tokio's batt
 +=====================================================================+
 ```
 
+```mermaid
+graph TD
+    subgraph User["User Application"]
+        A["volt.run / io.async / io.concurrent"]
+    end
+    subgraph API["User-Facing API"]
+        B["Io · Future · Group · sync.*\nchannel.* · net.* · time.* · fs.*\nsignal · process · stream · shutdown"]
+    end
+    subgraph Engine["Engine Internals"]
+        C["task.* · future.* · async_ops.*\nTimeout · Select · Join · Race · FutureTask"]
+    end
+    subgraph Runtime["Runtime Layer"]
+        D["Work-Stealing\nScheduler"]
+        E["I/O Driver"]
+        F["Timer Wheel"]
+        G["Blocking Pool"]
+    end
+    subgraph Platform["Platform Backends"]
+        H["io_uring\nLinux 5.1+"]
+        I["kqueue\nmacOS"]
+        J["IOCP\nWindows"]
+        K["epoll\nLinux"]
+    end
+
+    User --> API --> Engine --> Runtime
+    Runtime --> Platform
+
+    style User fill:#1e40af,color:#fff
+    style API fill:#1e3a5f,color:#fff
+    style Engine fill:#1e3a5f,color:#fff
+    style Runtime fill:#1e3a5f,color:#fff
+    style Platform fill:#374151,color:#fff
+```
+
 ## Key components
 
 ### Runtime (`src/runtime.zig`)
@@ -139,6 +173,19 @@ Volt uses three categories of threads:
 |  - CPU-intensive or blocking I/O           |
 |  - 10s idle timeout, auto-shrink           |
 +--------------------------------------------+
+```
+
+```mermaid
+graph LR
+    subgraph Workers["Worker Threads (N = CPU count)"]
+        W1["Scheduler loop\nPoll futures\nPoll I/O\nPoll timers"]
+    end
+    subgraph Blocking["Blocking Pool (0–512)"]
+        B1["On-demand spawn\nCPU / blocking I/O\n10s idle timeout"]
+    end
+
+    Workers -.- |"work-stealing"| Workers
+    Workers --> |"spawnBlocking"| Blocking
 ```
 
 Worker threads are created during `Io.init()` and run until `deinit()`. Blocking pool threads are created dynamically when `concurrent()` is called and no idle thread is available.

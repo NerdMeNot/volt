@@ -31,6 +31,21 @@ The blocking pool provides dedicated threads for this kind of work. Each blockin
 +--------------------------------------------------+
 ```
 
+```mermaid
+graph TD
+    S["submit(task)"] --> Q["Task Queue"]
+    Q --> |idle thread exists| W["Wake idle thread"]
+    Q --> |no idle, under cap| N["Spawn new thread"]
+    Q --> |at cap| P["Wait in queue"]
+    W --> E["Execute task"]
+    N --> E
+    P --> E
+
+    style S fill:#3b82f6,color:#fff
+    style E fill:#22c55e,color:#000
+    style Q fill:#6b7280,color:#fff
+```
+
 ### Key properties
 
 - **Dynamic scaling**: Threads spawn on demand, up to a configurable cap (default: 512).
@@ -119,6 +134,15 @@ Spawn
       +-- timeout (10s) --> Exit thread
       |
       +-- shutdown --> Exit thread
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Waiting : spawn
+    Waiting --> Executing : task available
+    Executing --> Waiting : task done, drain queue
+    Waiting --> [*] : timeout (10s)
+    Waiting --> [*] : shutdown
 ```
 
 ### Idle timeout

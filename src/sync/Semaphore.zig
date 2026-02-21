@@ -164,13 +164,26 @@ const WaiterList = LinkedList(Waiter, "pointers");
 ///
 /// Batch semaphore with direct-handoff:
 /// - tryAcquire: lock-free CAS (no mutex)
-/// - release: always takes mutex, serves waiters directly
+/// - release: lock-free fast_waiter slot for single-waiter case, mutex slow path
 /// - acquireWait: lock-free fast path, mutex-before-CAS slow path
 pub const Semaphore = struct {
-    /// Currently available permits (only modified under mutex OR via CAS)
-    permits: std.atomic.Value(usize),
+    /// Currently available permits (only modified under mutex OR via CAS).
+    /// Cache-line aligned to avoid false sharing with mutex/waiters under
+    /// contention — permits is CAS'd by every tryAcquire on the fast path.
+    permits: std.atomic.Value(usize) align(std.atomic.cache_line),
 
-    /// Mutex protecting the waiters list. Taken by release() and
+    /// Atomic single-waiter fast slot for lock-free release.
+    /// Value: 0 = empty, non-zero = pointer to Waiter.
+    /// Registration: CAS 0→ptr under mutex (in acquireWaitDirect).
+    /// Wake: swap to 0 in release() before taking mutex (lock-free).
+    ///
+    /// NOT the same as the has_waiters flag that deadlocked (see MEMORY.md).
+    /// That checked a flag to skip mutex — permits floated in the atomic
+    /// while a waiter was queued. fast_waiter atomically CONSUMES a waiter
+    /// pointer via swap, handing permits directly without the atomic counter.
+    fast_waiter: std.atomic.Value(usize),
+
+    /// Mutex protecting the waiters list. Taken by release() slow path and
     /// acquireWait()'s slow path. NOT taken by tryAcquire().
     mutex: std.Thread.Mutex,
 
@@ -183,6 +196,7 @@ pub const Semaphore = struct {
     pub fn init(permits: usize) Self {
         return .{
             .permits = std.atomic.Value(usize).init(permits),
+            .fast_waiter = std.atomic.Value(usize).init(0),
             .mutex = .{},
             .waiters = .{},
         };
@@ -276,25 +290,125 @@ pub const Semaphore = struct {
         return false;
     }
 
-    /// Release permits back to the semaphore.
+    /// Like acquireWait() but skips the lock-free CAS fast path.
+    /// Used by AcquireFuture.poll(.init) which already called tryAcquire()
+    /// and failed — repeating the CAS is wasteful since it almost never
+    /// succeeds nanoseconds after tryAcquire() just failed.
     ///
-    /// ALWAYS takes the mutex to check for waiters. This ensures no race
-    /// between release() adding permits and acquireWait() queueing a waiter.
-    /// If no waiters, surplus goes to atomic. If waiters, serves them directly.
-    pub fn release(self: *Self, num: usize) void {
-        if (num == 0) return;
+    /// Goes straight to mutex + CAS-under-lock + queue.
+    fn acquireWaitDirect(self: *Self, waiter: *Waiter) bool {
+        const needed = waiter.state.load(.acquire);
 
         self.mutex.lock();
 
-        // Check for waiters under lock
+        // Under lock: CAS to drain available permits.
+        // tryAcquire() is lock-free, so permits can change concurrently.
+        var acquired: usize = 0;
+        var curr = self.permits.load(.acquire);
+        while (acquired < needed and curr > 0) {
+            const take = @min(curr, needed - acquired);
+            if (self.permits.cmpxchgWeak(curr, curr - take, .acq_rel, .acquire)) |updated| {
+                curr = updated;
+                continue;
+            }
+            acquired += take;
+            curr = self.permits.load(.acquire);
+        }
+
+        if (acquired >= needed) {
+            waiter.state.store(0, .release);
+            self.mutex.unlock();
+            return true;
+        }
+
+        // Partially fulfilled — update waiter state
+        if (acquired > 0) {
+            var rem = acquired;
+            _ = waiter.assignPermits(&rem);
+        }
+
+        // Try single-waiter fast slot (avoids mutex on wake path)
+        if (self.fast_waiter.cmpxchgStrong(0, @intFromPtr(waiter), .release, .monotonic) == null) {
+            self.mutex.unlock();
+            return false;
+        }
+
+        // Fast slot occupied — fall back to linked list
+        self.waiters.pushFront(waiter);
+
+        self.mutex.unlock();
+        return false;
+    }
+
+    /// Release permits back to the semaphore.
+    ///
+    /// Fast path: try to serve the fast_waiter slot lock-free (no mutex).
+    /// Slow path: takes mutex, serves linked-list waiters directly.
+    pub fn release(self: *Self, num: usize) void {
+        if (num == 0) return;
+
+        // Fast path: try to serve fast_waiter without mutex.
+        // In the common case (8 tasks, 2 permits), most releases find
+        // exactly 1 waiter — serve it entirely through the atomic slot.
+        const fast_ptr = self.fast_waiter.swap(0, .acq_rel);
+        if (fast_ptr != 0) {
+            const w: *Waiter = @ptrFromInt(fast_ptr);
+            // CRITICAL: Copy waker info BEFORE modifying state to avoid
+            // use-after-free (AcquireFuture may deinit after isComplete).
+            const waker_fn = w.waker;
+            const waker_ctx = w.waker_ctx;
+            const remaining = w.state.load(.monotonic);
+
+            if (num >= remaining) {
+                // Fully satisfy the waiter
+                w.state.store(0, .release);
+                const surplus = num - remaining;
+                if (surplus > 0) {
+                    // Surplus permits: check for more waiters under mutex
+                    self.releaseSurplus(surplus);
+                }
+                // Wake AFTER state is visible
+                if (waker_fn) |wf| if (waker_ctx) |ctx| wf(ctx);
+                return;
+            }
+
+            // Partial: assign what we can, put waiter back
+            w.state.store(remaining - num, .release);
+            // Try fast slot first (common: slot is still empty since we just swapped)
+            if (self.fast_waiter.cmpxchgStrong(0, @intFromPtr(w), .release, .monotonic) == null) {
+                return; // Back in fast slot, no wake needed (still waiting)
+            }
+            // Fast slot taken by new waiter — push to list under mutex
+            self.mutex.lock();
+            self.waiters.pushFront(w);
+            self.mutex.unlock();
+            return;
+        }
+
+        // Slow path: no fast_waiter, take mutex
+        self.mutex.lock();
+
+        // Check for list waiters under lock
         if (self.waiters.back() == null) {
             _ = self.permits.fetchAdd(num, .release);
             self.mutex.unlock();
             return;
         }
 
-        // Serve queued waiters
+        // Serve queued waiters from the linked list
         self.releaseToWaiters(num);
+    }
+
+    /// Release surplus permits after serving the fast_waiter.
+    /// Checks for more waiters under mutex, or adds to atomic.
+    fn releaseSurplus(self: *Self, surplus: usize) void {
+        self.mutex.lock();
+        if (self.waiters.back() == null) {
+            _ = self.permits.fetchAdd(surplus, .release);
+            self.mutex.unlock();
+            return;
+        }
+        self.releaseToWaiters(surplus);
     }
 
     /// Slow path for release(): serve permits to queued waiters.
@@ -359,6 +473,17 @@ pub const Semaphore = struct {
             return;
         }
 
+        // Try to cancel from fast slot (lock-free)
+        if (self.fast_waiter.cmpxchgStrong(@intFromPtr(waiter), 0, .acq_rel, .monotonic) == null) {
+            // Removed from fast slot — return partial permits
+            const remaining = waiter.state.load(.monotonic);
+            const acquired = waiter.permits_requested - remaining;
+            if (acquired > 0) {
+                self.release(acquired);
+            }
+            return;
+        }
+
         self.mutex.lock();
 
         // Check again under lock
@@ -391,10 +516,12 @@ pub const Semaphore = struct {
     }
 
     /// Get number of waiters (for debugging/testing — O(n) list walk).
+    /// Includes the fast_waiter slot if occupied.
     pub fn waiterCount(self: *Self) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         var count: usize = 0;
+        if (self.fast_waiter.load(.acquire) != 0) count += 1;
         var it = self.waiters.iterator();
         while (it.next()) |_| count += 1;
         return count;
@@ -541,7 +668,7 @@ pub const AcquireFuture = struct {
                 self.stored_waker = ctx.getWaker().clone();
                 self.waiter.setWaker(@ptrCast(self), wakeCallback);
 
-                if (self.semaphore.acquireWait(&self.waiter)) {
+                if (self.semaphore.acquireWaitDirect(&self.waiter)) {
                     self.state = .acquired;
                     if (self.stored_waker) |*w| {
                         w.deinit();

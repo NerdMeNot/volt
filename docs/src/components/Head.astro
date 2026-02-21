@@ -8,6 +8,45 @@ import { ClientRouter } from 'astro:transitions';
 <ClientRouter />
 
 <script>
+  // Initialize Mermaid diagrams from ```mermaid code blocks.
+  // Transforms <pre><code class="language-mermaid"> into <pre class="mermaid">
+  // so mermaid.js can render them client-side.
+  import mermaid from 'mermaid';
+
+  function initMermaid() {
+    const isDark = document.documentElement.dataset.theme === 'dark' ||
+      document.documentElement.classList.contains('dark') ||
+      (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches &&
+       !document.documentElement.dataset.theme);
+
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: isDark ? 'dark' : 'default',
+      themeVariables: isDark
+        ? { primaryColor: '#3b82f6', primaryTextColor: '#e2e8f0', lineColor: '#94a3b8' }
+        : { primaryColor: '#2563eb', primaryTextColor: '#1e293b', lineColor: '#475569' },
+    });
+
+    // Convert ```mermaid code blocks to mermaid-renderable format.
+    // Starlight renders them as: <pre><code class="language-mermaid">...</code></pre>
+    // Mermaid.js expects: <pre class="mermaid">...</pre>
+    document.querySelectorAll('code.language-mermaid').forEach((code) => {
+      const pre = code.parentElement;
+      if (pre && pre.tagName === 'PRE') {
+        pre.className = 'mermaid';
+        pre.textContent = code.textContent;
+      }
+    });
+
+    mermaid.run({ querySelector: 'pre.mermaid' });
+  }
+
+  // Run on initial load and after view transitions
+  initMermaid();
+  document.addEventListener('astro:page-load', initMermaid);
+</script>
+
+<script>
   // Preserve sidebar scroll position across view transitions.
   function saveSidebarScroll() {
     const sidebar = document.getElementById('starlight__sidebar');

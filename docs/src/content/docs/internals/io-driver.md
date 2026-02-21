@@ -263,6 +263,24 @@ Each worker tick:
     +--> parkWorker() if no work found
 ```
 
+```mermaid
+graph TD
+    T["Worker tick"] --> TM["pollTimers()"]
+    TM --> |worker 0 only| IO["pollIo()"]
+    TM --> |other workers| IO
+    IO --> |tryLock succeeds| W["backend.wait()"]
+    IO --> |tryLock fails| FW["findWork()"]
+    W --> PC["processCompletion()"]
+    PC --> FW
+    FW --> EX["executeTask()"]
+    EX --> |budget left| FW
+    EX --> |budget exhausted| PK["parkWorker()"]
+
+    style T fill:#3b82f6,color:#fff
+    style EX fill:#22c55e,color:#000
+    style PK fill:#6b7280,color:#fff
+```
+
 During parking, worker 0 may combine I/O and timer waiting:
 
 ```zig

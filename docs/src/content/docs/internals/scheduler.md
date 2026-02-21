@@ -47,6 +47,32 @@ When a worker needs a task, it searches in this order:
 7. Park                  -- Sleep with 10ms timeout until woken
 ```
 
+```mermaid
+graph TD
+    A["Global batch buffer"] -->|empty| B["LIFO slot"]
+    B -->|empty| C["Local queue"]
+    C -->|empty| D["Global queue"]
+    D -->|empty| E["Work stealing"]
+    E -->|nothing| F["Global queue (final)"]
+    F -->|empty| G["Park (sleep 10ms)"]
+
+    A -->|found| X["Execute task"]
+    B -->|found| X
+    C -->|found| X
+    D -->|found| X
+    E -->|found| X
+    F -->|found| X
+
+    style A fill:#22c55e,color:#000
+    style B fill:#22c55e,color:#000
+    style C fill:#22c55e,color:#000
+    style D fill:#3b82f6,color:#fff
+    style E fill:#3b82f6,color:#fff
+    style F fill:#6b7280,color:#fff
+    style G fill:#6b7280,color:#fff
+    style X fill:#16a34a,color:#fff
+```
+
 ## WorkStealQueue (lock-free ring buffer)
 
 Source: `src/internal/scheduler/Header.zig`
@@ -240,6 +266,15 @@ pub const ParkState = struct {
         if (prev == PARKED) futex.wake(1);
     }
 };
+```
+
+```mermaid
+stateDiagram-v2
+    UNPARKED --> PARKED : park() [CAS 0→1, futex wait]
+    PARKED --> UNPARKED : timeout / wakeup
+    UNPARKED --> UNPARKED : unpark() [swap→NOTIFIED, was UNPARKED]
+    PARKED --> NOTIFIED : unpark() [swap→NOTIFIED, futex wake]
+    NOTIFIED --> UNPARKED : park() [sees NOTIFIED, skip wait]
 ```
 
 Park timeout is 10ms. Worker 0 may use a shorter timeout based on the next timer expiration. On wake, the worker checks whether it was claimed by a notification (bitmap bit cleared) or woke from timeout (bitmap bit still set).

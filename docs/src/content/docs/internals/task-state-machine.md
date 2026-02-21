@@ -68,6 +68,21 @@ pub const State = packed struct(u64) {
                   COMPLETE
 ```
 
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE : spawn()
+    IDLE --> SCHEDULED : transitionToScheduled
+    SCHEDULED --> RUNNING : transitionToRunning
+    RUNNING --> IDLE : transitionToIdle
+    RUNNING --> COMPLETE : transitionToComplete
+    COMPLETE --> [*]
+
+    note right of RUNNING
+        notified bit may be set
+        while task is running
+    end note
+```
+
 | State | Meaning |
 |-------|---------|
 | **IDLE** | Not scheduled. Waiting for I/O, timer, or sync primitive wake. |
@@ -204,6 +219,22 @@ The dangerous scenario: a waker fires between `poll()` returning `.pending` and 
 - Since `prev.notified` was true, the task immediately reschedules itself.
 
 Without atomic clearing, there would be a TOCTOU race between checking `notified` and entering IDLE.
+
+```mermaid
+sequenceDiagram
+    participant W as Waker
+    participant T as Task (Worker)
+
+    T->>T: poll() returns .pending
+    W->>W: sees lifecycle = RUNNING
+    W->>W: sets notified = true
+    W-->>T: (no enqueue — task is running)
+    T->>T: transitionToIdle()
+    Note over T: atomically reads & clears notified
+    T->>T: prev.notified == true
+    T->>T: reschedule immediately
+    Note over T: No lost wakeup ✓
+```
 
 ## Reference counting
 
