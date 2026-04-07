@@ -118,6 +118,30 @@ pub const FileType = @import("fs/metadata.zig").FileType;
 pub const SystemTime = @import("fs/metadata.zig").SystemTime;
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Memory-Mapped Files
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const mapped_file_mod = @import("fs/MappedFile.zig");
+
+/// Memory-mapped file for zero-copy access to file contents.
+pub const MappedFile = mapped_file_mod.MappedFile;
+
+/// Protection mode for memory-mapped files.
+pub const MmapProtection = mapped_file_mod.MmapProtection;
+
+/// Options for memory-mapping a file.
+pub const MmapOptions = mapped_file_mod.MmapOptions;
+
+/// Advisory hint for mapped memory regions.
+pub const MadviceHint = mapped_file_mod.MadviceHint;
+
+/// Memory-map a file by path.
+pub const mmapFile = mapped_file_mod.mmapFile;
+
+/// Memory-map an open file handle.
+pub const mmapHandle = mapped_file_mod.mmapHandle;
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Async File I/O (requires Runtime)
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -169,6 +193,9 @@ pub const writeFile = ops.writeFile;
 
 /// Append data to a file (creates if needed).
 pub const appendFile = ops.appendFile;
+
+/// Get the size of a file in bytes.
+pub const fileSize = ops.fileSize;
 
 /// Copy a file.
 pub const copy = ops.copy;
@@ -251,4 +278,5 @@ test {
     _ = @import("fs/dir.zig");
     _ = @import("fs/ops.zig");
     _ = @import("fs/async_file.zig");
+    _ = @import("fs/MappedFile.zig");
 }

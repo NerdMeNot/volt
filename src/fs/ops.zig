@@ -165,6 +165,12 @@ pub fn symlinkMetadata(path: []const u8) !Metadata {
     return Metadata.fromStat(stat);
 }
 
+/// Get the size of a file in bytes.
+pub fn fileSize(path: []const u8) !u64 {
+    const meta = try metadata(path);
+    return meta.size();
+}
+
 /// Set permissions on a path.
 pub fn setPermissions(path: []const u8, perm: Permissions) !void {
     const path_z = try posix.toPosixPath(path);
@@ -316,6 +322,26 @@ test "symlink and readLink" {
     defer std.testing.allocator.free(read_target);
 
     try std.testing.expectEqualStrings(target, read_target);
+}
+
+test "fileSize" {
+    const path = "/tmp/blitz_io_filesize_test.txt";
+
+    try writeFile(path, "hello world!");
+    defer std.fs.deleteFileAbsolute(path) catch {};
+
+    const size = try fileSize(path);
+    try std.testing.expectEqual(@as(u64, 12), size);
+}
+
+test "fileSize - empty file" {
+    const path = "/tmp/blitz_io_filesize_empty.txt";
+
+    try writeFile(path, "");
+    defer std.fs.deleteFileAbsolute(path) catch {};
+
+    const size = try fileSize(path);
+    try std.testing.expectEqual(@as(u64, 0), size);
 }
 
 test "metadata" {

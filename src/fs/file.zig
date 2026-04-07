@@ -128,6 +128,19 @@ pub const File = struct {
         return index;
     }
 
+    /// Read as many bytes as possible into `buf`, retrying on partial reads.
+    /// Unlike `readAll`, does NOT return an error if EOF is reached before
+    /// the buffer is full. Returns the total number of bytes read.
+    pub fn readFull(self: *File, buf: []u8) !usize {
+        var total: usize = 0;
+        while (total < buf.len) {
+            const n = try self.read(buf[total..]);
+            if (n == 0) break;
+            total += n;
+        }
+        return total;
+    }
+
     /// Read data into multiple buffers (scatter read).
     /// More efficient than multiple read calls for structured data.
     pub fn readVectored(self: *File, iovecs: []posix.iovec) !usize {
@@ -275,6 +288,69 @@ pub const File = struct {
     /// Alias for syncAll.
     pub fn sync(self: *File) !void {
         try self.syncAll();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Advisory Hints
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Access pattern hint for the kernel.
+    pub const FileAdvice = enum {
+        /// Default behavior.
+        normal,
+        /// Reading front-to-back — increase read-ahead.
+        sequential,
+        /// Random access — disable read-ahead.
+        random,
+        /// Will need this data soon — start prefetching.
+        will_need,
+        /// Done with this data — can evict from cache.
+        dont_need,
+    };
+
+    /// Advise the kernel about the expected access pattern for this file.
+    /// This is a hint only — the kernel may ignore it.
+    /// On macOS, only `sequential` and `random` have effect (via F_RDAHEAD).
+    pub fn advise(self: *File, advice: FileAdvice) !void {
+        return self.adviseRange(0, 0, advice);
+    }
+
+    /// Advise the kernel about the expected access pattern for a byte range.
+    /// `offset` and `len` specify the range (0, 0 means entire file).
+    /// On macOS, range is ignored — only whole-file sequential/random hints work.
+    pub fn adviseRange(self: *File, offset: u64, len: u64, advice: FileAdvice) !void {
+        if (comptime builtin.os.tag == .linux) {
+            const linux = std.os.linux;
+            const adv: usize = switch (advice) {
+                .normal => linux.POSIX_FADV.NORMAL,
+                .sequential => linux.POSIX_FADV.SEQUENTIAL,
+                .random => linux.POSIX_FADV.RANDOM,
+                .will_need => linux.POSIX_FADV.WILLNEED,
+                .dont_need => linux.POSIX_FADV.DONTNEED,
+            };
+            const rc = linux.fadvise(self.handle, @intCast(offset), @intCast(len), adv);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return,
+                .BADF => unreachable, // We own the fd.
+                .INVAL => unreachable, // Invalid advice value.
+                else => |err| return posix.unexpectedErrno(err),
+            }
+        } else if (comptime builtin.os.tag == .macos or builtin.os.tag == .ios) {
+            // macOS: only sequential/random via fcntl(F_RDAHEAD).
+            // will_need/dont_need/normal have no equivalent for regular files.
+            // Range parameters are not supported — macOS has no posix_fadvise.
+            _ = .{ offset, len };
+            switch (advice) {
+                .sequential => {
+                    _ = try posix.fcntl(self.handle, std.c.F.RDAHEAD, 1);
+                },
+                .random => {
+                    _ = try posix.fcntl(self.handle, std.c.F.RDAHEAD, 0);
+                },
+                .normal, .will_need, .dont_need => {},
+            }
+        }
+        // Other platforms: no-op (best effort).
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -840,6 +916,126 @@ test "File - readAll error on short file" {
         var buf: [100]u8 = undefined;
         const result = file.readAll(&buf);
         try std.testing.expectError(error.EndOfStream, result);
+    }
+
+    try std.fs.deleteFileAbsolute(path);
+}
+
+test "File - advise sequential" {
+    const path = "/tmp/blitz_io_test_advise.txt";
+
+    {
+        var file = try File.create(path);
+        defer file.close();
+        try file.writeAll("test data for advisory hints");
+    }
+
+    {
+        var file = try File.open(path);
+        defer file.close();
+        try file.advise(.sequential);
+    }
+
+    try std.fs.deleteFileAbsolute(path);
+}
+
+test "File - advise random" {
+    const path = "/tmp/blitz_io_test_advise_random.txt";
+
+    {
+        var file = try File.create(path);
+        defer file.close();
+        try file.writeAll("test data for random access");
+    }
+
+    {
+        var file = try File.open(path);
+        defer file.close();
+        try file.advise(.random);
+    }
+
+    try std.fs.deleteFileAbsolute(path);
+}
+
+test "File - adviseRange" {
+    const path = "/tmp/blitz_io_test_advise_range.txt";
+
+    {
+        var file = try File.create(path);
+        defer file.close();
+        try file.writeAll("a" ** 4096);
+    }
+
+    {
+        var file = try File.open(path);
+        defer file.close();
+        try file.adviseRange(0, 1024, .will_need);
+        try file.adviseRange(1024, 1024, .dont_need);
+        try file.adviseRange(0, 0, .normal);
+    }
+
+    try std.fs.deleteFileAbsolute(path);
+}
+
+test "File - readFull complete" {
+    const path = "/tmp/blitz_io_test_readfull.txt";
+
+    {
+        var file = try File.create(path);
+        defer file.close();
+        try file.writeAll("Hello, readFull!");
+    }
+
+    {
+        var file = try File.open(path);
+        defer file.close();
+
+        var buf: [16]u8 = undefined;
+        const n = try file.readFull(&buf);
+        try std.testing.expectEqual(@as(usize, 16), n);
+        try std.testing.expectEqualStrings("Hello, readFull!", buf[0..n]);
+    }
+
+    try std.fs.deleteFileAbsolute(path);
+}
+
+test "File - readFull partial" {
+    const path = "/tmp/blitz_io_test_readfull_partial.txt";
+
+    {
+        var file = try File.create(path);
+        defer file.close();
+        try file.writeAll("short");
+    }
+
+    {
+        var file = try File.open(path);
+        defer file.close();
+
+        var buf: [100]u8 = undefined;
+        const n = try file.readFull(&buf);
+        try std.testing.expectEqual(@as(usize, 5), n);
+        try std.testing.expectEqualStrings("short", buf[0..n]);
+    }
+
+    try std.fs.deleteFileAbsolute(path);
+}
+
+test "File - readFull empty file" {
+    const path = "/tmp/blitz_io_test_readfull_empty.txt";
+
+    {
+        var file = try File.create(path);
+        file.close();
+    }
+
+    {
+        var file = try File.open(path);
+        defer file.close();
+
+        var buf: [64]u8 = undefined;
+        const n = try file.readFull(&buf);
+        try std.testing.expectEqual(@as(usize, 0), n);
     }
 
     try std.fs.deleteFileAbsolute(path);

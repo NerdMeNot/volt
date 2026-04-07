@@ -145,6 +145,20 @@ try fs.writeFile("config.json.tmp", new_config);
 try fs.rename("config.json.tmp", "config.json");
 ```
 
+### `fs.fileSize`
+
+```zig
+pub fn fileSize(path: []const u8) !u64
+```
+
+Get the size of a file in bytes without opening a handle. Convenience wrapper around `metadata(path).size()`.
+
+```zig
+const size = try fs.fileSize("dataset.csv");
+const buf = try allocator.alloc(u8, size);
+defer allocator.free(buf);
+```
+
 ### `fs.exists`
 
 ```zig
@@ -212,7 +226,8 @@ defer lock.close();
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `read` | `fn read(buf: []u8) !usize` | Read up to `buf.len` bytes, returns bytes read |
-| `readAll` | `fn readAll(buf: []u8) !usize` | Fill the buffer completely (retries on partial reads) |
+| `readAll` | `fn readAll(buf: []u8) !usize` | Fill the buffer completely (errors on EOF) |
+| `readFull` | `fn readFull(buf: []u8) !usize` | Fill the buffer, returns count (no error on EOF) |
 | `pread` | `fn pread(buf: []u8, offset: u64) !usize` | Read at a specific offset without seeking |
 | `readToEnd` | `fn readToEnd(allocator: Allocator) ![]u8` | Read entire remaining contents |
 | `readVectored` | `fn readVectored(iovecs: []posix.iovec) !usize` | Scatter read into multiple buffers |
@@ -221,7 +236,7 @@ defer lock.close();
 var file = try fs.File.open("binary.dat");
 defer file.close();
 
-// Read a fixed-size header
+// Read a fixed-size header (errors if file is too short)
 var header: [64]u8 = undefined;
 const n = try file.readAll(&header);
 if (n < 64) return error.UnexpectedEof;
@@ -229,6 +244,17 @@ if (n < 64) return error.UnexpectedEof;
 // Read the rest into a dynamic buffer
 const body = try file.readToEnd(allocator);
 defer allocator.free(body);
+```
+
+`readFull` is like `readAll` but returns the byte count instead of erroring on EOF -- useful for streaming parsers that process partial chunks:
+
+```zig
+var buf: [256 * 1024]u8 = undefined;
+while (true) {
+    const n = try file.readFull(&buf);
+    if (n == 0) break;
+    try processChunk(buf[0..n]);
+}
 ```
 
 #### Writing
@@ -289,6 +315,40 @@ try file.writeAll(critical_data);
 try file.syncAll(); // Ensure data survives a crash
 ```
 
+#### Advisory Hints
+
+Tell the kernel how you plan to access a file. On Linux this uses `posix_fadvise`; on macOS it uses `fcntl(F_RDAHEAD)` for sequential/random hints.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `advise` | `fn advise(advice: FileAdvice) !void` | Hint for the entire file |
+| `adviseRange` | `fn adviseRange(offset: u64, len: u64, advice: FileAdvice) !void` | Hint for a byte range |
+
+#### `File.FileAdvice`
+
+| Value | Description |
+|-------|-------------|
+| `.normal` | Default behavior |
+| `.sequential` | Reading front-to-back -- increase read-ahead |
+| `.random` | Random access -- disable read-ahead |
+| `.will_need` | Will need this data soon -- start prefetching |
+| `.dont_need` | Done with this data -- can evict from cache |
+
+```zig
+var file = try fs.File.open("data.parquet");
+defer file.close();
+
+// Sequential scan
+try file.advise(.sequential);
+
+// Targeted prefetch for a specific row group
+try file.adviseRange(row_group_offset, row_group_size, .will_need);
+```
+
+:::note[macOS limitations]
+On macOS, only `.sequential` and `.random` have effect on regular files. `.will_need`, `.dont_need`, and `.normal` are no-ops. Range parameters are ignored -- the hint applies to the whole file. For range-level control, use memory-mapped files with `MappedFile.advise()`.
+:::
+
 #### Reader/Writer Interfaces
 
 Files support standard `io.Reader` and `io.Writer` interfaces for composition with buffered I/O, compression, serialization, etc.
@@ -308,6 +368,102 @@ pub fn close(self: *File) void
 ```
 
 Close the file handle. Always use `defer file.close()` immediately after opening.
+
+---
+
+## Memory-Mapped Files
+
+### `fs.mmapFile`
+
+```zig
+pub fn mmapFile(path: []const u8, options: MmapOptions) !MappedFile
+```
+
+Memory-map a file by path. The file is opened, mapped, and the file descriptor is closed -- the mapping survives the close per POSIX. Returns `error.EmptyFile` for zero-length files.
+
+```zig
+var mapped = try fs.mmapFile("data.csv", .{});
+defer mapped.unmap();
+
+const data = mapped.slice(); // []const u8 backed by kernel page cache
+```
+
+### `fs.mmapHandle`
+
+```zig
+pub fn mmapHandle(file: *File, options: MmapOptions) !MappedFile
+```
+
+Memory-map an open file handle. Does NOT take ownership of the file -- the caller is still responsible for closing it. The mapping remains valid even after the file is closed.
+
+```zig
+var file = try fs.File.open("data.parquet");
+defer file.close();
+
+var mapped = try fs.mmapHandle(&file, .{});
+defer mapped.unmap();
+```
+
+### `fs.MmapOptions`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `protection` | `MmapProtection` | `.read_only` | `.read_only` or `.read_write` |
+| `sequential` | `bool` | `false` | Hint: sequential access (enables read-ahead) |
+| `random` | `bool` | `false` | Hint: random access (disables read-ahead) |
+| `populate` | `bool` | `false` | Pre-fault pages eagerly (`MAP_POPULATE` on Linux, `MADV_WILLNEED` on macOS) |
+
+### `fs.MmapProtection`
+
+| Value | MAP flags | Description |
+|-------|-----------|-------------|
+| `.read_only` | `MAP_PRIVATE`, `PROT_READ` | Pages can be read but not written |
+| `.read_write` | `MAP_SHARED`, `PROT_READ \| PROT_WRITE` | Pages can be read and written; changes flush to disk |
+
+### `fs.MappedFile`
+
+A memory-mapped file region. Read-only mappings are safe for concurrent reads from multiple threads. Read-write mappings require external synchronization.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `slice` | `fn slice() []const u8` | Immutable view of the mapped region |
+| `sliceMut` | `fn sliceMut() ![]u8` | Mutable view (errors on read-only mapping) |
+| `sync` | `fn sync() !void` | Flush changes to disk (`msync`) |
+| `advise` | `fn advise(offset, len, hint) !void` | Advise kernel about a region |
+| `unmap` | `fn unmap() void` | Release the mapping (`munmap`) |
+
+```zig
+// Read-write mapping with modification
+var mapped = try fs.mmapFile("output.dat", .{ .protection = .read_write });
+defer mapped.unmap();
+
+const buf = try mapped.sliceMut();
+@memcpy(buf[0..8], "HEADER!!");
+try mapped.sync();
+```
+
+### `fs.MadviceHint`
+
+Advisory hints for mapped memory regions (passed to `MappedFile.advise`):
+
+| Value | `madvise` flag | Description |
+|-------|----------------|-------------|
+| `.normal` | `MADV_NORMAL` | Default behavior |
+| `.sequential` | `MADV_SEQUENTIAL` | Sequential access -- increase read-ahead |
+| `.random` | `MADV_RANDOM` | Random access -- disable read-ahead |
+| `.will_need` | `MADV_WILLNEED` | Prefetch these pages into memory |
+| `.dont_need` | `MADV_DONTNEED` | Evict these pages from memory |
+
+```zig
+var mapped = try fs.mmapFile("large_file.parquet", .{});
+defer mapped.unmap();
+
+// Prefetch the row group we need
+try mapped.advise(rg_offset, rg_len, .will_need);
+
+// Release pages from the previous row group
+try mapped.advise(prev_offset, prev_len, .dont_need);
+```
 
 ---
 
