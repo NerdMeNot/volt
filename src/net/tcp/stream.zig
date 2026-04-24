@@ -3,6 +3,8 @@
 //! A connected TCP stream with async read/write, readiness polling, and futures.
 
 const std = @import("std");
+const syscall = @import("../../internal/syscall.zig");
+const thr = @import("../../internal/thread.zig");
 const c = @import("common.zig");
 const posix = c.posix;
 const mem = c.mem;
@@ -344,7 +346,7 @@ pub const TcpStream = struct {
 
     /// Shutdown the connection.
     pub fn shutdown(self: *TcpStream, how: ShutdownHow) !void {
-        try posix.shutdown(self.fd, how.toNative());
+        try syscall.shutdown(self.fd, how.toNative());
     }
 
     /// Peek at data without consuming it.
@@ -366,7 +368,7 @@ pub const TcpStream = struct {
 
         var addr: Address = undefined;
         addr.len = @sizeOf(posix.sockaddr.storage);
-        try posix.getsockname(self.fd, addr.sockaddrMut(), &addr.len);
+        try syscall.getsockname(self.fd, addr.sockaddrMut(), &addr.len);
         self.local_addr = addr;
         return addr;
     }
@@ -381,7 +383,7 @@ pub const TcpStream = struct {
         if (self.scheduled_io) |sio| {
             sio.shutdown();
         }
-        posix.close(self.fd);
+        syscall.close(self.fd);
         self.fd = c.INVALID_SOCKET;
     }
 
@@ -440,7 +442,7 @@ pub const ShutdownHow = enum {
     write,
     both,
 
-    fn toNative(self: ShutdownHow) posix.ShutdownHow {
+    fn toNative(self: ShutdownHow) syscall.ShutdownHow {
         return switch (self) {
             .read => .recv,
             .write => .send,
@@ -698,7 +700,7 @@ fn createConnectedPair() !struct { client: TcpStream, server: TcpStream, listene
             server_conn = result.stream;
             break;
         }
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        thr.sleep(5 * std.time.ns_per_ms);
     }
 
     return .{
@@ -733,7 +735,7 @@ test "TcpStream - tryWrite and tryRead roundtrip" {
         if (try pair.client.tryWrite(data[written..])) |n| {
             written += n;
         } else {
-            std.Thread.sleep(1_000_000);
+            thr.sleep(1_000_000);
         }
     }
     try testing.expectEqual(data.len, written);
@@ -746,7 +748,7 @@ test "TcpStream - tryWrite and tryRead roundtrip" {
             total += n;
             if (total >= data.len) break;
         }
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        thr.sleep(5 * std.time.ns_per_ms);
     }
     try testing.expectEqualStrings(data, buf[0..total]);
 }
@@ -768,7 +770,7 @@ test "TcpStream - EOF returns 0" {
                 break;
             }
         }
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        thr.sleep(5 * std.time.ns_per_ms);
     }
     try testing.expect(got_eof);
 }
@@ -783,7 +785,7 @@ test "TcpStream - peek does not consume data" {
     _ = try pair.client.tryWrite("peek test") orelse unreachable;
 
     // Wait for data to arrive
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    thr.sleep(50 * std.time.ns_per_ms);
 
     // Peek — data should still be in the buffer
     var buf1: [64]u8 = undefined;
@@ -816,7 +818,7 @@ test "TcpStream - shutdown write then read returns EOF" {
                 break;
             }
         }
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        thr.sleep(5 * std.time.ns_per_ms);
     }
     try testing.expect(got_eof);
 }
@@ -937,7 +939,7 @@ test "TcpStream - reader interface" {
     for (0..100) |_| {
         const n = r.read(buf[total..]) catch |err| switch (err) {
             error.WouldBlock => {
-                std.Thread.sleep(5 * std.time.ns_per_ms);
+                thr.sleep(5 * std.time.ns_per_ms);
                 continue;
             },
             else => return err,
@@ -968,7 +970,7 @@ test "TcpStream - vectored write" {
             written = n;
             break;
         }
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        thr.sleep(5 * std.time.ns_per_ms);
     }
     try testing.expectEqual(@as(usize, 11), written);
 
@@ -980,7 +982,7 @@ test "TcpStream - vectored write" {
             total += n;
             if (total >= 11) break;
         }
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        thr.sleep(5 * std.time.ns_per_ms);
     }
     try testing.expectEqualStrings("hello world", buf[0..total]);
 }

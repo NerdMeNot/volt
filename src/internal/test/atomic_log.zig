@@ -22,6 +22,7 @@
 //!       std.atomic.Value(usize);
 
 const std = @import("std");
+const thr = @import("../thread.zig");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
@@ -100,7 +101,7 @@ pub const AtomicLog = struct {
 
     /// Global singleton instance.
     var global: ?*AtomicLog = null;
-    var global_mutex: std.Thread.Mutex = .{};
+    var global_mutex: thr.Mutex = .{};
 
     pub fn init() AtomicLog {
         return .{

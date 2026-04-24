@@ -1,7 +1,7 @@
 //! Mutex - Async Mutual Exclusion
 //!
 //! An async-aware mutex that allows tasks to wait for exclusive access.
-//! For blocking mutex, use `std.Thread.Mutex` from the standard library.
+//! For blocking mutex, use `thr.Mutex` from the standard library.
 //!
 //! ## Usage
 //!
@@ -30,6 +30,7 @@
 //!
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 
 const semaphore_mod = @import("Semaphore.zig");
 const Semaphore = semaphore_mod.Semaphore;

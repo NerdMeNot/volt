@@ -45,6 +45,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const syscall = @import("../internal/syscall.zig");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
@@ -256,7 +257,7 @@ pub const AsyncFile = struct {
                 if (ctx.off) |o| {
                     return posix.pwrite(ctx.fd, ctx.buffer, o);
                 } else {
-                    return posix.write(ctx.fd, ctx.buffer);
+                    return syscall.write(ctx.fd, ctx.buffer);
                 }
             }
         };
@@ -291,7 +292,7 @@ pub const AsyncFile = struct {
     pub fn readVectored(self: *Self, iovecs: []posix.iovec) !usize {
         // readv doesn't benefit from io_uring significantly for files,
         // and io_uring readv support varies by kernel version
-        return posix.readv(self.handle, iovecs);
+        return syscall.readv(self.handle, iovecs);
     }
 
     /// Read into multiple buffers at a specific offset.
@@ -302,7 +303,7 @@ pub const AsyncFile = struct {
     /// Write data from multiple buffers (gather write).
     /// More efficient than multiple write calls for structured data.
     pub fn writeVectored(self: *Self, iovecs: []const posix.iovec_const) !usize {
-        return posix.writev(self.handle, iovecs);
+        return syscall.writev(self.handle, iovecs);
     }
 
     /// Write from multiple buffers at a specific offset.
@@ -568,7 +569,7 @@ pub const AsyncFile = struct {
         if (comptime builtin.os.tag == .linux) {
             if (self.tryCloseIoUring()) return;
         }
-        posix.close(self.handle);
+        syscall.close(self.handle);
         self.handle = -1;
     }
 
@@ -696,7 +697,7 @@ test "AsyncFile - openSync read mode" {
     const full_path = try dir.dir.realpath(path, &full_path_buf);
 
     const fd = try AsyncFile.openSync(full_path, .{ .read = true });
-    defer posix.close(fd);
+    defer syscall.close(fd);
 
     var buf: [16]u8 = undefined;
     const n = try posix.read(fd, &buf);
@@ -722,14 +723,14 @@ test "AsyncFile - openSync write+create+truncate mode" {
         .create = true,
         .truncate = true,
     });
-    defer posix.close(fd);
+    defer syscall.close(fd);
 
     // Write new content
-    _ = try posix.write(fd, "new");
+    _ = try syscall.write(fd, "new");
 
     // Verify truncation + new content
     const rd_fd = try AsyncFile.openSync(full_path, .{ .read = true });
-    defer posix.close(rd_fd);
+    defer syscall.close(rd_fd);
 
     var buf: [16]u8 = undefined;
     const n = try posix.read(rd_fd, &buf);
@@ -749,7 +750,7 @@ test "AsyncFile - openSync read+write mode" {
     const full_path = try dir.dir.realpath(path, &full_path_buf);
 
     const fd = try AsyncFile.openSync(full_path, .{ .read = true, .write = true });
-    defer posix.close(fd);
+    defer syscall.close(fd);
 
     // Read existing
     var buf: [16]u8 = undefined;
@@ -758,7 +759,7 @@ test "AsyncFile - openSync read+write mode" {
 
     // Write at start (seek back first)
     try posix.lseek_SET(fd, 0);
-    _ = try posix.write(fd, "DATA");
+    _ = try syscall.write(fd, "DATA");
 
     // Read back
     try posix.lseek_SET(fd, 0);
@@ -785,13 +786,13 @@ test "openSyncAppend creates and appends" {
     const full_path = try dir.dir.realpath(path, &full_path_buf);
 
     const fd = try openSyncAppend(full_path);
-    defer posix.close(fd);
+    defer syscall.close(fd);
 
-    _ = try posix.write(fd, "second");
+    _ = try syscall.write(fd, "second");
 
     // Verify
     const rd_fd = try AsyncFile.openSync(full_path, .{ .read = true });
-    defer posix.close(rd_fd);
+    defer syscall.close(rd_fd);
 
     var buf: [32]u8 = undefined;
     const n = try posix.read(rd_fd, &buf);

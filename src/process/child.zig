@@ -23,8 +23,10 @@
 //!
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 const builtin = @import("builtin");
 const posix = std.posix;
+const syscall = @import("../internal/syscall.zig");
 const Allocator = std.mem.Allocator;
 const windows = if (builtin.os.tag == .windows) std.os.windows else undefined;
 
@@ -402,7 +404,7 @@ pub const Child = struct {
     waiters: WaitWaiterList = .{},
 
     /// Mutex protecting state
-    mutex: std.Thread.Mutex = .{},
+    mutex: thr.Mutex = .{},
 
     const Self = @This();
 
@@ -741,7 +743,7 @@ test "ChildStdin/ChildStdout - basic operations" {
     }
 
     // Create a pipe (Unix)
-    const pipe_fds = try posix.pipe();
+    const pipe_fds = try syscall.pipe();
 
     var stdin_handle = ChildStdin.init(pipe_fds[1]);
     var stdout_handle = ChildStdout.init(pipe_fds[0]);
@@ -909,7 +911,7 @@ test "Child - waitBlocking without process returns error" {
 test "ChildStderr - pipe roundtrip" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    const pipe_fds = try posix.pipe();
+    const pipe_fds = try syscall.pipe();
     var write_file = std.fs.File{ .handle = pipe_fds[1] };
     var stderr_handle = ChildStderr.init(pipe_fds[0]);
 
@@ -926,8 +928,8 @@ test "ChildStderr - pipe roundtrip" {
 test "ChildStdin - double close is safe" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    const pipe_fds = try posix.pipe();
-    posix.close(pipe_fds[0]); // close read end
+    const pipe_fds = try syscall.pipe();
+    syscall.close(pipe_fds[0]); // close read end
 
     var stdin_handle = ChildStdin.init(pipe_fds[1]);
     stdin_handle.close();
@@ -939,8 +941,8 @@ test "ChildStdin - double close is safe" {
 test "ChildStdin - write after close returns error" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    const pipe_fds = try posix.pipe();
-    posix.close(pipe_fds[0]);
+    const pipe_fds = try syscall.pipe();
+    syscall.close(pipe_fds[0]);
 
     var stdin_handle = ChildStdin.init(pipe_fds[1]);
     stdin_handle.close();
@@ -952,8 +954,8 @@ test "ChildStdin - write after close returns error" {
 test "ChildStdout - read after close returns error" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    const pipe_fds = try posix.pipe();
-    posix.close(pipe_fds[1]);
+    const pipe_fds = try syscall.pipe();
+    syscall.close(pipe_fds[1]);
 
     var stdout_handle = ChildStdout.init(pipe_fds[0]);
     stdout_handle.close();

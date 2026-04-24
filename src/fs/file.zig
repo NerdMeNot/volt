@@ -35,6 +35,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const syscall = @import("../internal/syscall.zig");
 const builtin = @import("builtin");
 
 const OpenOptions = @import("open_options.zig").OpenOptions;
@@ -144,7 +145,7 @@ pub const File = struct {
     /// Read data into multiple buffers (scatter read).
     /// More efficient than multiple read calls for structured data.
     pub fn readVectored(self: *File, iovecs: []posix.iovec) !usize {
-        return posix.readv(self.handle, iovecs);
+        return syscall.readv(self.handle, iovecs);
     }
 
     /// Read into multiple buffers at a specific offset.
@@ -183,7 +184,7 @@ pub const File = struct {
     /// Write data to the file.
     /// Returns the number of bytes written.
     pub fn write(self: *File, data: []const u8) !usize {
-        return posix.write(self.handle, data);
+        return syscall.write(self.handle, data);
     }
 
     /// Write data at a specific offset without changing the file position.
@@ -204,7 +205,7 @@ pub const File = struct {
     /// Write data from multiple buffers (gather write).
     /// More efficient than multiple write calls for structured data.
     pub fn writeVectored(self: *File, iovecs: []const posix.iovec_const) !usize {
-        return posix.writev(self.handle, iovecs);
+        return syscall.writev(self.handle, iovecs);
     }
 
     /// Write from multiple buffers at a specific offset.
@@ -342,10 +343,10 @@ pub const File = struct {
             _ = .{ offset, len };
             switch (advice) {
                 .sequential => {
-                    _ = try posix.fcntl(self.handle, std.c.F.RDAHEAD, 1);
+                    _ = try syscall.fcntl(self.handle, std.c.F.RDAHEAD, 1);
                 },
                 .random => {
-                    _ = try posix.fcntl(self.handle, std.c.F.RDAHEAD, 0);
+                    _ = try syscall.fcntl(self.handle, std.c.F.RDAHEAD, 0);
                 },
                 .normal, .will_need, .dont_need => {},
             }
@@ -410,7 +411,7 @@ pub const File = struct {
 
     fn fileWriteFn(ctx: *anyopaque, data: []const u8) io.Error!usize {
         const self: *File = @ptrCast(@alignCast(ctx));
-        const n = posix.write(self.handle, data) catch |err| switch (err) {
+        const n = syscall.write(self.handle, data) catch |err| switch (err) {
             error.WouldBlock => return error.WouldBlock,
             error.InputOutput => return error.IoError,
             error.BrokenPipe => return error.BrokenPipe,
@@ -440,7 +441,7 @@ pub const File = struct {
 
     /// Close the file.
     pub fn close(self: *File) void {
-        posix.close(self.handle);
+        syscall.close(self.handle);
         self.handle = -1;
     }
 };

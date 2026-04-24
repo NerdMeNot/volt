@@ -30,6 +30,7 @@
 //!
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 const builtin = @import("builtin");
 
 const LinkedList = @import("../internal/util/linked_list.zig").LinkedList;
@@ -126,7 +127,7 @@ pub const Interval = struct {
     tick_ready: bool,
 
     /// Mutex protecting state
-    mutex: std.Thread.Mutex,
+    mutex: thr.Mutex,
 
     const Self = @This();
 
@@ -440,7 +441,7 @@ test "Interval - poll wakes waiter" {
     }
 
     // Wait longer than the interval and poll
-    std.Thread.sleep(10_000); // 10 microseconds
+    thr.sleep(10_000); // 10 microseconds
     int.poll();
 
     try std.testing.expect(woken);
@@ -451,13 +452,13 @@ test "Interval - multiple ticks" {
     var int = Interval.init(Duration.fromNanos(1));
 
     // Wait for interval to be ready
-    std.Thread.sleep(1000);
+    thr.sleep(1000);
 
     // First tick
     try std.testing.expect(int.tryTick());
 
     // Wait again
-    std.Thread.sleep(1000);
+    thr.sleep(1000);
 
     // Second tick
     try std.testing.expect(int.tryTick());

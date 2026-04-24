@@ -3,6 +3,8 @@
 //! Borrowed and owned halves for concurrent read/write access to a TcpStream.
 
 const std = @import("std");
+const syscall = @import("../../internal/syscall.zig");
+const thr = @import("../../internal/thread.zig");
 const builtin = @import("builtin");
 const c = @import("common.zig");
 const posix = c.posix;
@@ -181,7 +183,7 @@ pub const OwnedReadHalf = struct {
 
         var addr: Address = undefined;
         addr.len = @sizeOf(posix.sockaddr.storage);
-        try posix.getsockname(self.inner.fd, addr.sockaddrMut(), &addr.len);
+        try syscall.getsockname(self.inner.fd, addr.sockaddrMut(), &addr.len);
         self.inner.local_addr = addr;
         return addr;
     }
@@ -209,7 +211,7 @@ pub const OwnedReadHalf = struct {
         const prev = self.inner.ref_count.fetchSub(1, .acq_rel);
         if (prev == 1) {
             // Last reference - close the socket
-            posix.close(self.inner.fd);
+            syscall.close(self.inner.fd);
             self.inner.allocator.destroy(self.inner);
         }
     }
@@ -264,7 +266,7 @@ pub const OwnedWriteHalf = struct {
 
         var addr: Address = undefined;
         addr.len = @sizeOf(posix.sockaddr.storage);
-        try posix.getsockname(self.inner.fd, addr.sockaddrMut(), &addr.len);
+        try syscall.getsockname(self.inner.fd, addr.sockaddrMut(), &addr.len);
         self.inner.local_addr = addr;
         return addr;
     }
@@ -281,13 +283,13 @@ pub const OwnedWriteHalf = struct {
 
     pub fn deinit(self: *OwnedWriteHalf) void {
         if (self.shutdown_on_drop) {
-            posix.shutdown(self.inner.fd, .send) catch {};
+            syscall.shutdown(self.inner.fd, .send) catch {};
         }
 
         const prev = self.inner.ref_count.fetchSub(1, .acq_rel);
         if (prev == 1) {
             // Last reference - close the socket
-            posix.close(self.inner.fd);
+            syscall.close(self.inner.fd);
             self.inner.allocator.destroy(self.inner);
         }
     }
@@ -512,7 +514,7 @@ fn createConnectedPairForSplit() !struct { client: TcpStream, server: TcpStream,
             server_conn = result.stream;
             break;
         }
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        thr.sleep(5 * std.time.ns_per_ms);
     }
 
     return .{
@@ -565,7 +567,7 @@ test "WriteHalf - tryWrite sends data" {
             n = bytes;
             break;
         }
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        thr.sleep(5 * std.time.ns_per_ms);
     }
     try testing.expectEqualStrings("hello split", buf[0..n]);
 }
@@ -594,7 +596,7 @@ test "OwnedReadHalf/OwnedWriteHalf - basic I/O" {
             n = bytes;
             break;
         }
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        thr.sleep(5 * std.time.ns_per_ms);
     }
     try testing.expectEqualStrings("owned test", buf[0..n]);
 }
@@ -696,7 +698,7 @@ test "OwnedHalves - vectored write" {
             written = n;
             break;
         }
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        thr.sleep(5 * std.time.ns_per_ms);
     }
     try testing.expectEqual(@as(usize, 4), written);
 }

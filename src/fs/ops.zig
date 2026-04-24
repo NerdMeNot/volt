@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const syscall = @import("../internal/syscall.zig");
 const mem = std.mem;
 const builtin = @import("builtin");
 
@@ -154,14 +155,14 @@ pub fn readLink(allocator: mem.Allocator, path: []const u8) ![]u8 {
 /// Get metadata for a path.
 pub fn metadata(path: []const u8) !Metadata {
     const path_z = try posix.toPosixPath(path);
-    const stat = try posix.fstatatZ(posix.AT.FDCWD, &path_z, 0);
+    const stat = try syscall.fstatatZ(posix.AT.FDCWD, &path_z, 0);
     return Metadata.fromStat(stat);
 }
 
 /// Get metadata for a symbolic link (doesn't follow the link).
 pub fn symlinkMetadata(path: []const u8) !Metadata {
     const path_z = try posix.toPosixPath(path);
-    const stat = try posix.fstatatZ(posix.AT.FDCWD, &path_z, posix.AT.SYMLINK_NOFOLLOW);
+    const stat = try syscall.fstatatZ(posix.AT.FDCWD, &path_z, posix.AT.SYMLINK_NOFOLLOW);
     return Metadata.fromStat(stat);
 }
 
@@ -194,7 +195,7 @@ pub fn canonicalize(allocator: mem.Allocator, path: []const u8) ![]u8 {
 /// Check if a path exists.
 pub fn exists(path: []const u8) !bool {
     const path_z = try posix.toPosixPath(path);
-    _ = posix.fstatatZ(posix.AT.FDCWD, &path_z, 0) catch |err| switch (err) {
+    _ = syscall.fstatatZ(posix.AT.FDCWD, &path_z, 0) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };

@@ -11,6 +11,7 @@
 //! - Thread self-cleanup: exiting threads join previous exiting thread
 
 const std = @import("std");
+const thr = @import("thread.zig");
 const Allocator = std.mem.Allocator;
 
 /// Default keep-alive duration (10 seconds).
@@ -123,8 +124,8 @@ pub const BlockingPool = struct {
     allocator: Allocator,
 
     /// Synchronization.
-    mutex: std.Thread.Mutex = .{},
-    condvar: std.Thread.Condition = .{},
+    mutex: thr.Mutex = .{},
+    condvar: thr.Condition = .{},
 
     /// Shared state (protected by mutex).
     shared: Shared = .{},
@@ -460,7 +461,7 @@ pub fn BlockingHandle(comptime T: type) type {
 
             // Futex wait — blocks until state != PENDING
             while (self.state.load(.acquire) == PENDING) {
-                std.Thread.Futex.wait(&self.state, PENDING);
+                thr.Futex.wait(&self.state, PENDING);
             }
 
             // Copy results before freeing
@@ -487,14 +488,14 @@ pub fn BlockingHandle(comptime T: type) type {
         fn complete(self: *Self, value: T) void {
             self.result = value;
             self.state.store(COMPLETED, .release);
-            std.Thread.Futex.wake(&self.state, 1);
+            thr.Futex.wake(&self.state, 1);
         }
 
         /// Signal error (called by blocking worker thread).
         fn completeWithError(self: *Self, e: anyerror) void {
             self.err = e;
             self.state.store(COMPLETED, .release);
-            std.Thread.Futex.wake(&self.state, 1);
+            thr.Futex.wake(&self.state, 1);
         }
     };
 }
@@ -749,7 +750,7 @@ test "BlockingPool - thread idle timeout" {
     try std.testing.expect(initial_threads >= 1);
 
     // Wait for idle timeout (50ms + buffer)
-    std.Thread.sleep(150 * std.time.ns_per_ms);
+    thr.sleep(150 * std.time.ns_per_ms);
 
     // Thread should have exited due to idle timeout
     // (may still be 1 if another task came in, but shouldn't be more)

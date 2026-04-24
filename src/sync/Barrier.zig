@@ -32,6 +32,7 @@
 //!
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 
 const LinkedList = @import("../internal/util/linked_list.zig").LinkedList;
 
@@ -144,7 +145,7 @@ pub const Barrier = struct {
     arrived: usize,
 
     /// Mutex protecting internal state
-    mutex: std.Thread.Mutex,
+    mutex: thr.Mutex,
 
     /// Waiting tasks
     waiters: WaiterList,

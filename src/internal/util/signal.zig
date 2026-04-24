@@ -22,6 +22,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const syscall = @import("../syscall.zig");
 
 // Windows-specific imports.
 // On Windows, `windows` is the real `std.os.windows` which provides:
@@ -198,7 +199,7 @@ pub const SignalHandler = struct {
     /// Clean up resources.
     pub fn deinit(self: *Self) void {
         switch (self.kind) {
-            .signalfd, .kqueue => posix.close(self.fd),
+            .signalfd, .kqueue => syscall.close(self.fd),
             .self_pipe => self.deinitSelfPipe(),
             .windows_console => self.deinitWindowsConsole(),
         }
@@ -278,8 +279,8 @@ pub const SignalHandler = struct {
             builtin.os.tag == .openbsd or builtin.os.tag == .netbsd);
         if (!is_bsd) return error.UnsupportedPlatform;
         {
-            const kq = posix.kqueue() catch return error.KqueueFailed;
-            errdefer posix.close(kq);
+            const kq = syscall.kqueue() catch return error.KqueueFailed;
+            errdefer syscall.close(kq);
 
             // Register for each signal
             var changelist: [8]posix.Kevent = undefined;
@@ -370,8 +371,8 @@ pub const SignalHandler = struct {
 
         // Ensure we clean up on any early exit
         errdefer {
-            posix.close(read_fd);
-            if (owns_write_fd) posix.close(write_fd);
+            syscall.close(read_fd);
+            if (owns_write_fd) syscall.close(write_fd);
         }
 
         // Atomically try to set the global write fd using compare-exchange.
@@ -398,7 +399,7 @@ pub const SignalHandler = struct {
             } else {
                 // Another handler exists - close our duplicate write fd
                 // (we'll share the existing one)
-                posix.close(write_fd);
+                syscall.close(write_fd);
                 owns_write_fd = false;
                 break;
             }
@@ -434,7 +435,7 @@ pub const SignalHandler = struct {
         if (comptime builtin.os.tag == .windows) return;
 
         // Close read end
-        posix.close(self.fd);
+        syscall.close(self.fd);
 
         // Decrement ref count and close write fd if last user
         const remaining = self_pipe_ref_count.fetchSub(1, .acq_rel);
@@ -442,7 +443,7 @@ pub const SignalHandler = struct {
             // We were the last user - close global write fd
             const write_fd = self_pipe_write_fd.swap(-1, .acq_rel);
             if (write_fd >= 0) {
-                posix.close(write_fd);
+                syscall.close(write_fd);
             }
             // Clear pending signals
             _ = pending_signals.swap(0, .release);
@@ -462,7 +463,7 @@ pub const SignalHandler = struct {
             // Best-effort write to wake event loop. Errors are non-critical:
             // - EAGAIN: pipe full, event loop will wake anyway
             // - EBADF: pipe closed, shutdown in progress
-            _ = posix.write(write_fd, &byte) catch {};
+            _ = syscall.write(write_fd, &byte) catch {};
         }
     }
 

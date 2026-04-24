@@ -2,7 +2,7 @@
     .fingerprint = 0xb2bb3dcf10d2de94,
     .name = .volt,
     .version = "1.1.0",
-    .minimum_zig_version = "0.15.0",
+    .minimum_zig_version = "0.16.0",
 
     .dependencies = .{
         // Blitz compute pool - lazy dependency (only fetched with -Denable_blitz=true)

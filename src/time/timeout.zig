@@ -30,6 +30,7 @@
 //!
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 const builtin = @import("builtin");
 
 const LinkedList = @import("../internal/util/linked_list.zig").LinkedList;
@@ -113,7 +114,7 @@ pub const Deadline = struct {
     waiters: DeadlineWaiterList,
 
     /// Mutex protecting state
-    mutex: std.Thread.Mutex,
+    mutex: thr.Mutex,
 
     const Self = @This();
 
@@ -529,7 +530,7 @@ test "Deadline - not expired initially" {
 
 test "Deadline - expires after duration" {
     var dl = Deadline.init(Duration.fromNanos(1));
-    std.Thread.sleep(1000); // 1 microsecond
+    thr.sleep(1000); // 1 microsecond
     try std.testing.expect(dl.isExpired());
 }
 
@@ -558,7 +559,7 @@ test "Deadline - extend prevents expiration" {
 
 test "Deadline - reset resets timer" {
     var dl = Deadline.init(Duration.fromNanos(1));
-    std.Thread.sleep(1000);
+    thr.sleep(1000);
     try std.testing.expect(dl.isExpired());
 
     dl.reset(Duration.fromSecs(10));
@@ -609,7 +610,7 @@ test "Deadline - poll wakes waiters" {
     }
 
     // Wait longer and poll
-    std.Thread.sleep(10_000); // 10 microseconds
+    thr.sleep(10_000); // 10 microseconds
     dl.poll();
 
     try std.testing.expect(woken);

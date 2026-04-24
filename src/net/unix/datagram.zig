@@ -23,6 +23,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const syscall = @import("../../internal/syscall.zig");
 
 const stream_mod = @import("stream.zig");
 const UnixAddr = stream_mod.UnixAddr;
@@ -98,7 +99,7 @@ pub const UnixDatagram = struct {
 
     /// Create an unbound datagram socket.
     pub fn unbound() !Self {
-        const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, 0);
+        const fd = try syscall.socket(posix.AF.UNIX, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, 0);
         return .{ .fd = fd };
     }
 
@@ -110,17 +111,17 @@ pub const UnixDatagram = struct {
 
     /// Bind to an address.
     pub fn bindAddr(addr: UnixAddr) !Self {
-        const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, 0);
-        errdefer posix.close(fd);
+        const fd = try syscall.socket(posix.AF.UNIX, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, 0);
+        errdefer syscall.close(fd);
 
         var addr_copy = addr;
 
         // Remove existing socket file if it exists
         if (!addr.isAbstract()) {
-            std.fs.cwd().deleteFile(addr.path()) catch {};
+            syscall.unlink(addr.path()) catch {};
         }
 
-        try posix.bind(fd, addr_copy.sockaddr(), addr_copy.len());
+        try syscall.bind(fd, addr_copy.sockaddr(), addr_copy.len());
 
         return .{
             .fd = fd,
@@ -154,8 +155,8 @@ pub const UnixDatagram = struct {
             }
             // Set NONBLOCK and CLOEXEC manually
             for (&fds) |fd| {
-                _ = posix.fcntl(fd, posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))) catch {};
-                _ = posix.fcntl(fd, posix.F.SETFD, @as(u32, 1)) catch {}; // FD_CLOEXEC
+                _ = syscall.fcntl(fd, posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))) catch {};
+                _ = syscall.fcntl(fd, posix.F.SETFD, @as(u32, 1)) catch {}; // FD_CLOEXEC
             }
         }
 
@@ -176,7 +177,7 @@ pub const UnixDatagram = struct {
 
         var addr: posix.sockaddr.un = undefined;
         var len: posix.socklen_t = @sizeOf(posix.sockaddr.un);
-        try posix.getsockname(self.fd, @ptrCast(&addr), &len);
+        try syscall.getsockname(self.fd, @ptrCast(&addr), &len);
         self.local_addr = .{ .inner = addr };
         return self.local_addr.?;
     }
@@ -205,7 +206,7 @@ pub const UnixDatagram = struct {
     /// Connect to a peer address.
     pub fn connectAddr(self: *Self, addr: UnixAddr) !void {
         var addr_copy = addr;
-        try posix.connect(self.fd, addr_copy.sockaddr(), addr_copy.len());
+        try syscall.connect(self.fd, addr_copy.sockaddr(), addr_copy.len());
         self.peer_addr = addr;
     }
 
@@ -215,7 +216,7 @@ pub const UnixDatagram = struct {
 
     /// Try to send without blocking (connected mode).
     pub fn trySend(self: *Self, data: []const u8) !?usize {
-        const n = posix.send(self.fd, data, 0) catch |err| switch (err) {
+        const n = syscall.send(self.fd, data, 0) catch |err| switch (err) {
             error.WouldBlock => return null,
             else => return err,
         };
@@ -224,7 +225,7 @@ pub const UnixDatagram = struct {
 
     /// Try to receive without blocking (connected mode).
     pub fn tryRecv(self: *Self, buf: []u8) !?usize {
-        const n = posix.recv(self.fd, buf, 0) catch |err| switch (err) {
+        const n = syscall.recv(self.fd, buf, 0) catch |err| switch (err) {
             error.WouldBlock => return null,
             else => return err,
         };
@@ -233,12 +234,12 @@ pub const UnixDatagram = struct {
 
     /// Send data (connected mode, blocking).
     pub fn send(self: *Self, data: []const u8) !usize {
-        return posix.send(self.fd, data, 0);
+        return syscall.send(self.fd, data, 0);
     }
 
     /// Receive data (connected mode, blocking).
     pub fn recv(self: *Self, buf: []u8) !usize {
-        return posix.recv(self.fd, buf, 0);
+        return syscall.recv(self.fd, buf, 0);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -248,7 +249,7 @@ pub const UnixDatagram = struct {
     /// Try to send to address without blocking.
     pub fn trySendTo(self: *Self, data: []const u8, addr: UnixAddr) !?usize {
         var addr_copy = addr;
-        const n = posix.sendto(self.fd, data, 0, addr_copy.sockaddr(), addr_copy.len()) catch |err| switch (err) {
+        const n = syscall.sendto(self.fd, data, 0, addr_copy.sockaddr(), addr_copy.len()) catch |err| switch (err) {
             error.WouldBlock => return null,
             else => return err,
         };
@@ -260,7 +261,7 @@ pub const UnixDatagram = struct {
         var addr: posix.sockaddr.un = undefined;
         var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.un);
 
-        const n = posix.recvfrom(self.fd, buf, 0, @ptrCast(&addr), &addr_len) catch |err| switch (err) {
+        const n = syscall.recvfrom(self.fd, buf, 0, @ptrCast(&addr), &addr_len) catch |err| switch (err) {
             error.WouldBlock => return null,
             else => return err,
         };
@@ -274,7 +275,7 @@ pub const UnixDatagram = struct {
     /// Send to address (blocking).
     pub fn sendTo(self: *Self, data: []const u8, addr: UnixAddr) !usize {
         var addr_copy = addr;
-        return posix.sendto(self.fd, data, 0, addr_copy.sockaddr(), addr_copy.len());
+        return syscall.sendto(self.fd, data, 0, addr_copy.sockaddr(), addr_copy.len());
     }
 
     /// Receive from any address (blocking).
@@ -282,7 +283,7 @@ pub const UnixDatagram = struct {
         var addr: posix.sockaddr.un = undefined;
         var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.un);
 
-        const n = try posix.recvfrom(self.fd, buf, 0, @ptrCast(&addr), &addr_len);
+        const n = try syscall.recvfrom(self.fd, buf, 0, @ptrCast(&addr), &addr_len);
 
         return .{
             .len = n,
@@ -296,7 +297,7 @@ pub const UnixDatagram = struct {
 
     /// Peek at data without consuming it.
     pub fn peek(self: *Self, buf: []u8) !usize {
-        return posix.recv(self.fd, buf, posix.MSG.PEEK);
+        return syscall.recv(self.fd, buf, posix.MSG.PEEK);
     }
 
     /// Peek at data and get sender address.
@@ -304,7 +305,7 @@ pub const UnixDatagram = struct {
         var addr: posix.sockaddr.un = undefined;
         var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.un);
 
-        const n = try posix.recvfrom(self.fd, buf, posix.MSG.PEEK, @ptrCast(&addr), &addr_len);
+        const n = try syscall.recvfrom(self.fd, buf, posix.MSG.PEEK, @ptrCast(&addr), &addr_len);
 
         return .{
             .len = n,
@@ -318,12 +319,12 @@ pub const UnixDatagram = struct {
 
     /// Close the socket.
     pub fn close(self: *Self) void {
-        posix.close(self.fd);
+        syscall.close(self.fd);
 
         // Clean up socket file
         if (self.local_addr) |addr| {
             if (!addr.isAbstract()) {
-                std.fs.cwd().deleteFile(addr.path()) catch {};
+                syscall.unlink(addr.path()) catch {};
             }
         }
     }

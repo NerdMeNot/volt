@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const syscall = @import("syscall.zig");
 const Allocator = std.mem.Allocator;
 
 const backend_mod = @import("backend.zig");
@@ -390,38 +391,38 @@ test "IoDriver - TCP loopback send/recv" {
     defer driver.deinit();
 
     // Create BLOCKING listening socket (no NONBLOCK - we need sync accept)
-    const listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    defer posix.close(listen_fd);
+    const listen_fd = try syscall.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer syscall.close(listen_fd);
 
     // Allow address reuse
     try posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
 
     // Bind to ephemeral port
     var bind_addr = Address.initIpv4(.{ 127, 0, 0, 1 }, 0);
-    try posix.bind(listen_fd, @ptrCast(&bind_addr.storage), bind_addr.len);
-    try posix.listen(listen_fd, 1);
+    try syscall.bind(listen_fd, @ptrCast(&bind_addr.storage), bind_addr.len);
+    try syscall.listen(listen_fd, 1);
 
     // Get assigned port
     var name_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-    try posix.getsockname(listen_fd, @ptrCast(&bind_addr.storage), &name_len);
+    try syscall.getsockname(listen_fd, @ptrCast(&bind_addr.storage), &name_len);
     const port = bind_addr.port();
 
     // Create BLOCKING client socket and connect
-    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    defer posix.close(client_fd);
+    const client_fd = try syscall.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer syscall.close(client_fd);
 
     var connect_addr = Address.initIpv4(.{ 127, 0, 0, 1 }, port);
-    try posix.connect(client_fd, @ptrCast(&connect_addr.storage), connect_addr.len);
+    try syscall.connect(client_fd, @ptrCast(&connect_addr.storage), connect_addr.len);
 
     // Accept the connection (blocking)
     var accept_addr: posix.sockaddr = undefined;
     var accept_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-    const server_fd = try posix.accept(listen_fd, &accept_addr, &accept_addr_len, 0);
-    defer posix.close(server_fd);
+    const server_fd = try syscall.accept(listen_fd, &accept_addr, &accept_addr_len, 0);
+    defer syscall.close(server_fd);
 
     // NOW set both to non-blocking for async I/O testing
-    _ = try posix.fcntl(client_fd, posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
-    _ = try posix.fcntl(server_fd, posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+    _ = try syscall.fcntl(client_fd, posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+    _ = try syscall.fcntl(server_fd, posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
 
     const send_data = "Hello, IoDriver!";
     var recv_buf: [64]u8 = undefined;
@@ -468,25 +469,25 @@ test "IoDriver - TCP loopback accept/connect" {
     defer driver.deinit();
 
     // Create non-blocking listening socket
-    const listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-    defer posix.close(listen_fd);
+    const listen_fd = try syscall.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+    defer syscall.close(listen_fd);
 
     // Allow address reuse
     try posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
 
     // Bind to ephemeral port
     var bind_addr = Address.initIpv4(.{ 127, 0, 0, 1 }, 0);
-    try posix.bind(listen_fd, @ptrCast(&bind_addr.storage), bind_addr.len);
-    try posix.listen(listen_fd, 1);
+    try syscall.bind(listen_fd, @ptrCast(&bind_addr.storage), bind_addr.len);
+    try syscall.listen(listen_fd, 1);
 
     // Get assigned port
     var name_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-    try posix.getsockname(listen_fd, @ptrCast(&bind_addr.storage), &name_len);
+    try syscall.getsockname(listen_fd, @ptrCast(&bind_addr.storage), &name_len);
     const port = bind_addr.port();
 
     // Create non-blocking client socket
-    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-    defer posix.close(client_fd);
+    const client_fd = try syscall.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+    defer syscall.close(client_fd);
 
     // Setup accept address storage
     var accept_addr: posix.sockaddr = undefined;
@@ -495,7 +496,7 @@ test "IoDriver - TCP loopback accept/connect" {
     // For readiness-based backends (kqueue), we must initiate connect() first.
     // Non-blocking connect returns EINPROGRESS, then we wait for writability.
     var connect_addr = Address.initIpv4(.{ 127, 0, 0, 1 }, port);
-    posix.connect(client_fd, @ptrCast(&connect_addr.storage), connect_addr.len) catch |err| {
+    syscall.connect(client_fd, @ptrCast(&connect_addr.storage), connect_addr.len) catch |err| {
         // EINPROGRESS is expected for non-blocking connect
         if (err != error.WouldBlock) return err;
     };
@@ -528,7 +529,7 @@ test "IoDriver - TCP loopback accept/connect" {
 
     // Clean up accepted fd
     if (accepted_fd > 0) {
-        posix.close(accepted_fd);
+        syscall.close(accepted_fd);
     }
 
     try std.testing.expect(connect_done);

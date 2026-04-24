@@ -40,6 +40,7 @@
 //! This prevents starvation and missed wakeups.
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 
 const LinkedList = @import("../internal/util/linked_list.zig").LinkedList;
 const Pointers = @import("../internal/util/linked_list.zig").Pointers;
@@ -184,7 +185,7 @@ pub const Semaphore = struct {
 
     /// Mutex protecting the waiters list. Taken by release() slow path and
     /// acquireWait()'s slow path. NOT taken by tryAcquire().
-    mutex: std.Thread.Mutex,
+    mutex: thr.Mutex,
 
     /// Waiters list: pushFront for new waiters, serve from back (FIFO)
     waiters: WaiterList,

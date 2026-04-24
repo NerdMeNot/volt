@@ -61,6 +61,7 @@
 //! ```
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 const time_mod = @import("../time.zig");
 const Duration = time_mod.Duration;
 const Instant = time_mod.Instant;
@@ -701,7 +702,7 @@ test "Timeout - expires" {
     var timeout = Timeout(MockFuture).init(future, Duration.fromNanos(1));
 
     // Wait for timeout
-    std.Thread.sleep(1000);
+    thr.sleep(1000);
 
     const result = timeout.poll(.{});
     try std.testing.expect(result == .timeout);

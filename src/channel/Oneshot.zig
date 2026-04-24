@@ -47,6 +47,7 @@
 //!
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 
 const future_mod = @import("../future.zig");
 const Waker = future_mod.Waker;
@@ -91,7 +92,7 @@ pub fn Oneshot(comptime T: type) type {
             waiter: ?*RecvWaiter,
 
             /// Mutex for state transitions
-            mutex: std.Thread.Mutex,
+            mutex: thr.Mutex,
 
             pub fn init() Shared {
                 return .{

@@ -21,6 +21,7 @@
 //! This enables millions of concurrent tasks instead of thousands.
 
 const std = @import("std");
+const thr = @import("../thread.zig");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
@@ -750,7 +751,7 @@ pub const TaskQueue = struct {
 /// Enhanced with batch operations and lock-free length for fast emptiness checks.
 pub const GlobalTaskQueue = struct {
     queue: TaskQueue = .{},
-    mutex: std.Thread.Mutex = .{},
+    mutex: thr.Mutex = .{},
     /// Atomic length for lock-free emptiness/length checks.
     /// Updated inside the lock, but readable without locking.
     atomic_len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),

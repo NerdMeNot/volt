@@ -30,6 +30,7 @@
 //!
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 const Allocator = std.mem.Allocator;
 
 const LinkedList = @import("../internal/util/linked_list.zig").LinkedList;
@@ -143,7 +144,7 @@ pub fn BroadcastChannel(comptime T: type) type {
         closed: bool,
 
         /// Mutex protecting internal state
-        mutex: std.Thread.Mutex,
+        mutex: thr.Mutex,
 
         /// Waiting receivers
         recv_waiters: RecvWaiterList,

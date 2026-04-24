@@ -24,7 +24,9 @@
 //! Reference: POSIX.1-2017, Stevens UNIX Network Programming
 
 const std = @import("std");
+const thr = @import("../thread.zig");
 const posix = std.posix;
+const syscall = @import("../syscall.zig");
 
 const completion = @import("types.zig");
 const Operation = completion.Operation;
@@ -146,15 +148,15 @@ pub const PollBackend = struct {
         errdefer registrations.deinit();
 
         // Create self-pipe for cross-thread wakeup
-        const wakeup_pipe = try posix.pipe();
+        const wakeup_pipe = try syscall.pipe();
         errdefer {
-            posix.close(wakeup_pipe[0]);
-            posix.close(wakeup_pipe[1]);
+            syscall.close(wakeup_pipe[0]);
+            syscall.close(wakeup_pipe[1]);
         }
 
         // Set both ends to non-blocking
-        _ = try posix.fcntl(wakeup_pipe[0], posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
-        _ = try posix.fcntl(wakeup_pipe[1], posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+        _ = try syscall.fcntl(wakeup_pipe[0], posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+        _ = try syscall.fcntl(wakeup_pipe[1], posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
 
         return Self{
             .allocator = allocator,
@@ -178,8 +180,8 @@ pub const PollBackend = struct {
 
     /// Clean up resources.
     pub fn deinit(self: *Self) void {
-        posix.close(self.wakeup_pipe[0]);
-        posix.close(self.wakeup_pipe[1]);
+        syscall.close(self.wakeup_pipe[0]);
+        syscall.close(self.wakeup_pipe[1]);
         self.timers.deinit(self.allocator);
         self.registrations.deinit();
         self.allocator.free(self.pollfd_to_key);
@@ -197,7 +199,7 @@ pub const PollBackend = struct {
 
         // Write a byte to wake the poll
         const byte = [_]u8{1};
-        _ = posix.write(self.wakeup_pipe[1], &byte) catch {};
+        _ = syscall.write(self.wakeup_pipe[1], &byte) catch {};
     }
 
     /// Submit an I/O operation.
@@ -253,7 +255,7 @@ pub const PollBackend = struct {
             },
             .close => |c| {
                 // Close is synchronous
-                posix.close(c.fd);
+                syscall.close(c.fd);
                 // Will complete immediately in wait()
                 const reg = Registration.init(-1, op, submission_id, .{});
                 _ = try self.registrations.insert(reg);
@@ -491,31 +493,31 @@ pub const PollBackend = struct {
                 break :blk @intCast(n);
             },
             .write => |w| blk: {
-                const n = posix.write(w.fd, w.buffer) catch |err| {
+                const n = syscall.write(w.fd, w.buffer) catch |err| {
                     break :blk -@as(i32, @intFromEnum(errToErrno(err)));
                 };
                 break :blk @intCast(n);
             },
             .recv => |r| blk: {
-                const n = posix.recv(r.fd, r.buffer, r.flags) catch |err| {
+                const n = syscall.recv(r.fd, r.buffer, r.flags) catch |err| {
                     break :blk -@as(i32, @intFromEnum(errToErrno(err)));
                 };
                 break :blk @intCast(n);
             },
             .send => |s| blk: {
-                const n = posix.send(s.fd, s.buffer, s.flags) catch |err| {
+                const n = syscall.send(s.fd, s.buffer, s.flags) catch |err| {
                     break :blk -@as(i32, @intFromEnum(errToErrno(err)));
                 };
                 break :blk @intCast(n);
             },
             .accept => |a| blk: {
-                const result = posix.accept(a.fd, a.addr, a.addr_len, 0) catch |err| {
+                const result = syscall.accept(a.fd, a.addr, a.addr_len, 0) catch |err| {
                     break :blk -@as(i32, @intFromEnum(errToErrno(err)));
                 };
                 break :blk @intCast(result);
             },
             .connect => |c| blk: {
-                posix.connect(c.fd, c.addr, c.addr_len) catch |err| {
+                syscall.connect(c.fd, c.addr, c.addr_len) catch |err| {
                     // Check if already connected or in progress
                     const errno = errToErrno(err);
                     if (errno == .ISCONN) break :blk 0;
@@ -626,7 +628,7 @@ test "Poll - timer expiration" {
     });
 
     // Wait long enough for timer to expire
-    std.Thread.sleep(5_000_000); // 5ms
+    thr.sleep(5_000_000); // 5ms
 
     var completions: [8]Completion = undefined;
     const count = try backend.wait(&completions, 0);

@@ -31,7 +31,9 @@
 //! ```
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 const posix = std.posix;
+const syscall = @import("../internal/syscall.zig");
 const mem = std.mem;
 const builtin = @import("builtin");
 
@@ -93,20 +95,20 @@ pub const UdpSocket = struct {
     /// Bind to an address. Use port 0 to let the OS assign a port.
     pub fn bind(addr: Address) !UdpSocket {
         const family = addr.family();
-        const fd = try posix.socket(
+        const fd = try syscall.socket(
             family,
             posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
             0,
         );
-        errdefer posix.close(fd);
+        errdefer syscall.close(fd);
 
         // Bind to address
-        try posix.bind(fd, addr.sockaddr(), addr.len);
+        try syscall.bind(fd, addr.sockaddr(), addr.len);
 
         // Get actual bound address (important when port was 0)
         var local_addr: Address = undefined;
         local_addr.len = @sizeOf(posix.sockaddr.storage);
-        try posix.getsockname(fd, local_addr.sockaddrMut(), &local_addr.len);
+        try syscall.getsockname(fd, local_addr.sockaddrMut(), &local_addr.len);
 
         return .{
             .fd = fd,
@@ -123,7 +125,7 @@ pub const UdpSocket = struct {
 
     /// Create an unbound socket with specific address family.
     pub fn unboundWithFamily(family: u32) !UdpSocket {
-        const fd = try posix.socket(
+        const fd = try syscall.socket(
             family,
             posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
             0,
@@ -151,7 +153,7 @@ pub const UdpSocket = struct {
     pub fn fromStd(std_socket: std.net.DatagramSocket) UdpSocket {
         var local_addr: Address = undefined;
         local_addr.len = @sizeOf(posix.sockaddr.storage);
-        posix.getsockname(std_socket.handle, local_addr.sockaddrMut(), &local_addr.len) catch {};
+        syscall.getsockname(std_socket.handle, local_addr.sockaddrMut(), &local_addr.len) catch {};
 
         return .{
             .fd = std_socket.handle,
@@ -169,7 +171,7 @@ pub const UdpSocket = struct {
 
     /// Close the socket.
     pub fn close(self: *UdpSocket) void {
-        posix.close(self.fd);
+        syscall.close(self.fd);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -184,7 +186,7 @@ pub const UdpSocket = struct {
     /// - The socket is NOT actually connected (UDP is connectionless)
     ///   but the kernel filters incoming packets and remembers the destination
     pub fn connect(self: *UdpSocket, addr: Address) !void {
-        try posix.connect(self.fd, addr.sockaddr(), addr.len);
+        try syscall.connect(self.fd, addr.sockaddr(), addr.len);
         self.peer_addr = addr;
     }
 
@@ -194,7 +196,7 @@ pub const UdpSocket = struct {
         // Connect to AF_UNSPEC to disconnect
         var unspec: posix.sockaddr = undefined;
         unspec.family = posix.AF.UNSPEC;
-        posix.connect(self.fd, &unspec, @sizeOf(posix.sockaddr)) catch |err| {
+        syscall.connect(self.fd, &unspec, @sizeOf(posix.sockaddr)) catch |err| {
             // Some systems return EAFNOSUPPORT, which is fine
             if (err != error.AddressFamilyNotSupported) return err;
         };
@@ -1023,7 +1025,7 @@ test "UdpSocket - send and receive" {
     // Receive on server
     var buf: [64]u8 = undefined;
     // May need a small delay for the packet to arrive
-    std.Thread.sleep(1_000_000); // 1ms
+    thr.sleep(1_000_000); // 1ms
 
     if (try server.tryRecvFrom(&buf)) |result| {
         try std.testing.expectEqualStrings(msg, buf[0..result.len]);
@@ -1046,7 +1048,7 @@ test "UdpSocket - connect and send/recv" {
     const msg = "connected udp";
     _ = try client.trySend(msg);
 
-    std.Thread.sleep(1_000_000); // 1ms
+    thr.sleep(1_000_000); // 1ms
 
     var buf: [64]u8 = undefined;
     if (try server.tryRecvFrom(&buf)) |_| {
@@ -1175,7 +1177,7 @@ test "UdpSocket - peek" {
         return err;
     };
 
-    std.Thread.sleep(1_000_000); // 1ms
+    thr.sleep(1_000_000); // 1ms
 
     // Peek should return data without consuming it
     var buf1: [64]u8 = undefined;

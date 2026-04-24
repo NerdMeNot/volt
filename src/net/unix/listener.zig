@@ -23,8 +23,10 @@
 //! ```
 
 const std = @import("std");
+const thr = @import("../../internal/thread.zig");
 const builtin = @import("builtin");
 const posix = std.posix;
+const syscall = @import("../../internal/syscall.zig");
 
 const stream_mod = @import("stream.zig");
 const UnixStream = stream_mod.UnixStream;
@@ -221,7 +223,7 @@ pub const UnixListener = struct {
     fd: posix.socket_t,
     local_addr: UnixAddr,
     waiters: AcceptWaiterList = .{},
-    mutex: std.Thread.Mutex = .{},
+    mutex: thr.Mutex = .{},
 
     const Self = @This();
 
@@ -233,18 +235,18 @@ pub const UnixListener = struct {
 
     /// Bind to an address.
     pub fn bindAddr(addr: UnixAddr) !Self {
-        const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, 0);
-        errdefer posix.close(fd);
+        const fd = try syscall.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, 0);
+        errdefer syscall.close(fd);
 
         var addr_copy = addr;
 
         // Remove existing socket file if it exists
         if (!addr.isAbstract()) {
-            std.fs.cwd().deleteFile(addr.path()) catch {};
+            syscall.unlink(addr.path()) catch {};
         }
 
-        try posix.bind(fd, addr_copy.sockaddr(), addr_copy.len());
-        try posix.listen(fd, 128);
+        try syscall.bind(fd, addr_copy.sockaddr(), addr_copy.len());
+        try syscall.listen(fd, 128);
 
         return .{
             .fd = fd,
@@ -255,17 +257,17 @@ pub const UnixListener = struct {
     /// Bind with specific backlog.
     pub fn bindWithBacklog(path: []const u8, backlog: u31) !Self {
         const addr = try UnixAddr.fromPath(path);
-        const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, 0);
-        errdefer posix.close(fd);
+        const fd = try syscall.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, 0);
+        errdefer syscall.close(fd);
 
         var addr_copy = addr;
 
         if (!addr.isAbstract()) {
-            std.fs.cwd().deleteFile(addr.path()) catch {};
+            syscall.unlink(addr.path()) catch {};
         }
 
-        try posix.bind(fd, addr_copy.sockaddr(), addr_copy.len());
-        try posix.listen(fd, backlog);
+        try syscall.bind(fd, addr_copy.sockaddr(), addr_copy.len());
+        try syscall.listen(fd, backlog);
 
         return .{
             .fd = fd,
@@ -292,7 +294,7 @@ pub const UnixListener = struct {
         var peer_addr: posix.sockaddr.un = undefined;
         var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.un);
 
-        const client_fd = posix.accept(self.fd, @ptrCast(&peer_addr), &addr_len, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch |err| switch (err) {
+        const client_fd = syscall.accept(self.fd, @ptrCast(&peer_addr), &addr_len, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch |err| switch (err) {
             error.WouldBlock => return null,
             else => return err,
         };
@@ -340,11 +342,11 @@ pub const UnixListener = struct {
 
     /// Close the listener.
     pub fn close(self: *Self) void {
-        posix.close(self.fd);
+        syscall.close(self.fd);
 
         // Clean up socket file
         if (!self.local_addr.isAbstract()) {
-            std.fs.cwd().deleteFile(self.local_addr.path()) catch {};
+            syscall.unlink(self.local_addr.path()) catch {};
         }
     }
 };
@@ -403,7 +405,7 @@ test "UnixListener - accept connection" {
     }.run, .{path});
 
     // Accept
-    std.Thread.sleep(10_000_000); // 10ms
+    thr.sleep(10_000_000); // 10ms
     if (try listener.tryAccept()) |res| {
         var stream = res.stream;
         defer stream.close();

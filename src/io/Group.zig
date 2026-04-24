@@ -21,6 +21,7 @@
 //! use `io.@"async"()` directly with your own tracking.
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 const Io = @import("../Io.zig");
 const fn_future_mod = @import("../future/FnFuture.zig");
 const FnFuture = fn_future_mod.FnFuture;
@@ -70,7 +71,7 @@ pub const Group = struct {
                 } else if (spin_count < 12) {
                     std.Thread.yield() catch {};
                 } else {
-                    std.Thread.sleep(1_000);
+                    thr.sleep(1_000);
                 }
                 spin_count +|= 1;
             }

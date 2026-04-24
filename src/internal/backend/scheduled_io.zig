@@ -41,6 +41,7 @@
 //! Inspired by production async runtime I/O state machines with proven correctness.
 
 const std = @import("std");
+const thr = @import("../thread.zig");
 const bit = @import("../util/bit.zig");
 const linked_list = @import("../util/linked_list.zig");
 const cacheline = @import("../util/cacheline.zig");
@@ -171,7 +172,7 @@ pub const ScheduledIo = struct {
     // ─────────────────────────────────────────────────────────────────────
 
     /// Mutex protecting waiters list.
-    waiters_lock: std.Thread.Mutex,
+    waiters_lock: thr.Mutex,
 
     /// List of tasks waiting for readiness (FIFO for fairness).
     waiters: WaiterList,

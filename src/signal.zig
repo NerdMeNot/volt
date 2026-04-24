@@ -46,6 +46,7 @@
 //!
 
 const std = @import("std");
+const thr = @import("internal/thread.zig");
 const builtin = @import("builtin");
 const posix = std.posix;
 
@@ -141,7 +142,7 @@ pub const AsyncSignal = struct {
     pending: SignalSet,
 
     /// Mutex protecting state
-    mutex: std.Thread.Mutex,
+    mutex: thr.Mutex,
 
     /// Waiters list
     waiters: SignalWaiterList,

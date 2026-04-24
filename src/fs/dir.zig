@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const syscall = @import("../internal/syscall.zig");
 const builtin = @import("builtin");
 const mem = std.mem;
 
@@ -31,13 +32,13 @@ const FileType = @import("metadata.zig").FileType;
 /// Create a new directory.
 pub fn createDir(path: []const u8) !void {
     const path_z = try posix.toPosixPath(path);
-    try posix.mkdiratZ(posix.AT.FDCWD, &path_z, 0o755);
+    try syscall.mkdiratZ(posix.AT.FDCWD, &path_z, 0o755);
 }
 
 /// Create a new directory with specific permissions.
 pub fn createDirMode(path: []const u8, mode: u32) !void {
     const path_z = try posix.toPosixPath(path);
-    try posix.mkdiratZ(posix.AT.FDCWD, &path_z, @intCast(mode));
+    try syscall.mkdiratZ(posix.AT.FDCWD, &path_z, @intCast(mode));
 }
 
 /// Create a directory and all parent directories as needed.
@@ -72,7 +73,7 @@ pub fn createDirAll(path: []const u8) !void {
 /// Remove an empty directory.
 pub fn removeDir(path: []const u8) !void {
     const path_z = try posix.toPosixPath(path);
-    try posix.unlinkatZ(posix.AT.FDCWD, &path_z, posix.AT.REMOVEDIR);
+    try syscall.unlinkatZ(posix.AT.FDCWD, &path_z, posix.AT.REMOVEDIR);
 }
 
 /// Remove a directory and all its contents recursively.
@@ -106,7 +107,7 @@ pub fn removeDirAll(allocator: mem.Allocator, path: []const u8) !void {
 /// Remove a file.
 pub fn removeFile(path: []const u8) !void {
     const path_z = try posix.toPosixPath(path);
-    try posix.unlinkatZ(posix.AT.FDCWD, &path_z, 0);
+    try syscall.unlinkatZ(posix.AT.FDCWD, &path_z, 0);
 }
 
 /// Directory entry from readDir.
@@ -233,7 +234,7 @@ pub const DirBuilder = struct {
             } else {
                 try createDirAll(path);
                 // Set final mode only
-                try posix.fchmodat(posix.AT.FDCWD, path, @intCast(self.mode), 0);
+                try syscall.fchmodat(posix.AT.FDCWD, path, @intCast(self.mode), 0);
             }
         } else {
             try createDirMode(path, self.mode);
@@ -280,7 +281,7 @@ test "createDir and removeDir" {
 
     // Verify it exists
     const path_z = try posix.toPosixPath(path);
-    const stat = try posix.fstatatZ(posix.AT.FDCWD, &path_z, 0);
+    const stat = try syscall.fstatatZ(posix.AT.FDCWD, &path_z, 0);
     try std.testing.expect((stat.mode & posix.S.IFMT) == posix.S.IFDIR);
 }
 
@@ -292,7 +293,7 @@ test "createDirAll" {
 
     // Verify deepest dir exists
     const path_z = try posix.toPosixPath(path);
-    const stat = try posix.fstatatZ(posix.AT.FDCWD, &path_z, 0);
+    const stat = try syscall.fstatatZ(posix.AT.FDCWD, &path_z, 0);
     try std.testing.expect((stat.mode & posix.S.IFMT) == posix.S.IFDIR);
 }
 
@@ -348,9 +349,9 @@ test "DirBuilder - modeForAll" {
     defer removeDirAll(std.testing.allocator, base) catch {};
 
     // Check that intermediate directories also have the mode
-    const stat_a = try posix.fstatatZ(posix.AT.FDCWD, &(try posix.toPosixPath("/tmp/blitz_io_dirbuilder_all/a")), 0);
-    const stat_b = try posix.fstatatZ(posix.AT.FDCWD, &(try posix.toPosixPath("/tmp/blitz_io_dirbuilder_all/a/b")), 0);
-    const stat_c = try posix.fstatatZ(posix.AT.FDCWD, &(try posix.toPosixPath(path)), 0);
+    const stat_a = try syscall.fstatatZ(posix.AT.FDCWD, &(try posix.toPosixPath("/tmp/blitz_io_dirbuilder_all/a")), 0);
+    const stat_b = try syscall.fstatatZ(posix.AT.FDCWD, &(try posix.toPosixPath("/tmp/blitz_io_dirbuilder_all/a/b")), 0);
+    const stat_c = try syscall.fstatatZ(posix.AT.FDCWD, &(try posix.toPosixPath(path)), 0);
 
     // Mode should be 0o700 for all (with directory bit)
     const expected_mode = 0o700;

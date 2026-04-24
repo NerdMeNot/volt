@@ -26,6 +26,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const syscall = @import("../../internal/syscall.zig");
 const Allocator = std.mem.Allocator;
 
 const LinkedList = @import("../../internal/util/linked_list.zig").LinkedList;
@@ -163,11 +164,11 @@ pub const UnixStream = struct {
 
     /// Connect to a Unix socket address.
     pub fn connectAddr(addr: UnixAddr) !Self {
-        const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, 0);
-        errdefer posix.close(fd);
+        const fd = try syscall.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, 0);
+        errdefer syscall.close(fd);
 
         var addr_copy = addr;
-        posix.connect(fd, addr_copy.sockaddr(), addr_copy.len()) catch |err| switch (err) {
+        syscall.connect(fd, addr_copy.sockaddr(), addr_copy.len()) catch |err| switch (err) {
             error.WouldBlock, error.ConnectionPending => {
                 // Non-blocking connect in progress - that's fine
             },
@@ -207,7 +208,7 @@ pub const UnixStream = struct {
 
         var addr: posix.sockaddr.un = undefined;
         var len: posix.socklen_t = @sizeOf(posix.sockaddr.un);
-        try posix.getsockname(self.fd, @ptrCast(&addr), &len);
+        try syscall.getsockname(self.fd, @ptrCast(&addr), &len);
         self.local_addr = .{ .inner = addr };
         return self.local_addr.?;
     }
@@ -227,7 +228,7 @@ pub const UnixStream = struct {
 
     /// Try to write without blocking.
     pub fn tryWrite(self: *Self, data: []const u8) !?usize {
-        const n = posix.write(self.fd, data) catch |err| switch (err) {
+        const n = syscall.write(self.fd, data) catch |err| switch (err) {
             error.WouldBlock => return null,
             else => return err,
         };
@@ -241,25 +242,25 @@ pub const UnixStream = struct {
 
     /// Blocking write.
     pub fn write(self: *Self, data: []const u8) !usize {
-        return posix.write(self.fd, data);
+        return syscall.write(self.fd, data);
     }
 
     /// Write all data.
     pub fn writeAll(self: *Self, data: []const u8) !void {
         var offset: usize = 0;
         while (offset < data.len) {
-            offset += try posix.write(self.fd, data[offset..]);
+            offset += try syscall.write(self.fd, data[offset..]);
         }
     }
 
     /// Read with scatter/gather.
     pub fn readv(self: *Self, iovecs: []posix.iovec) !usize {
-        return posix.readv(self.fd, iovecs);
+        return syscall.readv(self.fd, iovecs);
     }
 
     /// Write with scatter/gather.
     pub fn writev(self: *Self, iovecs: []const posix.iovec_const) !usize {
-        return posix.writev(self.fd, iovecs);
+        return syscall.writev(self.fd, iovecs);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -271,7 +272,7 @@ pub const UnixStream = struct {
         write,
         both,
 
-        fn toNative(self: ShutdownHow) posix.ShutdownHow {
+        fn toNative(self: ShutdownHow) syscall.ShutdownHow {
             return switch (self) {
                 .read => .recv,
                 .write => .send,
@@ -282,12 +283,12 @@ pub const UnixStream = struct {
 
     /// Shutdown the socket.
     pub fn shutdown(self: *Self, how: ShutdownHow) !void {
-        try posix.shutdown(self.fd, how.toNative());
+        try syscall.shutdown(self.fd, how.toNative());
     }
 
     /// Close the socket.
     pub fn close(self: *Self) void {
-        posix.close(self.fd);
+        syscall.close(self.fd);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -359,12 +360,12 @@ test "UnixStream - create socket" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     // Just test that we can create a socket (connecting will fail without a server)
-    const fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, 0) catch |err| {
+    const fd = syscall.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, 0) catch |err| {
         // Skip on systems that don't support Unix sockets
         if (err == error.AddressFamilyNotSupported) return error.SkipZigTest;
         return err;
     };
-    defer posix.close(fd);
+    defer syscall.close(fd);
 
     const stream = UnixStream.fromFd(fd);
     try std.testing.expect(stream.fileno() == fd);
@@ -471,7 +472,7 @@ test "UnixStream - tryRead tryWrite" {
         const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
         if (rc != 0) return error.SkipZigTest;
         for (&fds) |fd| {
-            _ = posix.fcntl(fd, posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))) catch {};
+            _ = syscall.fcntl(fd, posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))) catch {};
         }
     }
 

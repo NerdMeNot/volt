@@ -22,6 +22,7 @@
 //!
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 
 const LinkedList = @import("../internal/util/linked_list.zig").LinkedList;
 const Pointers = @import("../internal/util/linked_list.zig").Pointers;
@@ -136,7 +137,7 @@ pub fn OnceCell(comptime T: type) type {
         value: T,
 
         /// Mutex for waiters list
-        mutex: std.Thread.Mutex,
+        mutex: thr.Mutex,
 
         /// Waiters for initialization
         waiters: InitWaiterList,

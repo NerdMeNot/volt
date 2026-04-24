@@ -21,6 +21,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
+const syscall = @import("../syscall.zig");
 
 const completion = @import("types.zig");
 const Operation = completion.Operation;
@@ -39,7 +40,7 @@ pub fn isSupported() bool {
 
     if (linux.E.init(res) == .SUCCESS) {
         // Successfully created, close it
-        posix.close(@intCast(res));
+        syscall.close(@intCast(res));
         return true;
     }
 
@@ -231,7 +232,7 @@ pub const IoUringBackend = struct {
             return error.WakeupCreationFailed;
         }
         const wakeup_fd: posix.fd_t = @intCast(wakeup_result);
-        errdefer posix.close(wakeup_fd);
+        errdefer syscall.close(wakeup_fd);
 
         // Register eventfd with io_uring for efficient wakeup
         // This allows the kernel to signal when the eventfd is written to
@@ -254,7 +255,7 @@ pub const IoUringBackend = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        posix.close(self.wakeup_fd);
+        syscall.close(self.wakeup_fd);
         self.overflow_completions.deinit(self.allocator);
         self.allocator.free(self.cqe_buffer);
         self.operations.deinit();
@@ -272,7 +273,7 @@ pub const IoUringBackend = struct {
 
         // Write to eventfd to wake the ring
         const val: u64 = 1;
-        _ = posix.write(self.wakeup_fd, std.mem.asBytes(&val)) catch {};
+        _ = syscall.write(self.wakeup_fd, std.mem.asBytes(&val)) catch {};
     }
 
     /// Submit an operation to the ring.
@@ -839,8 +840,8 @@ test "IoUringBackend - TCP socket accept" {
     defer backend.deinit();
 
     // Create listening socket
-    const listen_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
-    defer std.posix.close(listen_fd);
+    const listen_fd = try std.syscall.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
+    defer std.syscall.close(listen_fd);
 
     // Bind to ephemeral port
     var addr = std.posix.sockaddr.in{
@@ -848,12 +849,12 @@ test "IoUringBackend - TCP socket accept" {
         .port = 0,
         .addr = std.mem.nativeToBig(u32, 0x7f000001),
     };
-    try std.posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
-    try std.posix.listen(listen_fd, 1);
+    try std.syscall.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+    try std.syscall.listen(listen_fd, 1);
 
     // Get assigned port
     var name_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
-    try std.posix.getsockname(listen_fd, @ptrCast(&addr), &name_len);
+    try std.syscall.getsockname(listen_fd, @ptrCast(&addr), &name_len);
 
     // Submit accept operation
     var accept_addr: std.posix.sockaddr = undefined;
@@ -870,10 +871,10 @@ test "IoUringBackend - TCP socket accept" {
     });
 
     // Create client and connect
-    const client_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    defer std.posix.close(client_fd);
+    const client_fd = try std.syscall.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    defer std.syscall.close(client_fd);
 
-    try std.posix.connect(client_fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+    try std.syscall.connect(client_fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
 
     // Wait for accept completion
     var completions: [8]Completion = undefined;
@@ -884,7 +885,7 @@ test "IoUringBackend - TCP socket accept" {
     try std.testing.expect(completions[0].result > 0);
 
     // Clean up accepted fd
-    std.posix.close(@intCast(completions[0].result));
+    std.syscall.close(@intCast(completions[0].result));
 }
 
 test "IoUringBackend - TCP socket send/recv" {
@@ -895,28 +896,28 @@ test "IoUringBackend - TCP socket send/recv" {
     defer backend.deinit();
 
     // Create connected socket pair using TCP loopback
-    const listen_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    defer std.posix.close(listen_fd);
+    const listen_fd = try std.syscall.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    defer std.syscall.close(listen_fd);
 
     var addr = std.posix.sockaddr.in{
         .family = std.posix.AF.INET,
         .port = 0,
         .addr = std.mem.nativeToBig(u32, 0x7f000001),
     };
-    try std.posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
-    try std.posix.listen(listen_fd, 1);
+    try std.syscall.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+    try std.syscall.listen(listen_fd, 1);
 
     var name_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
-    try std.posix.getsockname(listen_fd, @ptrCast(&addr), &name_len);
+    try std.syscall.getsockname(listen_fd, @ptrCast(&addr), &name_len);
 
-    const client_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    defer std.posix.close(client_fd);
-    try std.posix.connect(client_fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+    const client_fd = try std.syscall.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    defer std.syscall.close(client_fd);
+    try std.syscall.connect(client_fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
 
     var accept_addr: std.posix.sockaddr = undefined;
     var accept_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-    const server_fd = try std.posix.accept(listen_fd, &accept_addr, &accept_len, 0);
-    defer std.posix.close(server_fd);
+    const server_fd = try std.syscall.accept(listen_fd, &accept_addr, &accept_len, 0);
+    defer std.syscall.close(server_fd);
 
     // Submit send on client
     const send_data = "Hello io_uring!";
@@ -1002,7 +1003,7 @@ test "IoUringBackend - close operation" {
     defer backend.deinit();
 
     // Create a socket to close
-    const fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    const fd = try std.syscall.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
 
     // Submit close operation
     _ = try backend.submit(.{
@@ -1064,15 +1065,15 @@ test "IoUringBackend - read and write on pipe" {
     defer backend.deinit();
 
     // Create a pipe
-    const pipe_fds = try std.posix.pipe();
+    const pipe_fds = try std.syscall.pipe();
     defer {
-        std.posix.close(pipe_fds[0]);
-        std.posix.close(pipe_fds[1]);
+        std.syscall.close(pipe_fds[0]);
+        std.syscall.close(pipe_fds[1]);
     }
 
     // Write data first (synchronously)
     const write_data = "Test io_uring pipe";
-    _ = try std.posix.write(pipe_fds[1], write_data);
+    _ = try std.syscall.write(pipe_fds[1], write_data);
 
     // Submit read operation
     var read_buf: [64]u8 = undefined;
@@ -1236,10 +1237,10 @@ test "IoUringBackend - write operation on pipe" {
     defer backend.deinit();
 
     // Create a pipe
-    const pipe_fds = try std.posix.pipe();
+    const pipe_fds = try std.syscall.pipe();
     defer {
-        std.posix.close(pipe_fds[0]);
-        std.posix.close(pipe_fds[1]);
+        std.syscall.close(pipe_fds[0]);
+        std.syscall.close(pipe_fds[1]);
     }
 
     // Submit write operation via io_uring
@@ -1300,8 +1301,8 @@ test "IoUringBackend - multishot accept basic" {
     defer backend.deinit();
 
     // Create listening socket
-    const listen_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
-    defer std.posix.close(listen_fd);
+    const listen_fd = try std.syscall.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
+    defer std.syscall.close(listen_fd);
 
     // Bind to ephemeral port
     var addr = std.posix.sockaddr.in{
@@ -1309,12 +1310,12 @@ test "IoUringBackend - multishot accept basic" {
         .port = 0,
         .addr = std.mem.nativeToBig(u32, 0x7f000001),
     };
-    try std.posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
-    try std.posix.listen(listen_fd, 10);
+    try std.syscall.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+    try std.syscall.listen(listen_fd, 10);
 
     // Get assigned port
     var name_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
-    try std.posix.getsockname(listen_fd, @ptrCast(&addr), &name_len);
+    try std.syscall.getsockname(listen_fd, @ptrCast(&addr), &name_len);
 
     // Submit multishot accept
     var accept_addr: std.posix.sockaddr = undefined;
@@ -1334,9 +1335,9 @@ test "IoUringBackend - multishot accept basic" {
     try std.testing.expectEqual(@as(usize, 1), backend.inFlightCount());
 
     // Create first client and connect
-    const client1 = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    defer std.posix.close(client1);
-    try std.posix.connect(client1, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+    const client1 = try std.syscall.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    defer std.syscall.close(client1);
+    try std.syscall.connect(client1, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
 
     // Wait for first accept completion
     var completions: [8]Completion = undefined;
@@ -1349,16 +1350,16 @@ test "IoUringBackend - multishot accept basic" {
     // Check if MORE flag is set (multishot is still active)
     // Note: The kernel may or may not set MORE depending on timing
     const accepted_fd1: posix.fd_t = @intCast(completions[0].result);
-    defer std.posix.close(accepted_fd1);
+    defer std.syscall.close(accepted_fd1);
 
     // If MORE is set, operation should still be in-flight
     if (completions[0].hasMore()) {
         try std.testing.expectEqual(@as(usize, 1), backend.inFlightCount());
 
         // Create second client
-        const client2 = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-        defer std.posix.close(client2);
-        try std.posix.connect(client2, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+        const client2 = try std.syscall.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        defer std.syscall.close(client2);
+        try std.syscall.connect(client2, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
 
         // Wait for second accept
         count = try backend.wait(&completions, 100_000_000);
@@ -1368,7 +1369,7 @@ test "IoUringBackend - multishot accept basic" {
         try std.testing.expect(completions[0].result > 0);
 
         const accepted_fd2: posix.fd_t = @intCast(completions[0].result);
-        std.posix.close(accepted_fd2);
+        std.syscall.close(accepted_fd2);
 
         // Cancel the multishot
         try backend.cancelMultishot(multishot_id);

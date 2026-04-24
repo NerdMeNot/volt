@@ -3,6 +3,8 @@
 //! TCP listener for accepting incoming connections with ScheduledIo integration.
 
 const std = @import("std");
+const syscall = @import("../../internal/syscall.zig");
+const thr = @import("../../internal/thread.zig");
 const c = @import("common.zig");
 const posix = c.posix;
 const mem = c.mem;
@@ -62,26 +64,26 @@ pub const TcpListener = struct {
     pub fn bindWithBacklog(addr: Address, backlog: u31) !TcpListener {
         // Create socket
         const family = addr.family();
-        const fd = try posix.socket(
+        const fd = try syscall.socket(
             family,
             posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
             0,
         );
-        errdefer posix.close(fd);
+        errdefer syscall.close(fd);
 
         // Set SO_REUSEADDR
         try setBoolOption(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, true);
 
         // Bind
-        try posix.bind(fd, addr.sockaddr(), addr.len);
+        try syscall.bind(fd, addr.sockaddr(), addr.len);
 
         // Get actual bound address
         var local_addr: Address = undefined;
         local_addr.len = @sizeOf(posix.sockaddr.storage);
-        try posix.getsockname(fd, local_addr.sockaddrMut(), &local_addr.len);
+        try syscall.getsockname(fd, local_addr.sockaddrMut(), &local_addr.len);
 
         // Listen
-        try posix.listen(fd, backlog);
+        try syscall.listen(fd, backlog);
 
         return .{
             .fd = fd,
@@ -100,7 +102,7 @@ pub const TcpListener = struct {
     pub fn fromStd(std_server: std.net.Server) TcpListener {
         var local_addr: Address = undefined;
         local_addr.len = @sizeOf(posix.sockaddr.storage);
-        posix.getsockname(std_server.stream.handle, local_addr.sockaddrMut(), &local_addr.len) catch {
+        syscall.getsockname(std_server.stream.handle, local_addr.sockaddrMut(), &local_addr.len) catch {
             local_addr = Address.fromPort(0);
         };
 
@@ -128,7 +130,7 @@ pub const TcpListener = struct {
         var peer_addr: Address = undefined;
         peer_addr.len = @sizeOf(posix.sockaddr.storage);
 
-        const client_fd = posix.accept(
+        const client_fd = syscall.accept(
             self.fd,
             peer_addr.sockaddrMut(),
             &peer_addr.len,
@@ -192,7 +194,7 @@ pub const TcpListener = struct {
         if (self.scheduled_io) |sio| {
             sio.shutdown();
         }
-        posix.close(self.fd);
+        syscall.close(self.fd);
         self.fd = c.INVALID_SOCKET;
     }
 
@@ -309,7 +311,7 @@ test "TcpListener - tryAccept returns AcceptResult on connection" {
             accepted = true;
             break;
         }
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        thr.sleep(5 * std.time.ns_per_ms);
     }
     try testing.expect(accepted);
 }
@@ -362,6 +364,6 @@ test "TcpListener - AcceptResult helpers" {
             try testing.expect(addr_str.len > 0);
             break;
         }
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        thr.sleep(5 * std.time.ns_per_ms);
     }
 }

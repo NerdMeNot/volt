@@ -30,6 +30,7 @@
 //!
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 const Allocator = std.mem.Allocator;
 
 const timer_mod = @import("../internal/scheduler/TimerWheel.zig");
@@ -79,7 +80,7 @@ pub const TimerDriver = struct {
     wheel: TimerWheel,
 
     /// Mutex protecting the wheel
-    mutex: std.Thread.Mutex,
+    mutex: thr.Mutex,
 
     /// Allocator for heap-allocated entries
     allocator: Allocator,
@@ -315,7 +316,7 @@ test "TimerDriver - register and poll" {
     try std.testing.expectEqual(@as(usize, 1), driver.len());
 
     // Wait and poll
-    std.Thread.sleep(10_000); // 10 microseconds
+    thr.sleep(10_000); // 10 microseconds
     const fired = driver.poll();
 
     try std.testing.expect(fired >= 1);
@@ -378,7 +379,7 @@ test "TimerDriver - external entry" {
     try std.testing.expectEqual(@as(usize, 1), driver.len());
 
     // Wait and poll
-    std.Thread.sleep(10_000);
+    thr.sleep(10_000);
     _ = driver.poll();
 
     try std.testing.expect(woken);

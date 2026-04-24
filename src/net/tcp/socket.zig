@@ -51,7 +51,7 @@ pub const TcpSocket = struct {
 
     /// Create a new IPv4 TCP socket.
     pub fn newV4() !TcpSocket {
-        const fd = try posix.socket(
+        const fd = try syscall.socket(
             posix.AF.INET,
             posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
             0,
@@ -61,7 +61,7 @@ pub const TcpSocket = struct {
 
     /// Create a new IPv6 TCP socket.
     pub fn newV6() !TcpSocket {
-        const fd = try posix.socket(
+        const fd = try syscall.socket(
             posix.AF.INET6,
             posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
             0,
@@ -226,7 +226,7 @@ pub const TcpSocket = struct {
     /// Bind to a local address before connecting.
     /// Use this when you need to select the source address/port.
     pub fn bind(self: *TcpSocket, addr: Address) !void {
-        try posix.bind(self.fd, addr.sockaddr(), addr.len);
+        try syscall.bind(self.fd, addr.sockaddr(), addr.len);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -240,13 +240,13 @@ pub const TcpSocket = struct {
         try setNonBlocking(self.fd, true);
 
         // Initiate connect
-        posix.connect(self.fd, addr.sockaddr(), addr.len) catch |err| switch (err) {
+        syscall.connect(self.fd, addr.sockaddr(), addr.len) catch |err| switch (err) {
             error.WouldBlock => {
                 // Connection in progress - wait for completion
                 try waitForConnect(self.fd);
             },
             else => {
-                posix.close(self.fd);
+                syscall.close(self.fd);
                 return err;
             },
         };
@@ -268,10 +268,10 @@ pub const TcpSocket = struct {
         // Get local address
         var local_addr: Address = undefined;
         local_addr.len = @sizeOf(posix.sockaddr.storage);
-        try posix.getsockname(self.fd, local_addr.sockaddrMut(), &local_addr.len);
+        try syscall.getsockname(self.fd, local_addr.sockaddrMut(), &local_addr.len);
 
         // Start listening
-        try posix.listen(self.fd, backlog);
+        try syscall.listen(self.fd, backlog);
 
         return TcpListener{
             .fd = self.fd,
@@ -288,7 +288,7 @@ pub const TcpSocket = struct {
     pub fn localAddr(self: TcpSocket) !Address {
         var addr: Address = undefined;
         addr.len = @sizeOf(posix.sockaddr.storage);
-        try posix.getsockname(self.fd, addr.sockaddrMut(), &addr.len);
+        try syscall.getsockname(self.fd, addr.sockaddrMut(), &addr.len);
         return addr;
     }
 
@@ -299,7 +299,7 @@ pub const TcpSocket = struct {
 
     /// Close without converting to stream/listener.
     pub fn close(self: *TcpSocket) void {
-        posix.close(self.fd);
+        syscall.close(self.fd);
         self.fd = c.INVALID_SOCKET;
     }
 
@@ -410,6 +410,7 @@ pub const Keepalive = struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const std = @import("std");
+const syscall = @import("../../internal/syscall.zig");
 const testing = std.testing;
 
 test "TcpSocket - newV4 create and close" {

@@ -37,6 +37,7 @@
 //!
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 const builtin = @import("builtin");
 
 const LinkedList = @import("../internal/util/linked_list.zig").LinkedList;
@@ -111,7 +112,7 @@ pub const Sleep = struct {
     elapsed: bool,
 
     /// Mutex protecting state
-    mutex: std.Thread.Mutex,
+    mutex: thr.Mutex,
 
     const Self = @This();
 
@@ -363,7 +364,7 @@ pub fn sleepUntil(deadline: Instant) Sleep {
 /// Blocking sleep (for non-async contexts).
 /// Prefer async sleep when running inside the runtime.
 pub fn blockingSleep(duration: Duration) void {
-    std.Thread.sleep(duration.asNanos());
+    thr.sleep(duration.asNanos());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -496,7 +497,7 @@ test "Sleep - poll wakes waiters" {
     }
 
     // Wait longer and poll
-    std.Thread.sleep(10_000); // 10 microseconds
+    thr.sleep(10_000); // 10 microseconds
     s.poll();
 
     try std.testing.expect(woken);
@@ -514,7 +515,7 @@ test "Sleep - remaining time" {
 
 test "Sleep - reset extends deadline" {
     var s = Sleep.init(Duration.fromNanos(1));
-    std.Thread.sleep(100);
+    thr.sleep(100);
 
     try std.testing.expect(s.tryWait()); // Should be elapsed
 
@@ -535,7 +536,7 @@ test "SleepManager - basic" {
     try std.testing.expectEqual(@as(usize, 2), manager.len());
 
     // Wait for s1 to expire
-    std.Thread.sleep(1000);
+    thr.sleep(1000);
     const completed = manager.pollAll();
 
     try std.testing.expect(completed >= 1);
@@ -573,7 +574,7 @@ test "sleepWithDriver - basic" {
     try std.testing.expectEqual(@as(usize, 1), driver.len());
 
     // Wait and poll
-    std.Thread.sleep(10_000); // 10 microseconds
+    thr.sleep(10_000); // 10 microseconds
     _ = driver.poll();
 
     try std.testing.expect(waiter.isComplete());
@@ -593,7 +594,7 @@ test "sleepWithDriverEntry - zero allocation" {
     try std.testing.expectEqual(@as(usize, 1), driver.len());
 
     // Wait and poll
-    std.Thread.sleep(10_000);
+    thr.sleep(10_000);
     _ = driver.poll();
 
     try std.testing.expect(waiter.isComplete());

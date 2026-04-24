@@ -44,6 +44,7 @@
 //! Reference: crossbeam-channel, Vyukov MPMC bounded queue
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 const Allocator = std.mem.Allocator;
 
 const LinkedList = @import("../internal/util/linked_list.zig").LinkedList;
@@ -256,7 +257,7 @@ pub fn Channel(comptime T: type) type {
         sender_count: usize,
 
         /// Mutex protecting ONLY the waiter lists (never the buffer)
-        waiter_mutex: std.Thread.Mutex,
+        waiter_mutex: thr.Mutex,
 
         /// Waiters for send (blocked when full)
         send_waiters: SendWaiterList,

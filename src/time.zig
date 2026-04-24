@@ -14,6 +14,7 @@
 //! - `Deadline` - Timeout tracking
 
 const std = @import("std");
+const thr = @import("internal/thread.zig");
 
 /// A duration of time (nanosecond precision).
 pub const Duration = struct {
@@ -262,14 +263,14 @@ test "Duration - multiply and divide" {
 
 test "Instant - elapsed increases" {
     const start = Instant.now();
-    std.Thread.sleep(1_000_000); // 1ms
+    thr.sleep(1_000_000); // 1ms
     const elapsed = start.elapsed();
     try std.testing.expect(elapsed.asNanos() >= 1_000_000);
 }
 
 test "Instant - ordering" {
     const a = Instant.now();
-    std.Thread.sleep(100);
+    thr.sleep(100);
     const b = Instant.now();
 
     try std.testing.expect(a.isBefore(b));

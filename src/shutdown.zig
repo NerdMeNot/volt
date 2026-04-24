@@ -57,6 +57,7 @@
 //! - Allows graceful drain of in-flight requests
 
 const std = @import("std");
+const thr = @import("internal/thread.zig");
 const builtin = @import("builtin");
 
 const signal_mod = @import("signal.zig");
@@ -91,10 +92,10 @@ pub const Shutdown = struct {
     pending_count: std.atomic.Value(usize),
 
     /// Mutex for state changes
-    mutex: std.Thread.Mutex,
+    mutex: thr.Mutex,
 
     /// Condition variable for waiting on pending work completion
-    pending_cond: std.Thread.Condition,
+    pending_cond: thr.Condition,
 
     const Self = @This();
 

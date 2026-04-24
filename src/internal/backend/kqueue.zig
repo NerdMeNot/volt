@@ -14,6 +14,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const syscall = @import("../syscall.zig");
 
 const completion = @import("types.zig");
 const Operation = completion.Operation;
@@ -87,8 +88,8 @@ pub const KqueueBackend = struct {
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, config: anytype) !Self {
-        const kq_fd = try posix.kqueue();
-        errdefer posix.close(kq_fd);
+        const kq_fd = try syscall.kqueue();
+        errdefer syscall.close(kq_fd);
 
         const max_events = config.max_completions;
         const event_buffer = try allocator.alloc(Kevent, max_events);
@@ -181,7 +182,7 @@ pub const KqueueBackend = struct {
             entry.value.io.clearWakers(); // Break any remaining reference cycles
         }
 
-        posix.close(self.kq_fd);
+        syscall.close(self.kq_fd);
         self.registrations.deinit();
         self.change_list.deinit(self.allocator);
         self.allocator.free(self.event_buffer);
@@ -523,13 +524,13 @@ pub const KqueueBackend = struct {
                 break :blk @intCast(n);
             },
             .write => |w| blk: {
-                const n = posix.write(w.fd, w.buffer) catch |e| {
+                const n = syscall.write(w.fd, w.buffer) catch |e| {
                     break :blk -@as(i32, @intCast(@intFromEnum(errnoFromError(e))));
                 };
                 break :blk @intCast(n);
             },
             .accept => |a| blk: {
-                const result = posix.accept(a.fd, a.addr, a.addr_len, 0) catch |e| {
+                const result = syscall.accept(a.fd, a.addr, a.addr_len, 0) catch |e| {
                     break :blk -@as(i32, @intCast(@intFromEnum(errnoFromError(e))));
                 };
                 break :blk @intCast(result);
@@ -539,13 +540,13 @@ pub const KqueueBackend = struct {
                 break :blk 0;
             },
             .recv => |r| blk: {
-                const result = posix.recv(r.fd, r.buffer, r.flags) catch |e| {
+                const result = syscall.recv(r.fd, r.buffer, r.flags) catch |e| {
                     break :blk -@as(i32, @intCast(@intFromEnum(errnoFromError(e))));
                 };
                 break :blk @intCast(result);
             },
             .send => |s| blk: {
-                const result = posix.send(s.fd, s.buffer, s.flags) catch |e| {
+                const result = syscall.send(s.fd, s.buffer, s.flags) catch |e| {
                     break :blk -@as(i32, @intCast(@intFromEnum(errnoFromError(e))));
                 };
                 break :blk @intCast(result);
@@ -559,7 +560,7 @@ pub const KqueueBackend = struct {
                 break :blk @intCast(result);
             },
             .close => |c| blk: {
-                posix.close(c.fd);
+                syscall.close(c.fd);
                 break :blk 0;
             },
             .fsync => |f| blk: {
@@ -856,8 +857,8 @@ test "KqueueBackend - TCP socket accept readiness" {
     defer backend.deinit();
 
     // Create listening socket
-    const listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-    defer posix.close(listen_fd);
+    const listen_fd = try syscall.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+    defer syscall.close(listen_fd);
 
     // Bind to ephemeral port
     var addr = posix.sockaddr.in{
@@ -867,12 +868,12 @@ test "KqueueBackend - TCP socket accept readiness" {
     };
     // Fix byte order
     addr.addr = std.mem.nativeToBig(u32, 0x7f000001);
-    try posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
-    try posix.listen(listen_fd, 1);
+    try syscall.bind(listen_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+    try syscall.listen(listen_fd, 1);
 
     // Get assigned port
     var name_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-    try posix.getsockname(listen_fd, @ptrCast(&addr), &name_len);
+    try syscall.getsockname(listen_fd, @ptrCast(&addr), &name_len);
 
     // Submit accept operation
     var accept_addr: posix.sockaddr = undefined;
@@ -889,10 +890,10 @@ test "KqueueBackend - TCP socket accept readiness" {
     });
 
     // Create client and connect
-    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    defer posix.close(client_fd);
+    const client_fd = try syscall.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer syscall.close(client_fd);
 
-    try posix.connect(client_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+    try syscall.connect(client_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
 
     // Wait for accept to complete
     var completions: [8]Completion = undefined;
@@ -903,7 +904,7 @@ test "KqueueBackend - TCP socket accept readiness" {
     try std.testing.expect(completions[0].result > 0); // Valid fd
 
     // Clean up accepted fd
-    posix.close(@intCast(completions[0].result));
+    syscall.close(@intCast(completions[0].result));
 }
 
 test "KqueueBackend - TCP socket send/recv readiness" {
@@ -916,32 +917,32 @@ test "KqueueBackend - TCP socket send/recv readiness" {
     defer backend.deinit();
 
     // Create connected socket pair using TCP loopback
-    const listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    defer posix.close(listen_fd);
+    const listen_fd = try syscall.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer syscall.close(listen_fd);
 
     var addr = posix.sockaddr.in{
         .family = posix.AF.INET,
         .port = 0,
         .addr = std.mem.nativeToBig(u32, 0x7f000001),
     };
-    try posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
-    try posix.listen(listen_fd, 1);
+    try syscall.bind(listen_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+    try syscall.listen(listen_fd, 1);
 
     var name_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-    try posix.getsockname(listen_fd, @ptrCast(&addr), &name_len);
+    try syscall.getsockname(listen_fd, @ptrCast(&addr), &name_len);
 
-    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    defer posix.close(client_fd);
-    try posix.connect(client_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+    const client_fd = try syscall.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer syscall.close(client_fd);
+    try syscall.connect(client_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
 
     var accept_addr: posix.sockaddr = undefined;
     var accept_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-    const server_fd = try posix.accept(listen_fd, &accept_addr, &accept_len, 0);
-    defer posix.close(server_fd);
+    const server_fd = try syscall.accept(listen_fd, &accept_addr, &accept_len, 0);
+    defer syscall.close(server_fd);
 
     // Set non-blocking
-    _ = try posix.fcntl(client_fd, posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
-    _ = try posix.fcntl(server_fd, posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+    _ = try syscall.fcntl(client_fd, posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+    _ = try syscall.fcntl(server_fd, posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
 
     // Submit send on client
     const send_data = "Hello kqueue!";
@@ -1077,7 +1078,7 @@ test "KqueueBackend - close operation" {
     defer backend.deinit();
 
     // Create a socket to close
-    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    const fd = try syscall.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
 
     // Submit close operation
     _ = try backend.submit(.{
@@ -1179,18 +1180,18 @@ test "KqueueBackend - read and write operations" {
     defer backend.deinit();
 
     // Create a pipe for read/write testing
-    const pipe_fds = try posix.pipe();
+    const pipe_fds = try syscall.pipe();
     defer {
-        posix.close(pipe_fds[0]);
-        posix.close(pipe_fds[1]);
+        syscall.close(pipe_fds[0]);
+        syscall.close(pipe_fds[1]);
     }
 
     // Set read end to non-blocking
-    _ = try posix.fcntl(pipe_fds[0], posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+    _ = try syscall.fcntl(pipe_fds[0], posix.F.SETFL, @as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
 
     // Write some data to the pipe (using posix.write directly, not async)
     const write_data = "Test pipe data";
-    _ = try posix.write(pipe_fds[1], write_data);
+    _ = try syscall.write(pipe_fds[1], write_data);
 
     // Submit read operation via backend
     var read_buf: [64]u8 = undefined;

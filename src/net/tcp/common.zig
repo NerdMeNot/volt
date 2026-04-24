@@ -2,6 +2,7 @@
 
 const std = @import("std");
 pub const posix = std.posix;
+pub const syscall = @import("../../internal/syscall.zig");
 pub const mem = std.mem;
 pub const builtin = @import("builtin");
 
@@ -54,7 +55,7 @@ pub fn getsockopt(fd: posix.socket_t, level: i32, opt: u32, buf: []u8) !void {
         const rc = ws2.getsockopt(fd, level, @intCast(opt), buf.ptr, &optlen);
         if (rc != 0) return error.Unexpected;
     } else {
-        try posix.getsockopt(fd, level, opt, buf);
+        try syscall.getsockopt(fd, level, opt, buf);
     }
 }
 
@@ -72,13 +73,13 @@ pub fn recvfrom(fd: posix.socket_t, buf: []u8, flags: u32, src_addr: *posix.sock
         }
         return @intCast(rc);
     } else {
-        return posix.recvfrom(fd, buf, flags, src_addr, addrlen);
+        return syscall.recvfrom(fd, buf, flags, src_addr, addrlen);
     }
 }
 
 /// Cross-platform recv. On Windows, uses ws2_32 directly to avoid libc dependency.
 /// Returns the same error set as posix.recv for caller compatibility.
-pub fn recv(fd: posix.socket_t, buf: []u8, flags: u32) posix.RecvFromError!usize {
+pub fn recv(fd: posix.socket_t, buf: []u8, flags: u32) syscall.RecvFromError!usize {
     if (comptime builtin.os.tag == .windows) {
         const ws2 = std.os.windows.ws2_32;
         const rc = ws2.recv(fd, buf.ptr, @intCast(buf.len), @intCast(flags));
@@ -94,13 +95,13 @@ pub fn recv(fd: posix.socket_t, buf: []u8, flags: u32) posix.RecvFromError!usize
         }
         return @intCast(rc);
     } else {
-        return posix.recv(fd, buf, flags);
+        return syscall.recv(fd, buf, flags);
     }
 }
 
 /// Cross-platform send. On Windows, uses ws2_32 directly to avoid libc dependency.
 /// Returns the same error set as posix.send for caller compatibility.
-pub fn send(fd: posix.socket_t, buf: []const u8, flags: u32) posix.SendError!usize {
+pub fn send(fd: posix.socket_t, buf: []const u8, flags: u32) syscall.SendError!usize {
     if (comptime builtin.os.tag == .windows) {
         const ws2 = std.os.windows.ws2_32;
         const rc = ws2.send(fd, buf.ptr, @intCast(buf.len), @intCast(flags));
@@ -115,7 +116,7 @@ pub fn send(fd: posix.socket_t, buf: []const u8, flags: u32) posix.SendError!usi
         }
         return @intCast(rc);
     } else {
-        return posix.send(fd, buf, flags);
+        return syscall.send(fd, buf, flags);
     }
 }
 
@@ -134,7 +135,7 @@ pub fn sendto(fd: posix.socket_t, buf: []const u8, flags: u32, dest_addr: *const
         }
         return @intCast(rc);
     } else {
-        return posix.sendto(fd, buf, flags, dest_addr, addrlen);
+        return syscall.sendto(fd, buf, flags, dest_addr, addrlen);
     }
 }
 
@@ -160,7 +161,7 @@ pub fn writev(fd: posix.socket_t, iovs: []const posix.iovec_const) !usize {
         }
         return bytes_sent;
     } else {
-        return posix.writev(fd, iovs);
+        return syscall.writev(fd, iovs);
     }
 }
 
@@ -187,7 +188,7 @@ pub fn readv(fd: posix.socket_t, iovs: []const posix.iovec) !usize {
         }
         return bytes_recv;
     } else {
-        return posix.readv(fd, iovs);
+        return syscall.readv(fd, iovs);
     }
 }
 
@@ -232,13 +233,13 @@ pub fn setNonBlocking(fd: posix.socket_t, value: bool) !void {
         const rc = std.os.windows.ws2_32.ioctlsocket(fd, @bitCast(@as(i32, std.os.windows.ws2_32.FIONBIO)), &mode);
         if (rc != 0) return error.Unexpected;
     } else {
-        const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
+        const flags = try syscall.fcntl(fd, posix.F.GETFL, 0);
         const new_flags = if (value)
             flags | @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))
         else
             flags & ~@as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
 
-        _ = try posix.fcntl(fd, posix.F.SETFL, new_flags);
+        _ = try syscall.fcntl(fd, posix.F.SETFL, new_flags);
     }
 }
 

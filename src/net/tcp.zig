@@ -31,6 +31,7 @@
 //! ```
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 const builtin = @import("builtin");
 const posix = std.posix;
 const c = @import("tcp/common.zig");
@@ -181,7 +182,7 @@ test "TCP - connect and transfer" {
             server_conn = result.stream;
             break;
         }
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        thr.sleep(10 * std.time.ns_per_ms);
     }
 
     var conn = server_conn orelse return error.NoConnection;
@@ -194,7 +195,7 @@ test "TCP - connect and transfer" {
         if (try client.tryWrite(data[written..])) |n| {
             written += n;
         } else {
-            std.Thread.sleep(1_000_000); // 1ms
+            thr.sleep(1_000_000); // 1ms
         }
     }
 
@@ -206,7 +207,7 @@ test "TCP - connect and transfer" {
             n = bytes;
             break;
         }
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        thr.sleep(10 * std.time.ns_per_ms);
     }
 
     if (n == 0) return error.NoData;
@@ -224,7 +225,7 @@ test "TcpStream - socket options" {
     // Wait for connection
     for (0..50) |_| {
         if (try listener.tryAccept()) |_| break;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        thr.sleep(10 * std.time.ns_per_ms);
     }
 
     try stream.setNoDelay(true);
@@ -244,7 +245,7 @@ test "TcpStream - split" {
     // Wait for connection
     for (0..50) |_| {
         if (try listener.tryAccept()) |_| break;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        thr.sleep(10 * std.time.ns_per_ms);
     }
 
     const halves = stream.split();
@@ -270,7 +271,7 @@ test "TcpStream - reader/writer interface" {
             server_conn = result.stream;
             break;
         }
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        thr.sleep(10 * std.time.ns_per_ms);
     }
 
     var conn = server_conn orelse return error.NoConnection;
@@ -289,7 +290,7 @@ test "TcpStream - reader/writer interface" {
     for (0..50) |_| {
         const rn = r.read(buf[total..]) catch |err| switch (err) {
             error.WouldBlock => {
-                std.Thread.sleep(10 * std.time.ns_per_ms);
+                thr.sleep(10 * std.time.ns_per_ms);
                 continue;
             },
             else => return err,
@@ -312,7 +313,7 @@ test "TcpStream - takeError" {
     // Accept to complete connection
     for (0..50) |_| {
         if (try listener.tryAccept()) |_| break;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        thr.sleep(10 * std.time.ns_per_ms);
     }
 
     // No error should be pending
@@ -330,7 +331,7 @@ test "TcpStream - TOS option" {
     // Accept to complete connection
     for (0..50) |_| {
         if (try listener.tryAccept()) |_| break;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        thr.sleep(10 * std.time.ns_per_ms);
     }
 
     // Set TOS (low delay)
@@ -347,7 +348,7 @@ test "TcpStream - fromStd/toStd" {
     // Accept to complete connection
     for (0..50) |_| {
         if (try listener.tryAccept()) |_| break;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        thr.sleep(10 * std.time.ns_per_ms);
     }
 
     // Convert to std
@@ -370,7 +371,7 @@ test "OwnedWriteHalf - forget" {
     // Accept to complete connection
     for (0..50) |_| {
         if (try listener.tryAccept()) |_| break;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        thr.sleep(10 * std.time.ns_per_ms);
     }
 
     // Split into owned halves
@@ -395,7 +396,7 @@ test "OwnedHalves - localAddr" {
     // Accept to complete connection
     for (0..50) |_| {
         if (try listener.tryAccept()) |_| break;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        thr.sleep(10 * std.time.ns_per_ms);
     }
 
     // Split into owned halves
@@ -426,7 +427,7 @@ test "OwnedHalves - vectored I/O" {
             server_conn = result.stream;
             break;
         }
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        thr.sleep(10 * std.time.ns_per_ms);
     }
     var conn = server_conn orelse return error.NoConnection;
     defer conn.close();
@@ -455,7 +456,7 @@ test "OwnedHalves - vectored I/O" {
             written = wn;
             break;
         }
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        thr.sleep(10 * std.time.ns_per_ms);
     }
     try std.testing.expectEqual(@as(usize, 8), written);
 }
@@ -474,7 +475,7 @@ test "TcpStream - tryIo custom operation" {
             server_conn = result.stream;
             break;
         }
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        thr.sleep(10 * std.time.ns_per_ms);
     }
     var conn = server_conn orelse return error.NoConnection;
     defer conn.close();

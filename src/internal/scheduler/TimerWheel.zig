@@ -16,6 +16,7 @@
 //! - Intrusive linked list: Zero allocation per timer entry
 
 const std = @import("std");
+const thr = @import("../thread.zig");
 const Allocator = std.mem.Allocator;
 const Header = @import("Header.zig").Header;
 
@@ -723,7 +724,7 @@ test "TimerWheel - insert and poll" {
     try std.testing.expectEqual(@as(usize, 1), wheel.len());
 
     // Wait for it to expire
-    std.Thread.sleep(2 * std.time.ns_per_ms);
+    thr.sleep(2 * std.time.ns_per_ms);
 
     const expired = wheel.poll();
     try std.testing.expect(expired != null);

@@ -5,7 +5,7 @@
 //! ## Stackless Architecture
 //!
 //! In the stackless model, "yield" means returning Poll::Pending from
-//! a future. For blocking sleep, use `std.Thread.sleep()` directly.
+//! a future. For blocking sleep, use `thr.sleep()` directly.
 //!
 //! ## Async Sleep
 //!
@@ -14,6 +14,7 @@
 //! waiting.
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 const time_mod = @import("../time.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════════

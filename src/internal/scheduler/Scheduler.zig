@@ -58,6 +58,7 @@
 //! └─────────────────────────────────────────────────────────────────────────┘
 
 const std = @import("std");
+const thr = @import("../thread.zig");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
@@ -375,9 +376,9 @@ pub const ParkState = struct {
                 std.debug.print("[PARK] parking, will wait on futex\n", .{});
             }
             if (timeout_ns) |ns| {
-                std.Thread.Futex.timedWait(&self.futex, PARKED, ns) catch {};
+                thr.Futex.timedWait(&self.futex, PARKED, ns) catch {};
             } else {
-                std.Thread.Futex.wait(&self.futex, PARKED);
+                thr.Futex.wait(&self.futex, PARKED);
             }
             if (debug_scheduler) {
                 std.debug.print("[PARK] woke from futex wait\n", .{});
@@ -399,7 +400,7 @@ pub const ParkState = struct {
             std.debug.print("[PARK] unpark: prev={d}, will_wake={}\n", .{ prev, prev == PARKED });
         }
         if (prev == PARKED) {
-            std.Thread.Futex.wake(&self.futex, 1);
+            thr.Futex.wake(&self.futex, 1);
         }
     }
 
@@ -761,7 +762,7 @@ pub const Worker = struct {
                 } else if (spins < 12) {
                     std.Thread.yield() catch {};
                 } else {
-                    std.Thread.sleep(1_000); // 1us
+                    thr.sleep(1_000); // 1us
                 }
                 spins +|= 1;
             }
@@ -801,7 +802,7 @@ pub const Worker = struct {
                 } else if (spins < 12) {
                     std.Thread.yield() catch {};
                 } else {
-                    std.Thread.sleep(1_000); // 1us
+                    thr.sleep(1_000); // 1us
                 }
                 spins +|= 1;
             }
@@ -1119,7 +1120,7 @@ pub const Scheduler = struct {
     timer_wheel: TimerWheel,
 
     /// Mutex protecting timer wheel (multiple workers may poll)
-    timer_mutex: std.Thread.Mutex = .{},
+    timer_mutex: thr.Mutex = .{},
 
     /// I/O backend (owned by scheduler for centralized management)
     backend: Backend,
@@ -1128,7 +1129,7 @@ pub const Scheduler = struct {
     completions: []Completion,
 
     /// Mutex protecting I/O backend (single poller at a time)
-    io_mutex: std.Thread.Mutex = .{},
+    io_mutex: thr.Mutex = .{},
 
     /// Allocator
     allocator: Allocator,
@@ -1453,7 +1454,7 @@ pub const Scheduler = struct {
                 // Even if we can't find work, a woken worker can
                 // steal from other workers' local queues.
                 self.wakeWorkerIfNeeded();
-                std.Thread.sleep(1_000); // 1us
+                thr.sleep(1_000); // 1us
             }
             spins +|= 1;
         }
@@ -1490,7 +1491,7 @@ pub const Scheduler = struct {
                 std.Thread.yield() catch {};
             } else {
                 self.wakeWorkerIfNeeded();
-                std.Thread.sleep(1_000);
+                thr.sleep(1_000);
             }
             spins +|= 1;
         }

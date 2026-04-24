@@ -29,6 +29,7 @@
 //!
 
 const std = @import("std");
+const thr = @import("../internal/thread.zig");
 
 const LinkedList = @import("../internal/util/linked_list.zig").LinkedList;
 const Pointers = @import("../internal/util/linked_list.zig").Pointers;
@@ -143,7 +144,7 @@ pub const Notify = struct {
     state: std.atomic.Value(u8),
 
     /// Mutex protecting the waiters list
-    mutex: std.Thread.Mutex,
+    mutex: thr.Mutex,
 
     /// Waiters list
     waiters: WaiterList,
