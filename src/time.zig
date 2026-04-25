@@ -290,54 +290,7 @@ test "Instant - ordering" {
     try std.testing.expect(b.isAfter(a));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Async Time Primitives (re-exports from time/)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Async sleep primitive.
-pub const sleep_mod = @import("time/sleep.zig");
-pub const Sleep = sleep_mod.Sleep;
-pub const SleepWaiter = sleep_mod.SleepWaiter;
-pub const SleepManager = sleep_mod.SleepManager;
-
-/// Recurring interval timer.
-pub const interval_mod = @import("time/interval.zig");
-pub const Interval = interval_mod.Interval;
-pub const IntervalWaiter = interval_mod.IntervalWaiter;
-pub const MissedTickBehavior = interval_mod.MissedTickBehavior;
-
-/// Deadline and timeout utilities.
-pub const timeout_mod = @import("time/timeout.zig");
-pub const Deadline = timeout_mod.Deadline;
-pub const DeadlineWaiter = timeout_mod.DeadlineWaiter;
-pub const TimeoutError = timeout_mod.TimeoutError;
-
-/// Convenience: create a sleep for the given duration.
-pub const sleep = sleep_mod.sleep;
-
-/// Convenience: create a sleep until the given instant.
-pub const sleepUntil = sleep_mod.sleepUntil;
-
-/// Convenience: blocking sleep (for non-async contexts).
-pub const blockingSleep = sleep_mod.blockingSleep;
-
-/// Convenience: create an interval timer.
-pub const interval = interval_mod.interval;
-
-/// Convenience: create a deadline.
-pub const deadline = timeout_mod.deadline;
-
-/// Timer driver for runtime integration.
-pub const driver_mod = @import("time/driver.zig");
-pub const TimerDriver = driver_mod.TimerDriver;
-pub const TimerHandle = driver_mod.TimerHandle;
-pub const getDriver = driver_mod.getDriver;
-pub const setDriver = driver_mod.setDriver;
-
-// Include async time module tests
-test {
-    _ = @import("time/sleep.zig");
-    _ = @import("time/interval.zig");
-    _ = @import("time/timeout.zig");
-    _ = @import("time/driver.zig");
-}
+// Async time primitives (Sleep, Interval, Deadline, TimerDriver) are
+// intentionally removed. They were Future/Poll-coupled in the stackless
+// tree; the stackful rebuild replaces them with coroutine-suspending
+// equivalents (volt.sleep, volt.interval, volt.withTimeout) at v0.7.
