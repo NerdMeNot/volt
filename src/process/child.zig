@@ -58,10 +58,10 @@ pub const ExitStatus = struct {
     /// Create from std.process.Child.Term
     pub fn fromTerm(term: std.process.Child.Term) Self {
         return switch (term) {
-            .Exited => |exit_code| .{ .raw = @as(u32, exit_code) << 8 },
-            .Signal => |sig| .{ .raw = sig },
-            .Stopped => |sig| .{ .raw = 0x7f | (sig << 8) },
-            .Unknown => |val| .{ .raw = val },
+            .exited => |exit_code| .{ .raw = @as(u32, exit_code) << 8 },
+            .signal => |sig| .{ .raw = @intFromEnum(sig) },
+            .stopped => |sig| .{ .raw = 0x7f | (@as(u32, @intFromEnum(sig)) << 8) },
+            .unknown => |val| .{ .raw = val },
         };
     }
 
@@ -227,76 +227,71 @@ pub const OutputFuture = struct {
 
 /// Write handle for child's stdin.
 pub const ChildStdin = struct {
-    file: std.fs.File,
+    fd: FileHandle,
     closed: bool = false,
 
     const Self = @This();
 
     pub fn init(file_handle: FileHandle) Self {
-        return .{ .file = .{ .handle = file_handle } };
-    }
-
-    pub fn initFromFile(file: std.fs.File) Self {
-        return .{ .file = file };
+        return .{ .fd = file_handle };
     }
 
     /// Write data to stdin.
     pub fn write(self: *Self, data: []const u8) !usize {
         if (self.closed) return error.Closed;
-        return self.file.write(data);
+        return syscall.write(self.fd, data);
     }
 
     /// Write all data to stdin.
     pub fn writeAll(self: *Self, data: []const u8) !void {
         if (self.closed) return error.Closed;
-        try self.file.writeAll(data);
+        var written: usize = 0;
+        while (written < data.len) {
+            written += try syscall.write(self.fd, data[written..]);
+        }
     }
 
     /// Close the stdin pipe.
     pub fn close(self: *Self) void {
         if (!self.closed) {
-            self.file.close();
+            syscall.close(self.fd);
             self.closed = true;
         }
     }
 
     /// Get the file descriptor (Unix) or HANDLE (Windows).
     pub fn handle(self: Self) FileHandle {
-        return self.file.handle;
+        return self.fd;
     }
 };
 
 /// Read handle for child's stdout.
 pub const ChildStdout = struct {
-    file: std.fs.File,
+    fd: FileHandle,
     closed: bool = false,
 
     const Self = @This();
 
     pub fn init(handle_val: FileHandle) Self {
-        return .{ .file = .{ .handle = handle_val } };
-    }
-
-    pub fn initFromFile(file: std.fs.File) Self {
-        return .{ .file = file };
+        return .{ .fd = handle_val };
     }
 
     /// Read from stdout.
     pub fn read(self: *Self, buf: []u8) !usize {
         if (self.closed) return error.Closed;
-        return self.file.read(buf);
+        return posix.read(self.fd, buf);
     }
 
     /// Read all available data from stdout.
     pub fn readAll(self: *Self, allocator: Allocator) ![]u8 {
         if (self.closed) return error.Closed;
 
-        var result: std.ArrayListUnmanaged(u8) = .{};
+        var result: std.ArrayListUnmanaged(u8) = .empty;
         errdefer result.deinit(allocator);
 
         var buf: [4096]u8 = undefined;
         while (true) {
-            const n = self.file.read(&buf) catch |err| switch (err) {
+            const n = posix.read(self.fd, &buf) catch |err| switch (err) {
                 error.WouldBlock => break,
                 else => return err,
             };
@@ -310,48 +305,44 @@ pub const ChildStdout = struct {
     /// Close the stdout pipe.
     pub fn close(self: *Self) void {
         if (!self.closed) {
-            self.file.close();
+            syscall.close(self.fd);
             self.closed = true;
         }
     }
 
     /// Get the file descriptor (Unix) or HANDLE (Windows).
     pub fn handle(self: Self) FileHandle {
-        return self.file.handle;
+        return self.fd;
     }
 };
 
 /// Read handle for child's stderr.
 pub const ChildStderr = struct {
-    file: std.fs.File,
+    fd: FileHandle,
     closed: bool = false,
 
     const Self = @This();
 
     pub fn init(handle_val: FileHandle) Self {
-        return .{ .file = .{ .handle = handle_val } };
-    }
-
-    pub fn initFromFile(file: std.fs.File) Self {
-        return .{ .file = file };
+        return .{ .fd = handle_val };
     }
 
     /// Read from stderr.
     pub fn read(self: *Self, buf: []u8) !usize {
         if (self.closed) return error.Closed;
-        return self.file.read(buf);
+        return posix.read(self.fd, buf);
     }
 
     /// Read all available data from stderr.
     pub fn readAll(self: *Self, allocator: Allocator) ![]u8 {
         if (self.closed) return error.Closed;
 
-        var result: std.ArrayListUnmanaged(u8) = .{};
+        var result: std.ArrayListUnmanaged(u8) = .empty;
         errdefer result.deinit(allocator);
 
         var buf: [4096]u8 = undefined;
         while (true) {
-            const n = self.file.read(&buf) catch |err| switch (err) {
+            const n = posix.read(self.fd, &buf) catch |err| switch (err) {
                 error.WouldBlock => break,
                 else => return err,
             };
@@ -365,14 +356,14 @@ pub const ChildStderr = struct {
     /// Close the stderr pipe.
     pub fn close(self: *Self) void {
         if (!self.closed) {
-            self.file.close();
+            syscall.close(self.fd);
             self.closed = true;
         }
     }
 
     /// Get the file descriptor (Unix) or HANDLE (Windows).
     pub fn handle(self: Self) FileHandle {
-        return self.file.handle;
+        return self.fd;
     }
 };
 
@@ -432,13 +423,13 @@ pub const Child = struct {
 
         // Wrap the file handles
         if (child.stdin) |stdin_file| {
-            result.stdin = ChildStdin.initFromFile(stdin_file);
+            result.stdin = ChildStdin.init(stdin_file.handle);
         }
         if (child.stdout) |stdout_file| {
-            result.stdout = ChildStdout.initFromFile(stdout_file);
+            result.stdout = ChildStdout.init(stdout_file.handle);
         }
         if (child.stderr) |stderr_file| {
-            result.stderr = ChildStderr.initFromFile(stderr_file);
+            result.stderr = ChildStderr.init(stderr_file.handle);
         }
 
         return result;
@@ -530,10 +521,15 @@ pub const Child = struct {
 
         self.mutex.unlock();
 
-        // Blocking wait using std.process.Child
+        // Blocking wait using std.process.Child.
+        // TODO(zig-0.16): std.process.Child.wait now requires an Io parameter.
+        // Pending the broader process-spawning rework (see command.spawn).
         if (self.std_child) |*child| {
-            const term = try child.wait();
-            const status = ExitStatus.fromTerm(term);
+            _ = child;
+            return error.NotImplementedOn0_16;
+        }
+        if (false) {
+            const status: ExitStatus = .{ .raw = 0 };
 
             self.mutex.lock();
             self.exit_status = status;
@@ -655,7 +651,7 @@ pub const Child = struct {
             // Windows: not supported via waitpid
             return null;
         } else {
-            const result = posix.waitpid(pid_val, posix.W.NOHANG);
+            const result = syscall.waitpid(pid_val, posix.W.NOHANG);
             if (result.pid != 0) {
                 const status = ExitStatus.fromRaw(result.status);
                 self.exit_status = status;
@@ -762,11 +758,11 @@ test "ChildStdin/ChildStdout - basic operations" {
 }
 
 test "ExitStatus - fromTerm Exited" {
-    const status = ExitStatus.fromTerm(.{ .Exited = 0 });
+    const status = ExitStatus.fromTerm(.{ .exited = 0 });
     try std.testing.expect(status.isSuccess());
     try std.testing.expectEqual(@as(?u8, 0), status.code());
 
-    const status2 = ExitStatus.fromTerm(.{ .Exited = 1 });
+    const status2 = ExitStatus.fromTerm(.{ .exited = 1 });
     try std.testing.expect(!status2.isSuccess());
     try std.testing.expectEqual(@as(?u8, 1), status2.code());
 }
@@ -774,7 +770,7 @@ test "ExitStatus - fromTerm Exited" {
 test "ExitStatus - fromTerm Signal" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    const status = ExitStatus.fromTerm(.{ .Signal = 9 });
+    const status = ExitStatus.fromTerm(.{ .signal = @enumFromInt(9) });
     try std.testing.expect(status.wasSignaled());
     try std.testing.expectEqual(@as(?u8, 9), status.signal());
     try std.testing.expect(status.code() == null);
@@ -783,7 +779,7 @@ test "ExitStatus - fromTerm Signal" {
 test "ExitStatus - fromTerm Stopped" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    const status = ExitStatus.fromTerm(.{ .Stopped = 19 });
+    const status = ExitStatus.fromTerm(.{ .stopped = @enumFromInt(19) });
     // Stopped: raw = 0x7f | (19 << 8) = 0x137f
     // signal(): raw & 0x7f = 0x7f, which is 0x7f → returns null (stopped, not signaled)
     try std.testing.expect(!status.wasSignaled());
@@ -912,11 +908,13 @@ test "ChildStderr - pipe roundtrip" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const pipe_fds = try syscall.pipe();
-    var write_file = std.fs.File{ .handle = pipe_fds[1] };
+    const write_fd = pipe_fds[1];
     var stderr_handle = ChildStderr.init(pipe_fds[0]);
 
-    try write_file.writeAll("error msg");
-    write_file.close();
+    var written: usize = 0;
+    const msg = "error msg";
+    while (written < msg.len) written += try syscall.write(write_fd, msg[written..]);
+    syscall.close(write_fd);
 
     var buf: [20]u8 = undefined;
     const n = try stderr_handle.read(&buf);

@@ -85,30 +85,14 @@ pub const TcpStream = struct {
         return socket.connect(addr);
     }
 
-    /// Create from a std.net.Stream (takes ownership).
-    /// Use this for interop with standard library code.
-    pub fn fromStd(std_stream: std.net.Stream) TcpStream {
-        // Get peer address
-        var peer_addr: Address = undefined;
-        peer_addr.len = @sizeOf(posix.sockaddr.storage);
-        posix.getpeername(std_stream.handle, peer_addr.sockaddrMut(), &peer_addr.len) catch {
-            peer_addr = Address.fromPort(0);
-        };
-
-        return .{
-            .fd = std_stream.handle,
-            .peer_addr = peer_addr,
-            .local_addr = null,
-            .scheduled_io = null,
-        };
-    }
-
-    /// Convert to std.net.Stream.
-    /// The underlying fd is transferred (this TcpStream becomes invalid).
-    pub fn toStd(self: *TcpStream) std.net.Stream {
+    /// Get the raw fd, transferring ownership (this TcpStream becomes invalid).
+    /// In Zig 0.15 this returned `std.net.Stream`; that type was removed in 0.16
+    /// when networking moved into std.Io. Callers can wrap the fd themselves
+    /// if they want a higher-level handle.
+    pub fn intoFd(self: *TcpStream) posix.socket_t {
         const fd = self.fd;
         self.fd = c.INVALID_SOCKET;
-        return .{ .handle = fd };
+        return fd;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -988,17 +972,6 @@ test "TcpStream - vectored write" {
 }
 
 test "TcpStream - fromStd roundtrip" {
-    var pair = try createConnectedPair();
-    defer pair.server.close();
-    defer pair.listener.close();
-
-    // Convert to std
-    const std_stream = pair.client.toStd();
-    // Convert back
-    var stream2 = TcpStream.fromStd(std_stream);
-    defer stream2.close();
-
-    // Should still be functional
-    try stream2.setNoDelay(true);
-    try testing.expect(try stream2.getNoDelay());
+    // TODO(zig-0.16): std.net.Stream was removed; fromStd no longer applies.
+    return error.SkipZigTest;
 }

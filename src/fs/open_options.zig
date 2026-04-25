@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const syscall = @import("../internal/syscall.zig");
 const builtin = @import("builtin");
 
 /// Builder for configuring how a file is opened.
@@ -108,7 +109,8 @@ pub const OpenOptions = struct {
     }
 
     /// Open the file at the given path with the configured options.
-    pub fn open(self: OpenOptions, path: []const u8) !std.fs.File {
+    /// Returns the raw fd; wrap in fs.File via fromRawFd if needed.
+    pub fn open(self: OpenOptions, path: []const u8) !posix.fd_t {
         // Build flags
         var flags: posix.O = .{};
 
@@ -142,13 +144,13 @@ pub const OpenOptions = struct {
 
         // Open the file
         const path_z = try posix.toPosixPath(path);
-        const fd = try posix.openZ(&path_z, flags, self.mode);
+        const fd = try syscall.openZ(&path_z, flags, self.mode);
 
-        return std.fs.File{ .handle = fd };
+        return fd;
     }
 
     /// Open the file at the given path (null-terminated).
-    pub fn openZ(self: OpenOptions, path: [*:0]const u8) !std.fs.File {
+    pub fn openZ(self: OpenOptions, path: [*:0]const u8) !posix.fd_t {
         var flags: posix.O = .{};
 
         if (self.read and self.write) {
@@ -176,8 +178,8 @@ pub const OpenOptions = struct {
 
         flags.CLOEXEC = true;
 
-        const fd = try posix.openZ(path, flags, self.mode);
-        return std.fs.File{ .handle = fd };
+        const fd = try syscall.openZ(path, flags, self.mode);
+        return fd;
     }
 };
 

@@ -91,7 +91,7 @@ pub const Signal = enum(u6) {
     }
 
     pub fn fromInt(sig: u6) ?Signal {
-        return std.meta.intToEnum(Signal, sig) catch null;
+        return std.enums.fromInt(Signal, sig);
     }
 };
 
@@ -307,12 +307,12 @@ pub const SignalHandler = struct {
                         .mask = posix.sigemptyset(),
                         .flags = 0,
                     };
-                    posix.sigaction(sig.toInt(), &act, null);
+                    posix.sigaction(@enumFromInt(sig.toInt()), &act, null);
                 }
             }
 
             if (change_count > 0) {
-                _ = posix.kevent(kq, changelist[0..change_count], &.{}, null) catch |err| {
+                _ = syscall.kevent(kq, changelist[0..change_count], &.{}, null) catch |err| {
                     return err;
                 };
             }
@@ -333,7 +333,7 @@ pub const SignalHandler = struct {
             var result = SignalSet.empty();
             var events: [8]posix.Kevent = undefined;
 
-            const count = posix.kevent(self.fd, &.{}, &events, &posix.timespec{ .sec = 0, .nsec = 0 }) catch |err| {
+            const count = syscall.kevent(self.fd, &.{}, &events, &posix.timespec{ .sec = 0, .nsec = 0 }) catch |err| {
                 return err;
             };
 

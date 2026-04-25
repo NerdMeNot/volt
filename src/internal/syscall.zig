@@ -35,9 +35,18 @@ pub const SocketError = error{
 } || std.posix.UnexpectedError;
 
 pub fn socket(domain: u32, sock_type: u32, protocol: u32) SocketError!posix.socket_t {
-    const rc = system.socket(domain, sock_type, protocol);
+    // On Darwin (and several BSDs), CLOEXEC/NONBLOCK aren't real socket-type
+    // bits — they're Zig shims that need post-create fcntl. Linux's accept4-
+    // style flags ARE real, so we keep them passthrough on Linux.
+    const has_native_flags = builtin.os.tag == .linux;
+    const flag_mask: u32 = posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
+    const native_type = if (has_native_flags) sock_type else sock_type & ~flag_mask;
+    const want_cloexec = !has_native_flags and (sock_type & posix.SOCK.CLOEXEC) != 0;
+    const want_nonblock = !has_native_flags and (sock_type & posix.SOCK.NONBLOCK) != 0;
+
+    const rc = system.socket(domain, native_type, protocol);
     switch (posix.errno(rc)) {
-        .SUCCESS => return @intCast(rc),
+        .SUCCESS => {},
         .ACCES => return error.PermissionDenied,
         .AFNOSUPPORT => return error.AddressFamilyNotSupported,
         .INVAL => return error.ProtocolFamilyNotAvailable,
@@ -48,6 +57,20 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) SocketError!posix.sock
         .PROTOTYPE => return error.SocketTypeNotSupported,
         else => |err| return posix.unexpectedErrno(err),
     }
+    const fd: posix.socket_t = @intCast(rc);
+    errdefer close(fd);
+
+    if (want_cloexec) {
+        const F = posix.F;
+        _ = fcntl(fd, F.SETFD, @intCast(@as(c_int, 1))) catch {}; // FD_CLOEXEC
+    }
+    if (want_nonblock) {
+        const F = posix.F;
+        const cur = fcntl(fd, F.GETFL, 0) catch 0;
+        const nb: u32 = @bitCast(posix.O{ .NONBLOCK = true });
+        _ = fcntl(fd, F.SETFL, cur | nb) catch {};
+    }
+    return fd;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -221,7 +244,7 @@ pub fn readv(fd: posix.fd_t, iov: []const posix.iovec) ReadError!usize {
             .BADF => return error.NotOpenForReading,
             .IO => return error.InputOutput,
             .ISDIR => return error.IsDir,
-            .NOBUFS, .NOMEM => return error.SystemResources,
+            .NOBUFS, .NOMEM => unreachable, // ReadError doesn't model SystemResources
             .CONNRESET => return error.ConnectionResetByPeer,
             .TIMEDOUT => return error.ConnectionTimedOut,
             .NOTCONN => return error.SocketNotConnected,
@@ -309,12 +332,35 @@ pub fn accept(
     addr_size: ?*posix.socklen_t,
     flags: u32,
 ) AcceptError!posix.socket_t {
+    // accept4 is Linux-only. Darwin/BSD has plain accept and emulates
+    // SOCK_CLOEXEC / SOCK_NONBLOCK via post-accept fcntl.
+    const has_accept4 = comptime switch (builtin.os.tag) {
+        .linux => true,
+        else => false,
+    };
     while (true) {
-        const rc = if (comptime @hasDecl(system, "accept4"))
+        const rc = if (comptime has_accept4)
             system.accept4(fd, addr, addr_size, flags)
         else
             system.accept(fd, addr, addr_size);
         const signed: isize = @bitCast(@as(usize, @bitCast(@as(isize, rc))));
+        if (comptime !has_accept4) {
+            if (signed >= 0) {
+                const accepted: posix.socket_t = @intCast(signed);
+                const flag_mask: u32 = posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
+                if ((flags & flag_mask) != 0) {
+                    if ((flags & posix.SOCK.CLOEXEC) != 0) {
+                        _ = fcntl(accepted, posix.F.SETFD, 1) catch {};
+                    }
+                    if ((flags & posix.SOCK.NONBLOCK) != 0) {
+                        const cur = fcntl(accepted, posix.F.GETFL, 0) catch 0;
+                        const nb: u32 = @bitCast(posix.O{ .NONBLOCK = true });
+                        _ = fcntl(accepted, posix.F.SETFL, cur | nb) catch {};
+                    }
+                }
+                return accepted;
+            }
+        }
         if (signed >= 0) return @intCast(signed);
         switch (posix.errno(signed)) {
             .INTR => continue,
@@ -655,6 +701,292 @@ pub fn fchmodat(dirfd: posix.fd_t, sub_path: []const u8, mode: u32, flags: u32) 
         .NOTDIR => return error.NotDir,
         .ROFS => return error.ReadOnlyFileSystem,
         else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// lseek wrappers
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const SeekError = error{
+    Unseekable,
+} || std.posix.UnexpectedError;
+
+const SEEK_SET: i32 = 0;
+const SEEK_CUR: i32 = 1;
+const SEEK_END: i32 = 2;
+
+fn lseek(fd: posix.fd_t, offset: i64, whence: i32) SeekError!u64 {
+    const rc = system.lseek(fd, @intCast(offset), whence);
+    const signed: i64 = @bitCast(@as(u64, @bitCast(@as(i64, rc))));
+    if (signed >= 0) return @intCast(signed);
+    switch (posix.errno(signed)) {
+        .BADF, .INVAL, .OVERFLOW, .NXIO, .SPIPE => return error.Unseekable,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
+pub fn lseekSet(fd: posix.fd_t, offset: u64) SeekError!void {
+    _ = try lseek(fd, @intCast(offset), SEEK_SET);
+}
+
+pub fn lseekCur(fd: posix.fd_t, offset: i64) SeekError!void {
+    _ = try lseek(fd, offset, SEEK_CUR);
+}
+
+pub fn lseekEnd(fd: posix.fd_t, offset: i64) SeekError!u64 {
+    return lseek(fd, offset, SEEK_END);
+}
+
+pub fn lseekCurPos(fd: posix.fd_t) SeekError!u64 {
+    return lseek(fd, 0, SEEK_CUR);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// fchmod
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn fchmod(fd: posix.fd_t, mode: u32) !void {
+    const m: posix.mode_t = @intCast(mode);
+    switch (posix.errno(system.fchmod(fd, m))) {
+        .SUCCESS => return,
+        .ACCES, .PERM => return error.AccessDenied,
+        .BADF, .INVAL, .ROFS, .IO => unreachable,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// readlinkatZ
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn readlinkatZ(dirfd: posix.fd_t, path: [*:0]const u8, buf: []u8) ![]u8 {
+    const rc = system.readlinkat(dirfd, path, buf.ptr, buf.len);
+    const signed: isize = @bitCast(rc);
+    if (signed >= 0) return buf[0..@intCast(signed)];
+    switch (posix.errno(signed)) {
+        .ACCES, .PERM => return error.AccessDenied,
+        .FAULT => unreachable,
+        .INVAL => return error.NotLink,
+        .IO => return error.InputOutput,
+        .LOOP => return error.SymLinkLoop,
+        .NAMETOOLONG => return error.NameTooLong,
+        .NOENT => return error.FileNotFound,
+        .NOTDIR => return error.NotDir,
+        .NOMEM => return error.SystemResources,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// pwrite / fstat / ftruncate / renameZ / symlinkatZ
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn pread(fd: posix.fd_t, bytes: []u8, offset: u64) ReadError!usize {
+    while (true) {
+        const rc = system.pread(fd, bytes.ptr, bytes.len, @intCast(offset));
+        const signed: isize = @bitCast(rc);
+        if (signed >= 0) return @intCast(signed);
+        switch (posix.errno(signed)) {
+            .INTR => continue,
+            .INVAL => unreachable,
+            .FAULT => unreachable,
+            .AGAIN => return error.WouldBlock,
+            .BADF => return error.NotOpenForReading,
+            .IO => return error.InputOutput,
+            .ISDIR => return error.IsDir,
+            .NOBUFS, .NOMEM => unreachable, // ReadError doesn't model SystemResources
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+pub fn pwrite(fd: posix.fd_t, bytes: []const u8, offset: u64) WriteError!usize {
+    while (true) {
+        const rc = system.pwrite(fd, bytes.ptr, bytes.len, @intCast(offset));
+        const signed: isize = @bitCast(rc);
+        if (signed >= 0) return @intCast(signed);
+        switch (posix.errno(signed)) {
+            .INTR => continue,
+            .INVAL => return error.InvalidArgument,
+            .FAULT => unreachable,
+            .AGAIN => return error.WouldBlock,
+            .BADF => return error.NotOpenForWriting,
+            .DQUOT => return error.DiskQuota,
+            .FBIG => return error.FileTooBig,
+            .IO => return error.InputOutput,
+            .NOSPC => return error.NoSpaceLeft,
+            .PERM => return error.AccessDenied,
+            .PIPE => return error.BrokenPipe,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+pub fn fstat(fd: posix.fd_t) !posix.Stat {
+    var stat: posix.Stat = undefined;
+    switch (posix.errno(system.fstat(fd, &stat))) {
+        .SUCCESS => return stat,
+        .BADF => unreachable,
+        .NOMEM => return error.SystemResources,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
+pub fn ftruncate(fd: posix.fd_t, length: u64) !void {
+    while (true) {
+        switch (posix.errno(system.ftruncate(fd, @intCast(length)))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .FBIG => return error.FileTooBig,
+            .IO => return error.InputOutput,
+            .PERM => return error.AccessDenied,
+            .BADF, .INVAL => unreachable,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+pub fn renameZ(old_path: [*:0]const u8, new_path: [*:0]const u8) !void {
+    switch (posix.errno(system.rename(old_path, new_path))) {
+        .SUCCESS => return,
+        .ACCES, .PERM => return error.AccessDenied,
+        .BUSY => return error.FileBusy,
+        .DQUOT => return error.DiskQuota,
+        .FAULT => unreachable,
+        .ISDIR => return error.IsDir,
+        .LOOP => return error.SymLinkLoop,
+        .MLINK => return error.LinkQuotaExceeded,
+        .NAMETOOLONG => return error.NameTooLong,
+        .NOENT => return error.FileNotFound,
+        .NOTDIR => return error.NotDir,
+        .NOMEM => return error.SystemResources,
+        .NOSPC => return error.NoSpaceLeft,
+        .EXIST, .NOTEMPTY => return error.PathAlreadyExists,
+        .ROFS => return error.ReadOnlyFileSystem,
+        .XDEV => return error.CrossDevice,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
+pub fn symlinkatZ(target_path: [*:0]const u8, dirfd: posix.fd_t, sym_link_path: [*:0]const u8) !void {
+    switch (posix.errno(system.symlinkat(target_path, dirfd, sym_link_path))) {
+        .SUCCESS => return,
+        .ACCES, .PERM => return error.AccessDenied,
+        .DQUOT => return error.DiskQuota,
+        .EXIST => return error.PathAlreadyExists,
+        .FAULT => unreachable,
+        .IO => return error.InputOutput,
+        .LOOP => return error.SymLinkLoop,
+        .NAMETOOLONG => return error.NameTooLong,
+        .NOENT => return error.FileNotFound,
+        .NOSPC => return error.NoSpaceLeft,
+        .NOTDIR => return error.NotDir,
+        .ROFS => return error.ReadOnlyFileSystem,
+        .NOMEM => return error.SystemResources,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// open / openat (Z variants)
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const OpenError = std.posix.OpenError;
+
+pub fn openZ(path: [*:0]const u8, flags: posix.O, mode: posix.mode_t) OpenError!posix.fd_t {
+    return openatZ(posix.AT.FDCWD, path, flags, mode);
+}
+
+pub fn openatZ(dirfd: posix.fd_t, path: [*:0]const u8, flags: posix.O, mode: posix.mode_t) OpenError!posix.fd_t {
+    return posix.openatZ(dirfd, path, flags, mode);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// waitpid
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const WaitPidResult = struct { pid: posix.pid_t, status: u32 };
+
+pub fn waitpid(pid: posix.pid_t, flags: u32) WaitPidResult {
+    var status: c_int = undefined;
+    while (true) {
+        const rc = system.waitpid(pid, &status, @intCast(flags));
+        const signed: isize = @bitCast(@as(usize, @bitCast(@as(isize, rc))));
+        switch (posix.errno(signed)) {
+            .SUCCESS => return .{ .pid = @intCast(rc), .status = @bitCast(status) },
+            .INTR => continue,
+            .CHILD => unreachable, // PID doesn't exist
+            .INVAL => unreachable, // bad flags
+            else => |err| {
+                _ = err;
+                return .{ .pid = -1, .status = 0 };
+            },
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// fsync
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const SyncError = error{
+    InputOutput,
+    NoSpaceLeft,
+    DiskQuota,
+} || std.posix.UnexpectedError;
+
+pub fn fsync(fd: posix.fd_t) SyncError!void {
+    while (true) {
+        switch (posix.errno(system.fsync(fd))) {
+            .SUCCESS => return,
+            .BADF, .INVAL, .ROFS => unreachable,
+            .IO => return error.InputOutput,
+            .NOSPC => return error.NoSpaceLeft,
+            .DQUOT => return error.DiskQuota,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// kevent (Darwin / BSD)
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const KeventError = error{
+    EventNotFound,
+    AccessDenied,
+    SystemResources,
+} || std.posix.UnexpectedError;
+
+pub fn kevent(
+    kq: i32,
+    changelist: []const posix.Kevent,
+    eventlist: []posix.Kevent,
+    timeout: ?*const posix.timespec,
+) KeventError!usize {
+    while (true) {
+        const rc = system.kevent(
+            kq,
+            changelist.ptr,
+            std.math.cast(c_int, changelist.len) orelse std.math.maxInt(c_int),
+            eventlist.ptr,
+            std.math.cast(c_int, eventlist.len) orelse std.math.maxInt(c_int),
+            timeout,
+        );
+        const signed: isize = @bitCast(@as(usize, @bitCast(@as(isize, rc))));
+        if (signed >= 0) return @intCast(signed);
+        switch (posix.errno(signed)) {
+            .INTR => continue,
+            .ACCES => return error.AccessDenied,
+            .FAULT => unreachable,
+            .BADF => unreachable,
+            .INVAL => unreachable,
+            .NOENT => return error.EventNotFound,
+            .NOMEM => return error.SystemResources,
+            .SRCH => return error.EventNotFound,
+            else => |err| return posix.unexpectedErrno(err),
+        }
     }
 }
 

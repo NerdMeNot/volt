@@ -540,29 +540,29 @@ pub const Address = struct {
 
     /// Write IP address to buffer (without port).
     pub fn ipString(self: Address, buf: []u8) []u8 {
-        var stream = std.io.fixedBufferStream(buf);
-        const writer = stream.writer();
-
         if (self.isIpv4()) {
             const octets = self.ipv4Octets().?;
-            writer.print("{}.{}.{}.{}", .{
-                octets[0],
-                octets[1],
-                octets[2],
-                octets[3],
-            }) catch return buf[0..0];
+            return std.fmt.bufPrint(buf, "{}.{}.{}.{}", .{
+                octets[0], octets[1], octets[2], octets[3],
+            }) catch buf[0..0];
         } else if (self.isIpv6()) {
-            // Simplified: just write full form
+            // Simplified: just write full form (no :: compression).
             const bytes = self.ipv6Bytes().?;
+            var pos: usize = 0;
             var i: usize = 0;
             while (i < 8) : (i += 1) {
-                if (i > 0) writer.writeAll(":") catch return buf[0..0];
+                if (i > 0) {
+                    if (pos >= buf.len) return buf[0..0];
+                    buf[pos] = ':';
+                    pos += 1;
+                }
                 const seg = @as(u16, bytes[i * 2]) << 8 | bytes[i * 2 + 1];
-                writer.print("{x}", .{seg}) catch return buf[0..0];
+                const written = std.fmt.bufPrint(buf[pos..], "{x}", .{seg}) catch return buf[0..0];
+                pos += written.len;
             }
+            return buf[0..pos];
         }
-
-        return buf[0..stream.pos];
+        return buf[0..0];
     }
 };
 

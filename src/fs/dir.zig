@@ -78,19 +78,17 @@ pub fn removeDir(path: []const u8) !void {
 
 /// Remove a directory and all its contents recursively.
 pub fn removeDirAll(allocator: mem.Allocator, path: []const u8) !void {
-    // Open the directory
-    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| switch (err) {
-        error.NotDir => {
-            // It's a file, just remove it
-            return removeFile(path);
-        },
+    // Open the directory; if it's actually a file, just remove it.
+    var iter = readDir(path) catch |err| switch (err) {
+        error.OpenDirFailed => return removeFile(path),
         else => return err,
     };
-    defer dir.close();
+    defer iter.close();
 
-    // Iterate and remove contents
-    var iter = dir.iterate();
     while (try iter.next()) |entry| {
+        // Skip "." and ".." which libc readdir returns
+        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+
         const full_path = try std.fs.path.join(allocator, &.{ path, entry.name });
         defer allocator.free(full_path);
 
@@ -131,36 +129,43 @@ pub const DirEntry = struct {
     }
 };
 
-/// Iterator over directory entries.
+/// Iterator over directory entries — backed by libc opendir/readdir/closedir
+/// since std.fs.Dir was moved into std.Io in Zig 0.16 and now requires an
+/// Io handle. Volt's fs API stays Io-free at this layer.
 pub const ReadDir = struct {
-    inner: std.fs.Dir.Iterator,
-    dir: std.fs.Dir,
+    handle: *std.c.DIR,
 
-    /// Get the next entry, or null if done.
+    /// Get the next entry, or null if done. Skips "." and ".." (matching
+    /// std.fs.Dir.Iterator semantics). The returned name slice is borrowed
+    /// from the entry buffer and only valid until next() or close().
     pub fn next(self: *ReadDir) !?DirEntry {
-        if (try self.inner.next()) |entry| {
+        while (true) {
+            const entry_ptr = std.c.readdir(self.handle) orelse return null;
+            const name_len = std.mem.indexOfScalar(u8, &entry_ptr.name, 0) orelse entry_ptr.name.len;
+            const name = entry_ptr.name[0..name_len];
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
             return DirEntry{
-                .name = entry.name,
-                .kind = fromStdKind(entry.kind),
+                .name = name,
+                .kind = fromDirentType(entry_ptr.type),
             };
         }
-        return null;
     }
 
     /// Close the directory iterator.
     pub fn close(self: *ReadDir) void {
-        self.dir.close();
+        _ = std.c.closedir(self.handle);
     }
 
-    fn fromStdKind(kind: std.fs.Dir.Entry.Kind) FileType {
-        return switch (kind) {
-            .file => .file,
-            .directory => .directory,
-            .sym_link => .sym_link,
-            .block_device => .block_device,
-            .character_device => .char_device,
-            .named_pipe => .fifo,
-            .unix_domain_socket => .socket,
+    fn fromDirentType(t: u8) FileType {
+        // POSIX dirent d_type values
+        return switch (t) {
+            1 => .fifo, // DT_FIFO
+            2 => .char_device, // DT_CHR
+            4 => .directory, // DT_DIR
+            6 => .block_device, // DT_BLK
+            8 => .file, // DT_REG
+            10 => .sym_link, // DT_LNK
+            12 => .socket, // DT_SOCK
             else => .unknown,
         };
     }
@@ -168,11 +173,9 @@ pub const ReadDir = struct {
 
 /// Open a directory for iteration.
 pub fn readDir(path: []const u8) !ReadDir {
-    const dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
-    return ReadDir{
-        .inner = dir.iterate(),
-        .dir = dir,
-    };
+    const path_z = try posix.toPosixPath(path);
+    const handle = std.c.opendir(&path_z) orelse return error.OpenDirFailed;
+    return ReadDir{ .handle = handle };
 }
 
 /// Directory builder with configurable options.
@@ -303,14 +306,12 @@ test "readDir" {
     try createDir(path);
     defer removeDirAll(std.testing.allocator, path) catch {};
 
-    // Create some files
-    {
-        var f = try std.fs.cwd().createFile("/tmp/blitz_io_test_readdir/file1.txt", .{});
-        f.close();
-    }
-    {
-        var f = try std.fs.cwd().createFile("/tmp/blitz_io_test_readdir/file2.txt", .{});
-        f.close();
+    // Create some test files via raw openat (std.fs.cwd().createFile is gone in 0.16)
+    inline for (&.{ "/tmp/blitz_io_test_readdir/file1.txt", "/tmp/blitz_io_test_readdir/file2.txt" }) |fpath| {
+        const path_z = try posix.toPosixPath(fpath);
+        const flags: posix.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
+        const fd = try posix.openatZ(posix.AT.FDCWD, &path_z, flags, 0o644);
+        syscall.close(fd);
     }
 
     // Read directory

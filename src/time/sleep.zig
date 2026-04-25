@@ -280,7 +280,7 @@ pub const SleepManager = struct {
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
-            .sleeps = .{},
+            .sleeps = .empty,
             .allocator = allocator,
         };
     }

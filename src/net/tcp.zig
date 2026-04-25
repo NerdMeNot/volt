@@ -340,26 +340,10 @@ test "TcpStream - TOS option" {
 }
 
 test "TcpStream - fromStd/toStd" {
-    var listener = try TcpListener.bind(Address.fromPort(0));
-    defer listener.close();
-
-    var stream = try TcpStream.connect(Address.loopbackV4(listener.localAddr().port()));
-
-    // Accept to complete connection
-    for (0..50) |_| {
-        if (try listener.tryAccept()) |_| break;
-        thr.sleep(10 * std.time.ns_per_ms);
-    }
-
-    // Convert to std
-    const std_stream = stream.toStd();
-
-    // Convert back
-    var stream2 = TcpStream.fromStd(std_stream);
-    defer stream2.close();
-
-    // Should still work
-    try stream2.setNoDelay(true);
+    // TODO(zig-0.16): std.net.Stream was removed when networking moved into
+    // std.Io. The Volt-side interop functions (TcpStream.fromStd / toStd)
+    // were dropped. Test is obsolete in its current form.
+    return error.SkipZigTest;
 }
 
 test "OwnedWriteHalf - forget" {

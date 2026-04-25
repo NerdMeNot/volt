@@ -58,6 +58,7 @@
 //! └─────────────────────────────────────────────────────────────────────────┘
 
 const std = @import("std");
+const time_mod = @import("../../time.zig");
 const thr = @import("../thread.zig");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -513,7 +514,7 @@ pub const Worker = struct {
     /// Initialize a worker with per-worker PRNG seed
     pub fn init(index: usize, scheduler: *Scheduler) Self {
         // Seed PRNG with worker index + timestamp for uniqueness
-        const ts: u128 = @bitCast(std.time.nanoTimestamp());
+        const ts: u128 = @bitCast(time_mod.nanoTimestamp());
         const seed: u64 = @as(u64, @truncate(ts)) +% @as(u64, index) *% 0x9E3779B97F4A7C15;
         return .{
             .index = index,
@@ -817,7 +818,7 @@ pub const Worker = struct {
     fn updateAdaptiveInterval(self: *Self, tasks_run: u32) void {
         if (tasks_run == 0) return;
 
-        const end_ns = std.time.nanoTimestamp();
+        const end_ns = time_mod.nanoTimestamp();
         const batch_ns: u64 = @intCast(@max(0, end_ns - self.batch_start_ns));
         const current_avg = batch_ns / tasks_run;
 
@@ -856,7 +857,7 @@ pub const Worker = struct {
 
         while (!self.scheduler.shutdown.load(.acquire)) {
             self.tick +%= 1;
-            self.batch_start_ns = std.time.nanoTimestamp();
+            self.batch_start_ns = time_mod.nanoTimestamp();
 
             // Poll timers at the start of each tick (worker 0 is primary timer driver)
             if (self.index == 0) {

@@ -478,7 +478,7 @@ pub const EpollBackend = struct {
                 };
                 break :blk @intCast(result);
             },
-            .connect => |_| blk: {
+            .connect => blk: {
                 // connect() was already initiated, just return success
                 break :blk 0;
             },

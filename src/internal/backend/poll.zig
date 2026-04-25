@@ -24,6 +24,7 @@
 //! Reference: POSIX.1-2017, Stevens UNIX Network Programming
 
 const std = @import("std");
+const time_mod = @import("../../time.zig");
 const thr = @import("../thread.zig");
 const posix = std.posix;
 const syscall = @import("../syscall.zig");
@@ -112,7 +113,7 @@ pub const PollBackend = struct {
 
     /// Start time for monotonic timer calculations.
     /// All timer deadlines are relative to this instant.
-    start_instant: std.time.Instant,
+    start_instant: time_mod.Instant,
 
     /// Self-pipe for cross-thread wakeup.
     /// [0] = read end (polled), [1] = write end (signaled)
@@ -166,7 +167,7 @@ pub const PollBackend = struct {
             .active_count = 0,
             .timers = std.ArrayList(Timer).empty,
             .next_timer_id = 1,
-            .start_instant = std.time.Instant.now() catch std.mem.zeroes(std.time.Instant),
+            .start_instant = time_mod.Instant.now(),
             .wakeup_pipe = wakeup_pipe,
             .wakeup_pending = std.atomic.Value(bool).init(false),
         };
@@ -174,8 +175,7 @@ pub const PollBackend = struct {
 
     /// Get current monotonic time as nanoseconds since start_instant.
     fn monotonicNow(self: *Self) u64 {
-        const now = std.time.Instant.now() catch return 0;
-        return now.since(self.start_instant);
+        return time_mod.Instant.now().since(self.start_instant);
     }
 
     /// Clean up resources.
@@ -473,7 +473,7 @@ pub const PollBackend = struct {
             // +1 for wakeup pipe at index 0
             const result = posix.poll(self.pollfds[0 .. self.active_count + 1], timeout_ms) catch |err| {
                 switch (err) {
-                    error.NetworkSubsystemFailed, error.SystemResources => return 0,
+                    error.NetworkDown, error.SystemResources => return 0,
                     error.Unexpected => return 0,
                 }
             };

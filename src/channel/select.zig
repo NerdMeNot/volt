@@ -38,6 +38,7 @@
 //! - Zero-allocation (stack-allocated waiters)
 
 const std = @import("std");
+const time_mod = @import("../time.zig");
 const SelectContext = @import("../sync/SelectContext.zig").SelectContext;
 const BranchWaker = @import("../sync/SelectContext.zig").BranchWaker;
 const MAX_SELECT_BRANCHES = @import("../sync/SelectContext.zig").MAX_SELECT_BRANCHES;
@@ -245,13 +246,13 @@ pub fn Selector(comptime max_branches: usize) type {
             }
 
             // Wait for completion
-            const start = if (timeout_ns != null) std.time.Instant.now() catch null else null;
+            const start: ?time_mod.Instant = if (timeout_ns != null) time_mod.Instant.now() else null;
 
             while (!completed.load(.acquire)) {
                 // Check timeout
                 if (timeout_ns) |timeout| {
                     if (start) |s| {
-                        const elapsed = (std.time.Instant.now() catch break).since(s);
+                        const elapsed = time_mod.Instant.now().since(s);
                         if (elapsed >= timeout) {
                             break;
                         }

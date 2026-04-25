@@ -16,6 +16,14 @@
 const std = @import("std");
 const thr = @import("internal/thread.zig");
 
+/// Monotonic-clock nanosecond timestamp. Replaces std.time.nanoTimestamp
+/// (removed in Zig 0.16, where time queries moved into std.Io).
+pub fn nanoTimestamp() i128 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+}
+
 /// A duration of time (nanosecond precision).
 pub const Duration = struct {
     nanos: u64,
@@ -152,12 +160,12 @@ pub const Instant = struct {
 
     /// Get current instant.
     pub fn now() Instant {
-        return .{ .timestamp = std.time.nanoTimestamp() };
+        return .{ .timestamp = nanoTimestamp() };
     }
 
     /// Duration elapsed since this instant.
     pub fn elapsed(self: Instant) Duration {
-        const current = std.time.nanoTimestamp();
+        const current = nanoTimestamp();
         const diff = current - self.timestamp;
         return .{ .nanos = if (diff < 0) 0 else @intCast(diff) };
     }
@@ -166,6 +174,11 @@ pub const Instant = struct {
     pub fn durationSince(self: Instant, earlier: Instant) Duration {
         const diff = self.timestamp - earlier.timestamp;
         return .{ .nanos = if (diff < 0) 0 else @intCast(diff) };
+    }
+
+    /// Nanoseconds since `earlier` (saturating). Mirrors the std.time.Instant API.
+    pub fn since(self: Instant, earlier: Instant) u64 {
+        return self.durationSince(earlier).nanos;
     }
 
     /// Add duration to instant.

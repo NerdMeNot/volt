@@ -12,6 +12,7 @@
 //! Modeled after production kqueue event loop patterns with battle-tested edge case handling.
 
 const std = @import("std");
+const time_mod = @import("../../time.zig");
 const builtin = @import("builtin");
 const posix = std.posix;
 const syscall = @import("../syscall.zig");
@@ -535,7 +536,7 @@ pub const KqueueBackend = struct {
                 };
                 break :blk @intCast(result);
             },
-            .connect => |_| blk: {
+            .connect => blk: {
                 // connect() was already initiated, just return success
                 break :blk 0;
             },
@@ -564,7 +565,7 @@ pub const KqueueBackend = struct {
                 break :blk 0;
             },
             .fsync => |f| blk: {
-                posix.fsync(f.fd) catch |e| {
+                syscall.fsync(f.fd) catch |e| {
                     break :blk -@as(i32, @intCast(@intFromEnum(errnoFromError(e))));
                 };
                 break :blk 0;
@@ -809,7 +810,7 @@ test "KqueueBackend - multiple timeout submissions" {
     var total_completed: usize = 0;
     var seen: [4]bool = .{ false, false, false, false };
 
-    const start = std.time.nanoTimestamp();
+    const start = time_mod.nanoTimestamp();
     while (total_completed < 3) {
         const count = try backend.wait(&completions, 100_000_000);
         for (completions[0..count]) |comp| {
@@ -818,7 +819,7 @@ test "KqueueBackend - multiple timeout submissions" {
             }
             total_completed += 1;
         }
-        if (std.time.nanoTimestamp() - start > 500_000_000) break;
+        if (time_mod.nanoTimestamp() - start > 500_000_000) break;
     }
 
     try std.testing.expect(seen[1]);
@@ -837,9 +838,9 @@ test "KqueueBackend - wait with zero timeout returns immediately" {
 
     // No operations submitted
     var completions: [8]Completion = undefined;
-    const start = std.time.nanoTimestamp();
+    const start = time_mod.nanoTimestamp();
     const count = try backend.wait(&completions, 0);
-    const elapsed = std.time.nanoTimestamp() - start;
+    const elapsed = time_mod.nanoTimestamp() - start;
 
     // Should return immediately with no completions
     try std.testing.expectEqual(@as(usize, 0), count);
@@ -975,7 +976,7 @@ test "KqueueBackend - TCP socket send/recv readiness" {
     var send_done = false;
     var recv_done = false;
     var recv_len: usize = 0;
-    const start = std.time.nanoTimestamp();
+    const start = time_mod.nanoTimestamp();
 
     while (!send_done or !recv_done) {
         const count = try backend.wait(&completions, 100_000_000);
@@ -986,7 +987,7 @@ test "KqueueBackend - TCP socket send/recv readiness" {
                 if (comp.result > 0) recv_len = @intCast(comp.result);
             }
         }
-        if (std.time.nanoTimestamp() - start > 1_000_000_000) break;
+        if (time_mod.nanoTimestamp() - start > 1_000_000_000) break;
     }
 
     try std.testing.expect(send_done);

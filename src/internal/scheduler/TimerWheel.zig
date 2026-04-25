@@ -16,6 +16,7 @@
 //! - Intrusive linked list: Zero allocation per timer entry
 
 const std = @import("std");
+const time_mod = @import("../../time.zig");
 const thr = @import("../thread.zig");
 const Allocator = std.mem.Allocator;
 const Header = @import("Header.zig").Header;
@@ -343,7 +344,7 @@ pub const TimerWheel = struct {
     now_ns: u64,
 
     /// Start time for monotonic clock
-    start_instant: std.time.Instant,
+    start_instant: time_mod.Instant,
 
     /// Number of active timers
     count: usize,
@@ -357,10 +358,7 @@ pub const TimerWheel = struct {
         wheel.allocator = allocator;
         wheel.count = 0;
         wheel.overflow = Slot.init();
-        wheel.start_instant = std.time.Instant.now() catch blk: {
-            // Fallback if Instant.now() fails — use zero-initialized Instant
-            break :blk std.mem.zeroes(std.time.Instant);
-        };
+        wheel.start_instant = time_mod.Instant.now();
         wheel.now_ns = 0;
 
         for (&wheel.levels) |*level| {
@@ -401,8 +399,7 @@ pub const TimerWheel = struct {
 
     /// Get current monotonic time in nanoseconds
     pub fn now(self: *const Self) u64 {
-        const current = std.time.Instant.now() catch return self.now_ns;
-        return current.since(self.start_instant);
+        return time_mod.Instant.now().since(self.start_instant);
     }
 
     /// Update the wheel's time

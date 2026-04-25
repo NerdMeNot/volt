@@ -53,34 +53,34 @@ pub const File = struct {
 
     /// Open a file for reading.
     pub fn open(path: []const u8) !File {
-        const std_file = try OpenOptions.new().setRead(true).open(path);
-        return .{ .handle = std_file.handle };
+        const raw_fd = try OpenOptions.new().setRead(true).open(path);
+        return .{ .handle = raw_fd };
     }
 
     /// Create a file for writing. Truncates if exists, creates if not.
     pub fn create(path: []const u8) !File {
-        const std_file = try OpenOptions.new()
+        const raw_fd = try OpenOptions.new()
             .setWrite(true)
             .setCreate(true)
             .setTruncate(true)
             .open(path);
-        return .{ .handle = std_file.handle };
+        return .{ .handle = raw_fd };
     }
 
     /// Create a new file, failing if it already exists.
     pub fn createNew(path: []const u8) !File {
-        const std_file = try OpenOptions.new()
+        const raw_fd = try OpenOptions.new()
             .setWrite(true)
             .setRead(true)
             .setCreateNew(true)
             .open(path);
-        return .{ .handle = std_file.handle };
+        return .{ .handle = raw_fd };
     }
 
     /// Open a file with custom options.
     pub fn openWithOptions(path: []const u8, opts: OpenOptions) !File {
-        const std_file = try opts.open(path);
-        return .{ .handle = std_file.handle };
+        const raw_fd = try opts.open(path);
+        return .{ .handle = raw_fd };
     }
 
     /// Get an OpenOptions builder.
@@ -91,16 +91,6 @@ pub const File = struct {
     /// Create from a raw file descriptor (takes ownership).
     pub fn fromRawFd(raw_fd: posix.fd_t) File {
         return .{ .handle = raw_fd };
-    }
-
-    /// Create from a std.fs.File (takes ownership).
-    pub fn fromStd(std_file: std.fs.File) File {
-        return .{ .handle = std_file.handle };
-    }
-
-    /// Convert to std.fs.File.
-    pub fn toStd(self: File) std.fs.File {
-        return .{ .handle = self.handle };
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -115,7 +105,7 @@ pub const File = struct {
 
     /// Read data at a specific offset without changing the file position.
     pub fn pread(self: *File, buf: []u8, offset: u64) !usize {
-        return posix.pread(self.handle, buf, offset);
+        return syscall.pread(self.handle, buf, offset);
     }
 
     /// Read exactly `buf.len` bytes or return an error.
@@ -189,7 +179,7 @@ pub const File = struct {
 
     /// Write data at a specific offset without changing the file position.
     pub fn pwrite(self: *File, data: []const u8, offset: u64) !usize {
-        return posix.pwrite(self.handle, data, offset);
+        return syscall.pwrite(self.handle, data, offset);
     }
 
     /// Write all data to the file.
@@ -226,17 +216,12 @@ pub const File = struct {
 
     /// Seek to a position. Returns the new position from the start.
     pub fn seek(self: *File, offset: i64, whence: SeekFrom) !u64 {
-        var std_file = self.toStd();
         switch (whence) {
-            .start => try std_file.seekTo(@intCast(offset)),
-            .current => try std_file.seekBy(offset),
-            .end => {
-                const end_pos = try std_file.getEndPos();
-                const new_pos = @as(i64, @intCast(end_pos)) + offset;
-                try std_file.seekTo(@intCast(new_pos));
-            },
+            .start => try syscall.lseekSet(self.handle, @intCast(offset)),
+            .current => try syscall.lseekCur(self.handle, offset),
+            .end => _ = try syscall.lseekEnd(self.handle, offset),
         }
-        return std_file.getPos();
+        return syscall.lseekCurPos(self.handle);
     }
 
     /// Seek to the start of the file.
@@ -246,8 +231,7 @@ pub const File = struct {
 
     /// Get the current position in the file.
     pub fn getPos(self: *File) !u64 {
-        var std_file = self.toStd();
-        return std_file.getPos();
+        return syscall.lseekCurPos(self.handle);
     }
 
     /// Seek to a specific position from the start.
@@ -274,7 +258,7 @@ pub const File = struct {
 
     /// Sync all OS-internal metadata and data to disk.
     pub fn syncAll(self: *File) !void {
-        try posix.fsync(self.handle);
+        try syscall.fsync(self.handle);
     }
 
     /// Sync data to disk (may not sync metadata).
@@ -282,7 +266,7 @@ pub const File = struct {
         if (comptime builtin.os.tag == .linux) {
             try posix.fdatasync(self.handle);
         } else {
-            try posix.fsync(self.handle);
+            try syscall.fsync(self.handle);
         }
     }
 
@@ -360,7 +344,7 @@ pub const File = struct {
 
     /// Get metadata about the file.
     pub fn metadata(self: *File) !Metadata {
-        const stat = try posix.fstat(self.handle);
+        const stat = try syscall.fstat(self.handle);
         return Metadata.fromStat(stat);
     }
 
@@ -368,12 +352,12 @@ pub const File = struct {
     /// If `size` is less than current, the file is truncated.
     /// If `size` is greater, the file is extended with zeros.
     pub fn setLen(self: *File, size: u64) !void {
-        try posix.ftruncate(self.handle, @intCast(size));
+        try syscall.ftruncate(self.handle, @intCast(size));
     }
 
     /// Set file permissions.
     pub fn setPermissions(self: *File, perm: Permissions) !void {
-        try posix.fchmod(self.handle, @intCast(perm.mode));
+        try syscall.fchmod(self.handle, @intCast(perm.mode));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -402,7 +386,6 @@ pub const File = struct {
         const n = posix.read(self.handle, buffer) catch |err| switch (err) {
             error.WouldBlock => return error.WouldBlock,
             error.InputOutput => return error.IoError,
-            error.BrokenPipe => return error.BrokenPipe,
             error.ConnectionResetByPeer => return error.ConnectionReset,
             else => return error.Unexpected,
         };
@@ -424,7 +407,7 @@ pub const File = struct {
 
     fn fileFlushFn(ctx: *anyopaque) io.Error!void {
         const self: *File = @ptrCast(@alignCast(ctx));
-        posix.fsync(self.handle) catch |err| switch (err) {
+        syscall.fsync(self.handle) catch |err| switch (err) {
             error.InputOutput => return error.IoError,
             else => return error.Unexpected,
         };
@@ -473,7 +456,7 @@ test "File - create and write" {
     }
 
     // Cleanup
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - seek" {
@@ -496,7 +479,7 @@ test "File - seek" {
         try std.testing.expectEqualStrings("56789", buf[0..n]);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - metadata" {
@@ -517,7 +500,7 @@ test "File - metadata" {
         try std.testing.expectEqual(@as(u64, 12), meta.size());
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - reader/writer interface" {
@@ -543,7 +526,7 @@ test "File - reader/writer interface" {
         try std.testing.expectEqualStrings("via io.Writer", buf[0..n]);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - vectored I/O" {
@@ -600,7 +583,7 @@ test "File - vectored I/O" {
         try std.testing.expectEqualStrings(":END", &buf3);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - setLen truncate" {
@@ -628,7 +611,7 @@ test "File - setLen truncate" {
         try std.testing.expectEqualStrings("Hello", buf[0..n]);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - file not found error" {
@@ -659,7 +642,7 @@ test "File - read past EOF returns 0" {
         try std.testing.expectEqual(@as(usize, 0), n2);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - pread and pwrite (positioned I/O)" {
@@ -693,7 +676,7 @@ test "File - pread and pwrite (positioned I/O)" {
         try std.testing.expectEqual(@as(u64, 0), try file.getPos());
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - readToEnd" {
@@ -716,7 +699,7 @@ test "File - readToEnd" {
         try std.testing.expectEqualStrings(content, data);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - position tracking" {
@@ -757,7 +740,7 @@ test "File - position tracking" {
         try std.testing.expectEqual(@as(u64, 0), try file.getPos());
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - seekTo and seekBy" {
@@ -788,7 +771,7 @@ test "File - seekTo and seekBy" {
         try std.testing.expectEqual(@as(u64, 4), try file.getPos());
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - getLen" {
@@ -809,7 +792,7 @@ test "File - getLen" {
         try std.testing.expectEqual(@as(u64, 19), len);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - setLen extend" {
@@ -843,17 +826,19 @@ test "File - setLen extend" {
         try std.testing.expectEqual(@as(u8, 0), buf[9]);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - fromRawFd" {
     const path = "/tmp/blitz_io_test_rawfd.txt";
 
-    // Create file using std library
-    const std_file = try std.fs.createFileAbsolute(path, .{});
+    // Create file using raw openat (std.fs.createFileAbsolute is gone in 0.16)
+    const path_z = try posix.toPosixPath(path);
+    const flags: posix.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
+    const raw_fd = try posix.openatZ(posix.AT.FDCWD, &path_z, flags, 0o644);
 
     // Wrap in our File type
-    var file = File.fromRawFd(std_file.handle);
+    var file = File.fromRawFd(raw_fd);
     defer file.close();
 
     try file.writeAll("from raw fd");
@@ -869,7 +854,7 @@ test "File - fromRawFd" {
         try std.testing.expectEqualStrings("from raw fd", buf[0..n]);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - createNew fails if exists" {
@@ -885,7 +870,7 @@ test "File - createNew fails if exists" {
     const result = File.createNew(path);
     try std.testing.expectError(error.PathAlreadyExists, result);
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - syncData" {
@@ -897,7 +882,7 @@ test "File - syncData" {
     try file.writeAll("data to sync");
     try file.syncData(); // Should not error
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - readAll error on short file" {
@@ -919,7 +904,7 @@ test "File - readAll error on short file" {
         try std.testing.expectError(error.EndOfStream, result);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - advise sequential" {
@@ -937,7 +922,7 @@ test "File - advise sequential" {
         try file.advise(.sequential);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - advise random" {
@@ -955,7 +940,7 @@ test "File - advise random" {
         try file.advise(.random);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - adviseRange" {
@@ -975,7 +960,7 @@ test "File - adviseRange" {
         try file.adviseRange(0, 0, .normal);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - readFull complete" {
@@ -997,7 +982,7 @@ test "File - readFull complete" {
         try std.testing.expectEqualStrings("Hello, readFull!", buf[0..n]);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - readFull partial" {
@@ -1019,7 +1004,7 @@ test "File - readFull partial" {
         try std.testing.expectEqualStrings("short", buf[0..n]);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - readFull empty file" {
@@ -1039,7 +1024,7 @@ test "File - readFull empty file" {
         try std.testing.expectEqual(@as(usize, 0), n);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - empty file operations" {
@@ -1064,7 +1049,7 @@ test "File - empty file operations" {
         try std.testing.expectEqual(@as(u64, 0), len);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }
 
 test "File - large write and read" {
@@ -1097,5 +1082,5 @@ test "File - large write and read" {
         try std.testing.expectEqualSlices(u8, data, read_data);
     }
 
-    try std.fs.deleteFileAbsolute(path);
+    try syscall.unlink(path);
 }

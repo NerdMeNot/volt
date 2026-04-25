@@ -30,6 +30,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const syscall = @import("../internal/syscall.zig");
 const builtin = @import("builtin");
 
 const File = @import("file.zig").File;
@@ -152,7 +153,7 @@ pub fn mmapFile(path: []const u8, options: MmapOptions) !MappedFile {
         opts = opts.setWrite(true);
     }
     const std_file = try opts.open(path);
-    var file = File.fromStd(std_file);
+    var file = File.fromRawFd(std_file);
     defer file.close();
 
     return mmapFd(file.handle, options);
@@ -169,14 +170,14 @@ pub fn mmapHandle(file: *File, options: MmapOptions) !MappedFile {
 }
 
 fn mmapFd(fd: posix.fd_t, options: MmapOptions) !MappedFile {
-    const stat = try posix.fstat(fd);
+    const stat = try syscall.fstat(fd);
     const size: usize = @intCast(stat.size);
     if (size == 0) return error.EmptyFile;
 
-    // Protection flags.
-    var prot: u32 = posix.PROT.READ;
+    // Protection flags. In Zig 0.16, posix.PROT is a packed struct (was u32 in 0.15).
+    var prot: posix.PROT = .{ .READ = true };
     if (options.protection == .read_write) {
-        prot |= posix.PROT.WRITE;
+        prot.WRITE = true;
     }
 
     // MAP flags.
@@ -244,7 +245,7 @@ test "MappedFile - read only" {
         defer file.close();
         try file.writeAll(content);
     }
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     var mapped = try mmapFile(path, .{});
     defer mapped.unmap();
@@ -260,7 +261,7 @@ test "MappedFile - read write and sync" {
         defer file.close();
         try file.writeAll("original content!");
     }
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     // Map read-write and modify.
     {
@@ -290,7 +291,7 @@ test "MappedFile - sliceMut on read only" {
         defer file.close();
         try file.writeAll("data");
     }
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     var mapped = try mmapFile(path, .{});
     defer mapped.unmap();
@@ -305,7 +306,7 @@ test "MappedFile - empty file" {
         var file = try File.create(path);
         file.close();
     }
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     const result = mmapFile(path, .{});
     try testing.expectError(error.EmptyFile, result);
@@ -320,7 +321,7 @@ test "MappedFile - mmapHandle" {
         defer file.close();
         try file.writeAll(content);
     }
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     var file = try File.open(path);
     defer file.close();
@@ -342,7 +343,7 @@ test "MappedFile - sequential hint" {
         defer file.close();
         try file.writeAll("sequential access data");
     }
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     var mapped = try mmapFile(path, .{ .sequential = true });
     defer mapped.unmap();
@@ -358,7 +359,7 @@ test "MappedFile - random hint" {
         defer file.close();
         try file.writeAll("random access data");
     }
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     var mapped = try mmapFile(path, .{ .random = true });
     defer mapped.unmap();
@@ -374,7 +375,7 @@ test "MappedFile - populate hint" {
         defer file.close();
         try file.writeAll("populated mapping");
     }
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     var mapped = try mmapFile(path, .{ .populate = true });
     defer mapped.unmap();
@@ -390,7 +391,7 @@ test "MappedFile - advise on mapped region" {
         defer file.close();
         try file.writeAll("a" ** 8192);
     }
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     var mapped = try mmapFile(path, .{});
     defer mapped.unmap();
@@ -416,7 +417,7 @@ test "MappedFile - large file" {
         defer file.close();
         try file.writeAll(data);
     }
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     var mapped = try mmapFile(path, .{});
     defer mapped.unmap();

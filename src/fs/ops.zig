@@ -70,13 +70,13 @@ pub fn writeFile(path: []const u8, data: []const u8) !void {
 
 /// Append data to a file, creating it if it doesn't exist.
 pub fn appendFile(path: []const u8, data: []const u8) !void {
-    const std_file = try File.getOptions()
+    const fd = try File.getOptions()
         .setWrite(true)
         .setCreate(true)
         .setAppend(true)
         .open(path);
 
-    var file = File.fromStd(std_file);
+    var file = File.fromRawFd(fd);
     defer file.close();
 
     try file.writeAll(data);
@@ -117,7 +117,7 @@ pub fn copy(src: []const u8, dst: []const u8) !u64 {
 pub fn rename(old_path: []const u8, new_path: []const u8) !void {
     const old_z = try posix.toPosixPath(old_path);
     const new_z = try posix.toPosixPath(new_path);
-    try posix.renameZ(&old_z, &new_z);
+    try syscall.renameZ(&old_z, &new_z);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -135,14 +135,14 @@ pub fn hardLink(src: []const u8, dst: []const u8) !void {
 pub fn symlink(target: []const u8, link_path: []const u8) !void {
     const target_z = try posix.toPosixPath(target);
     const link_z = try posix.toPosixPath(link_path);
-    try posix.symlinkatZ(&target_z, posix.AT.FDCWD, &link_z);
+    try syscall.symlinkatZ(&target_z, posix.AT.FDCWD, &link_z);
 }
 
 /// Read the target of a symbolic link.
 pub fn readLink(allocator: mem.Allocator, path: []const u8) ![]u8 {
     const path_z = try posix.toPosixPath(path);
     var buf: [posix.PATH_MAX]u8 = undefined;
-    const link_target = try posix.readlinkatZ(posix.AT.FDCWD, &path_z, &buf);
+    const link_target = try syscall.readlinkatZ(posix.AT.FDCWD, &path_z, &buf);
     const result = try allocator.alloc(u8, link_target.len);
     @memcpy(result, link_target);
     return result;
@@ -216,7 +216,7 @@ test "readFile and writeFile" {
     const content = "Hello from ops!";
 
     try writeFile(path, content);
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     const data = try readFile(std.testing.allocator, path);
     defer std.testing.allocator.free(data);
@@ -229,7 +229,7 @@ test "readFileString - valid UTF-8" {
     const content = "Hello, 世界! 🎉";
 
     try writeFile(path, content);
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     const data = try readFileString(std.testing.allocator, path);
     defer std.testing.allocator.free(data);
@@ -248,7 +248,7 @@ test "readFileString - invalid UTF-8" {
         try file.writeAll(&[_]u8{ 0xFF, 0xFE, 0x00 });
     }
 
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     const result = readFileString(std.testing.allocator, path);
     try std.testing.expectError(error.InvalidUtf8, result);
@@ -258,7 +258,7 @@ test "appendFile" {
     const path = "/tmp/blitz_io_append_test.txt";
 
     try writeFile(path, "line1\n");
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     try appendFile(path, "line2\n");
 
@@ -273,8 +273,8 @@ test "copy" {
     const dst = "/tmp/blitz_io_copy_dst.txt";
 
     try writeFile(src, "copy me!");
-    defer std.fs.deleteFileAbsolute(src) catch {};
-    defer std.fs.deleteFileAbsolute(dst) catch {};
+    defer syscall.unlink(src) catch {};
+    defer syscall.unlink(dst) catch {};
 
     const bytes = try copy(src, dst);
     try std.testing.expectEqual(@as(u64, 8), bytes);
@@ -291,7 +291,7 @@ test "exists" {
     try std.testing.expect(!try exists(path));
 
     try writeFile(path, "");
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     try std.testing.expect(try exists(path));
 }
@@ -301,7 +301,7 @@ test "rename" {
     const new = "/tmp/blitz_io_rename_new.txt";
 
     try writeFile(old, "rename me");
-    defer std.fs.deleteFileAbsolute(new) catch {};
+    defer syscall.unlink(new) catch {};
 
     try rename(old, new);
 
@@ -314,8 +314,8 @@ test "symlink and readLink" {
     const link = "/tmp/blitz_io_symlink_link";
 
     try writeFile(target, "target");
-    defer std.fs.deleteFileAbsolute(target) catch {};
-    defer std.fs.deleteFileAbsolute(link) catch {};
+    defer syscall.unlink(target) catch {};
+    defer syscall.unlink(link) catch {};
 
     try symlink(target, link);
 
@@ -329,7 +329,7 @@ test "fileSize" {
     const path = "/tmp/blitz_io_filesize_test.txt";
 
     try writeFile(path, "hello world!");
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     const size = try fileSize(path);
     try std.testing.expectEqual(@as(u64, 12), size);
@@ -339,7 +339,7 @@ test "fileSize - empty file" {
     const path = "/tmp/blitz_io_filesize_empty.txt";
 
     try writeFile(path, "");
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     const size = try fileSize(path);
     try std.testing.expectEqual(@as(u64, 0), size);
@@ -349,7 +349,7 @@ test "metadata" {
     const path = "/tmp/blitz_io_meta_ops.txt";
 
     try writeFile(path, "metadata test");
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    defer syscall.unlink(path) catch {};
 
     const meta = try metadata(path);
     try std.testing.expect(meta.isFile());
