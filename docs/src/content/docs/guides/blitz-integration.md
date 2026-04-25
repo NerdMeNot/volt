@@ -33,7 +33,7 @@ The typical pattern is: Volt manages connections and I/O, Blitz runs the heavy c
 const volt = @import("volt");
 const blitz = @import("blitz");
 
-fn handleRequest(io: volt.Io, data: []const u8) !void {
+fn handleRequest(io: volt.Runtime, data: []const u8) !void {
     // Offload CPU-parallel work to Blitz via the blocking pool
     const handle = try io.concurrent(struct {
         fn run(input: []const u8) ![]const u8 {

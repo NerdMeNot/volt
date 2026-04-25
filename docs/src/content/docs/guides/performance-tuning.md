@@ -19,7 +19,7 @@ try volt.runWith(allocator, .{}, myServer);
 try volt.runWith(allocator, .{ .num_workers = 4 }, myServer);
 
 // Manual runtime setup
-var io = try volt.Io.init(allocator, .{
+var io = try volt.Runtime.init(allocator, .{
     .num_workers = 8,
     .max_blocking_threads = 256,
 });
@@ -176,7 +176,7 @@ The blocking pool (`io.concurrent`) is the right place for allocation-heavy work
 The blocking pool spawns OS threads on demand for CPU-intensive or blocking I/O work.
 
 ```zig
-var io = try volt.Io.init(allocator, .{
+var io = try volt.Runtime.init(allocator, .{
     .max_blocking_threads = 512,          // Max concurrent blocking tasks
     .blocking_keep_alive_ns = 10 * std.time.ns_per_s, // Idle thread timeout
 });

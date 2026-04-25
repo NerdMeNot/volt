@@ -495,7 +495,7 @@ const n = try file.read(&buf);
 
 #### Async Convenience Functions
 
-These are the async equivalents of the top-level convenience functions. They require an `Io` handle.
+These are the async equivalents of the top-level convenience functions. They require an `Runtime` handle.
 
 ```zig
 // Read entire file without blocking the event loop
@@ -918,10 +918,10 @@ Use `AsyncFile` inside the runtime to process many files without blocking I/O wo
 const volt = @import("volt");
 const fs = volt.fs;
 
-fn processFiles(io: volt.Io, paths: []const []const u8) void {
+fn processFiles(io: volt.Runtime, paths: []const []const u8) void {
     for (paths) |path| {
         const f = io.@"async"(struct {
-            fn run(io_inner: volt.Io, p: []const u8) void {
+            fn run(io_inner: volt.Runtime, p: []const u8) void {
                 // AsyncFile uses io_uring on Linux, blocking pool elsewhere
                 const data = fs.readFileAsync(io_inner, std.heap.page_allocator, p) catch return;
                 defer std.heap.page_allocator.free(data);

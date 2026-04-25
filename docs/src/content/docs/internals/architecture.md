@@ -17,7 +17,7 @@ Volt is a production-grade async I/O runtime for Zig, modeled after Tokio's batt
 +=====================================================================+
 |                      User-Facing API                                |
 |                                                                     |
-|  volt.Io       volt.Future   volt.Group      volt.sync.*            |
+|  volt.Runtime       volt.Future   volt.Group      volt.sync.*            |
 |  volt.channel.*  volt.net.*  volt.time.*     volt.fs.*              |
 |  volt.signal   volt.process  volt.stream     volt.shutdown          |
 +=====================================================================+

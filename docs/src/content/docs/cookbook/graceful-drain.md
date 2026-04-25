@@ -91,7 +91,7 @@ pub fn main() !void {
 }
 
 fn acceptLoop(
-    io: volt.Io,
+    io: volt.Runtime,
     shutdown: *volt.shutdown.Shutdown,
     listener: *volt.net.TcpListener,
     connection_count: *u64,

@@ -24,7 +24,7 @@ pub fn main() !void {
     try volt.run(server);
 }
 
-fn server(io: volt.Io) void {
+fn server(io: volt.Runtime) void {
     // Bind to all interfaces on port 8080.
     // Under the hood this creates a socket, sets SO_REUSEADDR (so you can
     // restart immediately without TIME_WAIT errors), binds, and calls
@@ -253,7 +253,7 @@ pub fn main() !void {
     try volt.run(server);
 }
 
-fn server(io: volt.Io) void {
+fn server(io: volt.Runtime) void {
     var listener = volt.net.TcpListener.bind(
         volt.net.Address.fromPort(8080),
     ) catch |err| {
@@ -327,7 +327,7 @@ pub fn main() !void {
     try volt.run(server);
 }
 
-fn server(io: volt.Io) void {
+fn server(io: volt.Runtime) void {
     var listener = volt.net.TcpListener.bind(
         volt.net.Address.fromPort(8080),
     ) catch |err| {

@@ -8,6 +8,14 @@ const builtin = @import("builtin");
 const testing = std.testing;
 const Atomic = std.atomic.Value;
 
+/// Monotonic-clock timestamp in nanoseconds. Replaces std.time.nanoTimestamp
+/// (removed in 0.16; time queries moved to std.Io which requires an Io handle).
+fn nanoTimestamp() i128 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+}
+
 /// Thread-safe concurrent counter
 pub const ConcurrentCounter = struct {
     value: Atomic(usize) = Atomic(usize).init(0),
@@ -36,7 +44,7 @@ pub const ConcurrentCounter = struct {
 /// Simple countdown latch for synchronization
 pub const Latch = struct {
     count: Atomic(usize),
-    event: std.Thread.ResetEvent = .{},
+    event: ResetEvent = .{},
 
     pub fn init(count: usize) Latch {
         return .{
@@ -61,9 +69,9 @@ pub const Latch = struct {
 
     /// Wait with timeout
     pub fn timedWait(self: *Latch, timeout_ns: u64) bool {
-        const deadline = std.time.nanoTimestamp() + @as(i128, timeout_ns);
+        const deadline = nanoTimestamp() + @as(i128, timeout_ns);
         while (self.count.load(.acquire) > 0) {
-            const now = std.time.nanoTimestamp();
+            const now = nanoTimestamp();
             if (now >= deadline) return false;
             const remaining: u64 = @intCast(deadline - now);
             self.event.timedWait(remaining) catch {};
@@ -72,12 +80,45 @@ pub const Latch = struct {
     }
 };
 
+// std.Thread.ResetEvent moved to std.Io.Event (requires Io) in Zig 0.16.
+// `common` is a test-utility module without a volt dependency, so we roll
+// a minimal portable replacement here. Mutex+Condition would be cleaner but
+// also needs replacements; this atomic-only spin-then-yield variant is
+// adequate for test infrastructure.
+const ResetEvent = struct {
+    state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    pub fn set(self: *ResetEvent) void {
+        self.state.store(1, .release);
+    }
+
+    pub fn wait(self: *ResetEvent) void {
+        while (self.state.load(.acquire) == 0) {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    pub fn timedWait(self: *ResetEvent, timeout_ns: u64) error{Timeout}!void {
+        var elapsed: u64 = 0;
+        const slice_ns: u64 = 1_000_000; // 1ms slice
+        while (self.state.load(.acquire) == 0) {
+            if (elapsed >= timeout_ns) return error.Timeout;
+            std.Thread.yield() catch {};
+            elapsed += slice_ns;
+        }
+    }
+
+    pub fn reset(self: *ResetEvent) void {
+        self.state.store(0, .monotonic);
+    }
+};
+
 /// Barrier for thread synchronization
 pub const Barrier = struct {
     count: Atomic(usize),
     generation: Atomic(usize) = Atomic(usize).init(0),
     total: usize,
-    event: std.Thread.ResetEvent = .{},
+    event: ResetEvent = .{},
 
     pub fn init(count: usize) Barrier {
         return .{
@@ -127,7 +168,7 @@ pub const ThreadRng = struct {
     }
 
     pub fn initFromTime() ThreadRng {
-        const timestamp: u64 = @intCast(std.time.nanoTimestamp() & 0xFFFFFFFFFFFFFFFF);
+        const timestamp: u64 = @intCast(nanoTimestamp() & 0xFFFFFFFFFFFFFFFF);
         return init(timestamp);
     }
 

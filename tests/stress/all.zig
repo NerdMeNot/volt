@@ -16,6 +16,8 @@ const testing = std.testing;
 const Atomic = std.atomic.Value;
 const debug = std.debug;
 
+const thread_internal = @import("volt").internal.thread;
+
 const common = @import("common");
 const config = common.config;
 const ConcurrentCounter = common.ConcurrentCounter;
@@ -240,7 +242,7 @@ test "Channel stress - throughput" {
 test "Sync primitives - no memory leaks" {
     const rounds: usize = 1000;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
 
     for (0..rounds) |_| {
@@ -965,14 +967,14 @@ test "BlockingPool stress - thread scaling" {
     for (0..8) |_| {
         handles[submitted] = runBlocking(&pool, struct {
             fn slowTask() u64 {
-                std.Thread.sleep(50 * std.time.ns_per_ms);
+                thread_internal.sleep(50 * std.time.ns_per_ms);
                 return 42;
             }
         }.slowTask, .{}) catch continue;
         submitted += 1;
     }
 
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    thread_internal.sleep(10 * std.time.ns_per_ms);
     const threads_during = pool.threadCount();
     try testing.expect(threads_during > 0);
 
@@ -980,7 +982,7 @@ test "BlockingPool stress - thread scaling" {
         _ = h.wait() catch {};
     }
 
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    thread_internal.sleep(200 * std.time.ns_per_ms);
     const threads_after = pool.threadCount();
     try testing.expect(threads_after <= threads_during);
 

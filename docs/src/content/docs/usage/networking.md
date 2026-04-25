@@ -381,7 +381,7 @@ pub fn main() !void {
     try volt.run(server);
 }
 
-fn server(io: volt.Io) void {
+fn server(io: volt.Runtime) void {
     var listener = volt.net.listen("0.0.0.0:8080") catch return;
     defer listener.close();
 

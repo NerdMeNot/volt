@@ -18,7 +18,7 @@ All primitives are **async-aware**: when contended, they yield to the scheduler 
 ```zig
 const volt = @import("volt");
 
-fn example(io: volt.Io) void {
+fn example(io: volt.Runtime) void {
     // Protect shared state with a Mutex (convenience -- takes io, suspends until acquired)
     var mutex = volt.sync.Mutex.init();
     mutex.lock(io);
@@ -48,7 +48,7 @@ Each primitive provides four API tiers:
 | Tier | Pattern | Behavior |
 |------|---------|----------|
 | Non-blocking | `tryX()` | Returns immediately (lock-free CAS) |
-| Convenience | `x(io)` | Takes `Io` handle, suspends until complete |
+| Convenience | `x(io)` | Takes `Runtime` handle, suspends until complete |
 | Async Future | `xFuture()` | Returns a Future for manual scheduling |
 | Waiter | `xWait(waiter)` | Low-level, caller manages waiter lifecycle |
 
@@ -74,7 +74,7 @@ var mutex = Mutex.init();
 |--------|-----------|-------------|
 | `tryLock` | `fn tryLock(self: *Mutex) bool` | Non-blocking lock attempt. Returns `true` if acquired. |
 | `unlock` | `fn unlock(self: *Mutex) void` | Release the lock. Wakes the next waiter (FIFO). |
-| `lock` | `fn lock(self: *Mutex, io: volt.Io) void` | Convenience: acquire the lock, suspending until available. Takes the `Io` handle. |
+| `lock` | `fn lock(self: *Mutex, io: volt.Runtime) void` | Convenience: acquire the lock, suspending until available. Takes the `Runtime` handle. |
 | `lockFuture` | `fn lockFuture(self: *Mutex) LockFuture` | Returns a Future that resolves when the lock is acquired. |
 | `lockWait` | `fn lockWait(self: *Mutex, waiter: *Waiter) bool` | Waiter-based lock. Returns `true` if acquired immediately. |
 | `cancelLock` | `fn cancelLock(self: *Mutex, waiter: *Waiter) void` | Remove a waiter from the queue. |
@@ -87,7 +87,7 @@ var mutex = Mutex.init();
 The simplest way to acquire a mutex in an async task. Suspends the current task until the lock is available, then returns. The caller must call `unlock()` when done.
 
 ```zig
-fn updateCounter(io: volt.Io, mutex: *volt.sync.Mutex, counter: *u64) void {
+fn updateCounter(io: volt.Runtime, mutex: *volt.sync.Mutex, counter: *u64) void {
     mutex.lock(io);        // suspends if contended
     defer mutex.unlock();
     counter.* += 1;
@@ -152,7 +152,7 @@ const SharedCounter = struct {
 
     /// Increment the counter by 1, returning the previous value.
     /// Uses lock(io) to suspend until the lock is acquired.
-    fn increment(self: *SharedCounter, io: volt.Io) u64 {
+    fn increment(self: *SharedCounter, io: volt.Runtime) u64 {
         self.mutex.lock(io);
         defer self.mutex.unlock();
         const prev = self.value;
@@ -172,7 +172,7 @@ const SharedCounter = struct {
 
 var counter = SharedCounter.init();
 
-fn workerTask(io: volt.Io) void {
+fn workerTask(io: volt.Runtime) void {
     const prev = counter.increment(io);
     std.log.info("counter was {d}, now {d}", .{ prev, prev + 1 });
 }
@@ -222,7 +222,7 @@ const SessionCache = struct {
     }
 
     /// Store a session. Uses lock(io) to suspend until lock is available.
-    fn store(self: *SessionCache, io: volt.Io, token: []const u8, data: SessionData) !void {
+    fn store(self: *SessionCache, io: volt.Runtime, token: []const u8, data: SessionData) !void {
         self.mutex.lock(io);
         defer self.mutex.unlock();
         try self.sessions.put(token, data);
@@ -256,13 +256,13 @@ var rwlock = RwLock.init();
 |--------|-----------|-------------|
 | `tryReadLock` | `fn tryReadLock(self: *RwLock) bool` | Non-blocking read lock. |
 | `readUnlock` | `fn readUnlock(self: *RwLock) void` | Release read lock. |
-| `readLock` | `fn readLock(self: *RwLock, io: volt.Io) void` | Convenience: acquire read lock, suspending until available. |
+| `readLock` | `fn readLock(self: *RwLock, io: volt.Runtime) void` | Convenience: acquire read lock, suspending until available. |
 | `readLockFuture` | `fn readLockFuture(self: *RwLock) ReadLockFuture` | Returns a Future for read lock acquisition. |
 | `readLockWait` | `fn readLockWait(self: *RwLock, waiter: *ReadWaiter) bool` | Waiter-based read lock. |
 | `cancelReadLock` | `fn cancelReadLock(self: *RwLock, waiter: *ReadWaiter) void` | Cancel pending read lock. |
 | `tryWriteLock` | `fn tryWriteLock(self: *RwLock) bool` | Non-blocking write lock. |
 | `writeUnlock` | `fn writeUnlock(self: *RwLock) void` | Release write lock. |
-| `writeLock` | `fn writeLock(self: *RwLock, io: volt.Io) void` | Convenience: acquire write lock, suspending until available. |
+| `writeLock` | `fn writeLock(self: *RwLock, io: volt.Runtime) void` | Convenience: acquire write lock, suspending until available. |
 | `writeLockFuture` | `fn writeLockFuture(self: *RwLock) WriteLockFuture` | Returns a Future for write lock acquisition. |
 | `writeLockWait` | `fn writeLockWait(self: *RwLock, waiter: *WriteWaiter) bool` | Waiter-based write lock. |
 | `cancelWriteLock` | `fn cancelWriteLock(self: *RwLock, waiter: *WriteWaiter) void` | Cancel pending write lock. |
@@ -278,13 +278,13 @@ var rwlock = RwLock.init();
 The simplest way to acquire a read or write lock in an async task. Suspends the current task until the lock is available.
 
 ```zig
-fn readConfig(io: volt.Io, rwlock: *volt.sync.RwLock, config: *const AppConfig) AppConfig {
+fn readConfig(io: volt.Runtime, rwlock: *volt.sync.RwLock, config: *const AppConfig) AppConfig {
     rwlock.readLock(io);        // suspends if a writer is active
     defer rwlock.readUnlock();
     return config.*;
 }
 
-fn updateConfig(io: volt.Io, rwlock: *volt.sync.RwLock, config: *AppConfig, new: AppConfig) void {
+fn updateConfig(io: volt.Runtime, rwlock: *volt.sync.RwLock, config: *AppConfig, new: AppConfig) void {
     rwlock.writeLock(io);       // suspends until all readers and writers release
     defer rwlock.writeUnlock();
     config.* = new;
@@ -339,7 +339,7 @@ const ConfigStore = struct {
 
     /// Read the current configuration. Multiple tasks can call this
     /// concurrently without blocking each other.
-    fn read(self: *ConfigStore, io: volt.Io) AppConfig {
+    fn read(self: *ConfigStore, io: volt.Runtime) AppConfig {
         self.rwlock.readLock(io);
         defer self.rwlock.readUnlock();
         return self.config;
@@ -355,7 +355,7 @@ const ConfigStore = struct {
     }
 
     /// Check a single feature flag without copying the whole config.
-    fn hasFeatureFlag(self: *ConfigStore, io: volt.Io, flag_bit: u6) bool {
+    fn hasFeatureFlag(self: *ConfigStore, io: volt.Runtime, flag_bit: u6) bool {
         self.rwlock.readLock(io);
         defer self.rwlock.readUnlock();
         return (self.config.feature_flags & (@as(u64, 1) << flag_bit)) != 0;
@@ -363,14 +363,14 @@ const ConfigStore = struct {
 
     /// Update the configuration. Blocks all readers until complete.
     /// Only one writer can hold the lock at a time.
-    fn update(self: *ConfigStore, io: volt.Io, new_config: AppConfig) void {
+    fn update(self: *ConfigStore, io: volt.Runtime, new_config: AppConfig) void {
         self.rwlock.writeLock(io);
         defer self.rwlock.writeUnlock();
         self.config = new_config;
     }
 
     /// Partially update: change only the timeout, leave everything else.
-    fn setTimeout(self: *ConfigStore, io: volt.Io, timeout_ms: u64) void {
+    fn setTimeout(self: *ConfigStore, io: volt.Runtime, timeout_ms: u64) void {
         self.rwlock.writeLock(io);
         defer self.rwlock.writeUnlock();
         self.config.request_timeout_ms = timeout_ms;
@@ -385,7 +385,7 @@ var store = ConfigStore.init(.{
 });
 
 // Task A, B, C, D (concurrent readers -- all proceed in parallel):
-fn readerTask(io: volt.Io) void {
+fn readerTask(io: volt.Runtime) void {
     const cfg = store.read(io);
     std.log.info("timeout = {d}ms, max_conn = {d}", .{
         cfg.request_timeout_ms,
@@ -394,7 +394,7 @@ fn readerTask(io: volt.Io) void {
 }
 
 // Admin task (exclusive writer -- blocks readers while active):
-fn adminTask(io: volt.Io) void {
+fn adminTask(io: volt.Runtime) void {
     store.update(io, .{
         .max_connections = 2000,
         .request_timeout_ms = 15_000,
@@ -429,7 +429,7 @@ var sem = Semaphore.init(10); // 10 permits
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `tryAcquire` | `fn tryAcquire(self: *Semaphore, num: usize) bool` | Non-blocking acquire (lock-free CAS). |
-| `acquire` | `fn acquire(self: *Semaphore, io: volt.Io, num: usize) void` | Convenience: acquire permits, suspending until available. |
+| `acquire` | `fn acquire(self: *Semaphore, io: volt.Runtime, num: usize) void` | Convenience: acquire permits, suspending until available. |
 | `acquireFuture` | `fn acquireFuture(self: *Semaphore, num: usize) AcquireFuture` | Returns a Future that resolves when permits are acquired. |
 | `acquireWait` | `fn acquireWait(self: *Semaphore, waiter: *Waiter) bool` | Waiter-based acquire. |
 | `release` | `fn release(self: *Semaphore, num: usize) void` | Release permits. Wakes queued waiters. |
@@ -443,7 +443,7 @@ var sem = Semaphore.init(10); // 10 permits
 The simplest way to acquire permits in an async task. Suspends the current task until the requested permits are available.
 
 ```zig
-fn useConnection(io: volt.Io, pool_sem: *volt.sync.Semaphore) void {
+fn useConnection(io: volt.Runtime, pool_sem: *volt.sync.Semaphore) void {
     pool_sem.acquire(io, 1);     // suspends until a permit is available
     defer pool_sem.release(1);
     // use the connection
@@ -492,7 +492,7 @@ const DbConnectionPool = struct {
     }
 
     /// Acquire a connection slot. Suspends until one is available.
-    fn getConnection(self: *DbConnectionPool, io: volt.Io) void {
+    fn getConnection(self: *DbConnectionPool, io: volt.Runtime) void {
         self.semaphore.acquire(io, 1);
     }
 
@@ -519,7 +519,7 @@ const DbConnectionPool = struct {
 
 var pool = DbConnectionPool.init(5); // Max 5 concurrent DB connections
 
-fn handleRequest(io: volt.Io) !void {
+fn handleRequest(io: volt.Runtime) !void {
     // Acquire a connection slot, suspending until available.
     pool.getConnection(io);
     defer pool.releaseConnection();
@@ -548,7 +548,7 @@ const volt = @import("volt");
 /// Allow at most 20 outbound requests in flight at once.
 var request_limiter = volt.sync.Semaphore.init(20);
 
-fn fetchFromUpstream(io: volt.Io, url: []const u8) ![]const u8 {
+fn fetchFromUpstream(io: volt.Runtime, url: []const u8) ![]const u8 {
     // Acquire 1 permit. If 20 requests are already in flight,
     // this suspends the task until one finishes.
     request_limiter.acquire(io, 1);
@@ -556,7 +556,7 @@ fn fetchFromUpstream(io: volt.Io, url: []const u8) ![]const u8 {
     return doHttpGet(url);
 }
 
-fn doBulkFetch(io: volt.Io, urls: []const []const u8) !void {
+fn doBulkFetch(io: volt.Runtime, urls: []const []const u8) !void {
     // Acquire 5 permits at once for a batch operation.
     // This reserves 5 of the 20 slots, leaving 15 for other tasks.
     request_limiter.acquire(io, 5);

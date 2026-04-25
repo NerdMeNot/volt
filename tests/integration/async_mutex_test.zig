@@ -9,7 +9,7 @@ const testing = std.testing;
 const Atomic = std.atomic.Value;
 
 const volt = @import("volt");
-const Io = volt.Io;
+const Runtime = volt.Runtime;
 const Mutex = volt.sync.Mutex;
 const RwLock = volt.sync.RwLock;
 const Context = volt.future.Context;
@@ -153,7 +153,7 @@ test "Async Mutex - 8 tasks contended" {
     const num_tasks = 8;
     const ops_per_task = 100;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var mutex = Mutex.init();
@@ -172,7 +172,7 @@ test "Async Mutex - 64 tasks contended" {
     const num_tasks = 64;
     const ops_per_task = 50;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var mutex = Mutex.init();
@@ -193,7 +193,7 @@ test "Async RwLock - 4R + 2W" {
     const total_tasks = num_readers + num_writers;
     const ops_per_task = 100;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var rwlock = RwLock.init();
@@ -220,7 +220,7 @@ test "Async RwLock - writer-heavy 2R + 4W" {
     const total_tasks = num_readers + num_writers;
     const ops_per_task = 100;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var rwlock = RwLock.init();

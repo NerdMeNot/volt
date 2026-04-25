@@ -8,7 +8,7 @@ const testing = std.testing;
 const Atomic = std.atomic.Value;
 
 const volt = @import("volt");
-const Io = volt.Io;
+const Runtime = volt.Runtime;
 const Context = volt.future.Context;
 const PollResult = volt.future.PollResult;
 
@@ -52,7 +52,7 @@ const IndexedCounterFuture = struct {
 // ─────────────────────────────────────────────────────────────────────────────
 
 test "joinAll - 4 tasks return correct values" {
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var h1 = try io.awaitFuture(ValueFuture(1).init());
@@ -72,7 +72,7 @@ test "joinAll - 4 tasks return correct values" {
 }
 
 test "race - both tasks complete with valid results" {
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var counter = Atomic(usize).init(0);
@@ -93,7 +93,7 @@ test "race - both tasks complete with valid results" {
 test "select - 8 tasks all complete" {
     const num_tasks = 8;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var counter = Atomic(usize).init(0);

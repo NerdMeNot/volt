@@ -57,7 +57,7 @@ pub fn main() !void {
     volt.run(server, .{&chat});
 }
 
-fn server(io: volt.Io, chat: *BC) void {
+fn server(io: volt.Runtime, chat: *BC) void {
     var listener = try volt.net.TcpListener.bind(
         volt.net.Address.fromPort(7000),
     );
@@ -282,7 +282,7 @@ pub fn main() !void {
     volt.run(server, .{&chat});
 }
 
-fn server(io: volt.Io, chat: *BC) void {
+fn server(io: volt.Runtime, chat: *BC) void {
     var listener = try volt.net.TcpListener.bind(
         volt.net.Address.fromPort(7000),
     );
@@ -526,7 +526,7 @@ pub fn main() !void {
     volt.run(server, .{&chat});
 }
 
-fn server(io: volt.Io, chat: *BC) void {
+fn server(io: volt.Runtime, chat: *BC) void {
     var listener = try volt.net.TcpListener.bind(
         volt.net.Address.fromPort(7000),
     );
@@ -743,7 +743,7 @@ pub fn main() !void {
     volt.run(server, .{&chat});
 }
 
-fn server(io: volt.Io, chat: *BC) void {
+fn server(io: volt.Runtime, chat: *BC) void {
     var listener = try volt.net.TcpListener.bind(
         volt.net.Address.fromPort(7000),
     );

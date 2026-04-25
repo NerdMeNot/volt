@@ -18,13 +18,27 @@ const Atomic = std.atomic.Value;
 const ThreadRng = @import("concurrency.zig").ThreadRng;
 const native_os = builtin.os.tag;
 
+extern var environ: [*:null]?[*:0]const u8;
+
+fn getEnvPosix(name: []const u8) ?[:0]const u8 {
+    var i: usize = 0;
+    while (environ[i]) |entry| : (i += 1) {
+        const e = std.mem.span(entry);
+        if (e.len <= name.len) continue;
+        if (e[name.len] != '=') continue;
+        if (!std.mem.eql(u8, e[0..name.len], name)) continue;
+        return e[name.len + 1 ..];
+    }
+    return null;
+}
+
 /// Cross-platform check for whether an environment variable is set.
 fn hasEnv(comptime name: []const u8) bool {
     if (native_os == .windows) {
         const w_name = std.unicode.utf8ToUtf16LeStringLiteral(name);
         return std.process.getenvW(w_name) != null;
     } else {
-        return std.posix.getenv(name) != null;
+        return getEnvPosix(name) != null;
     }
 }
 
@@ -37,7 +51,7 @@ fn getenv(comptime name: []const u8, buf: []u8) ?[]const u8 {
         const len = std.unicode.utf16LeToUtf8(buf, w_value) catch return null;
         return buf[0..len];
     } else {
-        return std.posix.getenv(name);
+        return getEnvPosix(name);
     }
 }
 

@@ -71,7 +71,7 @@ defer sem.release(2);
 // Got 2 permits -- do work
 ```
 
-Pass the `io: volt.Io` handle so the semaphore can yield to the scheduler when permits are exhausted and resume the task when permits become available.
+Pass the `io: volt.Runtime` handle so the semaphore can yield to the scheduler when permits are exhausted and resume the task when permits become available.
 
 ### Advanced: acquireFuture(n)
 
@@ -140,7 +140,7 @@ fn handleIncoming(conn: TcpStream) void {
 const POOL_SIZE = 20;
 var pool_sem = volt.sync.Semaphore.init(POOL_SIZE);
 
-fn getConnection(io: volt.Io) !*Connection {
+fn getConnection(io: volt.Runtime) !*Connection {
     // Async wait for a connection slot
     pool_sem.acquire(io, 1);
     return pool.checkout();
@@ -210,7 +210,7 @@ if (result.is_leader) {
 }
 ```
 
-Pass the `io: volt.Io` handle so the barrier can yield to the scheduler and resume the task when all participants arrive.
+Pass the `io: volt.Runtime` handle so the barrier can yield to the scheduler and resume the task when all participants arrive.
 
 ### Advanced: waitFuture()
 

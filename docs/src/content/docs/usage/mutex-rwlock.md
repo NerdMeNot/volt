@@ -58,7 +58,7 @@ defer mutex.unlock();
 shared_counter += 1;
 ```
 
-Pass the `io: volt.Io` handle so the mutex can yield to the scheduler when contended and resume the task when the lock becomes available.
+Pass the `io: volt.Runtime` handle so the mutex can yield to the scheduler when contended and resume the task when the lock becomes available.
 
 ### Advanced: lockFuture()
 
@@ -189,7 +189,7 @@ defer rwlock.writeUnlock();
 shared_config = new_config;
 ```
 
-Pass the `io: volt.Io` handle so the lock can cooperate with the scheduler.
+Pass the `io: volt.Runtime` handle so the lock can cooperate with the scheduler.
 
 ### Advanced: readLockFuture() / writeLockFuture()
 

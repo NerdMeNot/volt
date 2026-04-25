@@ -125,7 +125,7 @@ fn benchMutexAsync(allocator: Allocator) !BenchResult {
     var stats = Stats{};
 
     // Create runtime ONCE
-    var io = try Io.init(allocator, .{ .num_workers = NUM_WORKERS });
+    var io = try Runtime.init(allocator, .{ .num_workers = NUM_WORKERS });
     defer io.deinit();
 
     // Shared mutex for contention
@@ -192,7 +192,7 @@ fn mutexTask(mutex: *Mutex, counter: *Atomic(u64)) void {
 fn benchSemaphoreAsync(allocator: Allocator) !BenchResult {
     var stats = Stats{};
 
-    var io = try Io.init(allocator, .{ .num_workers = NUM_WORKERS });
+    var io = try Runtime.init(allocator, .{ .num_workers = NUM_WORKERS });
     defer io.deinit();
 
     // Limited permits = high contention
@@ -248,7 +248,7 @@ fn semaphoreTask(semaphore: *Semaphore, counter: *Atomic(u64)) void {
 fn benchRwLockAsync(allocator: Allocator) !BenchResult {
     var stats = Stats{};
 
-    var io = try Io.init(allocator, .{ .num_workers = NUM_WORKERS });
+    var io = try Runtime.init(allocator, .{ .num_workers = NUM_WORKERS });
     defer io.deinit();
 
     var rwlock = RwLock.init();

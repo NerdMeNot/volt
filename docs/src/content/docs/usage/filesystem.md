@@ -274,7 +274,7 @@ Unlike `readAll` (which returns `error.EndOfStream` if the buffer can't be fille
 Inside the runtime, use `AsyncFile` for non-blocking operations (uses io_uring on Linux, blocking pool elsewhere):
 
 ```zig
-fn processFiles(io: volt.Io) !void {
+fn processFiles(io: volt.Runtime) !void {
     // Async read
     const data = try volt.fs.readFileAsync(io.runtime, allocator, "large_file.bin");
     defer allocator.free(data);
@@ -287,7 +287,7 @@ fn processFiles(io: volt.Io) !void {
 Or wrap synchronous operations with `io.concurrent()` to avoid blocking worker threads:
 
 ```zig
-fn readConfig(io: volt.Io) ![]const u8 {
+fn readConfig(io: volt.Runtime) ![]const u8 {
     var f = try io.concurrent(struct {
         fn run() ![]const u8 {
             return volt.fs.readFile(std.heap.page_allocator, "config.json");

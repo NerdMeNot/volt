@@ -72,7 +72,7 @@ notify.wait(io);
 processData(shared_buffer);
 ```
 
-Pass the `io: volt.Io` handle so the notify can yield to the scheduler and resume the task when a notification arrives.
+Pass the `io: volt.Runtime` handle so the notify can yield to the scheduler and resume the task when a notification arrives.
 
 ### Advanced: waitFuture()
 
@@ -117,7 +117,7 @@ notify.waiterCount();  // usize -- number of queued waiters
 var work_notify = volt.sync.Notify.init();
 
 // Worker loop
-fn workerLoop(io: volt.Io) void {
+fn workerLoop(io: volt.Runtime) void {
     while (running) {
         work_notify.wait(io); // Yields until work is available
         // Process all available work

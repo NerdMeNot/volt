@@ -3,15 +3,15 @@ title: Runtime
 description: Creating and configuring the Volt runtime, spawning tasks, and managing the application lifecycle.
 ---
 
-The `Io` handle is the primary entry point for Volt. It owns the runtime — the work-stealing scheduler, the blocking thread pool, and the I/O driver. Create it explicitly with `init`/`deinit` like an `Allocator`.
+The `Runtime` handle is the primary entry point for Volt. It owns the runtime — the work-stealing scheduler, the blocking thread pool, and the I/O driver. Create it explicitly with `init`/`deinit` like an `Allocator`.
 
 :::note[Not everything needs the runtime]
-The `tryX()` APIs (`tryLock`, `tryAcquire`, `trySend`, `tryRecv`) and all synchronous filesystem/networking operations work **without** a runtime. You only need the runtime for async APIs (`mutex.lock(io)`, `sem.acquire(io, n)`, `io.@"async"(func, args)`), async file I/O, and signal handling. All runtime-dependent operations go through `io: volt.Io` -- the type system ensures you have a runtime before you can call them. See [Basic Concepts](/getting-started/basic-concepts/) for the full breakdown.
+The `tryX()` APIs (`tryLock`, `tryAcquire`, `trySend`, `tryRecv`) and all synchronous filesystem/networking operations work **without** a runtime. You only need the runtime for async APIs (`mutex.lock(io)`, `sem.acquire(io, n)`, `io.@"async"(func, args)`), async file I/O, and signal handling. All runtime-dependent operations go through `io: volt.Runtime` -- the type system ensures you have a runtime before you can call them. See [Basic Concepts](/getting-started/basic-concepts/) for the full breakdown.
 :::
 
 ## Explicit pattern (recommended)
 
-Create `Io` explicitly — you control the allocator, configuration, and lifecycle:
+Create `Runtime` explicitly — you control the allocator, configuration, and lifecycle:
 
 ```zig
 const std = @import("std");
@@ -21,7 +21,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    var io = try volt.Io.init(gpa.allocator(), .{
+    var io = try volt.Runtime.init(gpa.allocator(), .{
         .num_workers = 4,
         .max_blocking_threads = 128,
         .blocking_keep_alive_ns = 30 * std.time.ns_per_s,
@@ -31,7 +31,7 @@ pub fn main() !void {
     try io.run(server);
 }
 
-fn server(io: volt.Io) void {
+fn server(io: volt.Runtime) void {
     // This runs inside the runtime.
     // All Volt APIs (net, sync, channel, time) are available here.
     _ = io;
@@ -42,7 +42,7 @@ This is the recommended pattern for production use. You get full control over me
 
 ## Zero-config shorthand
 
-For quick scripts and prototyping, `volt.run()` creates an `Io` handle with sensible defaults (`page_allocator`, auto-detected worker count) and cleans up automatically:
+For quick scripts and prototyping, `volt.run()` creates an `Runtime` handle with sensible defaults (`page_allocator`, auto-detected worker count) and cleans up automatically:
 
 ```zig
 const volt = @import("volt");
@@ -51,13 +51,13 @@ pub fn main() !void {
     try volt.run(server);
 }
 
-fn server(io: volt.Io) void {
+fn server(io: volt.Runtime) void {
     _ = io;
     // This runs inside the runtime.
 }
 ```
 
-For custom configuration without managing `Io` yourself, use `volt.runWith`:
+For custom configuration without managing `Runtime` yourself, use `volt.runWith`:
 
 ```zig
 try volt.runWith(gpa.allocator(), .{
@@ -78,13 +78,13 @@ When `num_workers` is `0`, the runtime queries the OS for the number of logical 
 
 ## Advanced: Direct Runtime access
 
-For advanced use cases (custom schedulers, library integration), you can access the underlying `Runtime` through `Io`:
+For advanced use cases (custom schedulers, library integration), you can access the underlying `Runtime` through `Runtime`:
 
 ```zig
 const volt = @import("volt");
 
 pub fn main() !void {
-    var io = try volt.Io.init(std.heap.page_allocator, .{
+    var io = try volt.Runtime.init(std.heap.page_allocator, .{
         .num_workers = 2,
     });
     defer io.deinit();
@@ -92,7 +92,7 @@ pub fn main() !void {
     try io.run(myApp);
 }
 
-fn myApp(io: volt.Io) !void {
+fn myApp(io: volt.Runtime) !void {
     // Access the underlying runtime if needed
     const scheduler = io.runtime.getScheduler();
     _ = scheduler;
@@ -155,7 +155,7 @@ pub fn main() !void {
     try volt.run(myApp);
 }
 
-fn myApp(io: volt.Io) !void {
+fn myApp(io: volt.Runtime) !void {
     // Spawn concurrent async tasks.
     // `@"async"` uses Zig's identifier quoting (`async` is a reserved keyword).
     // `@as(u64, 42)` provides an explicit type annotation for the integer literal.
@@ -191,12 +191,12 @@ Call `io.deinit()` to shut down the runtime. This:
 1. Sets the shutdown flag (atomic store).
 2. Stops the blocking pool (joins idle threads, waits for active ones).
 3. Stops the scheduler (signals workers, joins threads, frees task memory).
-4. Frees the runtime allocation (if the `Io` handle owns it).
+4. Frees the runtime allocation (if the `Runtime` handle owns it).
 
 Always use `defer io.deinit()` immediately after `init` to guarantee cleanup even on error paths:
 
 ```zig
-var io = try volt.Io.init(allocator, .{});
+var io = try volt.Runtime.init(allocator, .{});
 defer io.deinit();
 ```
 

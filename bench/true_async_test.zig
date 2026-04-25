@@ -27,7 +27,7 @@ pub fn main() !void {
 
     // Create runtime
     std.debug.print("1. Creating runtime with 4 workers...\n", .{});
-    var io = try Io.init(allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(allocator, .{ .num_workers = 4 });
     defer io.deinit();
     std.debug.print("   OK: Runtime created\n\n", .{});
 

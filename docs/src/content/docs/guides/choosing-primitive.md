@@ -106,7 +106,7 @@ These three are the "specialized channels" for specific patterns.
 Exactly one send, exactly one receive. Zero allocation.
 
 ```zig
-fn requestResponse(io: volt.Io, request: Request) !HttpResponse {
+fn requestResponse(io: volt.Runtime, request: Request) !HttpResponse {
     var os = volt.channel.oneshot(HttpResponse);
 
     // Spawn a task that computes the response

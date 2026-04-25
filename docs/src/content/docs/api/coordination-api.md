@@ -27,7 +27,7 @@ var notify = Notify.init();
 |--------|-----------|-------------|
 | `notifyOne` | `fn notifyOne(self: *Notify) void` | Wake one waiting task (FIFO). |
 | `notifyAll` | `fn notifyAll(self: *Notify) void` | Wake all waiting tasks. |
-| `wait` | `fn wait(self: *Notify, io: volt.Io) void` | Convenience: suspend until notified. Takes the `Io` handle. |
+| `wait` | `fn wait(self: *Notify, io: volt.Runtime) void` | Convenience: suspend until notified. Takes the `Runtime` handle. |
 | `waitFuture` | `fn waitFuture(self: *Notify) NotifyFuture` | Returns a Future that resolves when notified. |
 | `waitWith` | `fn waitWith(self: *Notify, waiter: *Waiter) void` | Add a waiter. |
 | `cancelWait` | `fn cancelWait(self: *Notify, waiter: *Waiter) void` | Remove a waiter. |
@@ -37,7 +37,7 @@ var notify = Notify.init();
 The simplest way to wait for a notification. Suspends the current task until `notifyOne()` or `notifyAll()` is called.
 
 ```zig
-fn consumer(io: volt.Io, notify: *volt.sync.Notify) void {
+fn consumer(io: volt.Runtime, notify: *volt.sync.Notify) void {
     notify.wait(io);  // suspends until notified
     // continue processing
 }
@@ -85,7 +85,7 @@ const WorkQueue = struct {
     }
 
     /// Producer: push work and wake one waiting consumer.
-    fn push(self: *WorkQueue, io: volt.Io, item: *WorkItem) void {
+    fn push(self: *WorkQueue, io: volt.Runtime, item: *WorkItem) void {
         // Acquire mutex to modify the linked list.
         self.mutex.lock(io);
         defer self.mutex.unlock();
@@ -99,7 +99,7 @@ const WorkQueue = struct {
     }
 
     /// Consumer: wait for work to arrive, then pop it.
-    fn pop(self: *WorkQueue, io: volt.Io) ?*WorkItem {
+    fn pop(self: *WorkQueue, io: volt.Runtime) ?*WorkItem {
         self.notify.wait(io);  // suspends until notified
 
         self.mutex.lock(io);
@@ -129,13 +129,13 @@ const WorkQueue = struct {
 var queue = WorkQueue.init();
 
 // --- Producer task ---
-fn producerTask(io: volt.Io) void {
+fn producerTask(io: volt.Runtime) void {
     var item = WorkQueue.WorkItem{ .payload = "process this row", .next = null };
     queue.push(io, &item);
 }
 
 // --- Consumer task ---
-fn consumerTask(io: volt.Io) void {
+fn consumerTask(io: volt.Runtime) void {
     if (queue.pop(io)) |work| {
         std.log.info("got work: {s}", .{work.payload});
     }
@@ -152,7 +152,7 @@ const volt = @import("volt");
 var shutdown_signal = volt.sync.Notify.init();
 
 // Worker tasks each wait on the same Notify:
-fn workerTask(io: volt.Io) void {
+fn workerTask(io: volt.Runtime) void {
     shutdown_signal.wait(io);
     std.log.info("shutting down, cleaning up resources", .{});
 }
@@ -184,7 +184,7 @@ var barrier = Barrier.init(4); // 4 tasks must arrive
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `wait` | `fn wait(self: *Barrier, io: volt.Io) bool` | Convenience: arrive and suspend until all tasks arrive. Returns `true` if this was the leader (last to arrive). |
+| `wait` | `fn wait(self: *Barrier, io: volt.Runtime) bool` | Convenience: arrive and suspend until all tasks arrive. Returns `true` if this was the leader (last to arrive). |
 | `waitFuture` | `fn waitFuture(self: *Barrier) BarrierFuture` | Returns a Future that resolves when all tasks arrive. |
 | `waitWith` | `fn waitWith(self: *Barrier, waiter: *Waiter) bool` | Arrive at barrier. Returns `true` if this was the last arrival. |
 
@@ -193,7 +193,7 @@ var barrier = Barrier.init(4); // 4 tasks must arrive
 The simplest way to arrive at a barrier. Suspends until all N tasks have arrived.
 
 ```zig
-fn workerPhase(io: volt.Io, barrier: *volt.sync.Barrier) void {
+fn workerPhase(io: volt.Runtime, barrier: *volt.sync.Barrier) void {
     // Phase 1 work...
     const is_leader = barrier.wait(io);  // suspends until all arrive
     if (is_leader) {
@@ -245,7 +245,7 @@ const ParallelJob = struct {
     }
 
     /// Each worker calls this with its own index.
-    fn runWorker(self: *ParallelJob, io: volt.Io, worker_id: usize, data_chunk: []const f64) void {
+    fn runWorker(self: *ParallelJob, io: volt.Runtime, worker_id: usize, data_chunk: []const f64) void {
         // --- Phase 1: independent computation ---
         var sum: f64 = 0;
         for (data_chunk) |val| {
@@ -302,7 +302,7 @@ var cell = OnceCell(ExpensiveResource).init();
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `get` | `fn get(self: *const OnceCell(T)) ?*const T` | Get the value if initialized. Lock-free. |
-| `getOrInit` | `fn getOrInit(self: *OnceCell(T), io: volt.Io, comptime init_fn: fn() T) *const T` | Convenience: get or initialize, suspending if another task is initializing. |
+| `getOrInit` | `fn getOrInit(self: *OnceCell(T), io: volt.Runtime, comptime init_fn: fn() T) *const T` | Convenience: get or initialize, suspending if another task is initializing. |
 | `getOrInitFuture` | `fn getOrInitFuture(self: *OnceCell(T), comptime init_fn: fn() T) GetOrInitFuture` | Returns a Future for get-or-init. |
 | `getOrInitWith` | `fn getOrInitWith(self: *OnceCell(T), waiter: *InitWaiter) ?*const T` | Waiter-based init. |
 | `set` | `fn set(self: *OnceCell(T), value: T) bool` | Set value. Returns `false` if already initialized. |
@@ -315,7 +315,7 @@ The simplest way to lazily initialize a value. The first caller runs the init fu
 ```zig
 var db_pool_cell = volt.sync.OnceCell(DbPool).init();
 
-fn getPool(io: volt.Io) *const DbPool {
+fn getPool(io: volt.Runtime) *const DbPool {
     return db_pool_cell.getOrInit(io, createDbPool);
 }
 ```
@@ -362,12 +362,12 @@ fn createDbPool() DbPool {
 
 /// Safe to call from any task, any thread, at any time.
 /// First call initializes, all subsequent calls return in ~0.4ns.
-fn getPool(io: volt.Io) *const DbPool {
+fn getPool(io: volt.Runtime) *const DbPool {
     return db_pool_cell.getOrInit(io, createDbPool);
 }
 
 // --- In request handler tasks ---
-fn handleRequest(io: volt.Io) void {
+fn handleRequest(io: volt.Runtime) void {
     const pool = getPool(io);
     std.log.info("using pool at {s}:{d}", .{ pool.host, pool.port });
     // ... use pool ...
@@ -405,7 +405,7 @@ fn loadTlsConfig() TlsConfig {
     };
 }
 
-fn getTlsConfig(io: volt.Io) *const TlsConfig {
+fn getTlsConfig(io: volt.Runtime) *const TlsConfig {
     return tls_config_cell.getOrInit(io, loadTlsConfig);
 }
 

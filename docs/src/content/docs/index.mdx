@@ -7,7 +7,7 @@ import { Card, CardGrid, Tabs, TabItem } from '@astrojs/starlight/components';
 
 **Volt is an async I/O runtime for Zig.** It provides a work-stealing task scheduler, synchronization primitives, channels, networking, filesystem, timers, and process management -- everything you need to build concurrent servers and services, in one package.
 
-Volt brings the same architecture that powers [Tokio](https://tokio.rs/) in Rust to Zig, adapted for Zig's value semantics and comptime specialization. Zero-allocation waiters, lock-free channels, and O(1) worker waking make it fast. An explicit `Io` handle (no hidden globals) makes it predictable. It is the I/O counterpart to [Blitz](https://github.com/NerdMeNot/blitz) (CPU parallelism), the same way Tokio complements Rayon.
+Volt brings the same architecture that powers [Tokio](https://tokio.rs/) in Rust to Zig, adapted for Zig's value semantics and comptime specialization. Zero-allocation waiters, lock-free channels, and O(1) worker waking make it fast. An explicit `Runtime` handle (no hidden globals) makes it predictable. It is the I/O counterpart to [Blitz](https://github.com/NerdMeNot/blitz) (CPU parallelism), the same way Tokio complements Rayon.
 
 ## Quick Example
 
@@ -18,7 +18,7 @@ pub fn main() !void {
     try volt.run(serve);
 }
 
-fn serve(io: volt.Io) void {
+fn serve(io: volt.Runtime) void {
     var listener = volt.net.listen("0.0.0.0:8080") catch return;
     defer listener.close();
     while (listener.tryAccept() catch null) |conn| {
@@ -98,7 +98,7 @@ mutex.lock(io);    // blocks this task until acquired
 defer mutex.unlock();
 ```
 
-The `tryX()` tier (`tryLock`, `tryAcquire`, `trySend`, `tryRecv`) and all filesystem/networking operations work without starting a runtime. Use them in CLI tools, scripts, or libraries that don't need async. The convenience tier (`mutex.lock(io)`, `ch.send(io, val)`, `sem.acquire(io, n)`) requires the `io: volt.Io` handle -- the type system enforces this at compile time, so you can't accidentally call async APIs without a runtime. See [Basic Concepts](/getting-started/basic-concepts/) for the full breakdown.
+The `tryX()` tier (`tryLock`, `tryAcquire`, `trySend`, `tryRecv`) and all filesystem/networking operations work without starting a runtime. Use them in CLI tools, scripts, or libraries that don't need async. The convenience tier (`mutex.lock(io)`, `ch.send(io, val)`, `sem.acquire(io, n)`) requires the `io: volt.Runtime` handle -- the type system enforces this at compile time, so you can't accidentally call async APIs without a runtime. See [Basic Concepts](/getting-started/basic-concepts/) for the full breakdown.
 
 ## Benchmark Highlights
 
@@ -152,7 +152,7 @@ All measurements on Apple M3 Pro, nanoseconds per operation, 4 worker threads.
 
 | Module | Description |
 |--------|-------------|
-| `volt.Io` | Runtime handle: `@"async"`, `concurrent`, passed explicitly like `Allocator` |
+| `volt.Runtime` | Runtime handle: `@"async"`, `concurrent`, passed explicitly like `Allocator` |
 | `volt.Future(T)` | Async result handle: `.@"await"(io)`, `.cancel(io)` |
 | `volt.Group` | Structured concurrency: `.spawn()`, `.wait()`, `.cancel()` |
 | `volt.sync` | Synchronization: Mutex, RwLock, Semaphore, Notify, Barrier, OnceCell |

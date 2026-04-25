@@ -88,7 +88,7 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     std.debug.print("Test: 1P 2C 20msg buf=5 workers=2\n", .{});
-    var io = try Io.init(allocator, .{ .num_workers = 2 });
+    var io = try Runtime.init(allocator, .{ .num_workers = 2 });
     defer io.deinit();
 
     var ch = try Channel(u64).init(allocator, 5);

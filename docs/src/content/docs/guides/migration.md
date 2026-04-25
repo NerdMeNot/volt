@@ -38,7 +38,7 @@ pub fn main() !void {
     try volt.run(server);
 }
 
-fn server(io: volt.Io) void {
+fn server(io: volt.Runtime) void {
     var listener = volt.net.listen("0.0.0.0:8080") catch return;
     defer listener.close();
 
@@ -65,7 +65,7 @@ Or manage the runtime manually:
 
 ```zig
 pub fn main() !void {
-    var io = try volt.Io.init(allocator, .{ .num_workers = 4 });
+    var io = try volt.Runtime.init(allocator, .{ .num_workers = 4 });
     defer io.deinit();
     try io.run(server);
 }
@@ -88,7 +88,7 @@ After (Volt tasks):
 ```zig
 const volt = @import("volt");
 
-fn runWorkers(io: volt.Io) void {
+fn runWorkers(io: volt.Runtime) void {
     var futures: [num_workers]@TypeOf(io.@"async"(workerFn, .{shared_state}) catch unreachable) = undefined;
 
     for (&futures) |*f| {
@@ -153,7 +153,7 @@ The `tryLock()` path is lock-free (CAS loop, no mutex). The waiter path only tak
 
 ### Using the Convenience API
 
-For integration with the scheduler, use the sync convenience methods that take an `Io` handle:
+For integration with the scheduler, use the sync convenience methods that take an `Runtime` handle:
 
 ```zig
 // Lock the mutex -- suspends the task until the lock is acquired
@@ -218,7 +218,7 @@ Some operations are inherently blocking (DNS resolution, file I/O on some platfo
 Use the **blocking pool** via `io.concurrent`:
 
 ```zig
-fn doResolve(io: volt.Io) !void {
+fn doResolve(io: volt.Runtime) !void {
     // Blocking DNS resolution on a separate OS thread
     const handle = try io.concurrent(struct {
         fn resolve(host: []const u8) !volt.net.Address {
@@ -304,7 +304,7 @@ fn myTask() void {
 }
 
 // GOOD: Or offload to blocking pool
-fn myTask(io: volt.Io) void {
+fn myTask(io: volt.Runtime) void {
     _ = io.concurrent(struct {
         fn work() void {
             std.Thread.sleep(1_000_000_000);

@@ -9,7 +9,7 @@ const testing = std.testing;
 const Atomic = std.atomic.Value;
 
 const volt = @import("volt");
-const Io = volt.Io;
+const Runtime = volt.Runtime;
 const Semaphore = volt.sync.Semaphore;
 const Context = volt.future.Context;
 const PollResult = volt.future.PollResult;
@@ -76,7 +76,7 @@ test "Async Semaphore - 8 tasks 2 permits" {
     const num_permits = 2;
     const ops_per_task = 100;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var semaphore = Semaphore.init(num_permits);
@@ -96,7 +96,7 @@ test "Async Semaphore - 16 tasks 1 permit" {
     const num_permits = 1;
     const ops_per_task = 50;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var semaphore = Semaphore.init(num_permits);
@@ -116,7 +116,7 @@ test "Async Semaphore - no contention" {
     const num_permits = 4;
     const ops_per_task = 200;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var semaphore = Semaphore.init(num_permits);

@@ -352,7 +352,7 @@ higher-level APIs that compose futures:
 ```zig
 const volt = @import("volt");
 
-fn handleRequest(io: volt.Io, user_id: u64, key: []const u8) !void {
+fn handleRequest(io: volt.Runtime, user_id: u64, key: []const u8) !void {
     // Spawn async tasks and await results
     var user_f = try io.@"async"(fetchUser, .{user_id});
     var posts_f = try io.@"async"(fetchPosts, .{user_id});
@@ -428,7 +428,7 @@ This design shares Volt's core philosophy: **explicit I/O handles, no hidden glo
 
 | Aspect | Zig `std.Io` | Volt |
 |--------|-------------|------|
-| I/O handle | `std.Io` (vtable-based interface) | `volt.Io` (runtime handle) |
+| I/O handle | `std.Io` (vtable-based interface) | `volt.Runtime` (runtime handle) |
 | Async call | `io.async(func, .{args})` | `io.@"async"(func, .{args})` |
 | Await | `future.await(io)` | `handle.@"await"(io)` |
 | Concurrency | Explicit `io.concurrent()` vs `io.async()` | All spawns are concurrent (work-stealing) |

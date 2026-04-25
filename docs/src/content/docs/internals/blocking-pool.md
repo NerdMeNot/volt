@@ -212,10 +212,10 @@ const MyWork = struct {
 
 ## Integration with the async scheduler
 
-The `Io` handle exposes blocking/CPU-intensive operations through `concurrent()`:
+The `Runtime` handle exposes blocking/CPU-intensive operations through `concurrent()`:
 
 ```zig
-// From inside async context (io: volt.Io):
+// From inside async context (io: volt.Runtime):
 const hash_handle = try io.concurrent(computeHash, .{data});
 const hash = try hash_handle.wait();
 ```

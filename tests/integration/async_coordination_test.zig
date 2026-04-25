@@ -9,7 +9,7 @@ const testing = std.testing;
 const Atomic = std.atomic.Value;
 
 const volt = @import("volt");
-const Io = volt.Io;
+const Runtime = volt.Runtime;
 const Barrier = volt.sync.Barrier;
 const Notify = volt.sync.Notify;
 const Context = volt.future.Context;
@@ -182,7 +182,7 @@ test "Async Barrier - 4 tasks x 10 generations" {
     const num_tasks = 4;
     const generations = 10;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var barrier = Barrier.init(num_tasks);
@@ -202,7 +202,7 @@ test "Async Barrier - 8 tasks x 5 generations" {
     const num_tasks = 8;
     const generations = 5;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var barrier = Barrier.init(num_tasks);
@@ -220,7 +220,7 @@ test "Async Barrier - 8 tasks x 5 generations" {
 test "Async Notify - 1 notifier 4 waiters" {
     const num_waiters = 4;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var notify = Notify.init();
@@ -244,7 +244,7 @@ test "Async Notify - 1 notifier 4 waiters" {
 test "Async Notify - notifyAll" {
     const num_waiters = 4;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var notify = Notify.init();

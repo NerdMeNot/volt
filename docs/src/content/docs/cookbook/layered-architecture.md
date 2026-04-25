@@ -28,7 +28,7 @@ This recipe shows how to structure a Volt application the same way you would in 
 │                          │                              │
 │  ┌───────────────────────▼───────────────────────────┐  │
 │  │  Per-request Context                              │  │
-│  │  • io: volt.Io                                    │  │
+│  │  • io: volt.Runtime                                    │  │
 │  │  • request_id: u64                                │  │
 │  └───────────────────────┬───────────────────────────┘  │
 │                          │                              │
@@ -62,7 +62,7 @@ const Container = struct {
 // Created per request. Carries the runtime handle and request-scoped data.
 
 const Ctx = struct {
-    io: volt.Io,
+    io: volt.Runtime,
     request_id: u64,
     container: *const Container,
 
@@ -101,7 +101,7 @@ pub fn main() !void {
     try volt.runWith(std.heap.page_allocator, .{
         .num_workers = 4,
     }, struct {
-        fn entry(io: volt.Io) void {
+        fn entry(io: volt.Runtime) void {
             serve(io, &container);
         }
     }.entry);
@@ -111,7 +111,7 @@ pub fn main() !void {
 
 var next_request_id: u64 = 0;
 
-fn serve(io: volt.Io, container: *const Container) void {
+fn serve(io: volt.Runtime, container: *const Container) void {
     var listener = volt.net.listen("0.0.0.0:8080") catch return;
     defer listener.close();
 
@@ -364,7 +364,7 @@ test "UserRepo.findById returns user" {
 // Test the service with a runtime -- it needs io for parallel queries
 test "UserService.getProfile fetches in parallel" {
     try volt.run(struct {
-        fn entry(io: volt.Io) !void {
+        fn entry(io: volt.Runtime) !void {
             var ctx = Ctx{
                 .io = io,
                 .request_id = 1,

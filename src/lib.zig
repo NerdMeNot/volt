@@ -16,15 +16,15 @@
 //!     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 //!     defer _ = gpa.deinit();
 //!
-//!     var io = try volt.Io.init(gpa.allocator(), .{});
-//!     defer io.deinit();
+//!     var rt = try volt.Runtime.init(gpa.allocator(), .{});
+//!     defer rt.deinit();
 //!
-//!     try io.run(server);
+//!     try rt.run(server);
 //! }
 //!
-//! fn server(io: volt.Io) !void {
-//!     var f = try io.@"async"(compute, .{42});
-//!     const result = f.@"await"(io);
+//! fn server(rt: volt.Runtime) !void {
+//!     var f = try rt.@"async"(compute, .{42});
+//!     const result = f.@"await"(rt);
 //!     _ = result;
 //! }
 //! ```
@@ -41,7 +41,7 @@
 //!
 //! | Module | Description |
 //! |--------|-------------|
-//! | `volt.Io` | Runtime handle — init/deinit/run/async (like Allocator) |
+//! | `volt.Runtime` | Runtime handle — init/deinit/run/async (like Allocator) |
 //! | `volt.Future` | Task result handle — await/cancel |
 //! | `volt.sync` | Synchronization: Mutex, RwLock, Semaphore, Notify, Barrier |
 //! | `volt.channel` | Message passing: Channel, Oneshot, Broadcast, Watch |
@@ -61,7 +61,7 @@ const is_windows = builtin.os.tag == .windows;
 // Namespaced Modules — Primary API
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Task spawning and concurrency (internal — use Io methods instead).
+/// Task spawning and concurrency (internal — use Runtime methods instead).
 const task_internal = @import("task.zig");
 
 /// Synchronization primitives for async tasks.
@@ -94,7 +94,7 @@ pub const process = if (!is_windows) @import("process.zig") else struct {};
 /// Graceful shutdown handler for async servers.
 pub const shutdown = @import("shutdown.zig");
 
-/// Async combinators (engine internal — prefer io.@"async" + Group).
+/// Async combinators (engine internal — prefer rt.@"async" + Group).
 pub const async_ops = @import("async.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -103,30 +103,35 @@ pub const async_ops = @import("async.zig");
 
 const runtime_mod = @import("runtime.zig");
 
-/// The primary entry point for Volt.
+/// The primary entry point for Volt — the user-facing runtime handle.
 ///
-/// Create with `Io.init(allocator, config)`, clean up with `io.deinit()`,
-/// and run your async root function with `io.run(myApp)`.
+/// Create with `Runtime.init(allocator, config)`, clean up with
+/// `rt.deinit()`, and run your async root function with `rt.run(myApp)`.
 ///
-/// Pass `Io` through function signatures like an `Allocator` — if a function
-/// needs to spawn tasks or use async runtime features, it takes `io: volt.Io`.
+/// Pass `Runtime` through function signatures like an `Allocator` — if a
+/// function needs to spawn tasks or use async runtime features, it takes
+/// `rt: volt.Runtime`.
 ///
-/// Tier 1 operations (`tryLock`, `trySend`, `tryRecv`) do NOT need Io.
+/// Tier 1 operations (`tryLock`, `trySend`, `tryRecv`) do NOT need a Runtime.
 /// Tier 2 operations (`@"async"`, `concurrent`) do.
-pub const Io = @import("Io.zig");
+///
+/// Note: in 0.15 this type was named `volt.Io`. Renamed to `volt.Runtime` in
+/// the 0.16 port (v1.0.0-zig0.16.0) to avoid colliding with `std.Io`, which
+/// is the new stdlib I/O interface in Zig 0.16.
+pub const Runtime = @import("Io.zig");
 
-/// Handle to an async task's result. Obtain via `io.@"async"()`.
+/// Handle to an async task's result. Obtain via `rt.@"async"()`.
 ///
 /// ```zig
-/// var f = try io.@"async"(compute, .{42});
-/// const result = f.@"await"(io);
+/// var f = try rt.@"async"(compute, .{42});
+/// const result = f.@"await"(rt);
 /// ```
-pub const Future = Io.IoFuture;
+pub const Future = Runtime.IoFuture;
 
 /// Structured concurrency — spawn tasks, wait for all, cancel on scope exit.
 ///
 /// ```zig
-/// var group = volt.Group.init(io);
+/// var group = volt.Group.init(rt);
 /// _ = group.spawn(fetchUser, .{id});
 /// _ = group.spawn(fetchPosts, .{id});
 /// group.wait();
@@ -141,8 +146,10 @@ pub const Config = runtime_mod.Config;
 // Exposed for benchmarks, custom Futures, and advanced integration.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Internal re-export for benchmark and advanced use. Prefer `volt.Io`.
-pub const Runtime = runtime_mod.Runtime;
+/// Internal scheduler/runtime engine — exposed for benchmarks and advanced
+/// integration only. Prefer `volt.Runtime` for normal use. (Renamed from
+/// the 0.15 internal `Runtime` to avoid colliding with the new public type.)
+pub const Engine = runtime_mod.Runtime;
 
 /// Internal re-export for benchmark and advanced use. Prefer `volt.Future`.
 pub const JoinHandle = runtime_mod.JoinHandle;
@@ -150,13 +157,13 @@ pub const JoinHandle = runtime_mod.JoinHandle;
 /// Zero-config entry point — run an async function with default settings.
 ///
 /// Uses `page_allocator` and default `Config`. For control over the
-/// allocator and configuration, use `Io.init` directly:
+/// allocator and configuration, use `Runtime.init` directly:
 ///
 /// ```zig
 /// // Explicit (recommended for production):
-/// var io = try volt.Io.init(allocator, .{ .num_workers = 4 });
-/// defer io.deinit();
-/// try io.run(myApp);
+/// var rt = try volt.Runtime.init(allocator, .{ .num_workers = 4 });
+/// defer rt.deinit();
+/// try rt.run(myApp);
 ///
 /// // Convenience shorthand:
 /// try volt.run(myApp);
@@ -167,7 +174,7 @@ pub fn run(comptime func: anytype) anyerror!PayloadType(@TypeOf(func)) {
 
 /// Convenience entry point with custom allocator and configuration.
 ///
-/// Equivalent to `Io.init` + `io.run` + `io.deinit`:
+/// Equivalent to `Runtime.init` + `rt.run` + `rt.deinit`:
 /// ```zig
 /// try volt.runWith(allocator, .{ .num_workers = 4 }, myApp);
 /// ```
@@ -176,9 +183,9 @@ pub fn runWith(
     config: Config,
     comptime func: anytype,
 ) anyerror!PayloadType(@TypeOf(func)) {
-    var io = try Io.init(allocator, config);
-    defer io.deinit();
-    return io.run(func);
+    var rt = try Runtime.init(allocator, config);
+    defer rt.deinit();
+    return rt.run(func);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -206,7 +213,7 @@ pub const version = struct {
     pub const major = 1;
     pub const minor = 0;
     pub const patch = 0;
-    pub const string = "1.0.0";
+    pub const string = "1.0.0-zig0.16.0";
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -299,7 +306,7 @@ test "run function compiles" {
 
 test "namespace structure" {
     // Core types
-    _ = Io;
+    _ = Runtime;
     _ = Future;
     _ = Group;
     _ = Config;

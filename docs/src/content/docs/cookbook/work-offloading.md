@@ -78,7 +78,7 @@ fn computeSha256Blocking(data: []const u8) [32]u8 {
 To set up the runtime and dispatch the blocking call explicitly:
 
 ```zig
-var io = try volt.Io.init(allocator, .{
+var io = try volt.Runtime.init(allocator, .{
     .num_workers = 4,            // I/O workers (usually = CPU count)
     .max_blocking_threads = 64,  // blocking pool ceiling
 });
@@ -280,7 +280,7 @@ The integration requires a bridge that manages task suspension on the Volt side 
 For a server that processes uploads (I/O) and compresses them (CPU):
 
 ```zig
-var io = try volt.Io.init(allocator, .{
+var io = try volt.Runtime.init(allocator, .{
     .num_workers = 4,              // 4 I/O workers
     .max_blocking_threads = 16,    // 16 CPU threads (match core count)
     .blocking_keep_alive_ns = 5 * std.time.ns_per_s, // shorter idle timeout

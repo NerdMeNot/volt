@@ -10,7 +10,7 @@ const testing = std.testing;
 const Atomic = std.atomic.Value;
 
 const volt = @import("volt");
-const Io = volt.Io;
+const Runtime = volt.Runtime;
 const Channel = volt.channel.Channel;
 const SendFuture = volt.channel.channel_mod.SendFuture;
 const RecvFuture = volt.channel.channel_mod.RecvFuture;
@@ -146,7 +146,7 @@ test "MPMC - 2P 4C capacity=1" {
     const total_msgs = 1000;
     const msgs_per_producer = total_msgs / num_producers;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var ch = try Channel(u64).init(testing.allocator, 1);
@@ -185,7 +185,7 @@ test "MPMC - 4P 4C capacity=64" {
     const total_msgs = 2000;
     const msgs_per_producer = total_msgs / num_producers;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var ch = try Channel(u64).init(testing.allocator, 64);
@@ -220,7 +220,7 @@ test "Channel close racing with waiters" {
     const num_consumers = 4;
     const num_msgs = 10;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var ch = try Channel(u64).init(testing.allocator, 4);
@@ -252,7 +252,7 @@ test "MPMC - close with no messages" {
     // All consumers should return cleanly on immediate close
     const num_consumers = 4;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var ch = try Channel(u64).init(testing.allocator, 4);

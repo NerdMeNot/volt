@@ -27,12 +27,12 @@ pub fn main() !void {
 
 // Explicit (full control, recommended for production)
 pub fn main() !void {
-    var io = try volt.Io.init(allocator, .{ .num_workers = 4 });
+    var io = try volt.Runtime.init(allocator, .{ .num_workers = 4 });
     defer io.deinit();
     try io.run(myApp);
 }
 
-fn myApp(io: volt.Io) void {
+fn myApp(io: volt.Runtime) void {
     // All Volt APIs available here
     _ = io;
 }
@@ -178,7 +178,7 @@ _ = shutdown.waitPendingTimeout(volt.Duration.fromSecs(5));
 
 ## Key Rules
 
-1. **`io` means async.** If a function takes `io: volt.Io`, it yields the task (safe on worker threads). If it doesn't take `io` and does I/O, it blocks the thread.
+1. **`io` means async.** If a function takes `io: volt.Runtime`, it yields the task (safe on worker threads). If it doesn't take `io` and does I/O, it blocks the thread.
 
 2. **Allocator means `deinit()`.** If you passed an allocator to create it (`Channel`, `BroadcastChannel`), `defer x.deinit()`. Everything else is zero-allocation.
 

@@ -17,7 +17,7 @@ The primary API for concurrent work in Volt uses two operations:
 ```zig
 const volt = @import("volt");
 
-fn app(io: volt.Io) !void {
+fn app(io: volt.Runtime) !void {
     // Launch an async task
     var f = try io.@"async"(fetchUser, .{@as(u64, 42)});
 
@@ -43,7 +43,7 @@ Zig reserves `async` and `await` as keywords. Volt uses Zig's identifier quoting
 When you need to run several operations concurrently, launch them all before awaiting any:
 
 ```zig
-fn app(io: volt.Io) !void {
+fn app(io: volt.Runtime) !void {
     // Launch both concurrently
     var user_f = try io.@"async"(fetchUser, .{@as(u64, 42)});
     var posts_f = try io.@"async"(fetchPosts, .{@as(u64, 42)});
@@ -63,7 +63,7 @@ Both tasks run in parallel on the scheduler. The awaits block the calling task (
 For spawning a dynamic number of tasks, use `volt.Group`:
 
 ```zig
-fn app(io: volt.Io) !void {
+fn app(io: volt.Runtime) !void {
     var group = volt.Group.init(io);
 
     // Spawn tasks into the group
@@ -83,7 +83,7 @@ Groups provide structured concurrency -- all spawned tasks are logically scoped 
 Individual futures can be cancelled:
 
 ```zig
-fn app(io: volt.Io) !void {
+fn app(io: volt.Runtime) !void {
     var f = try io.@"async"(longRunningTask, .{});
 
     // ... decide we don't need the result ...
@@ -127,7 +127,7 @@ CPU-intensive or blocking operations must not run on I/O worker threads (they wo
 
 ```zig
 // Offload CPU-heavy work to the blocking pool
-fn processData(io: volt.Io, data: []const u8) !Hash {
+fn processData(io: volt.Runtime, data: []const u8) !Hash {
     var f = try io.concurrent(computeExpensiveHash, .{data});
     const result = try f.@"await"(io);
     return result;
@@ -146,7 +146,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    var io = try volt.Io.init(gpa.allocator(), .{
+    var io = try volt.Runtime.init(gpa.allocator(), .{
         .num_workers = 8,
         .max_blocking_threads = 128,
         .blocking_keep_alive_ns = 30 * std.time.ns_per_s,
@@ -174,7 +174,7 @@ The `Config` fields:
 
 ## Tasks and the Io Handle
 
-A **task** is a lightweight unit of concurrent work scheduled on the runtime. All task operations go through the `io: volt.Io` handle.
+A **task** is a lightweight unit of concurrent work scheduled on the runtime. All task operations go through the `io: volt.Runtime` handle.
 
 ### Creating Tasks
 
@@ -187,7 +187,7 @@ pub fn main() !void {
     try volt.run(myApp);
 }
 
-fn myApp(io: volt.Io) !void {
+fn myApp(io: volt.Runtime) !void {
     // 1. Async: launch a function as a concurrent task (most common)
     var f = try io.@"async"(myFunc, .{arg1, arg2});
     const result = f.@"await"(io);
@@ -212,7 +212,7 @@ pub fn main() !void {
     try volt.run(myApp);
 }
 
-fn myApp(io: volt.Io) !void {
+fn myApp(io: volt.Runtime) !void {
     var f = try io.@"async"(compute, .{@as(i32, 5)});
 
     // Await the result (suspends this task, not the thread)
@@ -233,7 +233,7 @@ pub fn main() !void {
     try volt.run(myApp);
 }
 
-fn myApp(io: volt.Io) !void {
+fn myApp(io: volt.Runtime) !void {
     var group = volt.Group.init(io);
 
     // Spawn tasks into the group
@@ -300,7 +300,7 @@ When a task spawns a new child task, the child is placed in the worker's LIFO sl
 
 ### 1. Calling async methods without a runtime
 
-Async operations require the `io: volt.Io` handle, which only exists inside a running runtime. The type system catches this at compile time.
+Async operations require the `io: volt.Runtime` handle, which only exists inside a running runtime. The type system catches this at compile time.
 
 ```zig
 // BAD: No runtime -- this won't compile
@@ -314,7 +314,7 @@ pub fn main() !void {
     try volt.run(myApp);
 }
 
-fn myApp(io: volt.Io) !void {
+fn myApp(io: volt.Runtime) !void {
     var mutex = volt.sync.Mutex.init();
     mutex.lock(io); // io handle available inside the runtime
     defer mutex.unlock();
@@ -420,7 +420,7 @@ Networking convenience functions (`net.listen`, `TcpStream.tryRead`, `UdpSocket.
 
 ### Tier 2: `x(io)` -- Runtime Required
 
-These take the `io: volt.Io` handle as a parameter and suspend the calling task (not the OS thread) until the operation completes. Because all Tier 2 operations require the explicit `io` parameter, the type system prevents misuse at compile time -- you physically cannot call `mutex.lock(io)` without an `io` handle, and you cannot create an `io` handle without starting a runtime.
+These take the `io: volt.Runtime` handle as a parameter and suspend the calling task (not the OS thread) until the operation completes. Because all Tier 2 operations require the explicit `io` parameter, the type system prevents misuse at compile time -- you physically cannot call `mutex.lock(io)` without an `io` handle, and you cannot create an `io` handle without starting a runtime.
 
 ```zig
 const volt = @import("volt");
@@ -429,7 +429,7 @@ pub fn main() !void {
     try volt.run(myApp); // Start the runtime, pass io to myApp
 }
 
-fn myApp(io: volt.Io) !void {
+fn myApp(io: volt.Runtime) !void {
     var mutex = volt.sync.Mutex.init();
 
     // Blocking lock -- yields to scheduler if contended, returns when acquired
@@ -456,7 +456,7 @@ fn myApp(io: volt.Io) !void {
 | `Mutex.init()`, `Semaphore.init()`, `Channel.init()` | No | Just initialization |
 | `mutex.lock(io)`, `sem.acquire(io, n)`, `rwlock.readLock(io)` | **Yes** | Convenience methods that take `io` and suspend the task (not the OS thread) until acquired. |
 | `ch.send(io, val)`, `ch.recv(io)` | **Yes** | Convenience methods that take `io` and suspend the task (not the OS thread) until send/recv completes. |
-| `io.@"async"()`, `io.concurrent()` | **Yes** | Requires `io: volt.Io` -- enforced by the type system at compile time. |
+| `io.@"async"()`, `io.concurrent()` | **Yes** | Requires `io: volt.Runtime` -- enforced by the type system at compile time. |
 | `future.@"await"(io)`, `future.cancel(io)` | **Yes** (transitively) | Operates on Futures returned by `io.@"async"()`. |
 | `volt.Group` | **Yes** | Structured concurrency: `.spawn()`, `.wait()`, `.cancel()`. |
 | `fs.readFileAsync()`, `AsyncFile` | **Yes** | Requires runtime I/O backend. |

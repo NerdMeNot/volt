@@ -5,11 +5,11 @@ description: Build a reusable chat server library on top of Volt, then show how 
 
 The [Chat Server](/cookbook/chat-server) recipe builds a standalone chat server. This recipe takes a different angle: we build a **reusable chat library** that any application can embed. The library handles rooms, message routing, and client I/O internally. The application provides configuration, authentication hooks, and business logic on top.
 
-This is the pattern you would follow to build any server-side library on Volt -- an HTTP framework, a message broker, a game server. The core idea: **accept `io: volt.Io`, never create your own runtime**.
+This is the pattern you would follow to build any server-side library on Volt -- an HTTP framework, a message broker, a game server. The core idea: **accept `io: volt.Runtime`, never create your own runtime**.
 
 :::tip[What you will learn]
 - **Packaging a Volt-based server as a library** -- clean public API, hidden internals
-- **The `io: volt.Io` contract** -- how library code spawns tasks on the caller's runtime
+- **The `io: volt.Runtime` contract** -- how library code spawns tasks on the caller's runtime
 - **Room-based message routing** -- using channels and hashmaps to multiplex messages
 - **Hook pattern** -- letting applications inject behavior (auth, filtering) without touching library code
 - **End-to-end composition** -- an application that combines the chat library with a database client
@@ -109,7 +109,7 @@ const BC = volt.channel.BroadcastChannel(Message);
 
 pub const Server = struct {
     /// The Volt runtime handle -- borrowed from the application.
-    io: volt.Io,
+    io: volt.Runtime,
     allocator: std.mem.Allocator,
     config: Config,
     broadcast: *BC,
@@ -119,7 +119,7 @@ pub const Server = struct {
     ///
     /// `io` is stored for the lifetime of the server. All client
     /// handling tasks are spawned onto the application's scheduler.
-    pub fn init(io: volt.Io, allocator: std.mem.Allocator, config: Config) !Server {
+    pub fn init(io: volt.Runtime, allocator: std.mem.Allocator, config: Config) !Server {
         const bc = try allocator.create(BC);
         bc.* = try volt.channel.broadcast(
             Message,
@@ -347,13 +347,13 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     // ── One runtime for everything ─────────────────────────────────
-    var io = try volt.Io.init(allocator, .{ .num_workers = 8 });
+    var io = try volt.Runtime.init(allocator, .{ .num_workers = 8 });
     defer io.deinit();
 
     try io.run(app);
 }
 
-fn app(io: volt.Io) !void {
+fn app(io: volt.Runtime) !void {
     // ── Database (for auth + logging) ──────────────────────────────
     var db = try pg.Client.connect(io, .{
         .host = "127.0.0.1",
@@ -460,7 +460,7 @@ const volt = @import("volt");
 const chat = @import("zig-chat");
 
 pub fn main() !void {
-    var io = try volt.Io.init(allocator, .{});
+    var io = try volt.Runtime.init(allocator, .{});
     defer io.deinit();
 
     var server = try chat.Server.init(io, allocator, .{ .port = 9000 });
@@ -478,11 +478,11 @@ Every Volt-based library follows the same three rules:
 
 | Rule | Why |
 |------|-----|
-| **Accept `io: volt.Io` at creation time** | The application owns the runtime; the library borrows it |
+| **Accept `io: volt.Runtime` at creation time** | The application owns the runtime; the library borrows it |
 | **Store `io` in your struct** | So methods can spawn work without the caller passing io every time |
 | **Never call `Io.init`** | One runtime per process, created by the application |
 
-This is identical to how Zig's standard library handles allocators. If you know `fn foo(allocator: Allocator)`, you already understand `fn bar(io: volt.Io)`.
+This is identical to how Zig's standard library handles allocators. If you know `fn foo(allocator: Allocator)`, you already understand `fn bar(io: volt.Runtime)`.
 
 ## Try It Yourself
 
@@ -496,4 +496,4 @@ Use the database client to log every message to a `messages` table. The chat lib
 
 ### Variation 3: Add WebSocket support
 
-Replace the raw TCP accept loop with an HTTP upgrade handler. The client handler stays the same -- only the transport changes. This is the kind of layering that the `io: volt.Io` pattern enables cleanly.
+Replace the raw TCP accept loop with an HTTP upgrade handler. The client handler stays the same -- only the transport changes. This is the kind of layering that the `io: volt.Runtime` pattern enables cleanly.

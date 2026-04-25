@@ -18,7 +18,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    var io = try volt.Io.init(gpa.allocator(), .{
+    var io = try volt.Runtime.init(gpa.allocator(), .{
         .num_workers = 4,              // pin to 4 cores
         .max_blocking_threads = 128,   // cap blocking pool
     });
@@ -27,7 +27,7 @@ pub fn main() !void {
     try io.run(myApp);
 }
 
-fn myApp(io: volt.Io) void {
+fn myApp(io: volt.Runtime) void {
     _ = io;
     // Everything inside here runs on the async runtime.
     // volt.task, volt.sync, volt.channel, volt.net, volt.time -- all available.
@@ -51,7 +51,7 @@ All types are accessed through the `io` namespace: `volt.Runtime`, `volt.Config`
 
 ## Entry Points
 
-### `volt.Io.init` / `io.run` (Recommended)
+### `volt.Runtime.init` / `io.run` (Recommended)
 
 ```zig
 pub fn init(allocator: std.mem.Allocator, config: Config) !Io
@@ -59,7 +59,7 @@ pub fn run(self: Io, comptime func: anytype) anyerror!FnPayload(@TypeOf(func))
 pub fn deinit(self: *Io) void
 ```
 
-The primary entry point. Create `Io` explicitly — like an `Allocator`, you `init`/`deinit`/pass it through. This is the recommended pattern for production because you control the allocator, configuration, and lifecycle.
+The primary entry point. Create `Runtime` explicitly — like an `Allocator`, you `init`/`deinit`/pass it through. This is the recommended pattern for production because you control the allocator, configuration, and lifecycle.
 
 ```zig
 const std = @import("std");
@@ -74,7 +74,7 @@ pub fn main() !void {
         }
     }
 
-    var io = try volt.Io.init(gpa.allocator(), .{
+    var io = try volt.Runtime.init(gpa.allocator(), .{
         .num_workers = 4,
         .max_blocking_threads = 64,
     });
@@ -83,7 +83,7 @@ pub fn main() !void {
     try io.run(serve);
 }
 
-fn serve(io: volt.Io) void {
+fn serve(io: volt.Runtime) void {
     var listener = volt.net.listen("0.0.0.0:8080") catch return;
     defer listener.close();
 
@@ -113,7 +113,7 @@ pub fn run(comptime func: anytype) anyerror!PayloadType(@TypeOf(func))
 pub fn runWith(allocator: std.mem.Allocator, config: Config, comptime func: anytype) anyerror!PayloadType(@TypeOf(func))
 ```
 
-Convenience shorthands that create `Io`, run the function, and clean up. `volt.run` uses `page_allocator` with default config. `volt.runWith` accepts a custom allocator and config.
+Convenience shorthands that create `Runtime`, run the function, and clean up. `volt.run` uses `page_allocator` with default config. `volt.runWith` accepts a custom allocator and config.
 
 ```zig
 const volt = @import("volt");
@@ -130,7 +130,7 @@ pub fn main() !void {
 ```
 
 :::tip
-`volt.run` and `volt.runWith` are equivalent to `Io.init` + `io.run` + `io.deinit`. Use them for quick scripts; use the explicit `Io` pattern for production.
+`volt.run` and `volt.runWith` are equivalent to `Io.init` + `io.run` + `io.deinit`. Use them for quick scripts; use the explicit `Runtime` pattern for production.
 :::
 
 ---
@@ -147,12 +147,12 @@ The handle returned by `io.@"async"()`. Represents a spawned async task that wil
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `@"await"` | `fn @"await"(self: *Self, io: volt.Io) Result` | Suspend until the task completes and return its result. Takes the `Io` handle. |
-| `cancel` | `fn cancel(self: *Self, io: volt.Io) Result` | Cancel the task and wait for completion. This is NOT fire-and-forget -- it blocks until the task finishes. |
+| `@"await"` | `fn @"await"(self: *Self, io: volt.Runtime) Result` | Suspend until the task completes and return its result. Takes the `Runtime` handle. |
+| `cancel` | `fn cancel(self: *Self, io: volt.Runtime) Result` | Cancel the task and wait for completion. This is NOT fire-and-forget -- it blocks until the task finishes. |
 | `isDone` | `fn isDone(self: *const Self) bool` | Check if the task has completed (does not consume the result). |
 
 ```zig
-fn example(io: volt.Io) !void {
+fn example(io: volt.Runtime) !void {
     // Spawn an async task -- returns a Future
     const future = try io.@"async"(fetchUser, .{user_id});
 
@@ -181,7 +181,7 @@ A task group for structured concurrency. Spawn multiple tasks into the group and
 | `taskCount` | `fn taskCount(self: *Group) usize` | Return the number of tasks in the group. |
 
 ```zig
-fn example(io: volt.Io) !void {
+fn example(io: volt.Runtime) !void {
     var group = volt.Group.init(io);
 
     _ = group.spawn(fetchUser, .{id});
@@ -198,7 +198,7 @@ fn example(io: volt.Io) !void {
 
 ### `volt.Runtime`
 
-The underlying async I/O runtime. Combines a work-stealing scheduler, I/O driver, blocking pool, and timer wheel. Most users should use `Io` instead of `Runtime` directly.
+The underlying async I/O runtime. Combines a work-stealing scheduler, I/O driver, blocking pool, and timer wheel. Most users should use `Runtime` instead of `Runtime` directly.
 
 #### `init`
 
@@ -222,16 +222,16 @@ Shut down the runtime. Signals all workers to stop, joins threads, frees resourc
 pub fn run(self: *Runtime, comptime func: anytype) anyerror!FnPayload(@TypeOf(func))
 ```
 
-Run a function on the runtime, blocking the calling thread until complete. Creates a `FnFuture` from the function, spawns it, and blocks via `@"await"()`. The function receives a non-owning `Io` handle.
+Run a function on the runtime, blocking the calling thread until complete. Creates a `FnFuture` from the function, spawns it, and blocks via `@"await"()`. The function receives a non-owning `Runtime` handle.
 
 ```zig
-var io = try volt.Io.init(allocator, .{});
+var io = try volt.Runtime.init(allocator, .{});
 defer io.deinit();
 try io.run(myServer);
 ```
 
 :::note
-`Runtime` is an internal type. Most users should use `Io` methods (`io.@"async"`, `io.concurrent`) instead of interacting with `Runtime` directly.
+`Runtime` is an internal type. Most users should use `Runtime` methods (`io.@"async"`, `io.concurrent`) instead of interacting with `Runtime` directly.
 :::
 
 #### `getBlockingPool`
@@ -254,7 +254,7 @@ Access the underlying work-stealing scheduler.
 
 ## High-Level Task API
 
-These are the primary methods on `io: volt.Io` for spawning and awaiting work. They use Zig's `@""` quoting syntax because `async` and `await` are reserved keywords.
+These are the primary methods on `io: volt.Runtime` for spawning and awaiting work. They use Zig's `@""` quoting syntax because `async` and `await` are reserved keywords.
 
 :::note[Why `@"async"` and `@"await"`?]
 `async` and `await` are reserved keywords in Zig. The `@""` syntax is Zig's standard identifier quoting -- not Volt-specific. Read `io.@"async"` as "io dot async". See [Common Pitfalls](/guides/common-pitfalls/#the-async--await-syntax) for more.
@@ -264,7 +264,7 @@ These are the primary methods on `io: volt.Io` for spawning and awaiting work. T
 
 ```zig
 pub fn @"async"(
-    io: volt.Io,
+    io: volt.Runtime,
     comptime func: anytype,
     args: anytype,
 ) !IoFuture(FnReturnType(@TypeOf(func)))
@@ -293,10 +293,10 @@ const data = future.@"await"(io); // Propagates errors
 ### `future.@"await"` (Await)
 
 ```zig
-pub fn @"await"(self: Future(T), io: volt.Io) T
+pub fn @"await"(self: Future(T), io: volt.Runtime) T
 ```
 
-Suspend the current task until the future completes, then return its result. Takes the `Io` handle so the scheduler can poll other tasks while waiting.
+Suspend the current task until the future completes, then return its result. Takes the `Runtime` handle so the scheduler can poll other tasks while waiting.
 
 ```zig
 const future = try io.@"async"(fetchUser, .{user_id});
@@ -307,7 +307,7 @@ const user = future.@"await"(io);
 
 ```zig
 pub fn concurrent(
-    io: volt.Io,
+    io: volt.Runtime,
     comptime func: anytype,
     args: anytype,
 ) !*BlockingHandle(FnReturnType(@TypeOf(func)))
@@ -424,7 +424,7 @@ fn fetchUserPosts(user_id: u64) u32 {
     return 42;
 }
 
-fn handleRequest(io: volt.Io, user_id: u64) !void {
+fn handleRequest(io: volt.Runtime, user_id: u64) !void {
     // Spawn two concurrent tasks to fetch data in parallel
     const profile_future = try io.@"async"(fetchUserProfile, .{user_id});
     const posts_future = try io.@"async"(fetchUserPosts, .{user_id});
@@ -454,7 +454,7 @@ fn emitMetrics(event_name: []const u8, latency_ns: u64) void {
     _ = latency_ns;
 }
 
-fn processRequest(io: volt.Io, payload: []const u8) !void {
+fn processRequest(io: volt.Runtime, payload: []const u8) !void {
     const start = std.time.nanoTimestamp();
 
     // ... process the request ...
@@ -474,7 +474,7 @@ The `io` handle provides helpers for common multi-task patterns:
 ```zig
 const volt = @import("volt");
 
-fn coordinateTasks(io: volt.Io) !void {
+fn coordinateTasks(io: volt.Runtime) !void {
     // joinAll: wait for all tasks, fail on first error.
     // Returns a tuple of results in the same order as the futures.
     const f1 = try io.@"async"(fetchUser, .{id});
@@ -548,15 +548,15 @@ pub fn main() !void {
     defer shutdown_handler.deinit();
 
     // 3. Start the runtime with a tuned configuration.
-    //    The root function receives `io: volt.Io` from the runtime.
-    var io = try volt.Io.init(allocator, .{
+    //    The root function receives `io: volt.Runtime` from the runtime.
+    var io = try volt.Runtime.init(allocator, .{
         .num_workers = 0, // auto-detect CPU count
         .max_blocking_threads = 128,
     });
     defer io.deinit();
 
     try io.run(struct {
-        fn entry(rt_io: volt.Io) void {
+        fn entry(rt_io: volt.Runtime) void {
             // This is the root task -- runs on the scheduler.
             serveHttp(rt_io, &shutdown_handler) catch |err| {
                 log.err("Server error: {}", .{err});
@@ -569,7 +569,7 @@ pub fn main() !void {
     log.info("Server exited cleanly", .{});
 }
 
-fn serveHttp(io: volt.Io, shutdown_handler: *volt.shutdown.Shutdown) !void {
+fn serveHttp(io: volt.Runtime, shutdown_handler: *volt.shutdown.Shutdown) !void {
     var listener = try volt.net.listen("0.0.0.0:8080");
     defer listener.close();
 
@@ -623,7 +623,7 @@ const log = std.log.scoped(.worker);
 
 /// Background worker that periodically flushes an in-memory buffer
 /// to disk. Runs on the blocking pool so it never stalls I/O workers.
-fn flushLoop(io: volt.Io, interval_secs: u64, shutdown: *volt.shutdown.Shutdown) void {
+fn flushLoop(io: volt.Runtime, interval_secs: u64, shutdown: *volt.shutdown.Shutdown) void {
     while (!shutdown.isShutdown()) {
         // Sleep without blocking I/O workers
         std.Thread.sleep(interval_secs * std.time.ns_per_s);
@@ -642,7 +642,7 @@ fn flushBufferToDisk() void {
 }
 
 /// Start the server with a background flush worker alongside it.
-fn startWithBackgroundWorker(io: volt.Io, shutdown: *volt.shutdown.Shutdown) !void {
+fn startWithBackgroundWorker(io: volt.Runtime, shutdown: *volt.shutdown.Shutdown) !void {
     // Spawn the background flush worker.
     // It runs concurrently with the main accept loop.
     const worker_future = try io.@"async"(flushLoop, .{
@@ -690,7 +690,7 @@ pub fn main() !void {
     }
 
     // Create Io explicitly -- like an Allocator, you init/deinit/pass it through.
-    var io = try volt.Io.init(gpa.allocator(), .{
+    var io = try volt.Runtime.init(gpa.allocator(), .{
         .num_workers = 0, // auto-detect
     });
     defer io.deinit(); // Joins all worker threads, frees scheduler memory
@@ -699,7 +699,7 @@ pub fn main() !void {
     try io.run(appMain);
 }
 
-fn appMain(io: volt.Io) !void {
+fn appMain(io: volt.Runtime) !void {
     // Application logic runs here, inside the async runtime.
     // All volt.task, volt.sync, volt.channel, and volt.net APIs are available.
 

@@ -94,7 +94,7 @@ if (ch.recv(io)) |value| {
 }
 ```
 
-Pass the `io: volt.Io` handle so the channel can yield to the scheduler when the buffer is full (send) or empty (recv) and resume the task when the operation can proceed.
+Pass the `io: volt.Runtime` handle so the channel can yield to the scheduler when the buffer is full (send) or empty (recv) and resume the task when the operation can proceed.
 
 ### Advanced: sendFuture / recvFuture
 
@@ -208,7 +208,7 @@ if (waiter.value) |v| {
 ### Pattern: task result delivery
 
 ```zig
-fn deliverResult(io: volt.Io) void {
+fn deliverResult(io: volt.Runtime) void {
     var os = volt.channel.oneshot(ComputeResult);
 
     // Spawn computation

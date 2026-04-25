@@ -918,7 +918,7 @@ fn benchChannelMPMC() BenchResult {
     const msgs_per_producer = ASYNC_OPS / MPMC_PRODUCERS;
     const allocator = alloc_counter.allocator();
 
-    var io = Io.init(allocator, .{ .num_workers = NUM_WORKERS }) catch return .{};
+    var io = Runtime.init(allocator, .{ .num_workers = NUM_WORKERS }) catch return .{};
     defer io.deinit();
 
     for (0..WARMUP) |_| {
@@ -976,7 +976,7 @@ fn benchMutexContended() BenchResult {
     const ops_per_task = ASYNC_OPS / CONTENDED_MUTEX_TASKS;
     const allocator = alloc_counter.allocator();
 
-    var io = Io.init(allocator, .{ .num_workers = NUM_WORKERS }) catch return .{};
+    var io = Runtime.init(allocator, .{ .num_workers = NUM_WORKERS }) catch return .{};
     defer io.deinit();
 
     var mutex = Mutex.init();
@@ -1014,7 +1014,7 @@ fn benchRwLockContended() BenchResult {
     const ops_per_task = ASYNC_OPS / total_tasks;
     const allocator = alloc_counter.allocator();
 
-    var io = Io.init(allocator, .{ .num_workers = NUM_WORKERS }) catch return .{};
+    var io = Runtime.init(allocator, .{ .num_workers = NUM_WORKERS }) catch return .{};
     defer io.deinit();
 
     var rwlock = RwLock.init();
@@ -1062,7 +1062,7 @@ fn benchSemaphoreContended() BenchResult {
     const ops_per_task = ASYNC_OPS / CONTENDED_SEM_TASKS;
     const allocator = alloc_counter.allocator();
 
-    var io = Io.init(allocator, .{ .num_workers = NUM_WORKERS }) catch return .{};
+    var io = Runtime.init(allocator, .{ .num_workers = NUM_WORKERS }) catch return .{};
     defer io.deinit();
 
     var sem = Semaphore.init(CONTENDED_SEM_PERMITS);
@@ -1133,7 +1133,7 @@ fn benchTaskSpawnInner(io: Io) BenchResult {
 fn benchTaskSpawn() BenchResult {
     const allocator = alloc_counter.allocator();
 
-    var io = Io.init(allocator, .{ .num_workers = NUM_WORKERS }) catch return .{};
+    var io = Runtime.init(allocator, .{ .num_workers = NUM_WORKERS }) catch return .{};
     defer io.deinit();
 
     // Run on a worker thread (like Tokio's block_on)
@@ -1176,7 +1176,7 @@ fn benchTaskSpawnBatchInner(io: Io) BenchResult {
 /// Equivalent to Tokio: rt.block_on(async { spawn 100 tasks, then join all })
 fn benchTaskSpawnBatch() BenchResult {
     const allocator = alloc_counter.allocator();
-    var io = Io.init(allocator, .{ .num_workers = NUM_WORKERS }) catch return .{};
+    var io = Runtime.init(allocator, .{ .num_workers = NUM_WORKERS }) catch return .{};
     defer io.deinit();
 
     // Run on a worker thread (like Tokio's block_on)
@@ -1213,7 +1213,7 @@ fn benchBlockingSpawnInner(io: Io) BenchResult {
 /// Equivalent to Tokio: rt.block_on(async { spawn_blocking(|| {}).await })
 fn benchBlockingSpawn() BenchResult {
     const allocator = alloc_counter.allocator();
-    var io = Io.init(allocator, .{ .num_workers = NUM_WORKERS }) catch return .{};
+    var io = Runtime.init(allocator, .{ .num_workers = NUM_WORKERS }) catch return .{};
     defer io.deinit();
 
     // Run on a worker thread (like Tokio's block_on)

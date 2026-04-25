@@ -192,7 +192,7 @@ The most common pattern races `accept` against a shutdown signal using async tas
 
 ```zig
 fn serverLoop(
-    io: volt.Io,
+    io: volt.Runtime,
     listener: *volt.net.TcpListener,
     shutdown: *volt.shutdown.Shutdown,
 ) !void {

@@ -1,13 +1,13 @@
 //! The async I/O runtime handle.
 //!
-//! `Io` is the primary entry point for Volt. Create one explicitly with
+//! `Runtime` is the primary entry point for Volt. Create one explicitly with
 //! `init`/`deinit` like an `Allocator`, then pass it through your function
-//! signatures — if a function needs async capabilities, it takes `io: volt.Io`.
+//! signatures — if a function needs async capabilities, it takes `rt: volt.Runtime`.
 //!
 //! ## Two-Tier API
 //!
-//! - **Tier 1** (`tryLock`, `trySend`, `tryRecv`): No `Io` needed.
-//! - **Tier 2** (`@"async"`, `concurrent`): Requires `Io`.
+//! - **Tier 1** (`tryLock`, `trySend`, `tryRecv`): No `Runtime` needed.
+//! - **Tier 2** (`@"async"`, `concurrent`): Requires `Runtime`.
 //!
 //! ## Usage
 //!
@@ -15,12 +15,12 @@
 //! const volt = @import("volt");
 //!
 //! pub fn main() !void {
-//!     var io = try volt.Io.init(allocator, .{});
+//!     var io = try volt.Runtime.init(allocator, .{});
 //!     defer io.deinit();
 //!     try io.run(server);
 //! }
 //!
-//! fn server(io: volt.Io) !void {
+//! fn server(rt: volt.Runtime) !void {
 //!     var f = try io.@"async"(compute, .{42});
 //!     const result = f.@"await"(io);
 //! }
@@ -56,7 +56,7 @@ pub fn ConcurrentFuture(comptime T: type) type {
 
         /// Wait for the blocking task to complete.
         /// Uses spin → futex to minimize latency.
-        pub fn await(self: *@This(), _: Io) anyerror!T {
+        pub fn await(self: *@This(), _: Runtime) anyerror!T {
             const h = self.handle;
             const Handle = blocking_mod.BlockingHandle(T);
 
@@ -82,10 +82,10 @@ pub fn ConcurrentFuture(comptime T: type) type {
     };
 }
 
-const Io = @This();
+const Runtime = @This();
 
 runtime: *runtime_mod.Runtime,
-/// Set when this Io owns the runtime (created via `init`).
+/// Set when this Runtime owns the runtime (created via `init`).
 /// `null` for non-owning handles created internally.
 allocator: ?std.mem.Allocator = null,
 
@@ -93,17 +93,17 @@ allocator: ?std.mem.Allocator = null,
 // Lifecycle
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Create an Io handle with its own runtime.
+/// Create a Runtime handle with its own runtime.
 ///
 /// The runtime is heap-allocated using the provided allocator and fully
 /// owned by this handle. Call `deinit()` to shut down and free it.
 ///
 /// ```zig
-/// var io = try volt.Io.init(allocator, .{ .num_workers = 4 });
+/// var io = try volt.Runtime.init(allocator, .{ .num_workers = 4 });
 /// defer io.deinit();
 /// try io.run(myApp);
 /// ```
-pub fn init(allocator: std.mem.Allocator, config: runtime_mod.Config) !Io {
+pub fn init(allocator: std.mem.Allocator, config: runtime_mod.Config) !Runtime {
     const rt = try allocator.create(runtime_mod.Runtime);
     errdefer allocator.destroy(rt);
     rt.* = try runtime_mod.Runtime.init(allocator, config);
@@ -115,7 +115,7 @@ pub fn init(allocator: std.mem.Allocator, config: runtime_mod.Config) !Io {
 /// For owning handles (from `init`), this deinits the runtime and frees
 /// the heap allocation. For non-owning handles, this only shuts down
 /// the runtime.
-pub fn deinit(self: *Io) void {
+pub fn deinit(self: *Runtime) void {
     self.runtime.deinit();
     if (self.allocator) |alloc| {
         alloc.destroy(self.runtime);
@@ -124,18 +124,18 @@ pub fn deinit(self: *Io) void {
 
 /// Run a function as the root task on the scheduler.
 ///
-/// The function receives this `Io` handle as its first parameter,
+/// The function receives this `Runtime` handle as its first parameter,
 /// providing explicit access to the runtime for spawning tasks.
 /// Blocks the calling thread until the function completes.
 ///
 /// ```zig
-/// var io = try volt.Io.init(allocator, .{});
+/// var io = try volt.Runtime.init(allocator, .{});
 /// defer io.deinit();
 /// try io.run(myApp);
 ///
-/// fn myApp(io: volt.Io) void { ... }
+/// fn myApp(rt: volt.Runtime) void { ... }
 /// ```
-pub fn run(self: Io, comptime func: anytype) anyerror!fn_future_mod.FnPayload(@TypeOf(func)) {
+pub fn run(self: Runtime, comptime func: anytype) anyerror!fn_future_mod.FnPayload(@TypeOf(func)) {
     return self.runtime.runWithIo(self, func);
 }
 
@@ -154,7 +154,7 @@ pub fn run(self: Io, comptime func: anytype) anyerror!fn_future_mod.FnPayload(@T
 /// var f = try io.@"async"(fetchUser, .{user_id});
 /// const user = f.@"await"(io);
 /// ```
-pub fn async(self: Io, comptime func: anytype, args: anytype) !IoFuture(FnReturnType(@TypeOf(func))) {
+pub fn async(self: Runtime, comptime func: anytype, args: anytype) !IoFuture(FnReturnType(@TypeOf(func))) {
     const F = FnFuture(func, @TypeOf(args));
     const handle = try self.runtime.spawn(F, F.init(args));
     return .{ ._handle = handle };
@@ -171,7 +171,7 @@ pub fn async(self: Io, comptime func: anytype, args: anytype) !IoFuture(FnReturn
 /// const handle = try io.spawn(fetchUser, .{user_id});
 /// const user = handle.join();
 /// ```
-pub fn spawn(self: Io, comptime func: anytype, args: anytype) !runtime_mod.JoinHandle(FnReturnType(@TypeOf(func))) {
+pub fn spawn(self: Runtime, comptime func: anytype, args: anytype) !runtime_mod.JoinHandle(FnReturnType(@TypeOf(func))) {
     const F = FnFuture(func, @TypeOf(args));
     return self.runtime.spawn(F, F.init(args));
 }
@@ -185,7 +185,7 @@ pub fn spawn(self: Io, comptime func: anytype, args: anytype) !runtime_mod.JoinH
 /// ```zig
 /// const handle = try io.spawnFuture(mutex.lock());
 /// ```
-pub fn spawnFuture(self: Io, future: anytype) !runtime_mod.JoinHandle(@TypeOf(future).Output) {
+pub fn spawnFuture(self: Runtime, future: anytype) !runtime_mod.JoinHandle(@TypeOf(future).Output) {
     const F = @TypeOf(future);
     return self.runtime.spawn(F, future);
 }
@@ -193,7 +193,7 @@ pub fn spawnFuture(self: Io, future: anytype) !runtime_mod.JoinHandle(@TypeOf(fu
 /// Spawn an existing Future value, returning an `IoFuture` handle.
 ///
 /// Internal convenience used by sync/channel convenience methods.
-pub fn awaitFuture(self: Io, future: anytype) !IoFuture(@TypeOf(future).Output) {
+pub fn awaitFuture(self: Runtime, future: anytype) !IoFuture(@TypeOf(future).Output) {
     const F = @TypeOf(future);
     const handle = try self.runtime.spawn(F, future);
     return .{ ._handle = handle };
@@ -211,7 +211,7 @@ pub fn awaitFuture(self: Io, future: anytype) !IoFuture(@TypeOf(future).Output) 
 /// const hash = try f.await(io);
 /// ```
 pub fn concurrent(
-    self: Io,
+    self: Runtime,
     comptime func: anytype,
     args: anytype,
 ) !ConcurrentFuture(blocking_mod.ResultType(@TypeOf(func))) {
@@ -224,7 +224,7 @@ pub fn concurrent(
 /// Prefer `concurrent()` for async code. This method blocks the calling
 /// worker thread with a futex until the blocking work completes.
 pub fn concurrentBlocking(
-    self: Io,
+    self: Runtime,
     comptime func: anytype,
     args: anytype,
 ) !*blocking_mod.BlockingHandle(blocking_mod.ResultType(@TypeOf(func))) {
@@ -241,22 +241,22 @@ pub const spawnBlocking = concurrentBlocking;
 
 /// Wait for all tasks to complete. Returns tuple of results.
 /// Fails on first error (remaining tasks continue running).
-pub fn joinAll(_: Io, handles: anytype) combinators.JoinAllResult(@TypeOf(handles)) {
+pub fn joinAll(_: Runtime, handles: anytype) combinators.JoinAllResult(@TypeOf(handles)) {
     return combinators.joinAll(handles);
 }
 
 /// Wait for all tasks, collecting both successes and errors.
-pub fn tryJoinAll(_: Io, handles: anytype) combinators.TryJoinAllResult(@TypeOf(handles)) {
+pub fn tryJoinAll(_: Runtime, handles: anytype) combinators.TryJoinAllResult(@TypeOf(handles)) {
     return combinators.tryJoinAll(handles);
 }
 
 /// First task to complete wins. Cancels all other tasks.
-pub fn race(_: Io, handles: anytype) combinators.RaceResult(@TypeOf(handles)) {
+pub fn race(_: Runtime, handles: anytype) combinators.RaceResult(@TypeOf(handles)) {
     return combinators.race(handles);
 }
 
 /// First task to complete wins. Other tasks keep running.
-pub fn select(_: Io, handles: anytype) combinators.SelectResult(@TypeOf(handles)) {
+pub fn select(_: Runtime, handles: anytype) combinators.SelectResult(@TypeOf(handles)) {
     return combinators.select(handles);
 }
 
@@ -264,42 +264,42 @@ pub fn select(_: Io, handles: anytype) combinators.SelectResult(@TypeOf(handles)
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
-test "Io - init and deinit lifecycle" {
-    var io = try Io.init(std.testing.allocator, .{});
+test "Runtime - init and deinit lifecycle" {
+    var rt = try Runtime.init(std.testing.allocator, .{});
     // Should have an owning allocator
-    std.debug.assert(io.allocator != null);
-    io.deinit();
+    std.debug.assert(rt.allocator != null);
+    rt.deinit();
 }
 
-test "Io - init with custom config" {
-    var io = try Io.init(std.testing.allocator, .{
+test "Runtime - init with custom config" {
+    var rt = try Runtime.init(std.testing.allocator, .{
         .num_workers = 2,
         .max_blocking_threads = 64,
     });
-    defer io.deinit();
-    try std.testing.expect(io.allocator != null);
+    defer rt.deinit();
+    try std.testing.expect(rt.allocator != null);
 }
 
-test "Io - method signatures exist" {
+test "Runtime - method signatures exist" {
     // Verify all public methods exist at comptime
     comptime {
-        _ = Io.init;
-        _ = Io.deinit;
-        _ = Io.run;
-        _ = Io.async;
-        _ = Io.spawn;
-        _ = Io.spawnFuture;
-        _ = Io.awaitFuture;
-        _ = Io.concurrent;
-        _ = Io.spawnBlocking;
-        _ = Io.joinAll;
-        _ = Io.tryJoinAll;
-        _ = Io.race;
-        _ = Io.select;
+        _ = Runtime.init;
+        _ = Runtime.deinit;
+        _ = Runtime.run;
+        _ = Runtime.async;
+        _ = Runtime.spawn;
+        _ = Runtime.spawnFuture;
+        _ = Runtime.awaitFuture;
+        _ = Runtime.concurrent;
+        _ = Runtime.spawnBlocking;
+        _ = Runtime.joinAll;
+        _ = Runtime.tryJoinAll;
+        _ = Runtime.race;
+        _ = Runtime.select;
     }
 }
 
-test "Io - IoFuture type is accessible" {
+test "Runtime - IoFuture type is accessible" {
     comptime {
         _ = IoFuture(u32);
         _ = IoFuture(void);

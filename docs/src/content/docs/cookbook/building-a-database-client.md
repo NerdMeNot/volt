@@ -3,10 +3,10 @@ title: Building a Database Client
 description: Build a minimalistic Postgres client library on top of Volt, then show how end users consume it in their own projects.
 ---
 
-Most async runtimes prove their value not in benchmarks but in the libraries built on top of them. This recipe walks through creating a small but realistic Postgres client library powered by Volt, then shows how a separate application project would depend on that library. The goal is to demonstrate the full lifecycle: **library author accepts `io: volt.Io`**, library handles connections and queries internally, and **application author passes a single `Io` handle** down to every library that needs async.
+Most async runtimes prove their value not in benchmarks but in the libraries built on top of them. This recipe walks through creating a small but realistic Postgres client library powered by Volt, then shows how a separate application project would depend on that library. The goal is to demonstrate the full lifecycle: **library author accepts `io: volt.Runtime`**, library handles connections and queries internally, and **application author passes a single `Runtime` handle** down to every library that needs async.
 
 :::tip[What you will learn]
-- **The `Io`-as-parameter pattern** -- how library code accepts the runtime handle without owning it
+- **The `Runtime`-as-parameter pattern** -- how library code accepts the runtime handle without owning it
 - **Connection lifecycle** -- connecting, querying, and closing over TCP using Volt networking
 - **Spawning work inside a library** -- using `io.@"async"` from library code, not just application code
 - **Composing libraries** -- two independent Volt-based libraries sharing one runtime
@@ -15,7 +15,7 @@ Most async runtimes prove their value not in benchmarks but in the libraries bui
 
 ## Part 1: The Library (`zig-pg`)
 
-This is what the library author writes. The library never calls `Io.init` -- it receives an `Io` handle from whoever is using it.
+This is what the library author writes. The library never calls `Io.init` -- it receives an `Runtime` handle from whoever is using it.
 
 ### Complete Example
 
@@ -79,7 +79,7 @@ pub const Client = struct {
     /// The Volt runtime handle -- borrowed, not owned.
     /// This is the key pattern: the library stores the handle so every
     /// method can spawn async work without the caller passing io again.
-    io: volt.Io,
+    io: volt.Runtime,
     stream: volt.net.TcpStream,
     connected: bool,
 
@@ -89,7 +89,7 @@ pub const Client = struct {
     /// async operations (queries, pipelining, reconnection) use this
     /// single handle, which routes work to whatever runtime the
     /// application created.
-    pub fn connect(io: volt.Io, opts: ConnectOptions) !Client {
+    pub fn connect(io: volt.Runtime, opts: ConnectOptions) !Client {
         // Resolve and connect via TCP.
         const addr = volt.net.Address.parse(opts.host, opts.port) catch
             return error.InvalidAddress;
@@ -178,7 +178,7 @@ pub const Client = struct {
     /// This demonstrates spawning work from inside a library. The `io`
     /// handle stored at connect time makes this possible without the
     /// caller threading the handle through every call.
-    pub fn queryAsync(self: *Client, sql: []const u8) !volt.IoFuture(QueryResult) {
+    pub fn queryAsync(self: *Client, sql: []const u8) !volt.RuntimeFuture(QueryResult) {
         return self.io.@"async"(queryWrapper, .{ self, sql });
     }
 
@@ -302,17 +302,17 @@ pub const Client = struct {
 
 ```zig
 pub const Client = struct {
-    io: volt.Io,      // borrowed -- caller owns the runtime
+    io: volt.Runtime,      // borrowed -- caller owns the runtime
     stream: volt.net.TcpStream,
     connected: bool,
 ```
 
-The `Io` handle is 8 bytes (a pointer to the Runtime). Storing it in the client means every method can spawn async work without the caller passing `io` to every call. This is the same pattern as storing an `Allocator` in a container.
+The `Runtime` handle is 8 bytes (a pointer to the Runtime). Storing it in the client means every method can spawn async work without the caller passing `io` to every call. This is the same pattern as storing an `Allocator` in a container.
 
 **2. `connect` receives `io` once.**
 
 ```zig
-pub fn connect(io: volt.Io, opts: ConnectOptions) !Client {
+pub fn connect(io: volt.Runtime, opts: ConnectOptions) !Client {
 ```
 
 The application passes `io` at creation time. From that point on, the library has everything it needs. The caller never thinks about the runtime again.
@@ -320,7 +320,7 @@ The application passes `io` at creation time. From that point on, the library ha
 **3. Library can spawn tasks internally.**
 
 ```zig
-pub fn queryAsync(self: *Client, sql: []const u8) !volt.IoFuture(QueryResult) {
+pub fn queryAsync(self: *Client, sql: []const u8) !volt.RuntimeFuture(QueryResult) {
     return self.io.@"async"(queryWrapper, .{ self, sql });
 }
 ```
@@ -331,7 +331,7 @@ Because the library stores `io`, it can spawn work onto the shared scheduler. Th
 
 ## Part 2: The Application
 
-This is what the end user of `zig-pg` writes. They create a single `Io` handle and pass it to every library.
+This is what the end user of `zig-pg` writes. They create a single `Runtime` handle and pass it to every library.
 
 ### Complete Example
 
@@ -346,13 +346,13 @@ pub fn main() !void {
 
     // One runtime for the entire application.
     // Every library, every component shares this single handle.
-    var io = try volt.Io.init(gpa.allocator(), .{ .num_workers = 4 });
+    var io = try volt.Runtime.init(gpa.allocator(), .{ .num_workers = 4 });
     defer io.deinit();
 
     try io.run(app);
 }
 
-fn app(io: volt.Io) !void {
+fn app(io: volt.Runtime) !void {
     // Connect to the database -- passes io once at creation time.
     var db = try pg.Client.connect(io, .{
         .host = "127.0.0.1",
@@ -396,13 +396,13 @@ The public API is four methods:
 | `client.exec(sql)` | Execute a statement (no result rows). |
 | `client.close()` | Close the connection. |
 
-The user never interacts with Volt's internals. They do not need to know about `TcpStream`, `tryRead`, or the Postgres wire protocol. The library abstracts all of that behind a clean API that happens to accept `io: volt.Io` at the entry point.
+The user never interacts with Volt's internals. They do not need to know about `TcpStream`, `tryRead`, or the Postgres wire protocol. The library abstracts all of that behind a clean API that happens to accept `io: volt.Runtime` at the entry point.
 
 ---
 
 ## Part 3: Composing Multiple Libraries
 
-The real power of the `Io`-as-parameter pattern emerges when an application depends on *multiple* Volt-based libraries. Each library stores the same `Io` handle, and all work runs on the same scheduler.
+The real power of the `Runtime`-as-parameter pattern emerges when an application depends on *multiple* Volt-based libraries. Each library stores the same `Runtime` handle, and all work runs on the same scheduler.
 
 ```zig
 const std = @import("std");
@@ -415,13 +415,13 @@ pub fn main() !void {
     defer _ = gpa.deinit();
 
     // One runtime. One set of worker threads. One I/O driver.
-    var io = try volt.Io.init(gpa.allocator(), .{ .num_workers = 8 });
+    var io = try volt.Runtime.init(gpa.allocator(), .{ .num_workers = 8 });
     defer io.deinit();
 
     try io.run(app);
 }
 
-fn app(io: volt.Io) !void {
+fn app(io: volt.Runtime) !void {
     // Both libraries receive the SAME io handle.
     // They share the same worker pool, timer wheel, and I/O driver.
     var db = try pg.Client.connect(io, .{
@@ -458,7 +458,7 @@ fn app(io: volt.Io) !void {
 }
 ```
 
-In Tokio, this "just works" because the runtime is a hidden thread-local. In Volt, it works because both libraries accept `io: volt.Io` explicitly. The advantage of the explicit approach: **you can never accidentally create two runtimes**. If a function needs async, it says so in its signature.
+In Tokio, this "just works" because the runtime is a hidden thread-local. In Volt, it works because both libraries accept `io: volt.Runtime` explicitly. The advantage of the explicit approach: **you can never accidentally create two runtimes**. If a function needs async, it says so in its signature.
 
 ## Walkthrough
 
@@ -480,7 +480,7 @@ main()
             └─ all futures share the same worker pool
 ```
 
-Every arrow in this diagram passes the same 8-byte `Io` handle. There is exactly one scheduler, one I/O driver, and one timer wheel for the entire process.
+Every arrow in this diagram passes the same 8-byte `Runtime` handle. There is exactly one scheduler, one I/O driver, and one timer wheel for the entire process.
 
 ### Why not a global runtime?
 
@@ -490,7 +490,7 @@ Tokio uses a thread-local global to store the current runtime handle. This works
 - Nested `block_on` calls panic.
 - Testing requires careful setup to ensure the right runtime is active.
 
-Volt's explicit approach avoids all of these. If a function does not take `io: volt.Io`, it cannot access the runtime -- period. There is no hidden state to get wrong.
+Volt's explicit approach avoids all of these. If a function does not take `io: volt.Runtime`, it cannot access the runtime -- period. There is no hidden state to get wrong.
 
 ## Try It Yourself
 
@@ -500,12 +500,12 @@ Wrap the `Client` in a pool that manages multiple connections. The pool itself s
 
 ```zig
 pub const Pool = struct {
-    io: volt.Io,
+    io: volt.Runtime,
     opts: ConnectOptions,
     semaphore: volt.sync.Semaphore,
     // ... free list of Client instances ...
 
-    pub fn init(io: volt.Io, opts: ConnectOptions, max_conns: usize) Pool {
+    pub fn init(io: volt.Runtime, opts: ConnectOptions, max_conns: usize) Pool {
         return .{
             .io = io,
             .opts = opts,

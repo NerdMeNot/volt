@@ -15,6 +15,15 @@
 
 const std = @import("std");
 
+/// Thread-level sync primitives (raw, no Io required).
+/// New in 0.16 — replaces std.Thread.{Mutex,Condition,Futex,sleep} which
+/// moved into std.Io.* and require an Io handle.
+pub const thread = @import("internal/thread.zig");
+
+/// Raw syscall wrappers — replaces std.posix medium-level functions
+/// removed in Zig 0.16.
+pub const syscall = @import("internal/syscall.zig");
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Scheduler Internals
 // ═══════════════════════════════════════════════════════════════════════════════

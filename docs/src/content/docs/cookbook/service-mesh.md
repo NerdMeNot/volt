@@ -129,7 +129,7 @@ pub fn main() !void {
     std.debug.print("Gateway stopped.\n", .{});
 }
 
-fn acceptLoop(io: volt.Io, gw: *Gateway) void {
+fn acceptLoop(io: volt.Runtime, gw: *Gateway) void {
     var listener = volt.net.TcpListener.bind(
         volt.net.Address.fromPort(gw.config.listen_port),
     ) catch |err| {

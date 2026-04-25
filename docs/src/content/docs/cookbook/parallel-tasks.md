@@ -48,7 +48,7 @@ pub fn main() !void {
     try volt.run(dashboard);
 }
 
-fn dashboard(io: volt.Io) void {
+fn dashboard(io: volt.Runtime) void {
     std.debug.print("=== Service Health Dashboard ===\n\n", .{});
 
     // ── Pattern 1: Group ────────────────────────────────────────────────
@@ -78,7 +78,7 @@ fn dashboard(io: volt.Io) void {
 
 // -- Pattern 1: Group (await all) ---------------------------------------------
 
-fn checkAllServices(io: volt.Io) void {
+fn checkAllServices(io: volt.Runtime) void {
     // Spawn a health check task for each service.
     var futures: [services.len]@TypeOf(io.@"async"(checkService, .{services[0]}) catch unreachable) = undefined;
     for (services, 0..) |svc, i| {
@@ -137,7 +137,7 @@ fn checkService(svc: Service) HealthResult {
 
 // -- Pattern 2: race ----------------------------------------------------------
 
-fn findFastestService(io: volt.Io) void {
+fn findFastestService(io: volt.Runtime) void {
     // Spawn the same health check for each service, then race them.
     // The first task to complete wins; remaining tasks continue in
     // the background.
@@ -163,7 +163,7 @@ fn findFastestService(io: volt.Io) void {
 
 // -- Pattern 3: Collect with error handling -----------------------------------
 
-fn checkWithPartialFailures(io: volt.Io) void {
+fn checkWithPartialFailures(io: volt.Runtime) void {
     var futures: [services.len]@TypeOf(io.@"async"(checkService, .{services[0]}) catch unreachable) = undefined;
     for (services, 0..) |svc, i| {
         futures[i] = io.@"async"(checkService, .{svc}) catch return;
@@ -189,7 +189,7 @@ fn checkWithPartialFailures(io: volt.Io) void {
 
 // -- Pattern 4: select --------------------------------------------------------
 
-fn selectFirstResponse(io: volt.Io) void {
+fn selectFirstResponse(io: volt.Runtime) void {
     var futures: [services.len]@TypeOf(io.@"async"(checkService, .{services[0]}) catch unreachable) = undefined;
     for (services, 0..) |svc, i| {
         futures[i] = io.@"async"(checkService, .{svc}) catch return;
@@ -262,7 +262,7 @@ Race all health checks against a deadline. If no service responds within the tim
 const std = @import("std");
 const volt = @import("volt");
 
-fn checkAllWithTimeout(io: volt.Io, timeout: volt.Duration) ![services.len]HealthResult {
+fn checkAllWithTimeout(io: volt.Runtime, timeout: volt.Duration) ![services.len]HealthResult {
     var futures: [services.len]@TypeOf(io.@"async"(checkService, .{services[0]}) catch unreachable) = undefined;
     for (services, 0..) |svc, i| {
         futures[i] = try io.@"async"(checkService, .{svc});
@@ -293,7 +293,7 @@ const std = @import("std");
 const volt = @import("volt");
 
 fn speculativeFetch(
-    io: volt.Io,
+    io: volt.Runtime,
     primary: volt.net.Address,
     secondary: volt.net.Address,
 ) ![]u8 {
@@ -339,7 +339,7 @@ const volt = @import("volt");
 
 const NUM_WORKERS = 4;
 
-fn processBatchParallel(io: volt.Io, items: []const Item) ![NUM_WORKERS]BatchResult {
+fn processBatchParallel(io: volt.Runtime, items: []const Item) ![NUM_WORKERS]BatchResult {
     // Divide items into roughly equal chunks.
     const chunk_size = (items.len + NUM_WORKERS - 1) / NUM_WORKERS;
 

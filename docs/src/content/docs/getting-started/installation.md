@@ -219,7 +219,7 @@ pub fn main() !void {
     try volt.run(myApp);
 }
 
-fn myApp(io: volt.Io) !void {
+fn myApp(io: volt.Runtime) !void {
     var f = try io.@"async"(myFunc, .{});  // can't be called without io
     const result = f.@"await"(io);
 }
@@ -229,7 +229,7 @@ If you need an explicit runtime handle:
 
 ```zig
 pub fn main() !void {
-    var io = try volt.Io.init(allocator, .{});
+    var io = try volt.Runtime.init(allocator, .{});
     defer io.deinit();
     try io.run(myApp);
 }
@@ -250,7 +250,7 @@ Volt requires Zig 0.15.0 or later. Key 0.15.x API differences from earlier versi
 - Atomics use `std.atomic.Value(T)`, not `std.atomic.Atomic`
 - POSIX calls use `std.posix`, not `std.os`
 - No `@fence` builtin -- use `fetchAdd(0, .seq_cst)` for fences
-- No async/await keywords -- Volt uses explicit `Io` handle and manual state machines (similar to Zig's upcoming `std.Io` approach)
+- No async/await keywords -- Volt uses explicit `Runtime` handle and manual state machines (similar to Zig's upcoming `std.Io` approach)
 
 Check your version with:
 

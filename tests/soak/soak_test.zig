@@ -558,7 +558,7 @@ pub fn main() !void {
     const cfg = parseArgs(if (args.len > 1) args[1..] else &.{});
     printHeader(cfg);
 
-    var io = try Io.init(allocator, .{ .num_workers = cfg.num_workers });
+    var io = try Runtime.init(allocator, .{ .num_workers = cfg.num_workers });
     defer io.deinit();
 
     var state = try SoakState.init(allocator);

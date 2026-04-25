@@ -9,10 +9,10 @@ description: Wrapping operations with Deadline, retry with exponential backoff, 
 - Propagating a single deadline through a chain of sub-operations
 - Cascading timeouts that enforce per-layer budgets within an overall limit
 - Extending idle timeouts on progress (keep-alive pattern)
-- Wrapping async operations with timeout using the `Io` handle
+- Wrapping async operations with timeout using the `Runtime` handle
 :::
 
-Timeouts prevent operations from hanging indefinitely. Volt provides `Deadline` for tracking expiration and the explicit `Io` handle for async timeout patterns. This recipe shows how to combine them for robust error handling.
+Timeouts prevent operations from hanging indefinitely. Volt provides `Deadline` for tracking expiration and the explicit `Runtime` handle for async timeout patterns. This recipe shows how to combine them for robust error handling.
 
 ---
 
@@ -391,9 +391,9 @@ The `reset()` call moves the expiration point forward to 10 seconds from *now*, 
 
 ---
 
-## Pattern 6: Async Timeout with the `Io` Handle
+## Pattern 6: Async Timeout with the `Runtime` Handle
 
-**When to use:** You are working inside the async runtime and want to race an operation against a time limit. Spawn the work as an async task and use a `Deadline` to enforce the budget, all through the explicit `Io` handle.
+**When to use:** You are working inside the async runtime and want to race an operation against a time limit. Spawn the work as an async task and use a `Deadline` to enforce the budget, all through the explicit `Runtime` handle.
 
 When working inside the async runtime, spawn the operation and enforce a deadline:
 
@@ -401,12 +401,12 @@ When working inside the async runtime, spawn the operation and enforce a deadlin
 const std = @import("std");
 const volt = @import("volt");
 
-fn acceptConnection(io: *volt.Io, listener: *volt.net.TcpListener) !volt.net.TcpStream {
+fn acceptConnection(io: *volt.Runtime, listener: *volt.net.TcpListener) !volt.net.TcpStream {
     // Perform the accept through the runtime.
     return listener.accept(io);
 }
 
-fn acceptWithTimeout(io: *volt.Io, listener: *volt.net.TcpListener) void {
+fn acceptWithTimeout(io: *volt.Runtime, listener: *volt.net.TcpListener) void {
     // Spawn the accept as an async task.
     var f = io.@"async"(acceptConnection, .{ io, listener }) catch {
         std.debug.print("Failed to spawn accept task\n", .{});
@@ -431,7 +431,7 @@ fn handleConnection(conn: anytype) void {
 }
 ```
 
-This approach integrates naturally with the explicit `Io` handle pattern. The `Deadline` tracks wall-clock time while `io.@"async"` and `f.@"await"` handle the async scheduling. You get clear separation between "what to do" (the spawned task) and "how long to wait" (the deadline).
+This approach integrates naturally with the explicit `Runtime` handle pattern. The `Deadline` tracks wall-clock time while `io.@"async"` and `f.@"await"` handle the async scheduling. You get clear separation between "what to do" (the spawned task) and "how long to wait" (the deadline).
 
 ---
 
@@ -727,4 +727,4 @@ Try extending it: add per-strategy retry limits (e.g., at most 2 immediate retri
 | Deadline propagation | Multi-step request with a shared time budget |
 | Cascading timeouts | Layered systems (proxy, gateway) with per-layer limits |
 | Extending deadlines | Long transfers with idle detection (keep-alive) |
-| Async timeout with `Io` | Async operations inside the runtime using `io.@"async"` |
+| Async timeout with `Runtime` | Async operations inside the runtime using `io.@"async"` |

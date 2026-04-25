@@ -7,7 +7,7 @@ const std = @import("std");
 const testing = std.testing;
 
 const volt = @import("volt");
-const Io = volt.Io;
+const Runtime = volt.Runtime;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Blocking task functions (plain functions, no Io parameter)
@@ -22,11 +22,11 @@ fn computeSquare(x: u32) u32 {
 // ─────────────────────────────────────────────────────────────────────────────
 
 test "Blocking pool - single task" {
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     const Inner = struct {
-        fn run(inner_io: Io) !void {
+        fn run(inner_io: Runtime) !void {
             var f = try inner_io.concurrent(computeSquare, .{@as(u32, 7)});
             const result = try f.await(inner_io);
             try testing.expectEqual(@as(u32, 49), result);
@@ -37,13 +37,13 @@ test "Blocking pool - single task" {
 }
 
 test "Blocking pool - 10 concurrent tasks" {
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     const Inner = struct {
-        fn run(inner_io: Io) !void {
+        fn run(inner_io: Runtime) !void {
             const num_tasks = 10;
-            var futures: [num_tasks]Io.ConcurrentFuture(u32) = undefined;
+            var futures: [num_tasks]Runtime.ConcurrentFuture(u32) = undefined;
 
             for (0..num_tasks) |i| {
                 futures[i] = try inner_io.concurrent(computeSquare, .{@as(u32, @intCast(i))});
@@ -63,11 +63,11 @@ test "Blocking pool - 10 concurrent tasks" {
 }
 
 test "Blocking pool - from async context" {
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     const Inner = struct {
-        fn run(inner_io: Io) !void {
+        fn run(inner_io: Runtime) !void {
             // Use concurrent from within io.run context
             var f1 = try inner_io.concurrent(computeSquare, .{@as(u32, 10)});
             var f2 = try inner_io.concurrent(computeSquare, .{@as(u32, 5)});

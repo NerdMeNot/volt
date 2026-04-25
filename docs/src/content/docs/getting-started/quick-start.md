@@ -17,7 +17,7 @@ pub fn main() !void {
     try volt.run(serve);
 }
 
-fn serve(io: volt.Io) void {
+fn serve(io: volt.Runtime) void {
     var listener = volt.net.listen("0.0.0.0:8080") catch return;
     defer listener.close();
 
@@ -70,19 +70,19 @@ pub fn main() !void {
 
 `volt.run()` is the zero-config entry point. It:
 
-1. Creates an `Io` handle with default settings (auto-detected worker count, page allocator)
+1. Creates an `Runtime` handle with default settings (auto-detected worker count, page allocator)
 2. Wraps your function in a `FnFuture` and spawns it on the work-stealing scheduler
 3. Blocks `main` until the function completes
 4. Cleans up all resources on return
 
-For more control, create `Io` explicitly — like an `Allocator`, you `init`/`deinit`/pass it through:
+For more control, create `Runtime` explicitly — like an `Allocator`, you `init`/`deinit`/pass it through:
 
 ```zig
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    var io = try volt.Io.init(gpa.allocator(), .{
+    var io = try volt.Runtime.init(gpa.allocator(), .{
         .num_workers = 4,              // Fixed worker count
         .max_blocking_threads = 64,    // Cap blocking pool
     });
@@ -128,7 +128,7 @@ while (listener.tryAccept() catch null) |result| {
 - `null` -- when no connection is pending (would block)
 - An error -- on actual failure
 
-Each accepted connection is handed off to a new task via `io.@"async"()` (where `io` is the `volt.Io` handle passed to the root function). This spawns `handleClient` as a lightweight async task (~256 bytes) on the work-stealing scheduler and returns a `volt.Future`. The `.{result.stream}` syntax passes the `TcpStream` as the function argument.
+Each accepted connection is handed off to a new task via `io.@"async"()` (where `io` is the `volt.Runtime` handle passed to the root function). This spawns `handleClient` as a lightweight async task (~256 bytes) on the work-stealing scheduler and returns a `volt.Future`. The `.{result.stream}` syntax passes the `TcpStream` as the function argument.
 
 ### 5. Echo data back
 
@@ -198,7 +198,7 @@ pub fn main() !void {
     try volt.run(app);
 }
 
-fn app(io: volt.Io) !void {
+fn app(io: volt.Runtime) !void {
     // Launch concurrent async operations
     var user_f = try io.@"async"(fetchUser, .{@as(u64, 42)});
     var posts_f = try io.@"async"(fetchPosts, .{@as(u64, 42)});
@@ -224,7 +224,7 @@ fn fetchPosts(user_id: u64) u32 {
 `io.@"async"` returns a `volt.Future(T)` that you `.@"await"(io)` to get the result. For structured concurrency with many tasks, use `volt.Group`:
 
 ```zig
-fn app(io: volt.Io) !void {
+fn app(io: volt.Runtime) !void {
     var group = volt.Group.init(io);
 
     // Spawn multiple tasks into the group

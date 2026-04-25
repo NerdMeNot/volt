@@ -23,7 +23,7 @@ pub fn main() !void {
     try volt.run(server);
 }
 
-fn server(io: volt.Io) void {
+fn server(io: volt.Runtime) void {
     var listener = volt.net.TcpListener.bind(
         volt.net.Address.fromPort(8080),
     ) catch |err| {

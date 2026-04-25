@@ -124,7 +124,7 @@ Some Volt APIs are **synchronous** -- they block the OS thread, not just the tas
 | `mutex.tryLock()` | Non-blocking (returns immediately) |
 
 :::tip[Rule of thumb]
-If it takes `io: volt.Io`, it yields the task. If it doesn't take `io`, check whether it does I/O -- if so, wrap it in `io.concurrent()`.
+If it takes `io: volt.Runtime`, it yields the task. If it doesn't take `io`, check whether it does I/O -- if so, wrap it in `io.concurrent()`.
 :::
 
 ---

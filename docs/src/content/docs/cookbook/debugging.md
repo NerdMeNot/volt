@@ -12,7 +12,7 @@ When a task panics, Volt catches the panic and stores it in the task's result. I
 ### Catching panics from spawned tasks
 
 ```zig
-fn app(io: volt.Io) !void {
+fn app(io: volt.Runtime) !void {
     var f = try io.@"async"(riskyWork, .{});
     const result = f.@"await"(io);
     // If riskyWork panicked, the panic propagates here.
@@ -45,7 +45,7 @@ Wrap any operation that might deadlock in a timeout:
 ```zig
 const volt = @import("volt");
 
-fn fetchWithTimeout(io: volt.Io) !void {
+fn fetchWithTimeout(io: volt.Runtime) !void {
     var mutex = volt.sync.Mutex.init();
 
     // If the lock isn't acquired within 5 seconds, something is wrong
@@ -89,7 +89,7 @@ Volt tasks are stackless state machines, so stack traces show the scheduler's ca
 Add context to your task functions:
 
 ```zig
-fn handleRequest(io: volt.Io, request_id: u64) void {
+fn handleRequest(io: volt.Runtime, request_id: u64) void {
     std.debug.print("[req-{}] starting\n", .{request_id});
     defer std.debug.print("[req-{}] done\n", .{request_id});
 
@@ -128,7 +128,7 @@ pub fn main() !void {
         }
     }
 
-    var io = try volt.Io.init(gpa.allocator(), .{});
+    var io = try volt.Runtime.init(gpa.allocator(), .{});
     defer io.deinit();
 
     try io.run(myApp);

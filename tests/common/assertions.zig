@@ -8,6 +8,14 @@
 const std = @import("std");
 const testing = std.testing;
 
+/// Monotonic-clock timestamp in nanoseconds. Replaces std.time.nanoTimestamp
+/// (removed in 0.16; time queries moved to std.Io which requires an Io handle).
+fn nanoTimestamp() i128 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+}
+
 /// Assert that a poll result is Pending
 pub fn assertPending(poll_result: anytype) void {
     const T = @TypeOf(poll_result);
@@ -260,14 +268,14 @@ pub const TimeoutChecker = struct {
 
     pub fn init(timeout_ns: u64, name: []const u8) TimeoutChecker {
         return .{
-            .start = std.time.nanoTimestamp(),
+            .start = nanoTimestamp(),
             .timeout_ns = timeout_ns,
             .name = name,
         };
     }
 
     pub fn check(self: *const TimeoutChecker) void {
-        const elapsed_ns = std.time.nanoTimestamp() - self.start;
+        const elapsed_ns = nanoTimestamp() - self.start;
         if (elapsed_ns > self.timeout_ns) {
             std.debug.panic(
                 "Timeout in '{s}': took {}ns, limit {}ns",

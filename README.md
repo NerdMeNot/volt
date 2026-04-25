@@ -32,7 +32,7 @@ pub fn main() !void {
     try volt.run(serve);
 }
 
-fn serve(io: volt.Io) void {
+fn serve(io: volt.Runtime) void {
     var listener = volt.net.listen("0.0.0.0:8080") catch return;
     defer listener.close();
     while (listener.tryAccept() catch null) |conn| {
@@ -154,7 +154,7 @@ pub fn main() !void {
     try volt.run(serve);
 }
 
-fn serve(io: volt.Io) void {
+fn serve(io: volt.Runtime) void {
     var listener = volt.net.listen("0.0.0.0:8080") catch return;
     defer listener.close();
 
@@ -185,7 +185,7 @@ pub fn main() !void {
     try volt.run(fetchAll);
 }
 
-fn fetchAll(io: volt.Io) !void {
+fn fetchAll(io: volt.Runtime) !void {
     // Spawn concurrent tasks
     const user_h = try io.spawn(fetchUser, .{42});
     const posts_h = try io.spawn(fetchPosts, .{42});
@@ -227,7 +227,7 @@ pub fn main() !void {
 
 | Module | Description |
 |--------|-------------|
-| `volt.Io` | Runtime handle passed to tasks that need to spawn (Tier 2 API) |
+| `volt.Runtime` | Runtime handle passed to tasks that need to spawn (Tier 2 API) |
 | `volt.sync` | Synchronization: Mutex, RwLock, Semaphore, Notify, Barrier, OnceCell |
 | `volt.channel` | Message passing: Channel, Oneshot, Broadcast, Watch, Select |
 | `volt.net` | Networking: TCP, UDP, Unix sockets, DNS resolution |
@@ -242,7 +242,7 @@ pub fn main() !void {
 
 ### Task Spawning
 
-These functions require a `volt.Io` handle (received as a parameter by functions passed to `volt.run()`).
+These functions require a `volt.Runtime` handle (received as a parameter by functions passed to `volt.run()`).
 
 | Function | Description |
 |----------|-------------|
@@ -329,7 +329,7 @@ Convenience functions: `volt.net.listen(addr)`, `volt.net.connect(addr)`, `volt.
 ```zig
 const dur = volt.time.Duration.fromSecs(5);
 const start = volt.time.Instant.now();
-io.sleep(dur);  // requires volt.Io handle
+io.sleep(dur);  // requires volt.Runtime handle
 const elapsed = start.elapsed();
 ```
 
@@ -389,7 +389,7 @@ Memory: Volt **284 B/op** total vs Tokio's **1,868 B/op** -- 6.6x less allocatio
                               |
 +-----------------------------------------------------------------+
 |                        Public API                               |
-|  volt.Io      volt.sync    volt.channel   volt.net   volt.fs   |
+|  volt.Runtime      volt.sync    volt.channel   volt.net   volt.fs   |
 |  volt.time    volt.signal  volt.process   volt.stream           |
 |  volt.shutdown             volt.async_ops                       |
 +-----------------------------------------------------------------+
@@ -437,7 +437,7 @@ Memory: Volt **284 B/op** total vs Tokio's **1,868 B/op** -- 6.6x less allocatio
 
 5. **Zero-allocation waiters**: Waiter structs are embedded directly in `LockFuture`/`AcquireFuture` types. No heap allocation per contended wait.
 
-6. **Two-tier API**: `tryX()` methods (non-blocking) work without a runtime. `x(io)` methods (async, Future-based) require a `volt.Io` handle from `volt.run()`. The type system enforces this at compile time.
+6. **Two-tier API**: `tryX()` methods (non-blocking) work without a runtime. `x(io)` methods (async, Future-based) require a `volt.Runtime` handle from `volt.run()`. The type system enforces this at compile time.
 
 ## Best Practices
 
@@ -455,7 +455,7 @@ var timeout_future = volt.async_ops.Timeout(MyFuture).init(
     volt.time.Duration.fromSecs(5),
 );
 
-// DO: Use spawnBlocking for CPU-intensive work (requires volt.Io)
+// DO: Use spawnBlocking for CPU-intensive work (requires volt.Runtime)
 const hash = try io.spawnBlocking(computeExpensiveHash, .{data});
 
 // DO: Use tryX() when you can handle failure immediately (no Io needed)
@@ -477,7 +477,7 @@ var ch = try volt.channel.bounded(Job, allocator, 1000);
 
 ```zig
 // DON'T: Block the I/O thread with CPU-heavy work
-fn handleRequest(io: volt.Io, conn: volt.net.TcpStream) void {
+fn handleRequest(io: volt.Runtime, conn: volt.net.TcpStream) void {
     // BAD: This blocks a scheduler worker thread
     const hash = expensiveSha256(huge_payload);
     // GOOD: Offload to blocking pool
@@ -485,7 +485,7 @@ fn handleRequest(io: volt.Io, conn: volt.net.TcpStream) void {
 }
 
 // DON'T: Use OS blocking primitives inside async tasks
-fn badTask(io: volt.Io) void {
+fn badTask(io: volt.Runtime) void {
     std.Thread.sleep(1_000_000_000);  // BAD: blocks worker thread
     io.sleep(volt.time.Duration.fromSecs(1));  // GOOD: yields to scheduler
 }

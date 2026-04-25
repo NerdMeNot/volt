@@ -91,12 +91,12 @@ Single-value channel with change notification. Only the latest value is kept. Id
 Non-blocking operations that work anywhere, with or without a runtime. Examples: `tryLock()`, `tryAcquire()`, `trySend()`, `tryRecv()`. Return immediately with success/failure.
 
 **x(io) (Tier 2)**
-Convenience methods that take the `io: volt.Io` handle and suspend the task until the operation completes. Examples: `mutex.lock(io)`, `ch.send(io, val)`, `sem.acquire(io, n)`.
+Convenience methods that take the `io: volt.Runtime` handle and suspend the task until the operation completes. Examples: `mutex.lock(io)`, `ch.send(io, val)`, `sem.acquire(io, n)`.
 
 ## Additional Terms
 
 **Convenience API**
-The "Tier 2" methods that take `io: volt.Io` and suspend the calling task until the operation completes. For example, `mutex.lock(io)` and `ch.send(io, val)`. This is the recommended starting point for async code.
+The "Tier 2" methods that take `io: volt.Runtime` and suspend the calling task until the operation completes. For example, `mutex.lock(io)` and `ch.send(io, val)`. This is the recommended starting point for async code.
 
 **Future API**
 The lower-level API that returns `Future` objects for manual composition. For example, `mutex.lockFuture()` and `ch.sendFuture(val)`. Use when building combinators or integrating with custom schedulers.

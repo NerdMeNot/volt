@@ -106,7 +106,7 @@ pub fn main() !void {
     try volt.run(server);
 }
 
-fn server(io: volt.Io) void {
+fn server(io: volt.Runtime) void {
     var listener = volt.net.TcpListener.bind(
         volt.net.Address.fromPort(8080),
     ) catch |err| {
@@ -486,7 +486,7 @@ fn cleanupTask(
 Spawn the cleanup task at server startup alongside the accept loop:
 
 ```zig
-fn server(io: volt.Io) void {
+fn server(io: volt.Runtime) void {
     // ... listener setup ...
 
     // Spawn the cleanup task in the background.

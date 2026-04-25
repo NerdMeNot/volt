@@ -8,7 +8,7 @@ const testing = std.testing;
 const Atomic = std.atomic.Value;
 
 const volt = @import("volt");
-const Io = volt.Io;
+const Runtime = volt.Runtime;
 const Context = volt.future.Context;
 const PollResult = volt.future.PollResult;
 
@@ -56,7 +56,7 @@ const CounterFuture = struct {
 test "Scheduler - 100 tasks on 2 workers all complete" {
     const num_tasks = 100;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 2 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 2 });
     defer io.deinit();
 
     var tids: [num_tasks]Atomic(usize) = undefined;
@@ -86,7 +86,7 @@ test "Scheduler - 100 tasks on 2 workers all complete" {
 test "Spawn batch - 100 tasks all complete" {
     const num_tasks = 100;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var counter = Atomic(usize).init(0);
@@ -103,7 +103,7 @@ test "Spawn batch - 100 tasks all complete" {
 test "Sequential spawn+await - 50 rounds" {
     const rounds = 50;
 
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var counter = Atomic(usize).init(0);
@@ -117,7 +117,7 @@ test "Sequential spawn+await - 50 rounds" {
 }
 
 test "Dynamic spawn under load" {
-    var io = try Io.init(testing.allocator, .{ .num_workers = 4 });
+    var io = try Runtime.init(testing.allocator, .{ .num_workers = 4 });
     defer io.deinit();
 
     var counter = Atomic(usize).init(0);

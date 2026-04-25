@@ -312,7 +312,7 @@ The semaphore is initialized with `max_size` permits. Each `acquire` takes one p
 In a fully async context you would use the synchronous convenience method on the semaphore with a deadline check:
 
 ```zig
-// Inside an async task that receives an `io: *volt.Io` handle:
+// Inside an async task that receives an `io: *volt.Runtime` handle:
 var deadline = volt.time.Deadline.init(volt.Duration.fromSecs(5));
 if (!deadline.isExpired()) {
     pool.semaphore.acquire(io, 1);

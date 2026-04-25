@@ -388,7 +388,7 @@ const volt = @import("volt");
 const MAX_CONCURRENT_READS = 8;
 
 fn processFilesParallel(
-    io: volt.Io,
+    io: volt.Runtime,
     allocator: std.mem.Allocator,
     paths: []const []const u8,
 ) !void {

@@ -7,7 +7,7 @@ Tasks are the unit of concurrency in Volt -- lightweight async functions that ru
 
 The typical workflow: **spawn** a function as a task with `io.@"async"()`, do other work, then **await** the result with `future.@"await"(io)`. The scheduler distributes tasks across worker threads automatically, stealing work from busy workers to keep all cores fed. You write sequential-looking code; the runtime handles parallelism.
 
-All spawn and combinator operations go through an explicit `io: volt.Io` handle, following the same pattern Zig uses for `Allocator` -- if a function needs async capabilities, it takes an `io` parameter.
+All spawn and combinator operations go through an explicit `io: volt.Runtime` handle, following the same pattern Zig uses for `Allocator` -- if a function needs async capabilities, it takes an `io` parameter.
 
 For coordinating multiple tasks, Volt provides combinators inspired by Rust's futures:
 
@@ -25,7 +25,7 @@ pub fn main() !void {
     try volt.run(myApp);
 }
 
-fn myApp(io: volt.Io) !void {
+fn myApp(io: volt.Runtime) !void {
     // Spawn a function as a concurrent task
     const future = try io.@"async"(fetchUser, .{user_id});
     const user = future.@"await"(io);  // await the result
@@ -49,7 +49,7 @@ fn myApp(io: volt.Io) !void {
 }
 ```
 
-All spawn and combinator methods are on the `io: volt.Io` handle.
+All spawn and combinator methods are on the `io: volt.Runtime` handle.
 
 ## Spawning Tasks
 
@@ -57,7 +57,7 @@ All spawn and combinator methods are on the `io: volt.Io` handle.
 
 ```zig
 pub fn @"async"(
-    io: volt.Io,
+    io: volt.Runtime,
     comptime func: anytype,
     args: anytype,
 ) !IoFuture(FnReturnType(@TypeOf(func)))
@@ -117,7 +117,7 @@ fn fetchPosts(user_id: u64) ![]const Post {
     };
 }
 
-fn loadUserProfile(io: volt.Io, user_id: u64) !void {
+fn loadUserProfile(io: volt.Runtime, user_id: u64) !void {
     // Kick off both requests concurrently. Each @"async" schedules
     // the function on the work-stealing runtime immediately.
     const user_f = try io.@"async"(fetchUser, .{user_id});
@@ -134,7 +134,7 @@ fn loadUserProfile(io: volt.Io, user_id: u64) !void {
 
 pub fn main() !void {
     try volt.run(struct {
-        fn entry(io: volt.Io) !void {
+        fn entry(io: volt.Runtime) !void {
             try loadUserProfile(io, 42);
         }
     }.entry);
@@ -151,7 +151,7 @@ const sync = volt.sync;
 
 var config_mutex = sync.Mutex.init();
 
-fn updateConfig(io: volt.Io, new_config: Config) !void {
+fn updateConfig(io: volt.Runtime, new_config: Config) !void {
     // Validate concurrently while we wait for the lock
     const valid_f = try io.@"async"(validateConfig, .{new_config});
 
@@ -182,7 +182,7 @@ const val = channel.recv(io);   // suspends until value available
 
 ```zig
 pub fn concurrent(
-    io: volt.Io,
+    io: volt.Runtime,
     comptime func: anytype,
     args: anytype,
 ) !*BlockingHandle(FnReturnType(@TypeOf(func)))
@@ -251,7 +251,7 @@ fn parseCsv(raw: []const u8) ![]Record {
     return records.items;
 }
 
-fn processDataFile(io: volt.Io, path: []const u8) !void {
+fn processDataFile(io: volt.Runtime, path: []const u8) !void {
     // Step 1: Read file on blocking pool. The async worker that
     // runs this task is NOT blocked -- it continues polling other
     // tasks while the blocking thread does the read.
@@ -280,8 +280,8 @@ const Future = volt.Future;
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `@"await"` | `fn @"await"(self: *Self, io: volt.Io) Result` | Suspend until the task completes and return its result. Takes the `Io` handle. |
-| `cancel` | `fn cancel(self: *Self, io: volt.Io) Result` | Cancel the task and wait for completion. This is NOT fire-and-forget -- it blocks until the task finishes. |
+| `@"await"` | `fn @"await"(self: *Self, io: volt.Runtime) Result` | Suspend until the task completes and return its result. Takes the `Runtime` handle. |
+| `cancel` | `fn cancel(self: *Self, io: volt.Runtime) Result` | Cancel the task and wait for completion. This is NOT fire-and-forget -- it blocks until the task finishes. |
 | `isDone` | `fn isDone(self: *const Self) bool` | Check if the task has completed (does not consume the result). |
 
 ### Usage Patterns
@@ -293,7 +293,7 @@ the result. `@"await"` suspends the calling task until the spawned
 task completes.
 
 ```zig
-fn fetchReport(io: volt.Io, report_id: u64) !Report {
+fn fetchReport(io: volt.Runtime, report_id: u64) !Report {
     // Spawn the database query as a background task.
     const future = try io.@"async"(queryDatabase, .{report_id});
 
@@ -312,7 +312,7 @@ fn fetchReport(io: volt.Io, report_id: u64) !Report {
 Use `isDone` when you want to check if a task has completed without blocking.
 
 ```zig
-fn progressLoop(io: volt.Io) !void {
+fn progressLoop(io: volt.Runtime) !void {
     const future = try io.@"async"(longComputation, .{});
 
     var ticks: u32 = 0;
@@ -334,7 +334,7 @@ Discard the future to let the task run in the background. The task
 continues running to completion, but the result is discarded.
 
 ```zig
-fn emitAnalyticsEvent(io: volt.Io, event: AnalyticsEvent) !void {
+fn emitAnalyticsEvent(io: volt.Runtime, event: AnalyticsEvent) !void {
     // We do not want to wait for the network call to finish.
     // Spawn and discard the future.
     _ = try io.@"async"(sendToAnalytics, .{event});
@@ -354,12 +354,12 @@ It is NOT fire-and-forget -- the call blocks until the task finishes.
 If the task has already completed, `cancel` returns the result immediately.
 
 ```zig
-fn fetchWithTimeout(io: volt.Io, url: []const u8, deadline_ms: u64) !?[]const u8 {
+fn fetchWithTimeout(io: volt.Runtime, url: []const u8, deadline_ms: u64) !?[]const u8 {
     const fetch_f = try io.@"async"(httpGet, .{url});
 
     // Spawn a sleep as the deadline timer.
     const timer_f = try io.@"async"(struct {
-        fn sleep(io_inner: volt.Io, ms: u64) void {
+        fn sleep(io_inner: volt.Runtime, ms: u64) void {
             io_inner.sleep(volt.time.Duration.fromMillis(ms));
         }
     }.sleep, .{ io, deadline_ms });
@@ -400,7 +400,7 @@ Higher-level functions for coordinating multiple tasks.
 ### `joinAll`
 
 ```zig
-pub fn joinAll(io: volt.Io, futures: anytype) JoinAllResult(@TypeOf(futures))
+pub fn joinAll(io: volt.Runtime, futures: anytype) JoinAllResult(@TypeOf(futures))
 ```
 
 Wait for all tasks to complete. Returns a tuple of results. Fails on the first error (remaining tasks continue running).
@@ -451,7 +451,7 @@ const ProductPage = struct {
     reviews: Reviews,
 };
 
-fn buildProductPage(io: volt.Io, product_id: u64) !ProductPage {
+fn buildProductPage(io: volt.Runtime, product_id: u64) !ProductPage {
     // Scatter: spawn all three requests concurrently.
     const inv_f = try io.@"async"(fetchInventory, .{product_id});
     const price_f = try io.@"async"(fetchPricing, .{product_id});
@@ -478,7 +478,7 @@ fn buildProductPage(io: volt.Io, product_id: u64) !ProductPage {
 ### `tryJoinAll`
 
 ```zig
-pub fn tryJoinAll(io: volt.Io, futures: anytype) TryJoinAllResult(@TypeOf(futures))
+pub fn tryJoinAll(io: volt.Runtime, futures: anytype) TryJoinAllResult(@TypeOf(futures))
 ```
 
 Wait for all tasks, collecting both successes and errors. Does not fail early -- waits for every task.
@@ -500,7 +500,7 @@ When you need results from as many sources as possible, even if some
 fail. Unlike `joinAll`, this does not short-circuit on the first error.
 
 ```zig
-fn fetchFromAllRegions(io: volt.Io, key: []const u8) !void {
+fn fetchFromAllRegions(io: volt.Runtime, key: []const u8) !void {
     const us_f = try io.@"async"(fetchFromRegion, .{ "us-east-1", key });
     const eu_f = try io.@"async"(fetchFromRegion, .{ "eu-west-1", key });
     const ap_f = try io.@"async"(fetchFromRegion, .{ "ap-south-1", key });
@@ -565,7 +565,7 @@ Individual result type used by `tryJoinAll`.
 ### `race`
 
 ```zig
-pub fn race(io: volt.Io, futures: anytype) RaceResult(@TypeOf(futures))
+pub fn race(io: volt.Runtime, futures: anytype) RaceResult(@TypeOf(futures))
 ```
 
 First task to complete wins. Remaining tasks are cancelled.
@@ -615,7 +615,7 @@ fn fetchFromDatabase(user_id: u64) !UserProfile {
     };
 }
 
-fn getUser(io: volt.Io, user_id: u64) !UserProfile {
+fn getUser(io: volt.Runtime, user_id: u64) !UserProfile {
     // Both run concurrently. The race combinator returns the result
     // of whichever task completes first and cancels the other.
     //
@@ -652,7 +652,7 @@ fn fetchFromCacheOrNull(user_id: u64) !UserProfile {
 ### `select`
 
 ```zig
-pub fn select(io: volt.Io, futures: anytype) SelectResult(@TypeOf(futures))
+pub fn select(io: volt.Runtime, futures: anytype) SelectResult(@TypeOf(futures))
 ```
 
 First task to complete is returned. Remaining tasks keep running (not cancelled).
@@ -672,7 +672,7 @@ event that fires, along with the index indicating which source produced
 it. The other tasks remain active for future selects.
 
 ```zig
-fn eventLoop(io: volt.Io) !void {
+fn eventLoop(io: volt.Runtime) !void {
     const config_f = try io.@"async"(watchConfigChanges, .{});
     const health_f = try io.@"async"(watchHealthChecks, .{});
     const metric_f = try io.@"async"(watchMetricAlerts, .{});
@@ -808,7 +808,7 @@ const Job = struct { payload: []const u8 };
 
 /// The supervisor spawns workers and restarts them on failure.
 /// It runs until a shutdown event is received.
-fn supervisor(io: volt.Io, worker_count: u32) !void {
+fn supervisor(io: volt.Runtime, worker_count: u32) !void {
     var allocator = std.heap.page_allocator;
 
     var jobs = try channel.bounded(Job, allocator, 256);
@@ -870,7 +870,7 @@ no orphaned tasks linger after a timeout or shutdown.
 ```zig
 const volt = @import("volt");
 
-fn parentTask(io: volt.Io, urls: []const []const u8) ![]const u8 {
+fn parentTask(io: volt.Runtime, urls: []const []const u8) ![]const u8 {
     // Spawn a child task for each URL.
     var futures: [8]?volt.Future([]const u8) = .{null} ** 8;
     const count = @min(urls.len, futures.len);
@@ -908,7 +908,7 @@ fn childFetch(url: []const u8) ![]const u8 {
 }
 
 /// Usage: cancel the parent and all children are cleaned up.
-fn runWithTimeout(io: volt.Io) !void {
+fn runWithTimeout(io: volt.Runtime) !void {
     const parent_f = try io.@"async"(parentTask, .{
         io,
         &[_][]const u8{ "/api/a", "/api/b", "/api/c" },
@@ -918,7 +918,7 @@ fn runWithTimeout(io: volt.Io) !void {
     // cancel it. The errdefer inside parentTask will cascade the
     // cancellation to all children.
     const timer_f = try io.@"async"(struct {
-        fn wait(io_inner: volt.Io) void {
+        fn wait(io_inner: volt.Runtime) void {
             io_inner.sleep(volt.time.Duration.fromSecs(5));
         }
     }.wait, .{io});
@@ -1042,7 +1042,7 @@ fn sinkStage(input: *channel.Channel(EnrichedEvent)) void {
 }
 
 /// Wire up the pipeline: producer -> parse -> enrich -> sink.
-fn runPipeline(io: volt.Io) !void {
+fn runPipeline(io: volt.Runtime) !void {
     var allocator = std.heap.page_allocator;
 
     // Create channels between stages. The capacity acts as

@@ -225,7 +225,7 @@ For programmatic pipelines, spawn processes with `.pipe` I/O and connect them ma
 Inside the runtime, wrap blocking waits with `io.concurrent()`:
 
 ```zig
-fn runBuild(io: volt.Io) !volt.process.ExitStatus {
+fn runBuild(io: volt.Runtime) !volt.process.ExitStatus {
     var f = try io.concurrent(struct {
         fn run() !volt.process.ExitStatus {
             return volt.process.run(&.{ "cargo", "build", "--release" });

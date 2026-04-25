@@ -19,7 +19,7 @@ Use **Select** when you need to wait on multiple channels at once -- like a `sel
 ```zig
 const volt = @import("volt");
 
-fn example(io: volt.Io) void {
+fn example(io: volt.Runtime) void {
     // Work queue: producers push, consumers pull
     var ch = try volt.channel.bounded(u32, allocator, 256);
     defer ch.deinit();
@@ -138,10 +138,10 @@ switch (ch.trySend(42)) {
 #### `send(io, value)` (Convenience)
 
 ```zig
-pub fn send(self: *Channel(T), io: volt.Io, value: T) void
+pub fn send(self: *Channel(T), io: volt.Runtime, value: T) void
 ```
 
-Convenience method that suspends the current task until the value is sent or the channel closes. Takes the `Io` handle.
+Convenience method that suspends the current task until the value is sent or the channel closes. Takes the `Runtime` handle.
 
 ```zig
 ch.send(io, 42);  // suspends if buffer is full
@@ -180,7 +180,7 @@ switch (ch.tryRecv()) {
 #### `recv(io)` (Convenience)
 
 ```zig
-pub fn recv(self: *Channel(T), io: volt.Io) ?T
+pub fn recv(self: *Channel(T), io: volt.Runtime) ?T
 ```
 
 Convenience method that suspends the current task until a value is available. Returns `null` if the channel is closed and drained.
@@ -273,7 +273,7 @@ const OutputEntry = struct {
     severity: u8,
 };
 
-fn runPipeline(io: volt.Io, allocator: std.mem.Allocator) !void {
+fn runPipeline(io: volt.Runtime, allocator: std.mem.Allocator) !void {
     // Stage channels: raw lines -> parsed records -> output entries.
     // Capacity controls how far each stage can run ahead of the next.
     var raw_to_parsed = try Channel(RawLine).init(allocator, 64);
@@ -284,7 +284,7 @@ fn runPipeline(io: volt.Io, allocator: std.mem.Allocator) !void {
 
     // Stage 1: Reader -- pushes raw lines using convenience send.
     const reader_f = try io.@"async"(struct {
-        fn run(ch_io: volt.Io, ch: *Channel(RawLine)) void {
+        fn run(ch_io: volt.Runtime, ch: *Channel(RawLine)) void {
             const lines = [_][]const u8{
                 "2025-01-15T10:00:00Z INFO  Server started on :8080",
                 "2025-01-15T10:00:01Z DEBUG Connection accepted from 192.168.1.1",
@@ -304,7 +304,7 @@ fn runPipeline(io: volt.Io, allocator: std.mem.Allocator) !void {
     // Stage 2: Parser -- reads raw lines, writes parsed records.
     const parser_f = try io.@"async"(struct {
         fn run(
-            ch_io: volt.Io,
+            ch_io: volt.Runtime,
             input: *Channel(RawLine),
             output: *Channel(ParsedRecord),
         ) void {
@@ -362,7 +362,7 @@ const HttpResponse = struct {
     body_len: usize,
 };
 
-fn fanOutFanIn(io: volt.Io, allocator: std.mem.Allocator) !void {
+fn fanOutFanIn(io: volt.Runtime, allocator: std.mem.Allocator) !void {
     var requests = try Channel(HttpRequest).init(allocator, 128);
     defer requests.deinit();
 
@@ -376,7 +376,7 @@ fn fanOutFanIn(io: volt.Io, allocator: std.mem.Allocator) !void {
     for (&worker_futures) |*f| {
         f.* = try io.@"async"(struct {
             fn work(
-                w_io: volt.Io,
+                w_io: volt.Runtime,
                 req_ch: *Channel(HttpRequest),
                 resp_ch: *Channel(HttpResponse),
             ) void {
@@ -477,7 +477,7 @@ Non-blocking receive. Returns `null` if no value yet.
 #### `recv(io)` (Convenience)
 
 ```zig
-pub fn recv(self: *Receiver, io: volt.Io) RecvResult
+pub fn recv(self: *Receiver, io: volt.Runtime) RecvResult
 ```
 
 ```zig
@@ -569,7 +569,7 @@ const DnsRequest = struct {
     reply: *Oneshot(DnsResult).Sender,
 };
 
-fn dnsClient(io: volt.Io, request_queue: *Channel(DnsRequest)) !void {
+fn dnsClient(io: volt.Runtime, request_queue: *Channel(DnsRequest)) !void {
     // Client side: submit a query and wait for the reply.
     var reply_channel = Oneshot(DnsResult).init();
 
@@ -592,7 +592,7 @@ fn dnsClient(io: volt.Io, request_queue: *Channel(DnsRequest)) !void {
     }
 }
 
-fn dnsResolver(io: volt.Io, queue: *Channel(DnsRequest)) void {
+fn dnsResolver(io: volt.Runtime, queue: *Channel(DnsRequest)) void {
     while (queue.recv(io)) |req| {
         // Simulate DNS resolution.
         const result = DnsResult{
@@ -679,7 +679,7 @@ const TryRecvResult = union(enum) {
 #### `recv(io)` (Convenience)
 
 ```zig
-pub fn recv(self: *Receiver(T), io: volt.Io) RecvResult(T)
+pub fn recv(self: *Receiver(T), io: volt.Runtime) RecvResult(T)
 ```
 
 ```zig
@@ -770,7 +770,7 @@ const AppEvent = union(enum) {
     health: HealthCheck,
 };
 
-fn eventBus(io: volt.Io, allocator: std.mem.Allocator) !void {
+fn eventBus(io: volt.Runtime, allocator: std.mem.Allocator) !void {
     // Buffer 64 events. Slow receivers will see .lagged instead of blocking senders.
     var bus = try BroadcastChannel(AppEvent).init(allocator, 64);
     defer bus.deinit();
@@ -778,7 +778,7 @@ fn eventBus(io: volt.Io, allocator: std.mem.Allocator) !void {
     // Log sink: only cares about log events.
     var log_rx = bus.subscribe();
     const log_f = try io.@"async"(struct {
-        fn run(sink_io: volt.Io, rx: *BroadcastChannel(AppEvent).Receiver) void {
+        fn run(sink_io: volt.Runtime, rx: *BroadcastChannel(AppEvent).Receiver) void {
             var log_count: usize = 0;
             while (true) {
                 switch (rx.recv(sink_io)) {
@@ -804,7 +804,7 @@ fn eventBus(io: volt.Io, allocator: std.mem.Allocator) !void {
     // Metrics collector: only cares about metric events.
     var metrics_rx = bus.subscribe();
     const metrics_f = try io.@"async"(struct {
-        fn run(sink_io: volt.Io, rx: *BroadcastChannel(AppEvent).Receiver) void {
+        fn run(sink_io: volt.Runtime, rx: *BroadcastChannel(AppEvent).Receiver) void {
             var sum: f64 = 0;
             var count: usize = 0;
             while (true) {
@@ -910,7 +910,7 @@ Create a receiver at the current version.
 #### `changed(io)` (Convenience)
 
 ```zig
-pub fn changed(self: *Receiver(T), io: volt.Io) ChangedResult
+pub fn changed(self: *Receiver(T), io: volt.Runtime) ChangedResult
 ```
 
 ```zig
@@ -923,7 +923,7 @@ const ChangedResult = union(enum) {
 Convenience method that suspends the current task until the value changes or the sender closes. Returns a `ChangedResult` indicating the outcome.
 
 ```zig
-fn watchForConfigChanges(io: volt.Io, rx: *Watch(Config).Receiver) void {
+fn watchForConfigChanges(io: volt.Runtime, rx: *Watch(Config).Receiver) void {
     while (true) {
         switch (rx.changed(io)) {
             .changed => {
@@ -985,13 +985,13 @@ const default_config = AppConfig{
     .feature_flags = .{},
 };
 
-fn configReloadDemo(io: volt.Io) !void {
+fn configReloadDemo(io: volt.Runtime) !void {
     var config_watch = Watch(AppConfig).init(default_config);
 
     // Worker task: adapts behavior based on the latest config.
     var worker_rx = config_watch.subscribe();
     const worker_f = try io.@"async"(struct {
-        fn run(w_io: volt.Io, rx: *Watch(AppConfig).Receiver) void {
+        fn run(w_io: volt.Runtime, rx: *Watch(AppConfig).Receiver) void {
             var config_version: u64 = 0;
 
             // Read initial config.
@@ -1133,7 +1133,7 @@ const WorkItem = struct {
 const TimerTick = struct { tick_number: u64 };
 const ShutdownSignal = struct { reason: []const u8 };
 
-fn multiplexedServer(io: volt.Io, allocator: std.mem.Allocator) !void {
+fn multiplexedServer(io: volt.Runtime, allocator: std.mem.Allocator) !void {
     var work_ch = try Channel(WorkItem).init(allocator, 256);
     defer work_ch.deinit();
 
@@ -1145,7 +1145,7 @@ fn multiplexedServer(io: volt.Io, allocator: std.mem.Allocator) !void {
 
     // Timer task: emits periodic ticks for housekeeping.
     const timer_f = try io.@"async"(struct {
-        fn run(t_io: volt.Io, ch: *Channel(TimerTick)) void {
+        fn run(t_io: volt.Runtime, ch: *Channel(TimerTick)) void {
             var tick: u64 = 0;
             while (true) {
                 std.Thread.sleep(10_000_000); // 10ms
@@ -1158,7 +1158,7 @@ fn multiplexedServer(io: volt.Io, allocator: std.mem.Allocator) !void {
 
     // Producer task: enqueues work items.
     const producer_f = try io.@"async"(struct {
-        fn run(p_io: volt.Io, ch: *Channel(WorkItem)) void {
+        fn run(p_io: volt.Runtime, ch: *Channel(WorkItem)) void {
             const items = [_]WorkItem{
                 .{ .id = 1, .payload = "process_order", .priority = .high },
                 .{ .id = 2, .payload = "send_email", .priority = .normal },
