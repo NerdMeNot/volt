@@ -1,19 +1,39 @@
 //! # Volt — A stackful coroutine runtime for Zig
 //!
-//! Status: rebuilding. The stackless implementation has been stripped; the
-//! stackful rewrite is in progress. Public API is intentionally tiny right
-//! now — it grows as the new core comes online.
+//! Status: v0.1 — bootstrap + minimal scheduler. Public API:
+//!   - volt.run(allocator, fn, args)  — entry point; runs root coroutine
+//!   - volt.launch(fn, args)            — fire-and-forget; returns *Job
+//!   - volt.spawn(fn, args)             — value-returning; returns *Task(T)
+//!   - volt.yield()                     — explicit reschedule + cancel check
+//!   - Job/Task: cancel(), isActive(), isCompleted(), join()
 //!
-//! Spike validation (Darwin-ARM64, ReleaseFast):
-//!   - 10ns/switch one-way   (12-15× faster than Go)
-//!   - 622ns/spawn (gpa)     (~5× faster than Go)
-//!
-//! See `docs/design/api-design.md` for the API roadmap (forthcoming).
+//! Single-threaded scheduler in v0.1; multi-worker work-stealing in v0.9.
+//! No I/O integration yet (v0.2). No channels (v0.3). No structured
+//! concurrency (v0.5). See `docs/design/api-design.md` for the full roadmap.
 
 const std = @import("std");
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Time primitives — kept from the prior tree (model-agnostic types)
+// Public API — the user-facing surface
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const run = @import("api/run.zig").run;
+pub const launch = @import("api/launch.zig").launch;
+pub const destroyJob = @import("api/launch.zig").destroyJob;
+pub const spawn = @import("api/spawn.zig").spawn;
+pub const destroyTask = @import("api/spawn.zig").destroyTask;
+pub const yield = @import("api/yield.zig").yield;
+
+pub const Runtime = @import("runtime.zig").Runtime;
+pub const Config = @import("runtime.zig").Config;
+pub const Job = @import("task/job.zig").Job;
+pub const Task = @import("task/task.zig").Task;
+
+/// The currently-active runtime, if any. Returns null if not inside `volt.run`.
+pub const currentRuntime = @import("runtime.zig").currentRuntime;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Time primitives — model-agnostic types
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub const time = @import("time.zig");
@@ -21,26 +41,27 @@ pub const Duration = time.Duration;
 pub const Instant = time.Instant;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Internal — kept platform infrastructure
-//
-// These layers are execution-model agnostic. They survived the stackful
-// pivot because the rebuilt scheduler / I/O integration / sync primitives
-// will sit on top of them.
+// Internal building blocks — exposed for benchmarks/tests, not for users
 // ─────────────────────────────────────────────────────────────────────────────
 
+pub const coroutine = struct {
+    pub const Coroutine = @import("coroutine/coroutine.zig").Coroutine;
+    pub const State = @import("coroutine/coroutine.zig").State;
+    pub const ClosureBase = @import("coroutine/coroutine.zig").ClosureBase;
+    pub const stack = @import("coroutine/stack.zig");
+    pub const context = @import("coroutine/context_arm64.zig");
+    pub const spawn_helper = @import("coroutine/spawn.zig");
+};
+
+pub const scheduler = struct {
+    pub const tls = @import("scheduler/tls.zig");
+    pub const ReadyQueue = @import("scheduler/ready_queue.zig").ReadyQueue;
+    pub const Scheduler = @import("scheduler/scheduler.zig").Scheduler;
+};
+
 pub const internal = struct {
-    /// Raw thread-level sync primitives: Mutex, Condition, Futex, sleep.
-    /// 0.16 moved std.Thread.{Mutex,Condition,Futex,sleep} into std.Io;
-    /// these are Volt's own raw versions for use inside the runtime itself.
     pub const thread = @import("internal/thread.zig");
-
-    /// Raw syscall wrappers (socket, pipe, fcntl, kqueue, etc.) — replaces
-    /// the medium-level `std.posix.*` functions removed in 0.16.
     pub const syscall = @import("internal/syscall.zig");
-
-    /// Utility data structures kept because they're useful for any runtime:
-    /// intrusive linked list, slab allocator, object pool, stack guard,
-    /// cacheline alignment, bit manipulation.
     pub const util = struct {
         pub const linked_list = @import("internal/util/linked_list.zig");
         pub const slab = @import("internal/util/slab.zig");
@@ -65,11 +86,27 @@ pub const version = struct {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tests — pulls in inline tests from kept files only.
+// Tests — pull in inline tests from every module so `zig build test` covers
+// the whole tree.
 // ─────────────────────────────────────────────────────────────────────────────
 
 test {
     _ = time;
+    _ = coroutine.Coroutine;
+    _ = coroutine.stack;
+    _ = coroutine.context;
+    _ = coroutine.spawn_helper;
+    _ = scheduler.tls;
+    _ = scheduler.ReadyQueue;
+    _ = scheduler.Scheduler;
+    _ = Runtime;
+    _ = Job;
+    _ = @import("task/task.zig");
+    _ = @import("api/yield.zig");
+    _ = @import("api/launch.zig");
+    _ = @import("api/spawn.zig");
+    _ = @import("api/run.zig");
+    _ = @import("test/integration_test.zig");
     _ = internal.thread;
     _ = internal.syscall;
     _ = internal.util.linked_list;

@@ -25,33 +25,43 @@ zig build docs         # Generate API documentation
 The grand `test-all` / `test-stress` / `test-concurrency` / `bench` targets
 were removed with the stackless tree. They come back as the new core lands.
 
-## Current state (rebuilding)
+## Current state — v0.1 landed (2026-04-26)
 
 ```
 src/
-├── lib.zig                  # Public API entry — minimal scaffold
+├── lib.zig                  # Public API: run, launch, spawn, yield,
+│                            # Task, Job, Runtime
+├── runtime.zig              # Runtime wrapper around Scheduler + Config
 ├── time.zig                 # Duration, Instant types (model-agnostic)
-└── internal/
-    ├── thread/              # Mutex, Condition, Futex, sleep
-    │                        # Volt's own thread primitives — std.Thread.*
-    │                        # equivalents moved to std.Io in 0.16
-    ├── syscall.zig          # Raw syscall wrappers — replaces removed
-    │                        # medium-level std.posix.* functions
-    └── util/
-        ├── linked_list.zig  # Intrusive doubly-linked list
-        ├── slab.zig         # Slab allocator
-        ├── pool.zig         # Object pool (lock-free)
-        ├── stack_guard.zig  # Magic-number stack overflow detection
-        ├── cacheline.zig    # Cache-line alignment
-        ├── bit.zig          # Bit manipulation
-        ├── invocation_id.zig # ABA-protection IDs
-        └── signal.zig       # Signal handling helpers
+├── coroutine/               # The stackful primitive
+│   ├── coroutine.zig        # Coroutine struct, State, ClosureBase, cancel
+│   ├── context_arm64.zig    # AAPCS64 ctx switch + naked trampoline
+│   ├── stack.zig            # 64KB heap stacks (4KB at v0.9 with guards)
+│   └── spawn.zig            # Comptime-specialized closure factory + create()
+├── scheduler/               # FIFO single-threaded dispatch (v0.9 → workers)
+│   ├── scheduler.zig        # Dispatch loop, run, runUntilDone
+│   ├── ready_queue.zig      # Simple FIFO
+│   └── tls.zig              # Thread-local current_coro / current_rt
+├── api/                     # User-facing free functions
+│   ├── run.zig              # Bootstrap entry: spawn root, drain, return
+│   ├── launch.zig           # Fire-and-forget → *Job
+│   ├── spawn.zig            # Value-returning → *Task(T)
+│   └── yield.zig            # Reschedule + cancellation point
+├── task/                    # Handles
+│   ├── job.zig              # cancel, isActive, isCompleted, join
+│   └── task.zig             # Task(T): Job + typed join() with errunion
+├── test/
+│   └── integration_test.zig # 7 acceptance tests for v0.1
+└── internal/                # Platform internals (kept from prior tree)
+    ├── thread/              # Mutex, Condition, Futex, sleep — std.Thread.*
+    ├── syscall.zig          # Raw syscalls — replaces medium-level std.posix
+    └── util/                # linked_list, slab, pool, stack_guard,
+                             # cacheline, bit, invocation_id, signal
 
-spike/coroutines/             # Stackful spike — REFERENCE, will be deleted
-                              # once the production rewrite lands
-attic/                        # Archived for reference, will be deleted at v1
-├── concurrency-tests/        # Loom-style harness from prior tree
-└── vyukov_channel_reference.zig  # The optimized MPMC algorithm
+spike/coroutines/             # Stackful spike — kept until v0.9 perf parity
+attic/                        # Archived for reference, deleted at v1.0
+├── concurrency-tests/
+└── vyukov_channel_reference.zig
 ```
 
 ## Spike validation (Darwin-ARM64, ReleaseFast)
@@ -66,20 +76,22 @@ Numbers from `spike/coroutines/bench_switch.zig`. Stack size currently 64KB
 
 ## Roadmap (toward v1.0.0-zig0.16.0)
 
-| Version | Scope |
-|---|---|
-| v0.1 | Scheduler + run/launch/yield/scope (working coroutines, no I/O) |
-| v0.2 | I/O integration (kqueue/epoll/io_uring → coroutine wake) |
-| v0.3 | Channels + select |
-| v0.4 | Sync primitives (Mutex, Semaphore, Notify) |
-| v0.5 | Structured concurrency (scope, supervisor, cancellation) |
-| v0.6 | Streams/flows |
-| v0.7 | Timers (sleep, interval, withTimeout) |
-| v0.8 | Blocking pool, dispatcher abstraction |
-| v0.9 | Hardening (multi-arch asm, guard pages, slab pool) |
-| v1.0 | Ship |
+| Version | Scope | Status |
+|---|---|---|
+| v0.1 | Scheduler + run/launch/spawn/yield/Task/Job/cancel | ✅ done |
+| v0.2 | I/O integration (kqueue/epoll/io_uring → coroutine wake) | next |
+| v0.3 | Channels + select | |
+| v0.4 | Sync primitives (Mutex, Semaphore, Notify) | |
+| v0.5 | Structured concurrency (scope, supervisor, cancellation) | |
+| v0.6 | Streams/flows | |
+| v0.7 | Timers (sleep, interval, withTimeout) | |
+| v0.8 | Blocking pool, dispatcher abstraction | |
+| v0.9 | Hardening (multi-arch asm, guard pages, slab pool) | |
+| v1.0 | Ship | |
 
-Currently at v0.1 starting line.
+v0.1 acceptance: 7 integration tests covering run-with-value, run-with-error,
+spawn+join, launch+join, yield round-robin, cancel→error.Cancelled, and a
+100-coroutine stress smoke. All passing in `zig build test` (Debug).
 
 ## Zig 0.16.x API Notes
 
