@@ -71,6 +71,10 @@ pub const io = struct {
     pub const write = @import("io/io.zig").write;
     pub const writeAll = @import("io/io.zig").writeAll;
     pub const setNonblock = @import("io/io.zig").setNonblock;
+
+    pub const TcpListener = @import("io/net.zig").TcpListener;
+    pub const TcpStream = @import("io/net.zig").TcpStream;
+    pub const Address = @import("io/net.zig").Address;
 };
 
 pub const internal = struct {
@@ -117,6 +121,7 @@ test {
     _ = io.Reactor;
     _ = @import("io/wait.zig");
     _ = @import("io/io.zig");
+    _ = @import("io/net.zig");
     _ = Runtime;
     _ = Job;
     _ = @import("task/task.zig");
@@ -126,6 +131,7 @@ test {
     _ = @import("api/run.zig");
     _ = @import("test/integration_test.zig");
     _ = @import("test/io_integration_test.zig");
+    _ = @import("test/tcp_integration_test.zig");
     _ = internal.thread;
     _ = internal.syscall;
     _ = internal.util.linked_list;
