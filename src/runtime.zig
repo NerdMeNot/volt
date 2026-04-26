@@ -1,11 +1,14 @@
-//! Runtime: top-level handle to the Volt scheduler.
+//! Runtime: top-level handle to the Volt scheduler + reactor.
 //!
 //! Wraps the Scheduler with configuration (default stack size) and the
 //! caller's allocator. Users construct a Runtime via `volt.run(allocator, fn)`
 //! — they don't usually touch this type directly.
 //!
-//! In v0.1 the Runtime is single-threaded with one Scheduler. v0.9 will
-//! generalize to N workers each with their own scheduler instance.
+//! In v0.1 the Runtime was scheduler-only. v0.2 adds the I/O reactor, and
+//! the master dispatch loop moves here so it can interleave coroutine
+//! execution with reactor polling.
+//!
+//! Multi-worker work-stealing arrives in v0.9 — the public surface stays.
 
 const std = @import("std");
 const ctx = @import("coroutine/context_arm64.zig");
@@ -14,6 +17,7 @@ const tls = @import("scheduler/tls.zig");
 const Coroutine = @import("coroutine/coroutine.zig").Coroutine;
 const spawn_mod = @import("coroutine/spawn.zig");
 const stack_mod = @import("coroutine/stack.zig");
+const reactor_mod = @import("io/reactor.zig");
 
 pub const Config = struct {
     /// Default stack size for spawned coroutines.
@@ -24,17 +28,20 @@ pub const Runtime = struct {
     allocator: std.mem.Allocator,
     config: Config,
     scheduler: Scheduler,
+    reactor: reactor_mod.Reactor,
 
-    pub fn init(allocator: std.mem.Allocator, config: Config) Runtime {
+    pub fn init(allocator: std.mem.Allocator, config: Config) !Runtime {
         return .{
             .allocator = allocator,
             .config = config,
             .scheduler = Scheduler.init(allocator),
+            .reactor = try reactor_mod.Reactor.init(allocator),
         };
     }
 
     pub fn deinit(self: *Runtime) void {
         self.scheduler.deinit();
+        self.reactor.deinit();
     }
 
     /// Spawn a coroutine for `user_fn(args)` and add it to the ready queue.
@@ -54,15 +61,30 @@ pub const Runtime = struct {
         return created;
     }
 
-    /// Drain the scheduler — run until the ready queue is empty.
-    pub fn run(self: *Runtime) void {
-        self.scheduler.run(@ptrCast(self));
+    /// Drive the dispatch loop until `until_done.state == .done`. Used by the
+    /// bootstrap (`volt.run`) — we drain enough work for the root coroutine
+    /// to complete; orphan coros are reaped at deinit.
+    pub fn runUntilDone(self: *Runtime, until_done: *Coroutine) void {
+        while (until_done.state != .done) {
+            if (self.scheduler.tryDispatch(@ptrCast(self))) continue;
+
+            // Ready queue is empty. If there are I/O-parked coros, block on
+            // the reactor; otherwise we're genuinely idle and can stop.
+            if (self.reactor.pendingCount() == 0) break;
+
+            _ = self.reactor.poll(null, @ptrCast(self), reactorWake) catch |err| {
+                std.debug.panic("volt runtime: reactor.poll failed: {}", .{err});
+            };
+        }
     }
 
-    /// Drive until the given coroutine reaches `.done`. Used by the bootstrap
-    /// to drain enough work for the root coroutine to complete.
-    pub fn runUntilDone(self: *Runtime, coro: *Coroutine) void {
-        self.scheduler.runUntilDone(coro, @ptrCast(self));
+    /// Reactor wake callback: an event fired, mark the coro runnable and
+    /// re-enqueue it. Signature matches reactor.Reactor.poll's wakeFn param.
+    fn reactorWake(opaque_self: *anyopaque, coro: *Coroutine) anyerror!void {
+        const self: *Runtime = @ptrCast(@alignCast(opaque_self));
+        std.debug.assert(coro.state == .parked);
+        coro.state = .runnable;
+        try self.scheduler.requeue(coro);
     }
 };
 
@@ -73,7 +95,7 @@ pub fn currentRuntime() ?*Runtime {
 }
 
 test "runtime: init/deinit cycle" {
-    var rt = Runtime.init(std.testing.allocator, .{});
+    var rt = try Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
     try std.testing.expectEqual(stack_mod.default_size, rt.config.default_stack_size);
 }

@@ -25,33 +25,40 @@ zig build docs         # Generate API documentation
 The grand `test-all` / `test-stress` / `test-concurrency` / `bench` targets
 were removed with the stackless tree. They come back as the new core lands.
 
-## Current state — v0.1 landed (2026-04-26)
+## Current state — v0.1 + v0.2 landed (2026-04-26)
 
 ```
 src/
 ├── lib.zig                  # Public API: run, launch, spawn, yield,
-│                            # Task, Job, Runtime
-├── runtime.zig              # Runtime wrapper around Scheduler + Config
+│                            # Task, Job, Runtime, io.* (waitReadable etc.)
+├── runtime.zig              # Runtime: orchestrator owning scheduler + reactor
 ├── time.zig                 # Duration, Instant types (model-agnostic)
 ├── coroutine/               # The stackful primitive
-│   ├── coroutine.zig        # Coroutine struct, State, ClosureBase, cancel
+│   ├── coroutine.zig        # Coroutine struct (incl. .waiter), State,
+│   │                        # ClosureBase, cancel
 │   ├── context_arm64.zig    # AAPCS64 ctx switch + naked trampoline
 │   ├── stack.zig            # 64KB heap stacks (4KB at v0.9 with guards)
 │   └── spawn.zig            # Comptime-specialized closure factory + create()
-├── scheduler/               # FIFO single-threaded dispatch (v0.9 → workers)
-│   ├── scheduler.zig        # Dispatch loop, run, runUntilDone
+├── scheduler/               # Queue + dispatch primitive
+│   ├── scheduler.zig        # tryDispatch, enqueue, requeue
 │   ├── ready_queue.zig      # Simple FIFO
-│   └── tls.zig              # Thread-local current_coro / current_rt
+│   ├── tls.zig              # Thread-local current_coro / current_rt
+│   └── park.zig             # parkCurrent (suspend), unpark (resume)
+├── io/                      # v0.2 — async I/O
+│   ├── reactor.zig          # kqueue reactor (epoll on Linux comes next)
+│   ├── wait.zig             # waitReadable / waitWritable
+│   └── io.zig               # async read / write / writeAll, setNonblock
 ├── api/                     # User-facing free functions
 │   ├── run.zig              # Bootstrap entry: spawn root, drain, return
 │   ├── launch.zig           # Fire-and-forget → *Job
 │   ├── spawn.zig            # Value-returning → *Task(T)
 │   └── yield.zig            # Reschedule + cancellation point
-├── task/                    # Handles
+├── task/                    # Handles (v0.2: park-based join via .waiter)
 │   ├── job.zig              # cancel, isActive, isCompleted, join
 │   └── task.zig             # Task(T): Job + typed join() with errunion
 ├── test/
-│   └── integration_test.zig # 7 acceptance tests for v0.1
+│   ├── integration_test.zig    # 7 v0.1 acceptance tests
+│   └── io_integration_test.zig # 2 v0.2 async-I/O tests
 └── internal/                # Platform internals (kept from prior tree)
     ├── thread/              # Mutex, Condition, Futex, sleep — std.Thread.*
     ├── syscall.zig          # Raw syscalls — replaces medium-level std.posix
@@ -79,7 +86,8 @@ Numbers from `spike/coroutines/bench_switch.zig`. Stack size currently 64KB
 | Version | Scope | Status |
 |---|---|---|
 | v0.1 | Scheduler + run/launch/spawn/yield/Task/Job/cancel | ✅ done |
-| v0.2 | I/O integration (kqueue/epoll/io_uring → coroutine wake) | next |
+| v0.2 | kqueue reactor, async wait/read/write, park-based join | ✅ done (Darwin) |
+| v0.2.x | epoll backend (Linux), io_uring at v0.9 | next |
 | v0.3 | Channels + select | |
 | v0.4 | Sync primitives (Mutex, Semaphore, Notify) | |
 | v0.5 | Structured concurrency (scope, supervisor, cancellation) | |
@@ -92,6 +100,10 @@ Numbers from `spike/coroutines/bench_switch.zig`. Stack size currently 64KB
 v0.1 acceptance: 7 integration tests covering run-with-value, run-with-error,
 spawn+join, launch+join, yield round-robin, cancel→error.Cancelled, and a
 100-coroutine stress smoke. All passing in `zig build test` (Debug).
+
+v0.2 acceptance: 2 pipe-based async I/O tests (90/91 total tests pass; 1
+skipped). Reader parks on `EVFILT_READ`, writer wakes via reactor. Job.join
+is now park-based — parent suspends until child .done.
 
 ## Zig 0.16.x API Notes
 

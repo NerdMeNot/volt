@@ -3,8 +3,8 @@
 //! Returned by `volt.spawn(fn, args)`. Extends Job with typed `join()` that
 //! returns the user function's value.
 //!
-//! Lifetime: heap-allocated alongside the coroutine. Calling `Task.deinit()`
-//! is equivalent to dropping it — the underlying coroutine is owned by the
+//! Lifetime: heap-allocated alongside the coroutine. `volt.destroyTask(task)`
+//! releases the Task handle; the underlying coroutine is owned by the
 //! runtime and reaped at runtime deinit.
 
 const std = @import("std");
@@ -49,13 +49,10 @@ pub fn Task(comptime UserFn: type) type {
         }
 
         /// Wait until the coroutine is done; return its value (or an error
-        /// if it threw, or error.Cancelled if it was cancelled).
+        /// if it threw, or error.Cancelled if it was cancelled). Parks the
+        /// calling coroutine via Job.join (scheduler wakes us at .done).
         pub fn join(self: *Self) JoinT {
-            const yield_mod = @import("../api/yield.zig");
-            while (self.job.coro.state != .done) {
-                // v0.1: yield-and-recheck. v0.4 will use proper parking.
-                yield_mod.yield() catch |e| return e;
-            }
+            self.job.join() catch |e| return e;
 
             return switch (self.result.tag) {
                 .pending => unreachable, // .done implies tag != .pending

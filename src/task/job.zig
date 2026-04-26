@@ -5,11 +5,13 @@
 //!
 //! Lifetime: the Job is heap-allocated alongside the coroutine. The caller
 //! owns the Job pointer; the underlying Coroutine is owned by the runtime.
-//! Calling `Job.deinit()` releases the Job's hold on the coroutine but
-//! doesn't free the coroutine itself (the runtime does that at deinit).
+//! `volt.destroyJob(job)` releases the Job; the coroutine itself is reaped
+//! at runtime deinit.
 
 const std = @import("std");
 const Coroutine = @import("../coroutine/coroutine.zig").Coroutine;
+const tls = @import("../scheduler/tls.zig");
+const park = @import("../scheduler/park.zig");
 
 pub const Job = struct {
     coro: *Coroutine,
@@ -30,15 +32,29 @@ pub const Job = struct {
         return self.coro.isCancelled();
     }
 
-    /// Wait until the coroutine is done. v0.1 implementation is a yield loop —
-    /// not optimal but correct. v0.4 (sync primitives) gives us proper parking.
+    /// Wait until the coroutine is done. Parks the calling coroutine on
+    /// `self.coro.waiter` — the scheduler unparks us when the child
+    /// transitions to `.done`.
+    ///
+    /// Single-threaded v0.2 invariant: there's no race between checking
+    /// `.done` and setting `.waiter`, because we don't yield between those
+    /// statements. v0.9 multi-threaded will need atomic compare-and-set.
     pub fn join(self: *Job) error{Cancelled}!void {
-        const yield_mod = @import("../api/yield.zig");
-        while (self.coro.state != .done) {
-            // Yield gives other coroutines a chance to make progress;
-            // when we resume, we re-check.
-            try yield_mod.yield();
+        if (self.coro.state == .done) {
+            if (self.coro.isCancelled()) return error.Cancelled;
+            return;
         }
+
+        const me = tls.currentCoroutine() orelse
+            @panic("Job.join called outside a coroutine");
+
+        // Single-waiter for v0.2 — we'd otherwise clobber an existing one.
+        // Two coroutines waiting on the same Job is a v0.4 concern.
+        std.debug.assert(self.coro.waiter == null);
+        self.coro.waiter = me;
+
+        try park.parkCurrent();
+
         if (self.coro.isCancelled()) return error.Cancelled;
     }
 };

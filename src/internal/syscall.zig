@@ -215,6 +215,34 @@ pub fn writev(fd: posix.fd_t, iov: []const posix.iovec_const) WriteError!usize {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// read
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn read(fd: posix.fd_t, bytes: []u8) ReadError!usize {
+    const max = if (builtin.os.tag == .linux) 0x7ffff000 else std.math.maxInt(isize);
+    const count = @min(bytes.len, max);
+    while (true) {
+        const rc = system.read(fd, bytes.ptr, count);
+        const signed: isize = @bitCast(rc);
+        if (signed >= 0) return @intCast(signed);
+        switch (posix.errno(signed)) {
+            .INTR => continue,
+            .INVAL => unreachable,
+            .FAULT => unreachable,
+            .AGAIN => return error.WouldBlock,
+            .BADF => return error.NotOpenForReading,
+            .IO => return error.InputOutput,
+            .ISDIR => return error.IsDir,
+            .NOBUFS, .NOMEM => unreachable,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .TIMEDOUT => return error.ConnectionTimedOut,
+            .NOTCONN => return error.SocketNotConnected,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // readv
 // ─────────────────────────────────────────────────────────────────────────────
 

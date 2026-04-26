@@ -10,17 +10,23 @@ const tls = @import("../scheduler/tls.zig");
 const spawn_mod = @import("../coroutine/spawn.zig");
 
 /// Build the return type of `volt.run`:
-///   root_fn returns T  -> T              (spawn-OOM and root-cancel become panics)
-///   root_fn returns E!T -> (E || error{OutOfMemory, Cancelled})!T
+///   root_fn returns T  -> T              (init/spawn/cancel errors panic)
+///   root_fn returns E!T -> (E || RuntimeBootstrapError)!eu.payload
 ///
-/// We widen the error set on error-returning root fns because:
-///   - `Runtime.createCoroutine` can fail with `error.OutOfMemory`
-///   - The root coroutine itself could observe `error.Cancelled` (rare, but
-///     a hostile parent process or signal-driven cancel could trigger it)
+/// We widen the error set on error-returning root fns because the bootstrap
+/// itself can fail (kqueue init, OOM during spawn, root-cancellation propagation).
+const RuntimeBootstrapError = error{
+    OutOfMemory,
+    Cancelled,
+    ProcessFdQuotaExceeded,
+    SystemFdQuotaExceeded,
+    Unexpected,
+};
+
 fn RunReturnType(comptime UserFn: type) type {
     const RT = @typeInfo(UserFn).@"fn".return_type.?;
     return switch (@typeInfo(RT)) {
-        .error_union => |eu| (eu.error_set || error{ OutOfMemory, Cancelled })!eu.payload,
+        .error_union => |eu| (eu.error_set || RuntimeBootstrapError)!eu.payload,
         else => RT,
     };
 }
@@ -30,7 +36,11 @@ pub fn run(
     comptime root_fn: anytype,
     args: anytype,
 ) RunReturnType(@TypeOf(root_fn)) {
-    var rt = runtime_mod.Runtime.init(allocator, .{});
+    var rt = runtime_mod.Runtime.init(allocator, .{}) catch |err| {
+        const RT = @typeInfo(@TypeOf(root_fn)).@"fn".return_type.?;
+        if (@typeInfo(RT) == .error_union) return err;
+        std.debug.panic("volt.run: failed to initialize runtime: {}", .{err});
+    };
     defer rt.deinit();
 
     tls.setRuntime(@ptrCast(&rt));

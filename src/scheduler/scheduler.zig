@@ -1,16 +1,16 @@
-//! Single-threaded round-robin scheduler.
+//! Single-threaded round-robin scheduler — the queue and dispatch primitive.
 //!
-//! The dispatch loop:
-//!   1. Pop a runnable coroutine from the ready queue
-//!   2. Set TLS so anyone calling `volt.currentCoroutine()` finds it
-//!   3. swap into it (registers + sp restored, lr was set by initContext)
-//!   4. Coroutine runs until it yields, parks, or finishes
-//!   5. swap returns; observe state; re-enqueue (runnable), reap (done),
-//!      or leave alone (parked — wakeup is someone else's job)
-//!   6. repeat until predicate says stop
+//! In v0.1 this also drove the master loop. As of v0.2, with the reactor in
+//! the picture, the master loop moved up to `Runtime` so it can interleave:
 //!
-//! v0.1 is single-threaded and FIFO. Multi-worker work-stealing comes in
-//! v0.9 — the interface stays stable.
+//!   while (work_left) {
+//!       if (scheduler.tryDispatch()) continue;            // ran a ready coro
+//!       if (reactor.has_pending) reactor.poll(forever);   // wake on I/O
+//!       else break;                                       // genuinely idle
+//!   }
+//!
+//! The scheduler stays small: a queue + a swap. The reactor stays small: a
+//! kqueue + a wake callback. Runtime is the orchestrator.
 
 const std = @import("std");
 const Coroutine = @import("../coroutine/coroutine.zig").Coroutine;
@@ -47,28 +47,25 @@ pub const Scheduler = struct {
         self.ready.deinit();
     }
 
-    /// Register a freshly-created coroutine with the scheduler.
+    /// Register a freshly-created coroutine with the scheduler — track it
+    /// for ownership and put it on the ready queue.
     pub fn enqueue(self: *Scheduler, coro: *Coroutine) !void {
         try self.spawned.append(coro);
         try self.ready.push(coro);
     }
 
-    /// Drive the scheduler until the ready queue is empty.
-    /// `runtime_ptr` is what `volt.currentRuntime()` returns from inside coros.
-    pub fn run(self: *Scheduler, runtime_ptr: *anyopaque) void {
-        while (self.ready.pop()) |coro| {
-            self.dispatchOne(coro, runtime_ptr);
-        }
+    /// Re-enqueue an already-tracked coroutine (e.g., after an unpark).
+    /// Does NOT add to `spawned` — only `enqueue` does that.
+    pub fn requeue(self: *Scheduler, coro: *Coroutine) !void {
+        try self.ready.push(coro);
     }
 
-    /// Drive the scheduler until `until_done.state == .done`. Used by the
-    /// bootstrap (`volt.run`) — we only need to drain enough work for the
-    /// root coroutine to complete; orphan tasks are reaped at deinit.
-    pub fn runUntilDone(self: *Scheduler, until_done: *Coroutine, runtime_ptr: *anyopaque) void {
-        while (until_done.state != .done) {
-            const coro = self.ready.pop() orelse break;
-            self.dispatchOne(coro, runtime_ptr);
-        }
+    /// Run one ready coroutine if any. Returns true if a coro was dispatched,
+    /// false if the ready queue was empty.
+    pub fn tryDispatch(self: *Scheduler, runtime_ptr: *anyopaque) bool {
+        const coro = self.ready.pop() orelse return false;
+        self.dispatchOne(coro, runtime_ptr);
+        return true;
     }
 
     fn dispatchOne(self: *Scheduler, coro: *Coroutine, runtime_ptr: *anyopaque) void {
@@ -89,12 +86,19 @@ pub const Scheduler = struct {
                 self.ready.push(coro) catch @panic("OOM during reschedule");
             },
             .done => {
-                // Finished. Leave in `spawned` for deinit; handles (Job/Task)
+                // Finished. If there's a waiter (Task.join / Job.join),
+                // wake it. Leave the coro in `spawned` for deinit; handles
                 // can still observe state == .done.
+                if (coro.waiter) |waiter| {
+                    coro.waiter = null;
+                    std.debug.assert(waiter.state == .parked);
+                    waiter.state = .runnable;
+                    self.ready.push(waiter) catch @panic("OOM during waiter wake");
+                }
             },
             .parked => {
                 // Suspended on something else. Whoever owns the parking
-                // (channel, mutex, child join) re-enqueues when ready.
+                // (reactor, channel, mutex, child join) re-enqueues when ready.
             },
             .runnable => unreachable, // shouldn't be reachable mid-yield
         }

@@ -66,6 +66,13 @@ pub const Coroutine = struct {
     /// args are tuples and tuples can't live inline in extern structs.
     args_ptr: *anyopaque,
 
+    /// One coroutine waiting for this one to complete (e.g., parent in
+    /// `Task.join`). When this coroutine transitions to `.done`, the
+    /// scheduler unparks the waiter. v0.2 supports a single waiter — that's
+    /// enough for join semantics. Broadcast-style multi-waiter wake comes
+    /// at v0.4 when sync primitives need it.
+    waiter: ?*Coroutine = null,
+
     /// Did cancellation request arrive? Atomically observable.
     pub fn isCancelled(self: *const Coroutine) bool {
         return self.cancel_flag.load(.acquire);

@@ -57,6 +57,20 @@ pub const scheduler = struct {
     pub const tls = @import("scheduler/tls.zig");
     pub const ReadyQueue = @import("scheduler/ready_queue.zig").ReadyQueue;
     pub const Scheduler = @import("scheduler/scheduler.zig").Scheduler;
+    pub const park = @import("scheduler/park.zig");
+};
+
+pub const io = struct {
+    pub const Reactor = @import("io/reactor.zig").Reactor;
+    pub const EventKind = @import("io/reactor.zig").EventKind;
+
+    pub const waitReadable = @import("io/wait.zig").waitReadable;
+    pub const waitWritable = @import("io/wait.zig").waitWritable;
+
+    pub const read = @import("io/io.zig").read;
+    pub const write = @import("io/io.zig").write;
+    pub const writeAll = @import("io/io.zig").writeAll;
+    pub const setNonblock = @import("io/io.zig").setNonblock;
 };
 
 pub const internal = struct {
@@ -99,6 +113,10 @@ test {
     _ = scheduler.tls;
     _ = scheduler.ReadyQueue;
     _ = scheduler.Scheduler;
+    _ = scheduler.park;
+    _ = io.Reactor;
+    _ = @import("io/wait.zig");
+    _ = @import("io/io.zig");
     _ = Runtime;
     _ = Job;
     _ = @import("task/task.zig");
@@ -107,6 +125,7 @@ test {
     _ = @import("api/spawn.zig");
     _ = @import("api/run.zig");
     _ = @import("test/integration_test.zig");
+    _ = @import("test/io_integration_test.zig");
     _ = internal.thread;
     _ = internal.syscall;
     _ = internal.util.linked_list;
