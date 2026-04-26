@@ -39,12 +39,20 @@ pub const Coroutine = struct {
     /// Saved register state for context switching.
     ctx: ctx.Context = .{},
 
-    /// Where to yield back to. Set by the scheduler before the first swap-in;
-    /// every subsequent suspension also points at this.
+    /// Where to yield back to. Set by the scheduler before EVERY dispatch —
+    /// in multi-worker mode a coroutine may resume on a different worker than
+    /// it last suspended on, and must yield back to that worker's main_ctx.
     scheduler_ctx: *ctx.Context,
 
-    /// Lifecycle.
-    state: State,
+    /// Lifecycle. Atomic because:
+    ///   - Owner worker writes on dispatch (.running) and after swap-back
+    ///   - The coroutine itself writes on park (.parked) and on done (.done)
+    ///   - Sibling workers read during work-stealing
+    ///   - The reactor / completing children write .runnable when waking us
+    ///
+    /// Use `loadState`, `storeState`, `casState` instead of touching the
+    /// atomic value directly — keeps the orderings consistent.
+    state: std.atomic.Value(State),
 
     /// Atomic cancellation flag. Set by Job.cancel(); checked at suspension
     /// points (yield, sleep, channel ops) which then return error.Cancelled.
@@ -67,10 +75,30 @@ pub const Coroutine = struct {
 
     /// One coroutine waiting for this one to complete (e.g., parent in
     /// `Task.join`). When this coroutine transitions to `.done`, the
-    /// scheduler unparks the waiter. v0.2 supports a single waiter — that's
-    /// enough for join semantics. Broadcast-style multi-waiter wake comes
-    /// at v0.4 when sync primitives need it.
-    waiter: ?*Coroutine = null,
+    /// completing worker CAS-detaches the waiter and re-enqueues it.
+    /// Atomic so parent-attach (in Job.join) and child-detach (in the
+    /// done-handler) don't race. v0.4 will replace this with a multi-waiter
+    /// queue when sync primitives need broadcast wake.
+    waiter: std.atomic.Value(?*Coroutine) = std.atomic.Value(?*Coroutine).init(null),
+
+    /// Worker on which this coroutine should be re-enqueued by default
+    /// (typically the worker that spawned it). Stealers may move it elsewhere
+    /// transparently. v0.3 single-worker leaves this null and uses the
+    /// runtime's only worker.
+    home_worker: ?*anyopaque = null,
+
+    pub fn loadState(self: *const Coroutine) State {
+        return self.state.load(.acquire);
+    }
+
+    pub fn storeState(self: *Coroutine, new: State) void {
+        self.state.store(new, .release);
+    }
+
+    /// CAS the state. Returns null on success, the observed value on failure.
+    pub fn casState(self: *Coroutine, expected: State, new: State) ?State {
+        return self.state.cmpxchgStrong(expected, new, .acq_rel, .acquire);
+    }
 
     /// Did cancellation request arrive? Atomically observable.
     pub fn isCancelled(self: *const Coroutine) bool {
@@ -93,7 +121,7 @@ test "coroutine: cancel flag is initially false" {
     var coro_ctx: ctx.Context = .{};
     var coro: Coroutine = .{
         .scheduler_ctx = &coro_ctx,
-        .state = .runnable,
+        .state = std.atomic.Value(State).init(.runnable),
         .stack = &[_]u8{},
         .destroy_extras_fn = undefined,
         .closure_ptr = undefined,
@@ -102,4 +130,24 @@ test "coroutine: cancel flag is initially false" {
     try std.testing.expect(!coro.isCancelled());
     coro.cancel();
     try std.testing.expect(coro.isCancelled());
+}
+
+test "coroutine: state CAS round-trip" {
+    var coro_ctx: ctx.Context = .{};
+    var coro: Coroutine = .{
+        .scheduler_ctx = &coro_ctx,
+        .state = std.atomic.Value(State).init(.runnable),
+        .stack = &[_]u8{},
+        .destroy_extras_fn = undefined,
+        .closure_ptr = undefined,
+        .args_ptr = undefined,
+    };
+
+    try std.testing.expectEqual(State.runnable, coro.loadState());
+    try std.testing.expectEqual(@as(?State, null), coro.casState(.runnable, .running));
+    try std.testing.expectEqual(State.running, coro.loadState());
+
+    // CAS with wrong expected fails and returns observed.
+    try std.testing.expectEqual(@as(?State, .running), coro.casState(.runnable, .parked));
+    try std.testing.expectEqual(State.running, coro.loadState());
 }

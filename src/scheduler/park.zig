@@ -36,7 +36,7 @@ pub fn parkCurrent() error{Cancelled}!void {
     // cancelled; return immediately and let the caller unwind.
     if (coro.isCancelled()) return error.Cancelled;
 
-    coro.state = .parked;
+    coro.storeState(.parked);
     ctx_mod.swap(&coro.ctx, coro.scheduler_ctx);
     // We're back. Re-check cancellation in case it arrived while parked.
     if (coro.isCancelled()) return error.Cancelled;

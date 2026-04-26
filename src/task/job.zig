@@ -21,11 +21,11 @@ pub const Job = struct {
     }
 
     pub fn isActive(self: *const Job) bool {
-        return self.coro.state != .done;
+        return self.coro.loadState() != .done;
     }
 
     pub fn isCompleted(self: *const Job) bool {
-        return self.coro.state == .done;
+        return self.coro.loadState() == .done;
     }
 
     pub fn isCancelled(self: *const Job) bool {
@@ -33,14 +33,17 @@ pub const Job = struct {
     }
 
     /// Wait until the coroutine is done. Parks the calling coroutine on
-    /// `self.coro.waiter` — the scheduler unparks us when the child
-    /// transitions to `.done`.
+    /// `self.coro.waiter` — the worker that completes the child unparks us.
     ///
-    /// Single-threaded v0.2 invariant: there's no race between checking
-    /// `.done` and setting `.waiter`, because we don't yield between those
-    /// statements. v0.9 multi-threaded will need atomic compare-and-set.
+    /// Race-free under multi-worker:
+    /// 1. CAS-attach `me` into `self.coro.waiter` (null → me).
+    /// 2. Re-check `state == .done` AFTER the CAS — if the child completed
+    ///    before our CAS landed, the done-handler already saw waiter=null
+    ///    and didn't wake us, so we must wake ourselves by detaching and
+    ///    returning. This is the standard "publish-then-recheck" pattern.
+    /// 3. Otherwise park; the done-handler will swap waiter→null and wake us.
     pub fn join(self: *Job) error{Cancelled}!void {
-        if (self.coro.state == .done) {
+        if (self.coro.loadState() == .done) {
             if (self.coro.isCancelled()) return error.Cancelled;
             return;
         }
@@ -48,16 +51,32 @@ pub const Job = struct {
         const me = tls.currentCoroutine() orelse
             @panic("Job.join called outside a coroutine");
 
-        // Self-join would silently hang — parent waiting for itself, no one
-        // wakes it. Catch in debug.
         if (std.debug.runtime_safety and me == self.coro) {
             @panic("Job.join: coroutine cannot join itself");
         }
 
-        // Single-waiter for v0.2 — we'd otherwise clobber an existing one.
-        // Two coroutines waiting on the same Job is a v0.4 concern.
-        std.debug.assert(self.coro.waiter == null);
-        self.coro.waiter = me;
+        // Try to attach as the (single) waiter.
+        if (self.coro.waiter.cmpxchgStrong(null, me, .acq_rel, .acquire)) |existing| {
+            // Either someone else is already joining (v0.4 will allow this
+            // via a queue), or the slot got cleared by a fast-completing
+            // child — in which case we re-check state below.
+            if (existing != null) {
+                @panic("Job.join: another coroutine is already joining this job (v0.4 will allow multiple)");
+            }
+        }
+
+        // Re-check after attaching. If the child completed between our
+        // initial check and the CAS above, the done-handler may have run
+        // before our CAS — then it swapped null→null (waiter was null then)
+        // and didn't wake us. Detect by re-reading state.
+        if (self.coro.loadState() == .done) {
+            // Detach — done-handler already ran; nobody's going to wake us.
+            // Use a fetchExchange-style swap that returns the old value to
+            // detect whether the done-handler beat us to detaching.
+            _ = self.coro.waiter.swap(null, .acq_rel);
+            if (self.coro.isCancelled()) return error.Cancelled;
+            return;
+        }
 
         try park.parkCurrent();
 

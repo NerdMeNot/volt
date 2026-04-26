@@ -69,30 +69,33 @@ pub const Scheduler = struct {
     }
 
     fn dispatchOne(self: *Scheduler, coro: *Coroutine, runtime_ptr: *anyopaque) void {
-        coro.state = .running;
+        coro.storeState(.running);
         tls.setCurrent(coro, runtime_ptr);
         // Yield-back target for this coroutine is our own main_ctx.
         coro.scheduler_ctx = &self.main_ctx;
 
         ctx.swap(&self.main_ctx, &coro.ctx);
         // We're back. Coroutine has yielded, parked, or finished.
+        // acquire-load: pairs with the coroutine's release-store on park/done.
+        const observed = coro.loadState();
 
         tls.clearCurrent();
 
-        switch (coro.state) {
+        switch (observed) {
             .running => {
                 // Explicitly yielded — back into the ready queue.
-                coro.state = .runnable;
+                coro.storeState(.runnable);
                 self.ready.push(coro) catch @panic("OOM during reschedule");
             },
             .done => {
-                // Finished. If there's a waiter (Task.join / Job.join),
-                // wake it. Leave the coro in `spawned` for deinit; handles
-                // can still observe state == .done.
-                if (coro.waiter) |waiter| {
-                    coro.waiter = null;
-                    std.debug.assert(waiter.state == .parked);
-                    waiter.state = .runnable;
+                // Finished. If there's a waiter (Task.join / Job.join), wake
+                // it. CAS-detach so concurrent `Job.join` attaching from
+                // another worker can't race with us.
+                const old_waiter = coro.waiter.swap(null, .acq_rel);
+                if (old_waiter) |waiter| {
+                    // Waiter was parked on this coro. Mark runnable and re-enqueue.
+                    std.debug.assert(waiter.loadState() == .parked);
+                    waiter.storeState(.runnable);
                     self.ready.push(waiter) catch @panic("OOM during waiter wake");
                 }
             },

@@ -58,6 +58,7 @@ pub const scheduler = struct {
     pub const ReadyQueue = @import("scheduler/ready_queue.zig").ReadyQueue;
     pub const Scheduler = @import("scheduler/scheduler.zig").Scheduler;
     pub const park = @import("scheduler/park.zig");
+    pub const Deque = @import("scheduler/deque.zig").Deque;
 };
 
 pub const io = struct {
@@ -118,6 +119,7 @@ test {
     _ = scheduler.ReadyQueue;
     _ = scheduler.Scheduler;
     _ = scheduler.park;
+    _ = @import("scheduler/deque.zig");
     _ = io.Reactor;
     _ = @import("io/wait.zig");
     _ = @import("io/io.zig");

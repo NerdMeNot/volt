@@ -97,7 +97,9 @@ pub fn Closure(comptime user_fn: anytype, comptime Args: type) type {
                 }
             }
 
-            self.coro.state = .done;
+            // Release-store: the worker observes .done with acquire ordering
+            // and reads `result_ptr.tag` after — that read must see our writes.
+            self.coro.storeState(.done);
             ctx.swap(&self.coro.ctx, self.coro.scheduler_ctx);
             // Scheduler observes .done and won't resume us. Anything past
             // here is dead code — `unreachable` keeps the compiler happy.
@@ -168,7 +170,7 @@ pub fn create(
         // first time. Until then, leave it pointing at our own ctx (safe
         // sentinel — we'll never use it before dispatch).
         .scheduler_ctx = &coro.ctx,
-        .state = .runnable,
+        .state = std.atomic.Value(co.State).init(.runnable),
         .stack = stack,
         .destroy_extras_fn = &Cl.destroyExtras,
         .closure_ptr = @ptrCast(closure),

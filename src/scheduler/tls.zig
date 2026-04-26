@@ -62,11 +62,12 @@ test "tls: starts empty" {
 }
 
 test "tls: setCurrent / clearCurrent round trip" {
+    const State = @import("../coroutine/coroutine.zig").State;
     var dummy_rt: u32 = 42;
     var ctx_buf: @import("../coroutine/context_arm64.zig").Context = .{};
     var coro: Coroutine = .{
         .scheduler_ctx = &ctx_buf,
-        .state = .runnable,
+        .state = std.atomic.Value(State).init(.runnable),
         .stack = &[_]u8{},
         .destroy_extras_fn = undefined,
         .closure_ptr = undefined,

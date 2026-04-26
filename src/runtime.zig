@@ -65,7 +65,7 @@ pub const Runtime = struct {
     /// bootstrap (`volt.run`) — we drain enough work for the root coroutine
     /// to complete; orphan coros are reaped at deinit.
     pub fn runUntilDone(self: *Runtime, until_done: *Coroutine) void {
-        while (until_done.state != .done) {
+        while (until_done.loadState() != .done) {
             if (self.scheduler.tryDispatch(@ptrCast(self))) continue;
 
             // Ready queue is empty. If there are I/O-parked coros, block on
@@ -82,8 +82,10 @@ pub const Runtime = struct {
     /// re-enqueue it. Signature matches reactor.Reactor.poll's wakeFn param.
     fn reactorWake(opaque_self: *anyopaque, coro: *Coroutine) anyerror!void {
         const self: *Runtime = @ptrCast(@alignCast(opaque_self));
-        std.debug.assert(coro.state == .parked);
-        coro.state = .runnable;
+        // CAS .parked → .runnable. If the coroutine isn't parked here, it
+        // was already woken by another path (e.g., cancellation racing the
+        // I/O event in multi-worker mode) — drop the duplicate wake.
+        if (coro.casState(.parked, .runnable) != null) return;
         try self.scheduler.requeue(coro);
     }
 };
