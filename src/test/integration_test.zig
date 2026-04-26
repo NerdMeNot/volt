@@ -83,19 +83,17 @@ test "v0.1: launch + Job.join executes the child" {
 // 5. volt.yield — round-robin between coroutines
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Each coroutine writes into its own row of `events` — no shared counter,
+/// no inter-coroutine synchronization needed even when work-stealing scatters
+/// them across threads.
 const YieldTrace = struct {
-    items: [12]u32 = undefined,
-    len: usize = 0,
-    fn record(self: *YieldTrace, v: u32) void {
-        self.items[self.len] = v;
-        self.len += 1;
-    }
+    events: [3][4]u32 = .{.{0} ** 4} ** 3,
 };
 
 fn yielder(trace: *YieldTrace, id: u32, ticks: u32) !void {
     var i: u32 = 0;
     while (i < ticks) : (i += 1) {
-        trace.record(id * 10 + i);
+        trace.events[id - 1][i] = id * 10 + i;
         try volt.yield();
     }
 }
@@ -115,18 +113,18 @@ fn yieldRoot() !YieldTrace {
     return trace;
 }
 
-test "v0.1: three coroutines yield round-robin" {
+test "v0.1: three coroutines yield and each records its full sequence" {
     const trace = try volt.run(std.testing.allocator, yieldRoot, .{});
-    // Each yielder records 4 events; total 12.
-    try std.testing.expectEqual(@as(usize, 12), trace.len);
-    // First three events are id=1,2,3 with i=0 (recorded before first yield).
-    try std.testing.expectEqual(@as(u32, 10), trace.items[0]);
-    try std.testing.expectEqual(@as(u32, 20), trace.items[1]);
-    try std.testing.expectEqual(@as(u32, 30), trace.items[2]);
-    // Then i=1 from each.
-    try std.testing.expectEqual(@as(u32, 11), trace.items[3]);
-    try std.testing.expectEqual(@as(u32, 21), trace.items[4]);
-    try std.testing.expectEqual(@as(u32, 31), trace.items[5]);
+    // Each yielder must have recorded all 4 of its own ticks. The interleaving
+    // across the three coroutines is non-deterministic under multi-worker
+    // work-stealing, but each coroutine's own writes happen in order.
+    var id: u32 = 1;
+    while (id <= 3) : (id += 1) {
+        var i: u32 = 0;
+        while (i < 4) : (i += 1) {
+            try std.testing.expectEqual(id * 10 + i, trace.events[id - 1][i]);
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1,23 +1,26 @@
-//! Thread-local state for the active coroutine and runtime.
+//! Thread-local state for the active coroutine, runtime, and worker.
 //!
-//! When a coroutine is executing, two TLS slots are populated:
+//! When a coroutine is executing, three slots are populated on the worker's
+//! thread:
 //!   - `current_coroutine` — the coroutine currently on-CPU
-//!   - `current_runtime`   — the runtime that owns it
+//!   - `current_worker`    — the worker thread executing it
+//!   - `current_runtime`   — the runtime that owns both
 //!
-//! Operations like `volt.yield()`, `volt.launch(...)`, `mutex.lock()` query
-//! these slots to find their context without taking the runtime as a parameter.
-//! This is what gives the public API its Go/Kotlin-feel — runtime is invisible
-//! at the user level.
+//! `current_worker` and `current_runtime` are set once when the worker
+//! starts and cleared at shutdown. `current_coroutine` is set/cleared on
+//! every dispatch.
 //!
-//! Cost on Apple Silicon ARM64: a TLS read is a single instruction (~1ns).
+//! Operations like `volt.yield()`, `volt.spawn()`, `mutex.lock()` query
+//! these slots to find their context without taking the runtime / worker
+//! as parameters — that's what gives the public API its Go/Kotlin feel.
+//!
+//! Cost on Apple Silicon ARM64: a TLS read is one instruction (~1ns).
 
 const std = @import("std");
 const Coroutine = @import("../coroutine/coroutine.zig").Coroutine;
 
-/// Forward-declared opaque pointer for the runtime — actual Runtime lives
-/// in src/runtime.zig and includes this module. Circular import is avoided
-/// by using *anyopaque + a typed accessor in runtime.zig itself.
 threadlocal var current_coro: ?*Coroutine = null;
+threadlocal var current_worker: ?*anyopaque = null;
 threadlocal var current_rt: ?*anyopaque = null;
 
 /// The coroutine currently executing on this thread, or null if not in one.
@@ -32,26 +35,37 @@ pub fn currentRuntimeRaw() ?*anyopaque {
     return current_rt;
 }
 
-/// Set both TLS slots. Called by the scheduler immediately before swapping
+/// The worker executing this thread, or null. Type-erased for the same
+/// reason as `currentRuntimeRaw`.
+pub fn currentWorkerRaw() ?*anyopaque {
+    return current_worker;
+}
+
+/// Set the coroutine slot. Called by the worker immediately before swapping
 /// into a coroutine. Pair with `clearCurrent` after the swap returns.
 pub fn setCurrent(coro: *Coroutine, rt: *anyopaque) void {
     current_coro = coro;
     current_rt = rt;
 }
 
-/// Clear the coroutine slot but leave the runtime slot intact (the scheduler
-/// itself runs in the runtime's context).
+/// Clear the coroutine slot but leave the runtime/worker slots intact.
 pub fn clearCurrent() void {
     current_coro = null;
 }
 
-/// Set the runtime slot only. Called by `volt.run` at bootstrap, before any
-/// coroutine has been spawned, so operations like `volt.allocator` resolve.
+/// Set the worker slot. Called once when the worker starts.
+pub fn setCurrentWorker(worker: *anyopaque) void {
+    current_worker = worker;
+}
+
+pub fn clearCurrentWorker() void {
+    current_worker = null;
+}
+
 pub fn setRuntime(rt: *anyopaque) void {
     current_rt = rt;
 }
 
-/// Clear the runtime slot. Called by `volt.run` at teardown.
 pub fn clearRuntime() void {
     current_rt = null;
 }
@@ -59,6 +73,7 @@ pub fn clearRuntime() void {
 test "tls: starts empty" {
     try std.testing.expect(currentCoroutine() == null);
     try std.testing.expect(currentRuntimeRaw() == null);
+    try std.testing.expect(currentWorkerRaw() == null);
 }
 
 test "tls: setCurrent / clearCurrent round trip" {
@@ -80,7 +95,7 @@ test "tls: setCurrent / clearCurrent round trip" {
 
     clearCurrent();
     try std.testing.expect(currentCoroutine() == null);
-    try std.testing.expect(currentRuntimeRaw() != null); // rt not cleared
+    try std.testing.expect(currentRuntimeRaw() != null);
 
     clearRuntime();
     try std.testing.expect(currentRuntimeRaw() == null);

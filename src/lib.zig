@@ -55,8 +55,8 @@ pub const coroutine = struct {
 
 pub const scheduler = struct {
     pub const tls = @import("scheduler/tls.zig");
-    pub const ReadyQueue = @import("scheduler/ready_queue.zig").ReadyQueue;
-    pub const Scheduler = @import("scheduler/scheduler.zig").Scheduler;
+    pub const Worker = @import("scheduler/worker.zig").Worker;
+    pub const Injection = @import("scheduler/injection.zig").Injection;
     pub const park = @import("scheduler/park.zig");
     pub const Deque = @import("scheduler/deque.zig").Deque;
 };
@@ -116,10 +116,11 @@ test {
     _ = coroutine.context;
     _ = coroutine.spawn_helper;
     _ = scheduler.tls;
-    _ = scheduler.ReadyQueue;
-    _ = scheduler.Scheduler;
+    _ = scheduler.Worker;
+    _ = scheduler.Injection;
     _ = scheduler.park;
     _ = @import("scheduler/deque.zig");
+    _ = @import("scheduler/injection.zig");
     _ = io.Reactor;
     _ = @import("io/wait.zig");
     _ = @import("io/io.zig");
@@ -134,6 +135,7 @@ test {
     _ = @import("test/integration_test.zig");
     _ = @import("test/io_integration_test.zig");
     _ = @import("test/tcp_integration_test.zig");
+    _ = @import("test/multi_worker_test.zig");
     _ = internal.thread;
     _ = internal.syscall;
     _ = internal.util.linked_list;

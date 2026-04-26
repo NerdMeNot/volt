@@ -20,6 +20,7 @@ const system = posix.system;
 
 const Coroutine = @import("../coroutine/coroutine.zig").Coroutine;
 const syscall = @import("../internal/syscall.zig");
+const Mutex = @import("../internal/thread.zig").Mutex;
 
 comptime {
     if (builtin.os.tag != .macos and builtin.os.tag != .ios and
@@ -52,11 +53,18 @@ fn kindFor(filter: i16) EventKind {
 
 pub const Reactor = struct {
     kq: i32,
-    /// Currently parked coroutines, keyed by (fd, kind). Used to detect whether
-    /// any wait is outstanding (drives the "should we block on kevent?" branch
-    /// in the scheduler) and as a debug aid; on event delivery the udata field
-    /// of the kevent already carries the *Coroutine pointer.
+    /// Currently parked coroutines, keyed by (fd, kind). Used to detect
+    /// whether any wait is outstanding and as a debug aid; on event delivery
+    /// the kevent's `udata` field carries the *Coroutine pointer directly,
+    /// so this map is not on the wake path.
+    ///
+    /// Protected by `mutex` since `registerWait` and `poll` can run on
+    /// different worker threads in v0.3+.
     waiters: std.AutoHashMap(WaitKey, void),
+    /// Atomic count cache so `pendingCount()` doesn't have to take the mutex
+    /// on the worker idle path.
+    pending: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    mutex: Mutex = .{},
     allocator: std.mem.Allocator,
 
     pub const WaitKey = packed struct(u64) {
@@ -80,8 +88,11 @@ pub const Reactor = struct {
         self.waiters.deinit();
     }
 
+    /// Lock-free read of pending count. May be slightly stale wrt to a
+    /// concurrent register/poll on another thread, but that's fine for the
+    /// "should I park?" decision — the parker itself re-checks under lock.
     pub fn pendingCount(self: *const Reactor) usize {
-        return self.waiters.count();
+        return self.pending.load(.acquire);
     }
 
     /// Arm a one-shot wait for (fd, kind) and associate it with `coro`.
@@ -89,8 +100,6 @@ pub const Reactor = struct {
     /// touch coroutine state itself, only delivers wake events.
     pub fn registerWait(self: *Reactor, fd: posix.fd_t, kind: EventKind, coro: *Coroutine) !void {
         const key = WaitKey{ .fd = @intCast(fd), .kind_tag = @intFromEnum(kind) };
-        // Disallow double-registration on the same (fd,kind) — caller bug.
-        std.debug.assert(!self.waiters.contains(key));
 
         const ev = posix.Kevent{
             .ident = @intCast(fd),
@@ -100,19 +109,40 @@ pub const Reactor = struct {
             .data = 0,
             .udata = @intFromPtr(coro),
         };
+
+        // We arm the kevent BEFORE inserting into the waiters map: if the
+        // map insert fails (OOM), we must clean up the kevent registration.
         const changes = [_]posix.Kevent{ev};
         var dummy: [0]posix.Kevent = undefined;
         _ = try syscall.kevent(self.kq, &changes, &dummy, null);
 
-        try self.waiters.put(key, {});
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(!self.waiters.contains(key));
+        self.waiters.put(key, {}) catch |err| {
+            // Best-effort: tear down the kevent we just armed.
+            const remove_ev = posix.Kevent{
+                .ident = @intCast(fd),
+                .filter = filterFor(kind),
+                .flags = system.EV.DELETE,
+                .fflags = 0,
+                .data = 0,
+                .udata = 0,
+            };
+            const remove_changes = [_]posix.Kevent{remove_ev};
+            _ = syscall.kevent(self.kq, &remove_changes, &dummy, null) catch {};
+            return err;
+        };
+        _ = self.pending.fetchAdd(1, .release);
     }
 
-    /// Block on kevent for up to `timeout_ns` (or forever if null), unpark any
-    /// coros whose events fire, and return how many were woken.
+    /// Block on kevent for up to `timeout_ns` (or forever if null), unpark
+    /// each coro whose event fires, and return how many were woken.
     ///
-    /// `wakeFn(*anyopaque, *Coroutine)` is the scheduler's hook for re-enqueuing
-    /// a runnable coroutine. We pass it as a callback rather than importing the
-    /// scheduler to keep the reactor scheduler-agnostic (helps testing too).
+    /// Concurrency: only one worker should be inside `poll` at a time —
+    /// callers coordinate via `Runtime.tryClaimReactorPoll`. The wake
+    /// callback may be invoked many times before `poll` returns; callbacks
+    /// must be quick (the reactor lock is released before each callback).
     pub fn poll(
         self: *Reactor,
         timeout_ns: ?u64,
@@ -139,7 +169,10 @@ pub const Reactor = struct {
                 .fd = @intCast(ev.ident),
                 .kind_tag = @intFromEnum(kindFor(ev.filter)),
             };
-            _ = self.waiters.remove(key);
+            self.mutex.lock();
+            const removed = self.waiters.remove(key);
+            self.mutex.unlock();
+            if (removed) _ = self.pending.fetchSub(1, .release);
             try wakeFn(wake_ctx, coro);
         }
         return n;

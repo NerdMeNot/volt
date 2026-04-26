@@ -25,40 +25,43 @@ zig build docs         # Generate API documentation
 The grand `test-all` / `test-stress` / `test-concurrency` / `bench` targets
 were removed with the stackless tree. They come back as the new core lands.
 
-## Current state — v0.1 + v0.2 landed (2026-04-26)
+## Current state — v0.1 + v0.2 + v0.3 landed (2026-04-26)
 
 ```
 src/
 ├── lib.zig                  # Public API: run, launch, spawn, yield,
-│                            # Task, Job, Runtime, io.* (waitReadable etc.)
-├── runtime.zig              # Runtime: orchestrator owning scheduler + reactor
+│                            # Task, Job, Runtime, io.* (TcpListener etc.)
+├── runtime.zig              # Runtime: owns Worker[] + Injection + Reactor
 ├── time.zig                 # Duration, Instant types (model-agnostic)
 ├── coroutine/               # The stackful primitive
-│   ├── coroutine.zig        # Coroutine struct (incl. .waiter), State,
-│   │                        # ClosureBase, cancel
+│   ├── coroutine.zig        # Coroutine: atomic state + waiter, cancel
 │   ├── context_arm64.zig    # AAPCS64 ctx switch + naked trampoline
 │   ├── stack.zig            # 64KB heap stacks (4KB at v0.9 with guards)
-│   └── spawn.zig            # Comptime-specialized closure factory + create()
-├── scheduler/               # Queue + dispatch primitive
-│   ├── scheduler.zig        # tryDispatch, enqueue, requeue
-│   ├── ready_queue.zig      # Simple FIFO
-│   ├── tls.zig              # Thread-local current_coro / current_rt
-│   └── park.zig             # parkCurrent (suspend), unpark (resume)
-├── io/                      # v0.2 — async I/O
-│   ├── reactor.zig          # kqueue reactor (epoll on Linux comes next)
+│   └── spawn.zig            # Comptime-specialized closure factory
+├── scheduler/               # Multi-worker work-stealing
+│   ├── worker.zig           # Worker thread: Chase-Lev deque + parker
+│   ├── deque.zig            # Lock-free Chase-Lev work-stealing deque
+│   ├── injection.zig        # Global mutex-protected fallback queue
+│   ├── tls.zig              # Per-thread current_coro / worker / runtime
+│   └── park.zig             # parkCurrent — coroutine-level suspend
+├── io/                      # Async I/O — kqueue reactor (Darwin)
+│   ├── reactor.zig          # Shared reactor with single-poller-claim
 │   ├── wait.zig             # waitReadable / waitWritable
-│   └── io.zig               # async read / write / writeAll, setNonblock
+│   ├── io.zig               # async read / write / writeAll, setNonblock
+│   └── net.zig              # TcpListener + TcpStream + Address
 ├── api/                     # User-facing free functions
-│   ├── run.zig              # Bootstrap entry: spawn root, drain, return
+│   ├── run.zig              # Bootstrap: workers + root coro + drain
 │   ├── launch.zig           # Fire-and-forget → *Job
 │   ├── spawn.zig            # Value-returning → *Task(T)
 │   └── yield.zig            # Reschedule + cancellation point
-├── task/                    # Handles (v0.2: park-based join via .waiter)
-│   ├── job.zig              # cancel, isActive, isCompleted, join
-│   └── task.zig             # Task(T): Job + typed join() with errunion
+├── task/                    # Handles
+│   ├── job.zig              # cancel, isActive, join (CAS-attach waiter)
+│   └── task.zig             # Task(T): Job + typed join with errunion
 ├── test/
-│   ├── integration_test.zig    # 7 v0.1 acceptance tests
-│   └── io_integration_test.zig # 2 v0.2 async-I/O tests
+│   ├── integration_test.zig     # v0.1 spawn/join/yield/cancel
+│   ├── io_integration_test.zig  # v0.2 pipe-based async I/O
+│   ├── tcp_integration_test.zig # v0.2 TCP loopback echo
+│   └── multi_worker_test.zig    # v0.3 cross-thread + 256-coro stress
 └── internal/                # Platform internals (kept from prior tree)
     ├── thread/              # Mutex, Condition, Futex, sleep — std.Thread.*
     ├── syscall.zig          # Raw syscalls — replaces medium-level std.posix
@@ -86,9 +89,10 @@ Numbers from `spike/coroutines/bench_switch.zig`. Stack size currently 64KB
 | Version | Scope | Status |
 |---|---|---|
 | v0.1 | Scheduler + run/launch/spawn/yield/Task/Job/cancel | ✅ done |
-| v0.2 | kqueue reactor, async wait/read/write, park-based join | ✅ done (Darwin) |
-| v0.2.x | epoll backend (Linux), io_uring at v0.9 | next |
-| v0.3 | Channels + select | |
+| v0.2 | kqueue reactor, async wait/read/write, TCP types | ✅ done (Darwin) |
+| v0.3 | Multi-worker work-stealing scheduler (Chase-Lev) | ✅ done |
+| v0.3.x | Channels + select | next |
+| v0.2.x | epoll backend (Linux), io_uring at v0.9 | |
 | v0.4 | Sync primitives (Mutex, Semaphore, Notify) | |
 | v0.5 | Structured concurrency (scope, supervisor, cancellation) | |
 | v0.6 | Streams/flows | |
@@ -97,13 +101,15 @@ Numbers from `spike/coroutines/bench_switch.zig`. Stack size currently 64KB
 | v0.9 | Hardening (multi-arch asm, guard pages, slab pool) | |
 | v1.0 | Ship | |
 
-v0.1 acceptance: 7 integration tests covering run-with-value, run-with-error,
-spawn+join, launch+join, yield round-robin, cancel→error.Cancelled, and a
-100-coroutine stress smoke. All passing in `zig build test` (Debug).
+v0.1 acceptance: 7 integration tests — run-with-value, run-with-error,
+spawn+join, launch+join, yield, cancel→error.Cancelled, 100-coroutine smoke.
 
-v0.2 acceptance: 2 pipe-based async I/O tests (90/91 total tests pass; 1
-skipped). Reader parks on `EVFILT_READ`, writer wakes via reactor. Job.join
-is now park-based — parent suspends until child .done.
+v0.2 acceptance: pipe + TCP async I/O. Reader parks on `EVFILT_READ`, writer
+wakes via reactor. Job.join is park-based — parent suspends until child .done.
+
+v0.3 acceptance: 102 tests — including multi-thread parallelism check
+(coroutines observe ≥2 distinct OS thread IDs) and 256-coro CPU-bound
+stress across the worker pool. Default workers = `getCpuCount()`.
 
 ## Zig 0.16.x API Notes
 
