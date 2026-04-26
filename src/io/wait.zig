@@ -15,10 +15,11 @@ const tls = @import("../scheduler/tls.zig");
 const park = @import("../scheduler/park.zig");
 const reactor_mod = @import("reactor.zig");
 
-pub const WaitError = error{
-    Cancelled,
-    OutOfMemory,
-} || @typeInfo(@typeInfo(@TypeOf(reactor_mod.Reactor.registerWait)).@"fn".return_type.?).error_union.error_set;
+/// Errors from registering with the reactor and parking.
+/// `KeventError` covers the kqueue side; `Cancelled` covers cancellation;
+/// `OutOfMemory` covers the waiters-map insert.
+pub const WaitError = error{ Cancelled, OutOfMemory } ||
+    @import("../internal/syscall.zig").KeventError;
 
 fn waitOn(fd: posix.fd_t, kind: reactor_mod.EventKind) WaitError!void {
     const rt = runtime_mod.currentRuntime() orelse

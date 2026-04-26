@@ -27,17 +27,13 @@ pub const Address = extern union {
     in6: posix.sockaddr.in6,
 
     pub fn ip4(octets: [4]u8, port: u16) Address {
-        // sockaddr_in.addr is in network byte order (big-endian) — but stored
-        // as a u32. We pack the octets directly: a.b.c.d -> a is highest byte
-        // when laid out big-endian.
-        const addr_be: u32 = (@as(u32, octets[0]) << 24) |
-            (@as(u32, octets[1]) << 16) |
-            (@as(u32, octets[2]) << 8) |
-            @as(u32, octets[3]);
+        // sockaddr_in.addr is a 4-byte field in network byte order. Reinterpret
+        // the octets as a u32 with the same byte layout — bytesToValue preserves
+        // the in-memory byte order, so a.b.c.d on the wire stays a.b.c.d.
         return .{ .in = .{
             .family = posix.AF.INET,
             .port = std.mem.nativeToBig(u16, port),
-            .addr = std.mem.nativeToBig(u32, addr_be),
+            .addr = std.mem.bytesToValue(u32, &octets),
             .zero = .{0} ** 8,
         } };
     }
@@ -54,7 +50,7 @@ pub const Address = extern union {
         return switch (self.any.family) {
             posix.AF.INET => @sizeOf(posix.sockaddr.in),
             posix.AF.INET6 => @sizeOf(posix.sockaddr.in6),
-            else => @sizeOf(posix.sockaddr),
+            else => @panic("Address.osSockLen: unsupported family — only AF_INET / AF_INET6 in v0.2"),
         };
     }
 
@@ -63,7 +59,7 @@ pub const Address = extern union {
         return switch (self.any.family) {
             posix.AF.INET => std.mem.bigToNative(u16, self.in.port),
             posix.AF.INET6 => std.mem.bigToNative(u16, self.in6.port),
-            else => 0,
+            else => @panic("Address.getPort: unsupported family"),
         };
     }
 };

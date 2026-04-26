@@ -4,7 +4,7 @@
 //!   - Closure: extern struct, run_fn at offset 0 (asm trampoline reads it)
 //!   - Args storage: heap-allocated tuple (tuples can't live inline in extern)
 //!   - Result storage: heap-allocated struct holding state + value + error
-//!   - Stack: 16-byte aligned heap allocation (default 16KB in v0.1)
+//!   - Stack: 16-byte aligned heap allocation (size from `stack.default_size`)
 //!   - Coroutine: ties everything together with lifecycle state
 //!
 //! Each (user_fn, Args) pair produces a unique Closure type at comptime.

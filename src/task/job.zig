@@ -48,6 +48,12 @@ pub const Job = struct {
         const me = tls.currentCoroutine() orelse
             @panic("Job.join called outside a coroutine");
 
+        // Self-join would silently hang — parent waiting for itself, no one
+        // wakes it. Catch in debug.
+        if (std.debug.runtime_safety and me == self.coro) {
+            @panic("Job.join: coroutine cannot join itself");
+        }
+
         // Single-waiter for v0.2 — we'd otherwise clobber an existing one.
         // Two coroutines waiting on the same Job is a v0.4 concern.
         std.debug.assert(self.coro.waiter == null);

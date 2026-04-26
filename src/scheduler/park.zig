@@ -1,37 +1,33 @@
-//! Park / unpark — the primitive that lets a coroutine suspend and be
-//! resumed externally.
+//! Park — suspend the current coroutine until something else resumes it.
 //!
-//! `parkCurrent()` is called from inside a coroutine; it transitions the
-//! coroutine to `.parked` and swaps back to the scheduler. The coroutine
-//! stays out of the ready queue until someone calls `unpark(coro)` to
-//! re-enqueue it.
+//! `parkCurrent()` transitions the running coroutine to `.parked` and swaps
+//! back to the scheduler. The coroutine stays out of the ready queue until
+//! someone (the reactor, a sibling coroutine completing, etc.) marks it
+//! runnable and pushes it back via `Scheduler.requeue`.
 //!
 //! This is the building block for:
+//!   - I/O readiness wake-ups (reactor parks on EAGAIN, unparks via wakeFn)
 //!   - Job.join / Task.join (parent parks until child .done)
-//!   - I/O readiness wake-ups (reactor parks on EAGAIN, unparks on kqueue)
-//!   - Channel send/recv (slot-empty / queue-empty parking)
-//!   - Mutex / Semaphore acquire (queued behind contended primitives)
+//!   - Channel send/recv (slot-empty / queue-empty parking — v0.3)
+//!   - Mutex / Semaphore acquire (queued contention — v0.4)
 //!
-//! Cancellation: `parkCurrent()` is a cancellation point. If the cancel
-//! flag is set when we re-enter (after being unparked), it returns
-//! `error.Cancelled` so the caller can unwind.
+//! Cancellation: `parkCurrent()` is a cancellation point. It returns
+//! `error.Cancelled` if the cancel flag is set when the function is called
+//! or after the coroutine is resumed.
 //!
-//! Thread-safety (v0.1 single-threaded, design forward-compatible):
-//!   `unpark` is intended to be safe to call from any thread (e.g., the
-//!   reactor running on its own thread, or a wake from a sibling worker
-//!   in v0.9). The current single-worker scheduler doesn't yet enforce
-//!   that — `enqueue` uses an unsynchronized array list. v0.9 will swap
-//!   in a lock-free injector queue and unpark becomes truly safe.
+//! There is no `unpark` helper — each parking primitive owns its own wake
+//! protocol. The reactor unparks via its wakeFn callback; the scheduler
+//! unparks join-waiters when a coroutine transitions to `.done`. Channels
+//! and locks will follow suit. Centralizing "unpark" here would only invite
+//! ownership confusion (which list is the coro tracked in? was it already
+//! re-enqueued?). Keep `parkCurrent()` symmetric with `swap`: a single
+//! suspend-and-resume primitive, leaving wake-up policy to each primitive.
 
 const std = @import("std");
 const Coroutine = @import("../coroutine/coroutine.zig").Coroutine;
 const ctx_mod = @import("../coroutine/context_arm64.zig");
 const tls = @import("tls.zig");
 
-/// Suspend the current coroutine. Returns when someone calls `unpark` on it.
-///
-/// MUST be called from inside a coroutine (panics otherwise). Returns
-/// `error.Cancelled` if cancellation arrived before or during the park.
 pub fn parkCurrent() error{Cancelled}!void {
     const coro = tls.currentCoroutine() orelse
         @panic("park.parkCurrent called outside a coroutine");
@@ -42,28 +38,12 @@ pub fn parkCurrent() error{Cancelled}!void {
 
     coro.state = .parked;
     ctx_mod.swap(&coro.ctx, coro.scheduler_ctx);
-    // Unpark resumes us here. Re-check cancellation: a cancel may have
-    // arrived while we were parked, so callers need a chance to unwind
-    // even if the wake reason was unrelated.
+    // We're back. Re-check cancellation in case it arrived while parked.
     if (coro.isCancelled()) return error.Cancelled;
 }
 
-/// Re-enqueue a parked coroutine. Idempotent in the sense that calling it
-/// on an already-runnable coroutine is undefined — callers are expected to
-/// hold the parking primitive's lock to ensure exactly-once unpark per park.
-///
-/// Takes the runtime/scheduler pointer because unparkers don't necessarily
-/// run inside a coroutine (e.g., the reactor thread); they can't use TLS.
-pub fn unpark(coro: *Coroutine, scheduler_ptr: anytype) !void {
-    // State transition: parked -> runnable. Use atomic when v0.9 adds
-    // multi-worker. v0.1 single-threaded so plain assignment is fine.
-    std.debug.assert(coro.state == .parked);
-    coro.state = .runnable;
-    try scheduler_ptr.scheduler.enqueue(coro);
-}
-
 test "park: parkCurrent without coroutine panics" {
-    // Smoke test — we can't actually catch the panic here without a child
-    // process, so just verify the function exists and the TLS is empty.
+    // Smoke test — we can't catch the panic here without a child process,
+    // so just assert the precondition (TLS is empty when not in a coro).
     try std.testing.expect(tls.currentCoroutine() == null);
 }

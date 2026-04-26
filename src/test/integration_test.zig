@@ -166,6 +166,37 @@ test "v0.1: cancellation propagates via error.Cancelled" {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 6b. Cancel-before-first-dispatch — the trampoline short-circuits before
+//     invoking the user fn at all.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn neverRuns(flag: *bool) !void {
+    flag.* = true;
+}
+
+fn cancelBeforeStartRoot() !bool {
+    var ran = false;
+    var t = try volt.spawn(neverRuns, .{&ran});
+    defer volt.destroyTask(t);
+
+    // Cancel immediately, before the scheduler has a chance to dispatch the
+    // child. The closure trampoline should observe the cancel flag at entry
+    // and skip the user fn entirely.
+    t.cancel();
+
+    const result = t.join();
+    if (result) |_| return error.ExpectedCancelled else |e| {
+        if (e != error.Cancelled) return error.WrongError;
+    }
+    return ran;
+}
+
+test "v0.1: cancel-before-first-dispatch skips the user fn entirely" {
+    const ran = try volt.run(std.testing.allocator, cancelBeforeStartRoot, .{});
+    try std.testing.expect(!ran);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 7. Many coroutines — stress shape
 // ─────────────────────────────────────────────────────────────────────────────
 

@@ -54,11 +54,11 @@ pub fn writeAll(fd: posix.fd_t, buf: []const u8) WriteError!void {
     }
 }
 
-/// Put `fd` into non-blocking mode (O_NONBLOCK). Idempotent.
+/// Put `fd` into non-blocking mode (O_NONBLOCK). Idempotent — returns early
+/// if the flag is already set.
 pub fn setNonblock(fd: posix.fd_t) syscall.FcntlError!void {
-    const F = posix.system.F;
-    const flags_raw = try syscall.fcntl(fd, F.GETFL, 0);
-    const O_NONBLOCK: u32 = @bitCast(posix.O{ .NONBLOCK = true });
-    if ((flags_raw & O_NONBLOCK) != 0) return; // already set
-    _ = try syscall.fcntl(fd, F.SETFL, flags_raw | O_NONBLOCK);
+    const flags_raw = try syscall.fcntl(fd, posix.F.GETFL, 0);
+    const nonblock_bits: u32 = @bitCast(posix.O{ .NONBLOCK = true });
+    if ((flags_raw & nonblock_bits) != 0) return;
+    _ = try syscall.fcntl(fd, posix.F.SETFL, flags_raw | nonblock_bits);
 }

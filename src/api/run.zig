@@ -63,7 +63,14 @@ pub fn run(
     const RT = @typeInfo(@TypeOf(root_fn)).@"fn".return_type.?;
 
     return switch (result.tag) {
-        .pending => unreachable, // .done implies tag != .pending
+        .pending => std.debug.panic(
+            "volt.run: dispatch loop exited with the root coroutine still .pending. " ++
+                "This means the root parked on something nothing will ever wake — typically " ++
+                "a join on a coroutine that was never spawned, or a wait on an fd that was " ++
+                "registered without a corresponding I/O event. Audit the root fn for an " ++
+                "unmatched park/wait.",
+            .{},
+        ),
         .ok => result.value,
         .err => blk: {
             if (@typeInfo(RT) == .error_union) {

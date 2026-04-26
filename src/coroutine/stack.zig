@@ -1,9 +1,8 @@
 //! Stack allocation for coroutines.
 //!
 //! v0.1: simple aligned heap allocation, no guard pages, no slab pooling.
-//! Default stack size is 16KB per coroutine — enough headroom for typical
-//! Zig code that calls into allocators, while small enough that ~64K
-//! coroutines fit in 1GB.
+//! Default size 64KB — see `default_size` for rationale. Drops to 4KB at
+//! v0.9 once guard pages can catch overflow.
 //!
 //! Future:
 //!   v0.9 — guard pages for overflow detection (mmap with PROT_NONE bottom)

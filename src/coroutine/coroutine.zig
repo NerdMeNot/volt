@@ -14,7 +14,6 @@
 
 const std = @import("std");
 const ctx = @import("context_arm64.zig");
-const stack_mod = @import("stack.zig");
 
 /// Lifecycle states. Encoded as enum so transitions are explicit.
 pub const State = enum(u8) {
