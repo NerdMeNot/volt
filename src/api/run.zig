@@ -21,6 +21,10 @@ const RuntimeBootstrapError = error{
     SystemFdQuotaExceeded,
     InvalidWorkerCount,
     Unexpected,
+    // From kqueue init / EV_USER registration:
+    AccessDenied,
+    EventNotFound,
+    SystemResources,
 } || std.Thread.SpawnError;
 
 fn RunReturnType(comptime UserFn: type) type {

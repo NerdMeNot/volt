@@ -51,6 +51,11 @@ fn kindFor(filter: i16) EventKind {
     };
 }
 
+/// Sentinel `udata` value used by the wake-tickle path. Any pointer that
+/// won't collide with a real *Coroutine works — we use 1, since coroutines
+/// are page-aligned on the heap and never have address 1.
+const TICKLE_UDATA: usize = 1;
+
 pub const Reactor = struct {
     kq: i32,
     /// Currently parked coroutines, keyed by (fd, kind). Used to detect
@@ -76,11 +81,44 @@ pub const Reactor = struct {
     pub fn init(allocator: std.mem.Allocator) !Reactor {
         const kq = try syscall.kqueue();
         errdefer syscall.close(kq);
+
+        // Register a persistent EV_USER event for instant wake-up. Other
+        // threads call `tickle()` to NOTE_TRIGGER it, which immediately
+        // returns the polling worker from kevent. This eliminates the
+        // 100ms reactor poll timeout for new-work / shutdown latency.
+        const tickle_ev = posix.Kevent{
+            .ident = 0,
+            .filter = system.EVFILT.USER,
+            .flags = system.EV.ADD | system.EV.CLEAR,
+            .fflags = 0,
+            .data = 0,
+            .udata = TICKLE_UDATA,
+        };
+        const changes = [_]posix.Kevent{tickle_ev};
+        var dummy: [0]posix.Kevent = undefined;
+        _ = try syscall.kevent(kq, &changes, &dummy, null);
+
         return .{
             .kq = kq,
             .waiters = std.AutoHashMap(WaitKey, void).init(allocator),
             .allocator = allocator,
         };
+    }
+
+    /// NOTE_TRIGGER the EV_USER tickle event so any thread blocked in
+    /// `poll()` returns immediately. Safe to call from any thread.
+    pub fn tickle(self: *Reactor) void {
+        const ev = posix.Kevent{
+            .ident = 0,
+            .filter = system.EVFILT.USER,
+            .flags = 0,
+            .fflags = system.NOTE.TRIGGER,
+            .data = 0,
+            .udata = TICKLE_UDATA,
+        };
+        const changes = [_]posix.Kevent{ev};
+        var dummy: [0]posix.Kevent = undefined;
+        _ = syscall.kevent(self.kq, &changes, &dummy, null) catch {};
     }
 
     pub fn deinit(self: *Reactor) void {
@@ -163,7 +201,10 @@ pub const Reactor = struct {
             if (ts) |*t| t else null,
         );
 
+        var woken: usize = 0;
         for (events[0..n]) |ev| {
+            // Ignore the tickle event — it just returned us from kevent.
+            if (ev.udata == TICKLE_UDATA) continue;
             const coro: *Coroutine = @ptrFromInt(ev.udata);
             const key = WaitKey{
                 .fd = @intCast(ev.ident),
@@ -174,8 +215,9 @@ pub const Reactor = struct {
             self.mutex.unlock();
             if (removed) _ = self.pending.fetchSub(1, .release);
             try wakeFn(wake_ctx, coro);
+            woken += 1;
         }
-        return n;
+        return woken;
     }
 };
 

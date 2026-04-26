@@ -34,10 +34,10 @@ const runtime_mod = @import("../runtime.zig");
 
 const INITIAL_DEQUE_CAPACITY: usize = 256;
 
-/// How long a worker blocks on the reactor before re-checking shutdown / new
-/// work elsewhere. 100ms keeps shutdown latency reasonable without burning
-/// CPU. EV_USER (kqueue) / eventfd (epoll) for instant wake is a v1.0 polish.
-const REACTOR_POLL_TIMEOUT_NS: u64 = 100 * std.time.ns_per_ms;
+/// Maximum reactor poll block time. With EV_USER tickle wired up via
+/// `Runtime.notify*`, the polling worker returns immediately on new work
+/// or shutdown — this timeout is effectively a watchdog for stuck conditions.
+const REACTOR_POLL_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
 
 /// Per-worker idle parker. Mutex + condvar; wake-up coordination via two
 /// flags (`parked` for the fast-path "nobody to wake" check, `unpark_pending`

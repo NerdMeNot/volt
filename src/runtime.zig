@@ -127,7 +127,12 @@ pub const Runtime = struct {
     /// Wake one parked worker — used when new work appears on the injection
     /// queue or a coroutine completes (its waiter may now be runnable).
     /// Avoids thundering herd by signalling at most one parked worker.
+    /// Also tickles the reactor so a worker blocked in `kevent()` returns
+    /// immediately (eliminates the 100ms reactor poll latency for new work).
     pub fn notifyOneWorker(self: *Runtime) void {
+        // Tickle reactor first — cheaper than a condvar signal, and if the
+        // poller is the only "idle" worker we want it to come back fast.
+        if (self.poll_claim.load(.acquire)) self.reactor.tickle();
         for (self.workers) |*w| {
             if (w.isParked()) {
                 w.unpark();
@@ -137,6 +142,7 @@ pub const Runtime = struct {
     }
 
     pub fn notifyAllWorkers(self: *Runtime) void {
+        if (self.poll_claim.load(.acquire)) self.reactor.tickle();
         for (self.workers) |*w| w.unpark();
     }
 
