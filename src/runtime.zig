@@ -147,21 +147,20 @@ pub const Runtime = struct {
     }
 
     /// Schedule a freshly-runnable coroutine onto whichever worker makes
-    /// sense. Used by:
-    ///   - Reactor wake on a worker that isn't the woken coro's home
-    ///   - Job.join wake of a sibling-thread parent
-    ///   - Cross-thread injection from non-worker callers
+    /// sense.
     ///
-    /// Strategy: prefer the home worker if known; else round-robin across
-    /// workers via local deque (never the global injection — that's slower).
-    /// If we're called from a worker thread and have nowhere better, push
-    /// to the calling worker's deque directly for cache locality.
+    /// Strategy:
+    ///   1. If `home_worker` is set AND we're calling from that worker's
+    ///      thread, push directly to the local deque (cache-warm path).
+    ///   2. Otherwise push to the global injection queue and wake one
+    ///      idle worker. If the injection queue is full, fall back to
+    ///      whichever worker we're calling from (or worker 0 from non-
+    ///      worker threads). Pushing to a non-owner deque is unsafe under
+    ///      Chase-Lev, so we never do it — the fallback IS legal because
+    ///      we only push to our own deque, just possibly the "wrong" one.
     pub fn scheduleRunnable(self: *Runtime, coro: *Coroutine) void {
-        // 1. Home worker if set.
         if (coro.home_worker) |opaque_w| {
             const home: *Worker = @ptrCast(@alignCast(opaque_w));
-            // Only owner can push to a worker's deque safely. Use injection
-            // if we're not the owner.
             if (currentWorker()) |me| {
                 if (me == home) {
                     home.run_queue.push(coro);
@@ -171,9 +170,43 @@ pub const Runtime = struct {
             }
         }
 
-        // 2. Push via injection — any worker can pop. Wake one to take it.
-        self.injection.push(coro) catch @panic("injection.push: OOM");
-        self.notifyOneWorker();
+        if (self.injection.push(coro)) {
+            self.notifyOneWorker();
+            return;
+        } else |err| switch (err) {
+            error.QueueFull => {
+                // Injection saturated — push onto the calling worker's
+                // own deque if we have one, else block-spin until injection
+                // drains. The block-spin is a last-resort backpressure path
+                // and should be rare (default cap is 16K pending wakes).
+                if (currentWorker()) |me| {
+                    me.run_queue.push(coro);
+                    me.unpark();
+                    return;
+                }
+                self.injectBlocking(coro);
+            },
+            error.OutOfMemory => @panic("injection.push: OOM during scheduleRunnable"),
+        }
+    }
+
+    /// Fallback when called from a non-worker thread AND injection is full.
+    /// Spins-then-yields until the queue drains. Should be unreachable in
+    /// practice — non-worker scheduleRunnable callers are rare.
+    fn injectBlocking(self: *Runtime, coro: *Coroutine) void {
+        var attempts: usize = 0;
+        while (true) : (attempts += 1) {
+            if (self.injection.push(coro)) {
+                self.notifyOneWorker();
+                return;
+            } else |err| switch (err) {
+                error.QueueFull => {
+                    if (attempts > 64) std.Thread.yield() catch {};
+                    std.atomic.spinLoopHint();
+                },
+                error.OutOfMemory => @panic("injection.push: OOM during scheduleRunnable"),
+            }
+        }
     }
 
     /// Spawn a coroutine for `user_fn(args)` on the calling worker's deque.
