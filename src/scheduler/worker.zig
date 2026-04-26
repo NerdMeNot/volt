@@ -26,6 +26,7 @@ const builtin = @import("builtin");
 const ctx = @import("../coroutine/context_arm64.zig");
 const co = @import("../coroutine/coroutine.zig");
 const Coroutine = co.Coroutine;
+const stack_mod = @import("../coroutine/stack.zig");
 const Deque = @import("deque.zig").Deque;
 const tls = @import("tls.zig");
 const thread = @import("../internal/thread.zig");
@@ -109,7 +110,7 @@ pub const Worker = struct {
     pub fn deinit(self: *Worker, allocator: std.mem.Allocator) void {
         for (self.spawned.items) |coro| {
             coro.destroy_extras_fn(allocator, coro);
-            allocator.free(coro.stack);
+            stack_mod.free(allocator, coro.stack);
             allocator.destroy(coro);
         }
         self.spawned.deinit();

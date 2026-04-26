@@ -25,6 +25,12 @@ const RuntimeBootstrapError = error{
     AccessDenied,
     EventNotFound,
     SystemResources,
+    // From mmap stack allocation with guard pages:
+    PermissionDenied,
+    MemoryMappingNotSupported,
+    MappingAlreadyExists,
+    LockedMemoryLimitExceeded,
+    GuardPageProtectionFailed,
 } || std.Thread.SpawnError;
 
 fn RunReturnType(comptime UserFn: type) type {
