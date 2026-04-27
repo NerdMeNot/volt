@@ -1,25 +1,24 @@
-//! `volt.yield()` — explicitly hand control back to the scheduler.
+//! `volt.yield()` — explicit reschedule + cancellation point.
 //!
-//! The current coroutine swaps back to the scheduler context; the scheduler
-//! re-enqueues it (state remains .running, observed as "yielded" by the
-//! dispatch loop) and picks the next runnable coroutine.
-//!
-//! Yield is also a cancellation point: if the coroutine has been cancelled,
-//! yield returns error.Cancelled (giving user code a chance to clean up via
-//! defer and return up the call stack).
+//! Implemented as: set `pending_event = &yield_singleton`, swap to scheduler.
+//! The worker reads `pending_event` and calls `Yield.subscribe(coro)` which
+//! pushes the coroutine back onto the local deque.
 
 const ctx_mod = @import("../coroutine/context_arm64.zig");
 const tls = @import("../scheduler/tls.zig");
+const event_source = @import("../coroutine/event_source.zig");
 
 pub fn yield() error{Cancelled}!void {
-    const coro = tls.currentCoroutine() orelse @panic("volt.yield called outside a coroutine");
+    const coro = tls.currentCoroutine() orelse
+        @panic("volt.yield called outside a coroutine");
 
-    // Cancellation point — observe the flag before parking.
     if (coro.isCancelled()) return error.Cancelled;
 
-    // Swap back to the scheduler. We come back here when re-dispatched.
+    // Be explicit even though `pending_event` defaults to yield_singleton —
+    // a Park.parkCurrent that returned just before yield could have left it
+    // pointing at the Park.
+    coro.pending_event = &event_source.yield_singleton;
     ctx_mod.swap(&coro.ctx, coro.scheduler_ctx);
 
-    // After resume, check again — cancellation may have arrived while parked.
     if (coro.isCancelled()) return error.Cancelled;
 }

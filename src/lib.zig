@@ -46,8 +46,9 @@ pub const Instant = time.Instant;
 
 pub const coroutine = struct {
     pub const Coroutine = @import("coroutine/coroutine.zig").Coroutine;
-    pub const State = @import("coroutine/coroutine.zig").State;
     pub const ClosureBase = @import("coroutine/coroutine.zig").ClosureBase;
+    pub const EventSource = @import("coroutine/event_source.zig").EventSource;
+    pub const event_source = @import("coroutine/event_source.zig");
     pub const stack = @import("coroutine/stack.zig");
     pub const context = @import("coroutine/context_arm64.zig");
     pub const spawn_helper = @import("coroutine/spawn.zig");
@@ -115,6 +116,7 @@ test {
     _ = coroutine.stack;
     _ = coroutine.context;
     _ = coroutine.spawn_helper;
+    _ = coroutine.event_source;
     _ = scheduler.tls;
     _ = scheduler.Worker;
     _ = scheduler.Injection;

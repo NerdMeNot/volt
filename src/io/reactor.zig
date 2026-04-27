@@ -18,7 +18,6 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const system = posix.system;
 
-const Coroutine = @import("../coroutine/coroutine.zig").Coroutine;
 const syscall = @import("../internal/syscall.zig");
 const Mutex = @import("../internal/thread.zig").Mutex;
 
@@ -133,10 +132,11 @@ pub const Reactor = struct {
         return self.pending.load(.acquire);
     }
 
-    /// Arm a one-shot wait for (fd, kind) and associate it with `coro`.
-    /// The caller must subsequently park `coro` — the reactor does not
-    /// touch coroutine state itself, only delivers wake events.
-    pub fn registerWait(self: *Reactor, fd: posix.fd_t, kind: EventKind, coro: *Coroutine) !void {
+    /// Arm a one-shot wait for (fd, kind). The `target` pointer is opaque
+    /// to the reactor — it's stored in the kevent's `udata` field and
+    /// passed back to the wake callback when the event fires. Typically
+    /// a `*Park` (see `io/wait.zig`).
+    pub fn registerWait(self: *Reactor, fd: posix.fd_t, kind: EventKind, target: *anyopaque) !void {
         const key = WaitKey{ .fd = @intCast(fd), .kind_tag = @intFromEnum(kind) };
 
         const ev = posix.Kevent{
@@ -145,7 +145,7 @@ pub const Reactor = struct {
             .flags = system.EV.ADD | system.EV.ONESHOT,
             .fflags = 0,
             .data = 0,
-            .udata = @intFromPtr(coro),
+            .udata = @intFromPtr(target),
         };
 
         // We arm the kevent BEFORE inserting into the waiters map: if the
@@ -174,18 +174,17 @@ pub const Reactor = struct {
         _ = self.pending.fetchAdd(1, .release);
     }
 
-    /// Block on kevent for up to `timeout_ns` (or forever if null), unpark
-    /// each coro whose event fires, and return how many were woken.
+    /// Block on kevent for up to `timeout_ns` (or forever if null), call
+    /// `wakeFn(wake_ctx, target)` for each fired event, and return how
+    /// many events were delivered (excluding the EV_USER tickle).
     ///
     /// Concurrency: only one worker should be inside `poll` at a time —
-    /// callers coordinate via `Runtime.tryClaimReactorPoll`. The wake
-    /// callback may be invoked many times before `poll` returns; callbacks
-    /// must be quick (the reactor lock is released before each callback).
+    /// callers coordinate via `Runtime.tryClaimReactorPoll`.
     pub fn poll(
         self: *Reactor,
         timeout_ns: ?u64,
         wake_ctx: *anyopaque,
-        wakeFn: *const fn (*anyopaque, *Coroutine) anyerror!void,
+        wakeFn: *const fn (*anyopaque, *anyopaque) anyerror!void,
     ) !usize {
         var events: [64]posix.Kevent = undefined;
         const ts: ?posix.timespec = if (timeout_ns) |ns| .{
@@ -203,9 +202,8 @@ pub const Reactor = struct {
 
         var woken: usize = 0;
         for (events[0..n]) |ev| {
-            // Ignore the tickle event — it just returned us from kevent.
             if (ev.udata == TICKLE_UDATA) continue;
-            const coro: *Coroutine = @ptrFromInt(ev.udata);
+            const target: *anyopaque = @ptrFromInt(ev.udata);
             const key = WaitKey{
                 .fd = @intCast(ev.ident),
                 .kind_tag = @intFromEnum(kindFor(ev.filter)),
@@ -214,7 +212,7 @@ pub const Reactor = struct {
             const removed = self.waiters.remove(key);
             self.mutex.unlock();
             if (removed) _ = self.pending.fetchSub(1, .release);
-            try wakeFn(wake_ctx, coro);
+            try wakeFn(wake_ctx, target);
             woken += 1;
         }
         return woken;
@@ -239,28 +237,24 @@ test "reactor: pipe readable wake" {
     defer syscall.close(fds[0]);
     defer syscall.close(fds[1]);
 
-    // Sentinel coro pointer — we won't touch *Coroutine fields, just verify
-    // identity round-trips through udata.
-    var fake_coro_storage: usize = 0xdeadbeef;
-    const fake_coro: *Coroutine = @ptrFromInt(@intFromPtr(&fake_coro_storage));
-
-    try r.registerWait(fds[0], .readable, fake_coro);
+    // Sentinel target — verify identity round-trips through kevent's udata.
+    var sentinel: usize = 0xdeadbeef;
+    try r.registerWait(fds[0], .readable, @ptrCast(&sentinel));
     try std.testing.expectEqual(@as(usize, 1), r.pendingCount());
 
-    // Write to the pipe so the read end becomes readable.
     _ = try syscall.write(fds[1], "x");
 
     const Ctx = struct {
-        woke: ?*Coroutine = null,
-        fn wake(opaque_self: *anyopaque, coro: *Coroutine) anyerror!void {
+        woke: ?*anyopaque = null,
+        fn wake(opaque_self: *anyopaque, target: *anyopaque) anyerror!void {
             const s: *@This() = @ptrCast(@alignCast(opaque_self));
-            s.woke = coro;
+            s.woke = target;
         }
     };
     var ctx: Ctx = .{};
 
     const n = try r.poll(0, &ctx, &Ctx.wake);
     try std.testing.expectEqual(@as(usize, 1), n);
-    try std.testing.expectEqual(fake_coro, ctx.woke.?);
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&sentinel)), ctx.woke.?);
     try std.testing.expectEqual(@as(usize, 0), r.pendingCount());
 }

@@ -121,7 +121,6 @@ pub const Worker = struct {
     /// local run queue. Owner-only.
     pub fn pushOwned(self: *Worker, coro: *Coroutine) !void {
         try self.spawned.append(coro);
-        coro.home_worker = @ptrCast(self);
         self.run_queue.push(coro);
     }
 
@@ -169,7 +168,7 @@ pub const Worker = struct {
 
     inline fn shouldStop(self: *Worker, until_done: ?*Coroutine) bool {
         if (until_done) |target| {
-            if (target.loadState() == .done) return true;
+            if (target.isDone()) return true;
         }
         return self.runtime.shutdownRequested();
     }
@@ -199,23 +198,22 @@ pub const Worker = struct {
     fn idleStep(self: *Worker) void {
         const rt = self.runtime;
 
-        // If reactor has pending I/O AND we can claim the poll, block on it
-        // briefly. Wake events go to our local deque — surface on next loop.
+        // If reactor has pending I/O AND we can claim the poll, block on it.
+        // The reactor's wake target is a *Park (registered by I/O code in
+        // `io/wait.zig`). `park.unpark()` runs the canonical race-free wake
+        // protocol — atomically takes the parked coro and routes it via
+        // `Runtime.schedule`.
         if (rt.reactor.pendingCount() > 0 and rt.tryClaimReactorPoll()) {
             defer rt.releaseReactorPoll();
+            const Park = @import("park.zig").Park;
             const Wake = struct {
-                worker: *Worker,
-                fn wake(opaque_self: *anyopaque, coro: *Coroutine) anyerror!void {
-                    const w: *@This() = @ptrCast(@alignCast(opaque_self));
-                    if (coro.casState(.parked, .runnable) != null) return;
-                    w.worker.run_queue.push(coro);
-                    // Wake one sibling in case the I/O burst is bigger than
-                    // we can dispatch alone.
-                    w.worker.runtime.notifyOneWorker();
+                fn wake(_: *anyopaque, target: *anyopaque) anyerror!void {
+                    const park: *Park = @ptrCast(@alignCast(target));
+                    park.unpark();
                 }
             };
-            var wake_ctx: Wake = .{ .worker = self };
-            _ = rt.reactor.poll(REACTOR_POLL_TIMEOUT_NS, &wake_ctx, &Wake.wake) catch |err| {
+            var dummy: u8 = 0;
+            _ = rt.reactor.poll(REACTOR_POLL_TIMEOUT_NS, @ptrCast(&dummy), &Wake.wake) catch |err| {
                 std.debug.panic("worker {d}: reactor.poll failed: {}", .{ self.id, err });
             };
             return;
@@ -227,36 +225,16 @@ pub const Worker = struct {
 
     fn dispatch(self: *Worker, coro: *Coroutine) void {
         tls.setCurrent(coro, @ptrCast(self.runtime));
-
         coro.scheduler_ctx = &self.main_ctx;
-        coro.storeState(.running);
 
         ctx.swap(&self.main_ctx, &coro.ctx);
-        // Coroutine yielded, parked, or finished — read state with acquire.
-        const observed = coro.loadState();
+        // Coroutine yielded, parked, or finished. It set `pending_event`
+        // before the swap (either to Yield/Park via yieldWith, or to Done
+        // via the trampoline on completion). Hand off ownership.
+        const es = coro.pending_event;
 
         tls.clearCurrent();
 
-        switch (observed) {
-            .running => {
-                // Yielded — back onto local run queue.
-                coro.storeState(.runnable);
-                self.run_queue.push(coro);
-            },
-            .done => {
-                // CAS-detach the waiter (Job.join attaches via CAS too).
-                const old_waiter = coro.waiter.swap(null, .acq_rel);
-                if (old_waiter) |waiter| {
-                    if (waiter.casState(.parked, .runnable) == null) {
-                        self.runtime.scheduleRunnable(waiter);
-                    }
-                }
-                self.runtime.notifyOneWorker();
-            },
-            .parked => {
-                // Suspended — owner re-enqueues on wake.
-            },
-            .runnable => unreachable,
-        }
+        es.subscribe_fn(@ptrCast(@constCast(es)), coro);
     }
 };

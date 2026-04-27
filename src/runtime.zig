@@ -53,10 +53,9 @@ pub const Runtime = struct {
     /// observe this in their main loop and exit.
     shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    /// Round-robin spawn distributor for cross-worker scheduling. Used when
-    /// a wake-up needs to land on some worker but we don't know which is
-    /// least loaded.
-    next_spawn_worker: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Round-robin counter for spreading wake-ups across workers (used by
+    /// notifyOneWorker to absorb the about-to-park race).
+    notify_rr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Runtime {
         const num_workers = blk: {
@@ -126,19 +125,32 @@ pub const Runtime = struct {
 
     /// Wake one parked worker — used when new work appears on the injection
     /// queue or a coroutine completes (its waiter may now be runnable).
-    /// Avoids thundering herd by signalling at most one parked worker.
-    /// Also tickles the reactor so a worker blocked in `kevent()` returns
-    /// immediately (eliminates the 100ms reactor poll latency for new work).
+    /// Wake one worker. Two races to absorb:
+    ///   1. A worker is between findWork and parker.park (parked flag not
+    ///      yet set). We must not lose the wake — `unpark` sets the parker's
+    ///      `unpark_pending` flag which the worker drains before sleeping.
+    ///   2. The reactor poller is blocked in `kevent`. EV_USER tickle
+    ///      returns it immediately.
+    ///
+    /// Strategy: scan for an actually-parked worker first (avoids waking a
+    /// running one — no thundering herd in the common case). If none
+    /// observed parked, call `unpark` on a round-robin victim — that sets
+    /// `unpark_pending` and absorbs the about-to-park race.
     pub fn notifyOneWorker(self: *Runtime) void {
-        // Tickle reactor first — cheaper than a condvar signal, and if the
-        // poller is the only "idle" worker we want it to come back fast.
         if (self.poll_claim.load(.acquire)) self.reactor.tickle();
-        for (self.workers) |*w| {
-            if (w.isParked()) {
-                w.unpark();
+
+        const rr = self.notify_rr.fetchAdd(1, .monotonic);
+        var i: usize = 0;
+        while (i < self.workers.len) : (i += 1) {
+            const idx = (rr + i) % self.workers.len;
+            if (self.workers[idx].isParked()) {
+                self.workers[idx].unpark();
                 return;
             }
         }
+        // No worker observed as parked — set unpark_pending on a round-
+        // robin victim to absorb the about-to-park race.
+        self.workers[rr % self.workers.len].unpark();
     }
 
     pub fn notifyAllWorkers(self: *Runtime) void {
@@ -146,53 +158,39 @@ pub const Runtime = struct {
         for (self.workers) |*w| w.unpark();
     }
 
-    /// Schedule a freshly-runnable coroutine onto whichever worker makes
-    /// sense.
+    /// Place a runnable coroutine on a worker.
     ///
-    /// Strategy:
-    ///   1. If `home_worker` is set AND we're calling from that worker's
-    ///      thread, push directly to the local deque (cache-warm path).
-    ///   2. Otherwise push to the global injection queue and wake one
-    ///      idle worker. If the injection queue is full, fall back to
-    ///      whichever worker we're calling from (or worker 0 from non-
-    ///      worker threads). Pushing to a non-owner deque is unsafe under
-    ///      Chase-Lev, so we never do it — the fallback IS legal because
-    ///      we only push to our own deque, just possibly the "wrong" one.
-    pub fn scheduleRunnable(self: *Runtime, coro: *Coroutine) void {
-        if (coro.home_worker) |opaque_w| {
-            const home: *Worker = @ptrCast(@alignCast(opaque_w));
-            if (currentWorker()) |me| {
-                if (me == home) {
-                    home.run_queue.push(coro);
-                    home.unpark();
-                    return;
-                }
-            }
+    /// Strategy: if we're on a worker thread, push to the calling worker's
+    /// own deque (cache-warm; safe under Chase-Lev because owner-only
+    /// pushes are legal). Otherwise inject globally and wake a worker.
+    ///
+    /// This is the single chokepoint for "I have a runnable coroutine,
+    /// please run it." Park.unpark, the bootstrap, and any future cross-
+    /// thread wake all funnel through here.
+    pub fn schedule(self: *Runtime, coro: *Coroutine) void {
+        if (currentWorker()) |me| {
+            me.run_queue.push(coro);
+            me.unpark();
+            return;
         }
+        self.injectGlobal(coro);
+    }
 
+    /// Push a coroutine onto the global injection queue and wake a worker.
+    /// Called from non-worker threads, or as a fallback when local deque
+    /// access isn't possible.
+    pub fn injectGlobal(self: *Runtime, coro: *Coroutine) void {
         if (self.injection.push(coro)) {
             self.notifyOneWorker();
             return;
         } else |err| switch (err) {
-            error.QueueFull => {
-                // Injection saturated — push onto the calling worker's
-                // own deque if we have one, else block-spin until injection
-                // drains. The block-spin is a last-resort backpressure path
-                // and should be rare (default cap is 16K pending wakes).
-                if (currentWorker()) |me| {
-                    me.run_queue.push(coro);
-                    me.unpark();
-                    return;
-                }
-                self.injectBlocking(coro);
-            },
-            error.OutOfMemory => @panic("injection.push: OOM during scheduleRunnable"),
+            error.QueueFull => self.injectBlocking(coro),
+            error.OutOfMemory => @panic("injection.push: OOM"),
         }
     }
 
-    /// Fallback when called from a non-worker thread AND injection is full.
-    /// Spins-then-yields until the queue drains. Should be unreachable in
-    /// practice — non-worker scheduleRunnable callers are rare.
+    /// Backpressure path when injection is full. Spins-then-yields until
+    /// the queue drains. Should be vanishingly rare — default cap is 16K.
     fn injectBlocking(self: *Runtime, coro: *Coroutine) void {
         var attempts: usize = 0;
         while (true) : (attempts += 1) {
@@ -204,7 +202,7 @@ pub const Runtime = struct {
                     if (attempts > 64) std.Thread.yield() catch {};
                     std.atomic.spinLoopHint();
                 },
-                error.OutOfMemory => @panic("injection.push: OOM during scheduleRunnable"),
+                error.OutOfMemory => @panic("injection.push: OOM"),
             }
         }
     }

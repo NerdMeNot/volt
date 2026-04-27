@@ -16,6 +16,7 @@ const ctx = @import("context_arm64.zig");
 const stack_mod = @import("stack.zig");
 const co = @import("coroutine.zig");
 const Coroutine = co.Coroutine;
+const event_source = @import("event_source.zig");
 
 /// Compute the payload type of a function's return type.
 ///   fn() T   -> T
@@ -97,12 +98,13 @@ pub fn Closure(comptime user_fn: anytype, comptime Args: type) type {
                 }
             }
 
-            // Release-store: the worker observes .done with acquire ordering
-            // and reads `result_ptr.tag` after — that read must see our writes.
-            self.coro.storeState(.done);
+            // Hand the coroutine to the Done EventSource. The worker
+            // post-swap reads `pending_event` and calls Done.subscribe,
+            // which sets `done_flag` and unparks any joiner.
+            self.coro.pending_event = &event_source.done_singleton;
             ctx.swap(&self.coro.ctx, self.coro.scheduler_ctx);
-            // Scheduler observes .done and won't resume us. Anything past
-            // here is dead code — `unreachable` keeps the compiler happy.
+            // The worker observes Done and never re-dispatches us. Anything
+            // past here is dead code.
             unreachable;
         }
 
@@ -166,11 +168,12 @@ pub fn create(
     };
 
     coro.* = .{
-        // scheduler_ctx is set when the scheduler dispatches us for the
-        // first time. Until then, leave it pointing at our own ctx (safe
-        // sentinel — we'll never use it before dispatch).
+        // scheduler_ctx is set on every dispatch. Until then, leave it
+        // pointing at our own ctx (safe sentinel — we never use it before
+        // dispatch).
         .scheduler_ctx = &coro.ctx,
-        .state = std.atomic.Value(co.State).init(.runnable),
+        // pending_event, done_flag, join_park, cancel_flag all default to
+        // their zero/initial values via the struct's field defaults.
         .stack = stack,
         .destroy_extras_fn = &Cl.destroyExtras,
         .closure_ptr = @ptrCast(closure),
