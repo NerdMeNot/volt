@@ -13,15 +13,16 @@ const spawn_mod = @import("../coroutine/spawn.zig");
 const Job = @import("job.zig").Job;
 
 /// Build the join() return type:
-///   user fn returns T   -> error{Cancelled}!T
-///   user fn returns !T  -> (error{Cancelled} || error_set_of_user_fn)!T
+///   user fn returns T   -> error{Cancelled, StackOverflow}!T
+///   user fn returns !T  -> (error{Cancelled, StackOverflow} || error_set_of_user_fn)!T
 fn JoinReturnType(comptime UserFn: type) type {
     const RT = @typeInfo(UserFn).@"fn".return_type.?;
+    const VoltErrors = error{ Cancelled, StackOverflow };
     switch (@typeInfo(RT)) {
         .error_union => |eu| {
-            return (eu.error_set || error{Cancelled})!eu.payload;
+            return (eu.error_set || VoltErrors)!eu.payload;
         },
-        else => return error{Cancelled}!RT,
+        else => return VoltErrors!RT,
     }
 }
 
@@ -40,6 +41,10 @@ pub fn Task(comptime UserFn: type) type {
             self.job.cancel();
         }
 
+        pub fn state(self: *const Self) @import("job.zig").State {
+            return self.job.state();
+        }
+
         pub fn isActive(self: *const Self) bool {
             return self.job.isActive();
         }
@@ -48,9 +53,17 @@ pub fn Task(comptime UserFn: type) type {
             return self.job.isCompleted();
         }
 
-        /// Wait until the coroutine is done; return its value (or an error
-        /// if it threw, or error.Cancelled if it was cancelled). Parks the
-        /// calling coroutine via Job.join (scheduler wakes us at .done).
+        pub fn setName(self: *Self, name: []const u8) void {
+            self.job.setName(name);
+        }
+
+        pub fn setSpawnSite(self: *Self, src: std.builtin.SourceLocation) void {
+            self.job.setSpawnSite(src);
+        }
+
+        /// Wait until the coroutine is done; return its value, or an
+        /// error: `error.Cancelled`, `error.StackOverflow`, or whatever
+        /// the user fn threw.
         pub fn join(self: *Self) JoinT {
             self.job.join() catch |e| return e;
 
@@ -59,6 +72,7 @@ pub fn Task(comptime UserFn: type) type {
                 .ok => self.result.value,
                 .err => @errorCast(self.result.err),
                 .cancelled => error.Cancelled,
+                .stack_overflow => error.StackOverflow,
             };
         }
     };

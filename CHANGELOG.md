@@ -2,7 +2,78 @@
 
 All notable changes to Volt are documented in this file.
 
-## v1.1.0-zig0.15.2
+## v1.0.0-zig0.16.0
+
+First release on the **stackful coroutine** architecture. The previous
+v1.0.0-zig0.15.2 / v1.1.0-zig0.15.2 entries below were a different
+runtime — Future/Poll state machines — preserved at git tag
+`pre-stackful-pivot`. This release is a ground-up rewrite.
+
+### Architecture
+
+- Stackful coroutines: each task owns a growable virtual stack
+  (1 page committed, grows in-place via `mprotect` /
+  `VirtualAlloc(MEM_COMMIT)` on guard-page hit; 8 MiB reservation
+  cap surfaced as `error.StackOverflow`). No compiler stackmaps.
+- Multi-worker work-stealing scheduler: per-worker Chase-Lev deque,
+  LIFO slot, global injection queue, EV_USER reactor wakeup.
+- Park-based primitives: `Coroutine.current_park` makes every
+  suspension cancellable from anywhere — cancel propagates into
+  sleep / I/O / channel / sync waits and surfaces `error.Cancelled`
+  promptly.
+- Slab-pooled stacks: `Done.subscribe` returns the stack to a per-
+  runtime pool on coroutine completion (cap=256, with miss/hit
+  counters in `RuntimeMetrics`).
+
+### Public surface
+
+- Bootstrap: `volt.run(allocator, fn, args)`.
+- Spawning: `volt.launch` (fire-and-forget → `*Job`), `volt.spawn`
+  (value-returning → `*Task(T)`), `volt.spawnBlocking` (off-loop
+  thread pool).
+- Channels: `Channel`, `Oneshot`, `Watch`, `Broadcast`, `select`.
+- Sync: `Mutex`, `RwLock`, `Semaphore`, `Notify`, `Barrier`,
+  `OnceCell`.
+- Structured concurrency: `volt.scope`, `Scope`, `JoinSet`,
+  `CancellationToken`.
+- Time: `volt.sleep`, `volt.withTimeout`, `Interval`.
+- I/O: `volt.io.TcpListener`, `TcpStream`, `Address`, `read`,
+  `write`, `writeAll`.
+- Filesystem: `volt.fs` (read/write/open).
+- Process: `volt.process.Command` (fork/execve/waitpid).
+- Signals: `volt.signal.shutdown`, `ctrlC`.
+- Observability: `volt.observability.snapshot`, `count`, `metrics`;
+  `volt.tracing.span` with OTel-shaped JSON sink.
+- Streams: `volt.stream.Stream` (async iterator + operators).
+
+### Platform support
+
+| Target                        | Backend       | Status                        |
+|-------------------------------|---------------|-------------------------------|
+| macOS arm64 / x86_64          | kqueue        | runtime + CI                  |
+| Linux x86_64 / arm64          | epoll         | runtime + CI                  |
+| Linux x86_64 / arm64          | io_uring      | parallel backend; cross-comp. |
+| Windows x86_64 / arm64 (IOCP) | reactor_iocp  | cross-compile only — see      |
+|                               |               | `src/io/reactor.zig`          |
+
+### Notes / known limitations
+
+- `volt.select` over multiple channels is currently lossy on
+  simultaneous publish (forwarder-based v1 design); lossless
+  arm/disarm select is on the v1.x plan.
+- Async preemption asm path is present (M8 watchdog scaffolding) but
+  not wired in by default — the SIGUSR1 / context-restore path SEGVs
+  in tight CPU loops we couldn't isolate without a kernel debugger.
+  Cooperative preemption (yield at every park / I/O / channel point)
+  is the v1.0 default; cooperative-only matches Go pre-1.14 and
+  exceeds `may`.
+- Windows runtime support: IOCP backend, VirtualAlloc stacks,
+  WaitOnAddress futex, QueryPerformanceCounter time, and Sleep are
+  all in place. Remaining: ioctlsocket / WriteFile / CreateProcess
+  arms in `io/net.zig`, `io/io.zig`, `process/Command.zig`, plus a
+  Windows CI runner.
+
+## v1.1.0-zig0.15.2 (legacy — Future/Poll runtime)
 
 ### Added
 
@@ -31,7 +102,7 @@ All notable changes to Volt are documented in this file.
 - Integration tests added to CI and nightly workflows.
 - macOS Intel runner for nightly builds.
 
-## v1.0.0-zig0.15.2
+## v1.0.0-zig0.15.2 (legacy — Future/Poll runtime)
 
 Initial release. High-performance async I/O runtime for Zig 0.15.2 with:
 

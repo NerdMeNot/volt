@@ -1,303 +1,152 @@
 ---
-title: Signals & Shutdown
-description: Handling OS signals and implementing graceful shutdown in Volt servers.
+title: Signals and Shutdown
+description: volt.signal — async-aware signal handling and graceful shutdown patterns.
 ---
 
-Production servers need to handle termination signals (Ctrl+C, `kill`) and shut down cleanly -- draining in-flight requests, closing connections, and flushing buffers. Volt provides `AsyncSignal` for signal handling and `Shutdown` for coordinating graceful shutdown.
-
-## Signal handling
-
-### AsyncSignal
-
-`AsyncSignal` wraps OS signal delivery into an async-aware API with waiter-based notification.
-
-#### Convenience constructors
+## Signal listening
 
 ```zig
-const volt = @import("volt");
+var sigs = try volt.signal.SignalListener.init(blk: {
+    var set = volt.signal.SignalSet.empty();
+    set.add(.SIGINT);
+    set.add(.SIGTERM);
+    set.add(.SIGUSR1);
+    break :blk set;
+});
+defer sigs.deinit();
 
-// Handle Ctrl+C (SIGINT)
-var ctrl_c = try volt.signal.AsyncSignal.ctrlC();
-defer ctrl_c.deinit();
-
-// Handle SIGTERM (termination request)
-var term = try volt.signal.AsyncSignal.terminate();
-defer term.deinit();
-
-// Handle SIGHUP (hangup/reload)
-var hup = try volt.signal.AsyncSignal.hangup();
-defer hup.deinit();
-
-// Handle both SIGINT and SIGTERM (common for servers)
-var shutdown_sig = try volt.signal.AsyncSignal.shutdown();
-defer shutdown_sig.deinit();
-```
-
-#### Custom signal sets
-
-```zig
-var signals = volt.signal.SignalSet.empty();
-signals.add(.SIGINT);
-signals.add(.SIGTERM);
-signals.add(.SIGHUP);
-
-var handler = try volt.signal.AsyncSignal.init(signals);
-defer handler.deinit();
-```
-
-#### Polling for signals
-
-Non-blocking check:
-
-```zig
-if (try handler.tryRecv()) |sig| {
-    switch (sig) {
-        .SIGINT => log.info("Received SIGINT", .{}),
-        .SIGTERM => log.info("Received SIGTERM", .{}),
-        .SIGHUP => reloadConfig(),
-        else => {},
-    }
+const fired = try sigs.wait();   // suspends; returns the SignalSet that fired
+if (fired.contains(.SIGUSR1)) {
+    // handle SIGUSR1
 }
 ```
 
-#### Async wait
+`SignalListener` builds on the kernel's `signalfd` (Linux) or
+`EVFILT_SIGNAL` (Darwin/BSD). It gives you a coroutine-friendly
+interface: `wait()` suspends until a signal in the set arrives.
 
-Register a waiter that is woken when a signal arrives:
+Common subsets have shortcuts:
 
 ```zig
-var waiter = volt.signal.SignalWaiter.init();
-waiter.setWaker(@ptrCast(&my_ctx), myWakeCallback);
+var s = try volt.signal.shutdown();   // SIGINT + SIGTERM
+defer s.deinit();
 
-if (!try handler.wait(&waiter)) {
-    // No signal pending. Yield to scheduler.
-    // When woken, waiter.isReady() is true.
-}
-
-if (waiter.signal()) |sig| {
-    log.info("Received signal: {}", .{sig});
-}
+var c = try volt.signal.ctrlC();      // SIGINT only
+defer c.deinit();
 ```
 
-#### Signal future
+`SignalListener.handler.read()` is non-blocking — returns the
+fired SignalSet or `error.WouldBlock`. Useful when you want to
+poll for shutdown without a dedicated coroutine.
 
-`SignalFuture` implements the `Future` trait. To race an accept against a shutdown signal, spawn both as async tasks and check which completes first:
+## Graceful shutdown pattern
 
-```zig
-var future = volt.signal.signalFuture(&handler);
-
-// Race accept against shutdown signal using async tasks
-var accept_f = try io.@"async"(acceptTask, .{listener});
-var signal_f = try io.@"async"(signalTask, .{&handler});
-// First to complete wins -- check isDone()
-```
-
-#### Cancellation
+The canonical TCP server with graceful shutdown:
 
 ```zig
-handler.cancelWait(&waiter);
-```
-
-### Blocking signal helpers
-
-For simple scripts that just need to wait for a signal:
-
-```zig
-// Block until Ctrl+C
-try volt.signal.waitForCtrlC();
-
-// Block until SIGINT or SIGTERM, returns which signal fired
-const sig = try volt.signal.waitForShutdown();
-```
-
-### Event loop integration
-
-`AsyncSignal` exposes a file descriptor (Unix) or event handle (Windows) for integration with I/O event loops:
-
-```zig
-const fd = handler.getFd();
-// Register fd for READABLE events in your event loop.
-// When readable, call:
-try handler.handleReadable();
-// This reads pending signals and wakes registered waiters.
-```
-
----
-
-## Shutdown coordinator
-
-The `Shutdown` type combines signal handling with pending-work tracking for clean server shutdown.
-
-### Initialization
-
-```zig
-var shutdown = try volt.shutdown.Shutdown.init();
-defer shutdown.deinit();
-```
-
-This automatically listens for SIGINT and SIGTERM. For custom signals:
-
-```zig
-var signals = volt.signal.SignalSet.empty();
-signals.add(.SIGINT);
-signals.add(.SIGHUP);
-
-var shutdown = try volt.shutdown.Shutdown.initWithSignals(signals);
-defer shutdown.deinit();
-```
-
-### Checking shutdown state
-
-```zig
-while (!shutdown.isShutdown()) {
-    // Accept and handle connections...
-    if (try listener.tryAccept()) |result| {
-        handleConnection(result.stream);
-    }
-}
-```
-
-`isShutdown` polls for signals non-blockingly and returns `true` once a signal is received or `trigger()` is called.
-
-### Manual trigger
-
-Trigger shutdown programmatically (e.g., from an HTTP `/shutdown` endpoint):
-
-```zig
-shutdown.trigger();
-
-// Check what triggered it
-if (shutdown.triggerSignal()) |sig| {
-    log.info("Shutdown triggered by {}", .{sig});
-} else {
-    log.info("Shutdown triggered manually", .{});
-}
-```
-
-### Shutdown future
-
-For use with `Select` to race accept against shutdown:
-
-```zig
-var future = shutdown.future();
-// ShutdownFuture implements poll/cancel
-```
-
-### Tracking pending work
-
-The `WorkGuard` pattern tracks in-flight requests so the server can wait for them to complete before exiting:
-
-```zig
-fn handleConnection(shutdown_ref: *volt.shutdown.Shutdown, stream: TcpStream) void {
-    // Register this work
-    var guard = shutdown_ref.startWork();
-    defer guard.deinit(); // Decrements pending count when done
-
-    // Process the request
-    processRequest(stream);
-}
-```
-
-Query pending work:
-
-```zig
-shutdown.pendingCount();    // usize -- number of active WorkGuards
-shutdown.hasPendingWork();  // bool
-```
-
-### Waiting for drain
-
-After triggering shutdown, wait for all in-flight work to complete:
-
-```zig
-// Wait up to 30 seconds (default) for pending work
-const all_done = shutdown.waitPending();
-if (!all_done) {
-    log.warn("Timed out waiting for pending work", .{});
-}
-
-// Custom timeout
-const all_done2 = shutdown.waitPendingTimeout(Duration.fromSecs(60));
-```
-
----
-
-## Complete graceful shutdown pattern
-
-```zig
-const volt = @import("volt");
-const std = @import("std");
-const log = std.log;
-
-pub fn main() !void {
-    var shutdown = try volt.shutdown.Shutdown.init();
-    defer shutdown.deinit();
-
-    var listener = try volt.net.listen("0.0.0.0:8080");
+fn serve() !void {
+    var listener = try volt.io.TcpListener.bind(volt.io.Address.any4(8080));
     defer listener.close();
 
-    log.info("Server listening on :8080. Press Ctrl+C to stop.", .{});
+    var shutdown = try volt.signal.shutdown();
+    defer shutdown.deinit();
 
-    // Accept loop
-    while (!shutdown.isShutdown()) {
-        if (listener.tryAccept() catch null) |result| {
-            // Track this connection
-            var guard = shutdown.startWork();
+    while (true) {
+        // Non-blocking shutdown check at the top of every iteration.
+        if (shutdown.handler.read()) |_| {
+            std.debug.print("shutdown signal received; draining\n", .{});
+            return;
+        } else |_| {}
 
-            // Spawn handler task (in production, use io.@"async")
-            handleRequest(result.stream);
-
-            guard.complete(); // Mark work as done
-        }
+        const conn = listener.accept() catch |err| switch (err) {
+            error.Cancelled => return,
+            else => return err,
+        };
+        _ = try volt.launch(handle, .{conn});
     }
-
-    log.info("Shutdown signal received. Draining...", .{});
-
-    // Wait for in-flight requests to finish
-    const drained = shutdown.waitPendingTimeout(
-        volt.time.Duration.fromSecs(30),
-    );
-
-    if (drained) {
-        log.info("All requests completed. Shutting down.", .{});
-    } else {
-        log.warn("Timed out. {} requests still pending.", .{
-            shutdown.pendingCount(),
-        });
-    }
-}
-
-fn handleRequest(stream: volt.net.TcpStream) void {
-    var conn = stream;
-    defer conn.close();
-    // Process...
 }
 ```
 
-## CancelToken
+When `volt.run` returns from `serve`, the runtime tears down the
+worker pool. Coroutines spawned via `volt.launch` (the per-connection
+handlers) get cancelled. Their current parks (on `read`, `writeAll`,
+etc.) surface `error.Cancelled` and they unwind cleanly.
 
-The `CancelToken` is an internal primitive used by `Select` operations. It provides atomic "first to claim wins" semantics:
+## Drain-then-exit pattern
+
+If you want spawned handlers to **finish their current request** but
+not accept new ones, wrap the spawn region in a `volt.scope`:
 
 ```zig
-var token = volt.sync.cancel_token.CancelToken.init();
+fn serve() !void {
+    var listener = try volt.io.TcpListener.bind(volt.io.Address.any4(8080));
+    defer listener.close();
 
-// Multiple branches race to claim
-if (token.tryClaimWinner(branch_id)) {
-    // This branch won
-} else {
-    // Another branch already claimed
+    try volt.scope(struct {
+        fn body(s: *volt.Scope) !void {
+            var shutdown = try volt.signal.shutdown();
+            defer shutdown.deinit();
+
+            while (true) {
+                if (shutdown.handler.read()) |_| return else |_| {}
+                const conn = listener.accept() catch |err| switch (err) {
+                    error.Cancelled => return,
+                    else => return err,
+                };
+                try s.spawn(handle, .{conn});
+            }
+        }
+    }.body);
+    // After the scope returns: every active handler has finished
+    // (or been cancelled and joined). The accept loop is gone.
 }
-
-token.isCancelledFor(branch_id); // true if this branch lost
 ```
 
-`CancelToken` is primarily used inside `SelectContext` (see [Select](/usage/select/)) and does not typically appear in application code.
+The scope joins every handler before returning. Existing connections
+finish their work; new ones don't get accepted because the loop has
+exited. This is the "graceful drain" semantic without manual
+WorkGuard tracking.
 
-## Platform notes
+## Per-coroutine signal handling
 
-| Platform | Signal mechanism |
-|----------|-----------------|
-| Linux | `signalfd` -- file descriptor that receives signals |
-| macOS | `kqueue` with `EVFILT_SIGNAL` |
-| Windows | `SetConsoleCtrlHandler` with event objects |
+`SignalListener` is a per-coroutine handle, not a process-global
+hook. You can have multiple listeners with different signal sets in
+different coroutines, and each gets its own signalfd. They don't
+interfere.
 
-The `AsyncSignal` abstraction hides these differences. On all platforms, signal delivery is converted into a waitable event that integrates with the async event loop.
+The kernel's signal mask is set once per process. Volt blocks the
+listened-for signals from interrupting normal code paths so
+`signalfd` is the only way they're delivered. This is correct
+behavior for an async-aware program; the signals don't go anywhere
+else.
+
+## What about real-time signals?
+
+`SignalSet` covers the standard POSIX signals (`SIGINT`, `SIGTERM`,
+`SIGHUP`, `SIGUSR1`, `SIGUSR2`, etc.). Real-time signals
+(`SIGRTMIN..SIGRTMAX`) aren't exposed in v1.0. If you need them for
+a specific use case, file an issue with the use case.
+
+## Windows
+
+`volt.signal` is currently POSIX-only. The Windows equivalent
+(`SetConsoleCtrlHandler` + named events for service signals) ships
+with the broader Windows runtime port — see the platform-status
+note in the [introduction](/).
+
+## Patterns to avoid
+
+```zig
+// DON'T install a regular signal handler with signal()/sigaction()
+// alongside SignalListener — Volt's listener takes ownership of the
+// signal mask and you'll miss deliveries.
+std.posix.sigaction(...);  // ← BAD
+
+// DON'T expect SignalListener to fire from an OS thread that's not
+// a Volt worker. The wait() call requires a coroutine context.
+```
+
+Both of these will appear to work in casual testing and break in
+hard-to-reproduce ways under load. Use `SignalListener` exclusively
+inside Volt; if you need to bridge to a non-Volt thread, send the
+signal info through a `Channel` to a coroutine that can react.

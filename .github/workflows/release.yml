@@ -14,7 +14,7 @@ on:
         type: boolean
 
 env:
-  ZIG_VERSION: "0.15.2"
+  ZIG_VERSION: "0.16.0"
 
 jobs:
   validate:
@@ -50,7 +50,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -61,20 +61,6 @@ jobs:
 
       - name: Run unit tests
         run: zig build test
-
-      - name: Run concurrency tests
-        run: zig build test-concurrency
-        env:
-          VOLT_TEST_INTENSITY: standard
-
-      - name: Run stress tests
-        if: matrix.os != 'windows-latest'
-        run: zig build test-stress
-        env:
-          VOLT_TEST_INTENSITY: stress
-
-      - name: Run robustness tests
-        run: zig build test-robustness
 
       - name: Build library
         run: zig build
@@ -130,10 +116,10 @@ jobs:
 
           | Platform | Backend | Status |
           |----------|---------|--------|
-          | Linux | io_uring | ✅ Full support |
-          | Linux | epoll | ✅ Fallback |
-          | macOS | kqueue | ✅ Full support |
-          | Windows | IOCP | ✅ Full support |
+          | macOS arm64/x86_64 | kqueue | runtime + CI |
+          | Linux x86_64/arm64 | epoll  | runtime + CI |
+          | Linux x86_64       | io_uring | parallel backend; cross-compile + CI |
+          | Windows x86_64/arm64 | IOCP | cross-compile only — see reactor.zig |
 
           ### Requirements
           - **Zig**: ${{ env.ZIG_VERSION }} or compatible

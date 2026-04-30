@@ -51,7 +51,7 @@ test "v0.3: coroutines observe at least two distinct OS thread IDs" {
     const cpus = std.Thread.getCpuCount() catch 1;
     if (cpus < 2) return error.SkipZigTest;
 
-    const probe = try volt.run(std.testing.allocator, probeRoot, .{});
+    const probe = try volt.run(.{ .allocator = std.testing.allocator }, probeRoot, .{});
 
     var seen = std.AutoHashMap(u64, void).init(std.testing.allocator);
     defer seen.deinit();
@@ -92,6 +92,6 @@ fn stressRoot() !u64 {
 }
 
 test "v0.3: 256 CPU-bound coroutines all complete across the worker pool" {
-    const total = try volt.run(std.testing.allocator, stressRoot, .{});
+    const total = try volt.run(.{ .allocator = std.testing.allocator }, stressRoot, .{});
     try std.testing.expectEqual(@as(u64, 256), total);
 }

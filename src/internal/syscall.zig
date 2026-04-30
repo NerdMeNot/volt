@@ -19,6 +19,17 @@ const posix = std.posix;
 /// Re-export the raw syscall layer so callers can reach down when needed.
 pub const system = std.posix.system;
 
+/// `posix.errno(rc)` shim that accepts a signed `rc` (negative-on-error
+/// convention) on both Darwin and Linux. On Linux `posix.errno` takes
+/// `usize`; we bit-cast. On Darwin/BSD it accepts the signed value
+/// directly (libc-typed return).
+inline fn errnoOf(signed: isize) std.posix.E {
+    return switch (builtin.os.tag) {
+        .linux => posix.errno(@as(usize, @bitCast(signed))),
+        else => posix.errno(signed),
+    };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Sockets
 // ─────────────────────────────────────────────────────────────────────────────
@@ -121,8 +132,13 @@ pub const FcntlError = error{
 
 pub fn fcntl(fd: posix.fd_t, cmd: i32, arg: usize) FcntlError!usize {
     while (true) {
-        const rc: usize = @bitCast(@as(isize, system.fcntl(fd, cmd, arg)));
-        switch (posix.errno(@as(isize, @bitCast(rc)))) {
+        // With libc linked, `system.fcntl` returns `c_int` on both
+        // Linux and Darwin (libc-typed return). Promote to isize for
+        // the negative-error / success-bitcast unification.
+        const raw = system.fcntl(fd, cmd, arg);
+        const signed: isize = @as(isize, raw);
+        const rc: usize = @bitCast(signed);
+        switch (errnoOf(signed)) {
             .SUCCESS => return rc,
             .INTR => continue,
             .ACCES => return error.Locked,
@@ -168,7 +184,7 @@ pub fn write(fd: posix.fd_t, bytes: []const u8) WriteError!usize {
         const rc = system.write(fd, bytes.ptr, count);
         const signed: isize = @bitCast(rc);
         if (signed >= 0) return @intCast(signed);
-        switch (posix.errno(signed)) {
+        switch (errnoOf(signed)) {
             .INTR => continue,
             .INVAL => return error.InvalidArgument,
             .FAULT => unreachable,
@@ -195,7 +211,7 @@ pub fn writev(fd: posix.fd_t, iov: []const posix.iovec_const) WriteError!usize {
         const rc = system.writev(fd, iov.ptr, iov_count);
         const signed: isize = @bitCast(rc);
         if (signed >= 0) return @intCast(signed);
-        switch (posix.errno(signed)) {
+        switch (errnoOf(signed)) {
             .INTR => continue,
             .INVAL => return error.InvalidArgument,
             .FAULT => unreachable,
@@ -225,7 +241,7 @@ pub fn read(fd: posix.fd_t, bytes: []u8) ReadError!usize {
         const rc = system.read(fd, bytes.ptr, count);
         const signed: isize = @bitCast(rc);
         if (signed >= 0) return @intCast(signed);
-        switch (posix.errno(signed)) {
+        switch (errnoOf(signed)) {
             .INTR => continue,
             .INVAL => unreachable,
             .FAULT => unreachable,
@@ -264,7 +280,7 @@ pub fn readv(fd: posix.fd_t, iov: []const posix.iovec) ReadError!usize {
         const rc = system.readv(fd, iov.ptr, iov_count);
         const signed: isize = @bitCast(rc);
         if (signed >= 0) return @intCast(signed);
-        switch (posix.errno(signed)) {
+        switch (errnoOf(signed)) {
             .INTR => continue,
             .INVAL => unreachable,
             .FAULT => unreachable,
@@ -371,7 +387,9 @@ pub fn accept(
             system.accept4(fd, addr, addr_size, flags)
         else
             system.accept(fd, addr, addr_size);
-        const signed: isize = @bitCast(@as(usize, @bitCast(@as(isize, rc))));
+        // With libc linked, both accept (Darwin) and accept4 (Linux)
+        // return `c_int`. Promote to isize for unified handling.
+        const signed: isize = @as(isize, rc);
         if (comptime !has_accept4) {
             if (signed >= 0) {
                 const accepted: posix.socket_t = @intCast(signed);
@@ -390,7 +408,7 @@ pub fn accept(
             }
         }
         if (signed >= 0) return @intCast(signed);
-        switch (posix.errno(signed)) {
+        switch (errnoOf(signed)) {
             .INTR => continue,
             .AGAIN => return error.WouldBlock,
             .BADF => unreachable,
@@ -511,7 +529,7 @@ pub fn sendto(
         const rc = system.sendto(fd, buf.ptr, buf.len, flags, dest_addr, addrlen);
         const signed: isize = @bitCast(rc);
         if (signed >= 0) return @intCast(signed);
-        switch (posix.errno(signed)) {
+        switch (errnoOf(signed)) {
             .ACCES => return error.AccessDenied,
             .AGAIN => return error.WouldBlock,
             .ALREADY => return error.FastOpenAlreadyInProgress,
@@ -565,7 +583,7 @@ pub fn recvfrom(
         const rc = system.recvfrom(fd, buf.ptr, buf.len, flags, src_addr, addrlen);
         const signed: isize = @bitCast(rc);
         if (signed >= 0) return @intCast(signed);
-        switch (posix.errno(signed)) {
+        switch (errnoOf(signed)) {
             .AGAIN => return error.WouldBlock,
             .BADF => unreachable,
             .CONNREFUSED => return error.ConnectionRefused,
@@ -748,7 +766,7 @@ fn lseek(fd: posix.fd_t, offset: i64, whence: i32) SeekError!u64 {
     const rc = system.lseek(fd, @intCast(offset), whence);
     const signed: i64 = @bitCast(@as(u64, @bitCast(@as(i64, rc))));
     if (signed >= 0) return @intCast(signed);
-    switch (posix.errno(signed)) {
+    switch (errnoOf(signed)) {
         .BADF, .INVAL, .OVERFLOW, .NXIO, .SPIPE => return error.Unseekable,
         else => |err| return posix.unexpectedErrno(err),
     }
@@ -792,7 +810,7 @@ pub fn readlinkatZ(dirfd: posix.fd_t, path: [*:0]const u8, buf: []u8) ![]u8 {
     const rc = system.readlinkat(dirfd, path, buf.ptr, buf.len);
     const signed: isize = @bitCast(rc);
     if (signed >= 0) return buf[0..@intCast(signed)];
-    switch (posix.errno(signed)) {
+    switch (errnoOf(signed)) {
         .ACCES, .PERM => return error.AccessDenied,
         .FAULT => unreachable,
         .INVAL => return error.NotLink,
@@ -815,7 +833,7 @@ pub fn pread(fd: posix.fd_t, bytes: []u8, offset: u64) ReadError!usize {
         const rc = system.pread(fd, bytes.ptr, bytes.len, @intCast(offset));
         const signed: isize = @bitCast(rc);
         if (signed >= 0) return @intCast(signed);
-        switch (posix.errno(signed)) {
+        switch (errnoOf(signed)) {
             .INTR => continue,
             .INVAL => unreachable,
             .FAULT => unreachable,
@@ -834,7 +852,7 @@ pub fn pwrite(fd: posix.fd_t, bytes: []const u8, offset: u64) WriteError!usize {
         const rc = system.pwrite(fd, bytes.ptr, bytes.len, @intCast(offset));
         const signed: isize = @bitCast(rc);
         if (signed >= 0) return @intCast(signed);
-        switch (posix.errno(signed)) {
+        switch (errnoOf(signed)) {
             .INTR => continue,
             .INVAL => return error.InvalidArgument,
             .FAULT => unreachable,
@@ -941,7 +959,7 @@ pub fn waitpid(pid: posix.pid_t, flags: u32) WaitPidResult {
     while (true) {
         const rc = system.waitpid(pid, &status, @intCast(flags));
         const signed: isize = @bitCast(@as(usize, @bitCast(@as(isize, rc))));
-        switch (posix.errno(signed)) {
+        switch (errnoOf(signed)) {
             .SUCCESS => return .{ .pid = @intCast(rc), .status = @bitCast(status) },
             .INTR => continue,
             .CHILD => unreachable, // PID doesn't exist
@@ -1004,7 +1022,7 @@ pub fn kevent(
         );
         const signed: isize = @bitCast(@as(usize, @bitCast(@as(isize, rc))));
         if (signed >= 0) return @intCast(signed);
-        switch (posix.errno(signed)) {
+        switch (errnoOf(signed)) {
             .INTR => continue,
             .ACCES => return error.AccessDenied,
             .FAULT => unreachable,

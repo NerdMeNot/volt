@@ -1,406 +1,184 @@
 ---
 title: Networking
-description: TCP, UDP, and Unix domain socket networking with Volt.
+description: TcpListener, TcpStream, Address — coroutine-aware TCP I/O.
 ---
 
-The `net` module provides production-grade networking with non-blocking I/O, async futures, and full socket option control.
-
-## Socket types
-
-| Type | Description |
-|------|-------------|
-| `TcpListener` | Accept incoming TCP connections |
-| `TcpStream` | Bidirectional TCP connection |
-| `TcpSocket` | Socket builder for pre-connection configuration |
-| `UdpSocket` | Connectionless datagram socket |
-| `UnixStream` | Unix domain stream socket |
-| `UnixListener` | Unix domain socket listener |
-| `UnixDatagram` | Unix domain datagram socket |
-| `Address` | IPv4/IPv6 socket address |
-
-:::caution[Handle all four outcomes from non-blocking reads]
-Every `tryRead`, `tryAccept`, and `tryRecv` returns **four** possible results. Missing any of them causes bugs:
-
-| Result | Meaning | What to do |
-|--------|---------|-----------|
-| `n > 0` | Got data | Process it |
-| `null` | Would block (no data ready) | Retry later (`orelse continue`) |
-| `n == 0` | Peer closed the connection (FIN) | Clean up and return |
-| `error` | Connection reset or failure | Log and return |
-
-**Copy-paste template for every read loop:**
-
-```zig
-while (true) {
-    const n = stream.tryRead(&buf) catch return orelse continue;
-    if (n == 0) return; // Peer disconnected
-    processData(buf[0..n]);
-}
-```
-
-See [Common Pitfalls](/guides/common-pitfalls/#the-three-way-io-pattern) for detailed examples of what goes wrong when you skip outcomes.
-:::
-
-## TCP server
-
-### Quick start with convenience functions
-
-```zig
-const volt = @import("volt");
-
-// Bind to an address string
-var listener = try volt.net.listen("0.0.0.0:8080");
-defer listener.close();
-
-// Or bind to a port on all interfaces
-var listener2 = try volt.net.listenPort(8080);
-defer listener2.close();
-```
-
-### Accept loop
-
-`tryAccept` returns an `AcceptResult` containing the new stream and the peer address:
-
-```zig
-while (true) {
-    if (try listener.tryAccept()) |result| {
-        var stream = result.stream;
-        const peer = result.peer_addr;
-        // Handle connection...
-        handleClient(&stream, peer);
-    }
-}
-```
-
-### Async accept
-
-`accept()` returns an `AcceptFuture` for scheduler integration:
-
-```zig
-var future = listener.accept();
-// Poll through your runtime...
-// When ready, result contains the stream and peer address.
-```
-
-## TCP client
-
-### Quick connect
-
-```zig
-var stream = try volt.net.connect("127.0.0.1:8080");
-defer stream.close();
-```
-
-### Connect with DNS resolution
-
-```zig
-var stream = try volt.net.connectHost(allocator, "example.com", 443);
-defer stream.close();
-```
-
-### Custom socket options
-
-Use `TcpSocket` as a builder to configure options before connecting:
-
-```zig
-var socket = try volt.net.TcpSocket.newV4();
-
-// Set buffer sizes
-try socket.setRecvBufferSize(65536);
-try socket.setSendBufferSize(65536);
-
-// Enable TCP keepalive
-try socket.setKeepalive(.{
-    .time = volt.time.Duration.fromSecs(60),
-});
-
-// Enable TCP_NODELAY (disable Nagle's algorithm)
-try socket.setNodelay(true);
-
-// Connect
-var stream = try socket.connect(addr);
-defer stream.close();
-```
-
-## TCP stream I/O
-
-### Non-blocking read/write
-
-```zig
-var buf: [4096]u8 = undefined;
-
-// tryRead returns ?usize -- null means WouldBlock
-if (try stream.tryRead(&buf)) |n| {
-    if (n == 0) {
-        // Connection closed by peer
-        return;
-    }
-    processData(buf[0..n]);
-}
-
-// tryWrite returns ?usize -- null means WouldBlock
-if (try stream.tryWrite(response_data)) |n| {
-    // n bytes were written
-}
-
-// writeAll blocks (retries) until all data is written
-try stream.writeAll("HTTP/1.1 200 OK\r\n\r\nHello!");
-```
-
-### Async futures
-
-```zig
-// Read future
-var read_future = stream.read(&buf);
-
-// Write future
-var write_future = stream.write(data);
-
-// Write-all future
-var write_all_future = stream.writeAll(data);
-
-// Readiness futures (wait for socket to be readable/writable)
-var readable_future = stream.readable();
-var writable_future = stream.writable();
-```
-
-### Peek
-
-Read data without consuming it from the receive buffer:
-
-```zig
-const n = try stream.peek(&buf);
-if (n > 0) {
-    // Peeked n bytes, data is still in the buffer
-}
-```
-
-### Shutdown
-
-Shut down one or both directions of the connection:
-
-```zig
-try stream.shutdown(.write); // No more writes (sends FIN)
-try stream.shutdown(.read);  // No more reads
-try stream.shutdown(.both);  // Both directions
-```
-
-### Splitting a stream
-
-Split a `TcpStream` into independent read and write halves for concurrent I/O:
-
-```zig
-// Borrowed split -- halves reference the original stream
-const halves = stream.split_halves();
-var reader = halves.read;
-var writer = halves.write;
-
-// Owned split -- halves can be moved to different tasks
-const owned = try stream.intoSplit(allocator);
-var owned_reader = owned.read;  // Can move to reader task
-var owned_writer = owned.write; // Can move to writer task
-```
-
-## UDP
-
-### One-to-many (sendTo/recvFrom)
-
-```zig
-var socket = try volt.net.UdpSocket.bind(volt.net.Address.fromPort(8080));
-defer socket.close();
-
-var buf: [1024]u8 = undefined;
-
-// Receive from any sender
-if (try socket.tryRecvFrom(&buf)) |result| {
-    const data = buf[0..result.len];
-    const sender = result.addr;
-
-    // Echo back to sender
-    _ = try socket.trySendTo(data, sender);
-}
-```
-
-### One-to-one (connect + send/recv)
-
-```zig
-var socket = try volt.net.UdpSocket.bind(volt.net.Address.fromPort(0));
-try socket.connect(server_addr);
-
-_ = try socket.trySend("hello");
-const n = try socket.tryRecv(&buf) orelse 0;
-```
-
-### Socket options
-
-```zig
-try socket.setBroadcast(true);
-try socket.setMulticastLoop(true);
-try socket.setMulticastTtl(2);
-try socket.setTtl(64);
-
-// Join a multicast group
-try socket.joinMulticast(multicast_addr, interface_addr);
-try socket.leaveMulticast(multicast_addr, interface_addr);
-```
-
-## Unix domain sockets
-
-Unix sockets provide local inter-process communication, faster than TCP loopback.
-
-### Stream (connection-oriented)
-
-```zig
-// Server
-var listener = try volt.net.UnixListener.bind("/tmp/myapp.sock");
-defer listener.close();
-
-if (try listener.tryAccept()) |result| {
-    var stream = result.stream;
-    defer stream.close();
-    // Handle connection...
-}
-
-// Client
-var stream = try volt.net.UnixStream.connect("/tmp/myapp.sock");
-defer stream.close();
-try stream.writeAll("hello");
-```
-
-### Datagram (connectionless)
-
-```zig
-var sock = try volt.net.UnixDatagram.bind("/tmp/myapp-dgram.sock");
-defer sock.close();
-
-_ = try sock.trySendTo("message", "/tmp/other.sock");
-
-var buf: [1024]u8 = undefined;
-if (try sock.tryRecvFrom(&buf)) |result| {
-    processMessage(buf[0..result.len]);
-}
-```
-
-## DNS resolution
-
-DNS lookups are blocking operations. Use them from the blocking pool in production:
-
-```zig
-// Resolve all addresses
-var result = try volt.net.resolve(allocator, "example.com", 443);
-defer result.deinit();
-
-for (result.addresses) |addr| {
-    // Try connecting to each address
-}
-
-// Resolve first address only
-const addr = try volt.net.resolveFirst(allocator, "example.com", 443);
-var stream = try volt.net.TcpStream.connect(addr);
-```
+Volt's networking surface is intentionally small for v1.0: TCP
+sockets and an `Address` type. UDP and Unix sockets are planned;
+TLS is out of scope (build it on top of `TcpStream`).
 
 ## Address
 
-The `Address` type wraps `sockaddr_storage` and supports both IPv4 and IPv6:
+`std.net.Address`-aligned constructors. Pick the form that matches
+how you have the address.
 
 ```zig
-// Parse from string
-const addr = try volt.net.Address.parse("127.0.0.1:8080");
+// Explicit octets:
+const a = volt.io.Address.initIp4(.{ 127, 0, 0, 1 }, 8080);
+const a6 = volt.io.Address.initIp6(.{0} ** 16, 8080);
 
-// From port only (binds to 0.0.0.0)
-const addr2 = volt.net.Address.fromPort(8080);
+// Common defaults:
+const lo = volt.io.Address.loopback4(8080);   // 127.0.0.1
+const lo6 = volt.io.Address.loopback6(8080);  // ::1
+const any = volt.io.Address.any4(8080);       // 0.0.0.0 — listen on every interface
+const any6 = volt.io.Address.any6(8080);      // ::
 
-// Get components
-const port = addr.port();
-const family = addr.family(); // AF.INET or AF.INET6
+// String parsing:
+const a = try volt.io.Address.parseIp4("192.168.1.50", 8080);
+const a = try volt.io.Address.parse("127.0.0.1:8080");
+const a = try volt.io.Address.parse("[::1]:9090");
+
+// Inspection:
+a.family();       // posix.AF.INET | AF.INET6
+a.getPort();      // u16, native byte order
+a.osSockLen();    // for bind/connect/accept
 ```
 
-## Connection Lifecycle and Peer Disconnect
+`parse` recognizes `host:port` for IPv4 and `[host]:port` for IPv6.
+Currently the IPv6 string parser only handles `::1` and `::`;
+full IPv6 text parsing is planned. For non-trivial IPv6 use
+`initIp6` directly.
 
-Understanding how TCP connections end is essential for writing robust servers.
-
-### Orderly shutdown (FIN)
-
-When the remote peer closes the connection gracefully, `tryRead` returns `0` bytes. This is not an error -- it means the peer sent a FIN packet:
+## TcpListener
 
 ```zig
-const n = stream.tryRead(&buf) catch return orelse continue;
-if (n == 0) {
-    // Peer closed the connection (FIN received).
-    // No more data will arrive. Clean up and return.
-    return;
+var listener = try volt.io.TcpListener.bind(volt.io.Address.any4(8080));
+defer listener.close();
+
+while (true) {
+    const conn = try listener.accept();   // suspends; reactor wakes us
+    _ = try volt.launch(handle, .{conn});
 }
 ```
 
-### Connection reset (RST)
+`bind(addr)`:
 
-If the remote peer crashes, the network drops, or the connection is forcibly closed, `tryRead` returns an error (typically `ConnectionResetByPeer` or `BrokenPipe`):
+- Creates a non-blocking socket.
+- Sets `SO_REUSEADDR`.
+- Binds to `addr`.
+- Listens with default backlog.
+
+Returns a `TcpListener` you must `close()` (or let the runtime tear
+down at shutdown).
+
+`accept()` suspends the calling coroutine on the listener fd until
+the kernel says a connection is ready, then returns a
+`TcpStream`. The new stream is also non-blocking and registered
+with the reactor.
 
 ```zig
-const n = stream.tryRead(&buf) catch |err| {
-    // Connection was reset or aborted.
-    // Log the error and clean up.
-    std.debug.print("Connection error: {}\n", .{err});
-    return;
-};
+const local: volt.io.Address = try listener.localAddress();
+// Useful when you bound port=0 (kernel-assigned port).
 ```
 
-### Write to a closed connection
-
-Writing to a connection after the peer has closed it produces `BrokenPipe`. Always handle write errors:
+## TcpStream
 
 ```zig
-stream.writeAll(response) catch |err| {
-    // Peer may have disconnected between read and write.
-    std.debug.print("Write failed: {}\n", .{err});
-    return;
-};
-```
-
-### Summary
-
-| `tryRead` result | Meaning |
-|------------------|---------|
-| `n > 0` | Data received |
-| `null` | Would block (no data ready, try again) |
-| `n == 0` | Orderly shutdown -- peer sent FIN |
-| `error` | Connection reset, abort, or network failure |
-
-For a complete example that handles all these cases, see the [Echo Server](/cookbook/echo-server/) cookbook.
-
----
-
-## Async server pattern
-
-A complete async TCP server skeleton:
-
-```zig
-const volt = @import("volt");
-
-pub fn main() !void {
-    try volt.run(server);
-}
-
-fn server(io: volt.Runtime) void {
-    var listener = volt.net.listen("0.0.0.0:8080") catch return;
-    defer listener.close();
-
-    while (true) {
-        if (listener.tryAccept() catch null) |result| {
-            _ = io.@"async"(handleClient, .{result.stream}) catch continue;
-        }
-    }
-}
-
-fn handleClient(conn: volt.net.TcpStream) void {
-    var stream = conn;
-    defer stream.close();
+fn handle(conn: volt.io.TcpStream) void {
+    var s = conn;
+    defer s.close();
 
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = stream.tryRead(&buf) catch return orelse continue;
-        if (n == 0) return; // Client disconnected
-        stream.writeAll(buf[0..n]) catch return;
+        const n = s.read(&buf) catch return;
+        if (n == 0) return;                       // peer closed
+        s.writeAll(buf[0..n]) catch return;
     }
 }
 ```
+
+`TcpStream` methods (all suspend on `WouldBlock`):
+
+| Method | Description |
+|---|---|
+| `read(&buf) !usize` | Read up to `buf.len` bytes; returns 0 on peer close |
+| `write(buf) !usize` | Write up to `buf.len` bytes; returns count actually written |
+| `writeAll(buf) !void` | Write the entire buffer, looping over partial writes |
+| `close()` | Close the fd; remove from reactor |
+
+Every read/write registers a wait on the reactor when the kernel
+returns `EWOULDBLOCK`. The reactor wakes the coroutine when the
+kernel signals readiness; the loop retries the syscall.
+
+### Connecting
+
+```zig
+var stream = try volt.io.TcpStream.connect(volt.io.Address.parse("127.0.0.1:8080") catch unreachable);
+defer stream.close();
+try stream.writeAll("ping");
+```
+
+`connect(addr)` does a non-blocking `connect()`, suspends on
+writability if the kernel returned `EINPROGRESS`, then checks
+`SO_ERROR` to surface connection failures. Returns the connected
+stream.
+
+## Cancellation through I/O
+
+Cancelling a coroutine parked on `read` / `accept` / `connect`
+unparks it; the next syscall returns `error.Cancelled`. This is
+how `volt.withTimeout` cancels a hung connection:
+
+```zig
+const data = volt.withTimeout(
+    volt.Duration.fromSecs(5),
+    readAll,
+    .{&stream},
+) catch |err| switch (err) {
+    error.Timeout => return error.ConnectionTimedOut,
+    else => return err,
+};
+```
+
+You don't need a deadline socket option or per-syscall timeout.
+
+## Server pattern with graceful shutdown
+
+```zig
+fn serve() !void {
+    var listener = try volt.io.TcpListener.bind(volt.io.Address.any4(8080));
+    defer listener.close();
+
+    var shutdown = try volt.signal.shutdown();
+    defer shutdown.deinit();
+
+    while (true) {
+        // Non-blocking shutdown check.
+        if (shutdown.handler.read()) |_| return else |_| {}
+
+        const conn = listener.accept() catch |err| switch (err) {
+            error.Cancelled => return,
+            else => return err,
+        };
+        _ = try volt.launch(handle, .{conn});
+    }
+}
+```
+
+For a more elegant shutdown that uses `volt.select`, see the
+[graceful drain cookbook](/cookbook/graceful-drain/).
+
+## What's NOT here
+
+- **TLS / SSL** — build on top of `TcpStream`. A `volt-tls` crate
+  is planned.
+- **DNS resolution** — would block the worker. Use
+  `volt.spawnBlocking` with `getaddrinfo` if you need it. A
+  proper async DNS resolver is planned.
+- **HTTP** — Volt is a runtime, not a framework. `volt-http` is a
+  separate library.
+- **UDP / Unix sockets** — planned, not yet shipped.
+
+## Low-level access
+
+If you need to register a non-TCP fd with the reactor (custom
+syscalls, FFI), `volt.io.lowlevel.*` exposes the building blocks:
+
+```zig
+try volt.io.lowlevel.setNonblock(my_fd);
+try volt.io.lowlevel.waitReadable(my_fd);
+const n = try volt.io.lowlevel.read(my_fd, &buf);
+```
+
+Most application code shouldn't touch these; they're for
+integration and library authors.

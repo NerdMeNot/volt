@@ -18,7 +18,13 @@ pub fn sleep(nanoseconds: u64) void {
                 nanoseconds / std.time.ns_per_ms,
                 std.math.maxInt(std.os.windows.DWORD) - 1,
             ));
-            std.os.windows.kernel32.Sleep(ms);
+            // std.os.windows.kernel32 lost `Sleep` in Zig 0.16; declare it
+            // locally. The Win32 contract is: void return, infinite if ms==
+            // INFINITE (0xFFFFFFFF).
+            const Sleep = struct {
+                extern "kernel32" fn Sleep(dwMilliseconds: std.os.windows.DWORD) callconv(.winapi) void;
+            }.Sleep;
+            Sleep(ms);
         },
         else => {
             const s = nanoseconds / std.time.ns_per_s;
@@ -45,6 +51,7 @@ pub fn sleep(nanoseconds: u64) void {
 }
 
 test "sleep - 1ms sleeps at least ~1ms" {
+    if (native_os == .windows) return error.SkipZigTest; // Windows time uses QPC; tested elsewhere
     // std.time.Timer is gone in 0.16; use raw clock_gettime.
     var ts0: std.posix.timespec = undefined;
     var ts1: std.posix.timespec = undefined;

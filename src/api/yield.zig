@@ -4,7 +4,7 @@
 //! The worker reads `pending_event` and calls `Yield.subscribe(coro)` which
 //! pushes the coroutine back onto the local deque.
 
-const ctx_mod = @import("../coroutine/context_arm64.zig");
+const ctx_mod = @import("../coroutine/context.zig");
 const tls = @import("../scheduler/tls.zig");
 const event_source = @import("../coroutine/event_source.zig");
 

@@ -78,7 +78,7 @@ test "tls: starts empty" {
 
 test "tls: setCurrent / clearCurrent round trip" {
     var dummy_rt: u32 = 42;
-    var ctx_buf: @import("../coroutine/context_arm64.zig").Context = .{};
+    var ctx_buf: @import("../coroutine/context.zig").Context = .{};
     var coro: Coroutine = .{
         .scheduler_ctx = &ctx_buf,
         .stack = &[_]u8{},

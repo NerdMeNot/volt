@@ -1,239 +1,165 @@
 ---
-title: Runtime
-description: Creating and configuring the Volt runtime, spawning tasks, and managing the application lifecycle.
+title: The Runtime
+description: How to bootstrap Volt with volt.run, what Config controls, and when to construct a Runtime by hand.
 ---
 
-The `Runtime` handle is the primary entry point for Volt. It owns the runtime — the work-stealing scheduler, the blocking thread pool, and the I/O driver. Create it explicitly with `init`/`deinit` like an `Allocator`.
-
-:::note[Not everything needs the runtime]
-The `tryX()` APIs (`tryLock`, `tryAcquire`, `trySend`, `tryRecv`) and all synchronous filesystem/networking operations work **without** a runtime. You only need the runtime for async APIs (`mutex.lock(io)`, `sem.acquire(io, n)`, `io.@"async"(func, args)`), async file I/O, and signal handling. All runtime-dependent operations go through `io: volt.Runtime` -- the type system ensures you have a runtime before you can call them. See [Basic Concepts](/getting-started/basic-concepts/) for the full breakdown.
-:::
-
-## Explicit pattern (recommended)
-
-Create `Runtime` explicitly — you control the allocator, configuration, and lifecycle:
+`volt.run` is the entry point. It takes a `Config`, a root function,
+and the args tuple for that function:
 
 ```zig
 const std = @import("std");
 const volt = @import("volt");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
-
-    var io = try volt.Runtime.init(gpa.allocator(), .{
-        .num_workers = 4,
-        .max_blocking_threads = 128,
-        .blocking_keep_alive_ns = 30 * std.time.ns_per_s,
-    });
-    defer io.deinit();
-
-    try io.run(server);
+    try volt.run(.{ .allocator = gpa.allocator() }, root, .{});
 }
 
-fn server(io: volt.Runtime) void {
-    // This runs inside the runtime.
-    // All Volt APIs (net, sync, channel, time) are available here.
-    _ = io;
+fn root() !void {
+    // You're inside the runtime now.
+    try volt.sleep(volt.Duration.fromMillis(50));
 }
 ```
 
-This is the recommended pattern for production use. You get full control over memory (any `std.mem.Allocator` works) and can detect leaks with GPA.
+The runtime owns the worker pool, the reactor, the global injection
+queue, and the per-task stack pool. It tears all of them down when
+`volt.run` returns. There is no global state and no `init()` call —
+constructing the runtime *is* `volt.run`.
 
-## Zero-config shorthand
-
-For quick scripts and prototyping, `volt.run()` creates an `Runtime` handle with sensible defaults (`page_allocator`, auto-detected worker count) and cleans up automatically:
+## Config
 
 ```zig
-const volt = @import("volt");
-
-pub fn main() !void {
-    try volt.run(server);
-}
-
-fn server(io: volt.Runtime) void {
-    _ = io;
-    // This runs inside the runtime.
-}
+pub const Config = struct {
+    allocator: std.mem.Allocator,    // required
+    workers: ?usize = null,          // null → getCpuCount()
+    deterministic: bool = false,     // single worker, fixed seed
+    pin_workers: bool = false,       // pthread_setaffinity_np per worker (Linux)
+};
 ```
 
-For custom configuration without managing `Runtime` yourself, use `volt.runWith`:
+- **`allocator`** — required. Used for the worker pool, the
+  injection queue, the reactor, and per-coroutine stacks. Volt does
+  not assume a particular allocator; pass whatever you'd pass to
+  `std.Thread.Pool.init`.
+- **`workers`** — number of worker threads. `null` (default) means
+  `getCpuCount()` with a floor of 1. Set to a small fixed number for
+  deterministic tests; set to a higher number than your CPU count
+  if your workload is mostly I/O-bound and you want to absorb more
+  pending I/O without spawning at every accept.
+- **`deterministic`** — forces single-worker mode and uses a
+  pseudo-random seed for steal selection. Useful for reproducible
+  test traces. Doesn't fully eliminate non-determinism (the OS
+  thread scheduler still nudges futex wakes), but eliminates
+  Volt's contributions.
+- **`pin_workers`** — pin worker `i` to core `i % cpu_count` on
+  Linux via `pthread_setaffinity_np`. No-op on Darwin (no clean
+  match for QoS classes). Reduces cross-core cache traffic on
+  latency-sensitive workloads.
+
+## Common patterns
+
+Default config (most cases):
 
 ```zig
-try volt.runWith(gpa.allocator(), .{
-    .num_workers = 4,
-}, server);
+try volt.run(.{ .allocator = a }, root, .{});
 ```
 
-### Config fields
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `num_workers` | `usize` | `0` (auto) | I/O worker thread count. `0` means one per logical CPU. |
-| `max_blocking_threads` | `usize` | `512` | Upper limit on blocking pool threads. |
-| `blocking_keep_alive_ns` | `u64` | 10 seconds | Idle blocking threads exit after this duration. |
-| `backend` | `?BackendType` | `null` (auto) | Force a specific I/O backend (io_uring, kqueue, epoll, IOCP). |
-
-When `num_workers` is `0`, the runtime queries the OS for the number of logical CPUs and creates one worker thread per core.
-
-## Advanced: Direct Runtime access
-
-For advanced use cases (custom schedulers, library integration), you can access the underlying `Runtime` through `Runtime`:
+Tuned worker count:
 
 ```zig
-const volt = @import("volt");
-
-pub fn main() !void {
-    var io = try volt.Runtime.init(std.heap.page_allocator, .{
-        .num_workers = 2,
-    });
-    defer io.deinit();
-
-    try io.run(myApp);
-}
-
-fn myApp(io: volt.Runtime) !void {
-    // Access the underlying runtime if needed
-    const scheduler = io.runtime.getScheduler();
-    _ = scheduler;
-}
+try volt.run(.{ .allocator = a, .workers = 4 }, root, .{});
 ```
 
-### Async primitives
-
-Sync primitives accept the `io` handle directly for async acquisition. No manual future spawning needed:
+Deterministic single-threaded for tests:
 
 ```zig
-var mutex = volt.sync.Mutex.init();
-
-// Acquire the mutex asynchronously -- suspends until lock is held
-mutex.lock(io);
-defer mutex.unlock();
+try volt.run(.{ .allocator = std.testing.allocator, .deterministic = true }, root, .{});
 ```
 
-The `io` handle lets the primitive yield to the scheduler when contended and resume the calling task when the resource becomes available.
-
-### Offloading blocking work
-
-CPU-intensive or legacy blocking I/O should run on the blocking pool so the async workers stay responsive:
+CPU-pinned for latency-critical:
 
 ```zig
-var f = try io.concurrent(computeHash, .{data});
-const hash = try f.@"await"(io);
+try volt.run(.{ .allocator = a, .workers = 8, .pin_workers = true }, root, .{});
 ```
 
-Blocking pool threads are created on demand (up to `max_blocking_threads`) and reclaimed after the keep-alive timeout.
+## Return type and error handling
 
-:::caution[Operations that block the thread]
-Some Volt APIs are synchronous and will block the calling OS thread. On a worker thread, this stalls every task on that worker.
+`volt.run` returns the same shape as the root function plus a
+runtime-error union:
 
-**Blocking APIs (use on main thread or blocking pool only):**
+- Root returns `T` — `volt.run` returns `T`. Init failures panic.
+- Root returns `E!T` — `volt.run` returns `(E || RunError)!T`. Init
+  failures and runtime errors flow through the error union.
 
-| API | What it does | Async alternative |
-|-----|-------------|-------------------|
-| `volt.run(fn)` | Blocks main thread until runtime exits | N/A (intentional) |
-| `volt.net.resolve()` | DNS lookup via `getaddrinfo` | Wrap in `io.concurrent()` |
-| `volt.fs.readFile()` | Synchronous file read | `io.concurrent(volt.fs.readFile, .{...})` |
-| `volt.fs.writeFile()` | Synchronous file write | `io.concurrent(volt.fs.writeFile, .{...})` |
-| `std.Thread.sleep()` | Blocks the OS thread | `volt.time.sleep(duration)` |
-
-**Safe on worker threads (these yield the task, not the thread):**
-
-`mutex.lock(io)`, `ch.send(io, val)`, `ch.recv(io)`, `sem.acquire(io, n)`, `volt.time.sleep(dur)`, `stream.tryRead()`, `stream.tryWrite()`
-
-See [Common Pitfalls](/guides/common-pitfalls/#operations-that-block-the-thread) for the full catalog.
-:::
-
-## Task spawning from within async context
-
-Inside an async context (from functions passed to `io.run` or spawned futures), use the `io` handle:
+`volt.RunError` is exported so you can build unified application
+error sets:
 
 ```zig
-const volt = @import("volt");
+const AppError = volt.RunError || error{ BadRequest, Forbidden };
 
-pub fn main() !void {
-    try volt.run(myApp);
-}
-
-fn myApp(io: volt.Runtime) !void {
-    // Spawn concurrent async tasks.
-    // `@"async"` uses Zig's identifier quoting (`async` is a reserved keyword).
-    // `@as(u64, 42)` provides an explicit type annotation for the integer literal.
-    var user_f = try io.@"async"(fetchUser, .{user_id});
-    var posts_f = try io.@"async"(fetchPosts, .{user_id});
-
-    // Await both results
-    const user = user_f.@"await"(io);
-    const posts = posts_f.@"await"(io);
-
-    // Use results...
-    _ = user;
-    _ = posts;
+fn main() !void {
+    const result: AppError!void = volt.run(.{ .allocator = a }, app, .{});
+    // ... handle uniformly ...
 }
 ```
 
-:::note[Why the `@""` syntax?]
-Zig reserves `async` and `await` as keywords. The `@"async"` and `@"await"` syntax is Zig's standard mechanism for using reserved words as identifiers, keeping the API familiar to developers coming from other async runtimes.
-:::
+## What happens when `root` returns
 
-### Available task functions
+1. `root` returns its value or error.
+2. `volt.run` signals shutdown to the worker pool.
+3. Workers drain remaining work — coroutines that were already
+   running finish their current tick. Coroutines waiting on I/O are
+   cancelled.
+4. Workers join.
+5. The reactor closes.
+6. The stack pool drains and unmaps all reserved address space.
+7. `volt.run` returns the root's value (or error).
 
-| Function | Returns | Description |
-|----------|---------|-------------|
-| `io.@"async"(func, args)` | `volt.Future(T)` | Spawn async task, returns a future |
-| `f.@"await"(io)` | `T` | Await a future's result |
-| `io.concurrent(func, args)` | `!ConcurrentFuture(T)` | Run on the blocking thread pool, call `.@"await"(io)` for result |
+A coroutine that's parked on something nothing will ever wake (e.g.
+a `Channel` whose every sender has been dropped without `close()`)
+will be cancelled during shutdown — its current park surfaces
+`error.Cancelled`, and the worker reaps it. You should not see
+"hangs forever on shutdown" with Volt; if you do, it's a bug.
 
-## Shutdown and cleanup
+## Constructing a Runtime by hand
 
-Call `io.deinit()` to shut down the runtime. This:
-
-1. Sets the shutdown flag (atomic store).
-2. Stops the blocking pool (joins idle threads, waits for active ones).
-3. Stops the scheduler (signals workers, joins threads, frees task memory).
-4. Frees the runtime allocation (if the `Runtime` handle owns it).
-
-Always use `defer io.deinit()` immediately after `init` to guarantee cleanup even on error paths:
-
-```zig
-var io = try volt.Runtime.init(allocator, .{});
-defer io.deinit();
-```
-
-For servers that need to drain in-flight requests before exiting, see [Signals & Shutdown](/usage/signals-shutdown/).
-
-## Thread-local runtime access
-
-Inside a runtime, the current `Runtime` pointer is stored in a thread-local variable. Access it with:
+For embedding scenarios — running coroutines from inside a larger
+program that owns its own main loop — you can drop one level deeper
+to `volt.Runtime`:
 
 ```zig
-const runtime_mod = @import("volt").internal.runtime;
-
-// Returns ?*Runtime -- null if not inside a runtime context.
-const rt = runtime_mod.getRuntime();
-
-// Panics if not inside a runtime context.
-const rt2 = runtime_mod.runtime();
+var rt = try volt.Runtime.init(.{ .allocator = a });
+defer rt.deinit();
+rt.bindWorkers();
+const created = try rt.spawnRoot(root, .{});
+try rt.start();
+rt.runUntilDone(created.coro);
 ```
 
-This is primarily useful for library code that needs to access the scheduler or blocking pool without threading the runtime through every function signature.
+This is what `volt.run` does internally. The five-step shape is the
+same as `std.Thread.Pool.init` + `Pool.spawn` + `Pool.deinit` —
+explicit because the embedding case wants control over each phase.
 
-## Architecture at a glance
+For 99% of programs, `volt.run` is what you want.
 
+## Single runtime per process
+
+You cannot nest `volt.run` calls. The runtime uses thread-local state
+to track the current coroutine, worker, and runtime; nested
+bootstraps would panic when the inner one tries to install over the
+outer's TLS. If you need to run multiple "Volt-like" islands, use
+one runtime with multiple `volt.scope` regions, or run them in
+separate OS processes.
+
+## Querying the active runtime
+
+Inside a coroutine:
+
+```zig
+const rt: ?*volt.Runtime = volt.currentRuntime();
 ```
-main() thread
-  |
-  v
-Io.init(allocator, config)
-  |-- Scheduler (N worker threads, work-stealing deques)
-  |-- BlockingPool (on-demand threads, up to max_blocking_threads)
-  |-- I/O Driver (platform backend: io_uring / kqueue / epoll / IOCP)
-  |
-  v
-io.run(myApp)  -->  @"async"  -->  @"await"
-  |
-  v
-io.deinit()
-```
 
-Each worker thread runs a tight loop: poll local deque, steal from siblings, check global queue, poll I/O, advance timers. Tasks are stackless futures weighing approximately 256-512 bytes, enabling millions of concurrent tasks.
+Returns `null` if you're not inside `volt.run`. Used internally by
+every primitive that needs to schedule wakes; you'd only reach for
+it directly when implementing your own park-based primitive.

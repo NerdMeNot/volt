@@ -58,7 +58,7 @@ fn echoRoot() !EchoCtx {
 }
 
 test "v0.2: TCP loopback echo (TcpListener + TcpStream + reactor)" {
-    const ctx = try volt.run(std.testing.allocator, echoRoot, .{});
+    const ctx = try volt.run(.{ .allocator = std.testing.allocator }, echoRoot, .{});
     try std.testing.expectEqualStrings("ping", ctx.server_received[0..ctx.server_received_len]);
     try std.testing.expectEqualStrings("pong", ctx.client_received[0..ctx.client_received_len]);
 }

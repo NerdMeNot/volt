@@ -12,7 +12,7 @@
 //! dispatch — calls go directly to the user fn.
 
 const std = @import("std");
-const ctx = @import("context_arm64.zig");
+const ctx = @import("context.zig");
 const stack_mod = @import("stack.zig");
 const co = @import("coroutine.zig");
 const Coroutine = co.Coroutine;
@@ -40,7 +40,7 @@ pub fn CanError(comptime UserFn: type) bool {
 pub fn ResultSlot(comptime Payload: type) type {
     return struct {
         const Self = @This();
-        pub const Tag = enum(u8) { pending, ok, err, cancelled };
+        pub const Tag = enum(u8) { pending, ok, err, cancelled, stack_overflow };
 
         tag: Tag = .pending,
         value: Payload = undefined,
@@ -129,12 +129,28 @@ pub fn Created(comptime UserFn: type) type {
     };
 }
 
+pub const StackOptions = struct {
+    /// Total reserved virtual size. The runtime grows committed pages
+    /// on demand up to this limit; overflow past it surfaces as
+    /// `error.StackOverflow`.
+    reserved: usize,
+    /// Initial committed bytes at the top. `null` = one system page
+    /// (default). `0` = fully lazy: the very first stack write traps
+    /// into the SIGSEGV handler and commits one page on demand.
+    initial_commit: ?usize = null,
+};
+
 /// Allocate a fresh coroutine for `user_fn(args)`. Returns the Coroutine
 /// pointer and a typed pointer to its result slot (used by Task to read the
 /// outcome later). The Coroutine is NOT yet enqueued — caller does that.
+///
+/// `recycled_stack`: if non-null, reuses that GrowableStack instead of
+/// calling `allocGrowable`. Used by Runtime to recycle stacks via the
+/// stack pool. Pass null on first-spawn paths or when no pool is wired.
 pub fn create(
     allocator: std.mem.Allocator,
-    stack_size: usize,
+    stack_opts: StackOptions,
+    recycled_stack: ?stack_mod.GrowableStack,
     comptime user_fn: anytype,
     args: anytype,
 ) !Created(@TypeOf(user_fn)) {
@@ -157,8 +173,14 @@ pub fn create(
     errdefer allocator.destroy(result);
     result.* = .{};
 
-    const stack = try stack_mod.alloc(allocator, stack_size);
-    errdefer stack_mod.free(allocator, stack);
+    const gs = if (recycled_stack) |rs| rs else blk: {
+        const initial_commit = stack_opts.initial_commit orelse stack_mod.defaultInitialCommit();
+        break :blk try stack_mod.allocGrowable(initial_commit, stack_opts.reserved);
+    };
+    errdefer if (recycled_stack == null) stack_mod.freeGrowable(gs);
+
+    const stack_ptr: [*]align(16) u8 = @ptrFromInt(gs.base);
+    const stack: []align(16) u8 = stack_ptr[0..gs.reserved_size];
 
     closure.* = .{
         .run_fn = &Cl.run,
@@ -175,6 +197,7 @@ pub fn create(
         // pending_event, done_flag, join_park, cancel_flag all default to
         // their zero/initial values via the struct's field defaults.
         .stack = stack,
+        .stack_committed_bottom = std.atomic.Value(usize).init(gs.committed_bottom),
         .destroy_extras_fn = &Cl.destroyExtras,
         .closure_ptr = @ptrCast(closure),
         .args_ptr = @ptrCast(args_storage),

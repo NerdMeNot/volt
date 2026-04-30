@@ -1,262 +1,324 @@
 ---
 title: Common Pitfalls
-description: Footguns, gotchas, and mistakes that trip up developers new to Volt -- with fixes for each.
-sidebar:
-  order: 0
+description: The mistakes that bite every Volt developer at least once. Read before shipping.
 ---
 
-Every issue on this page is something a real developer will hit within their first hour using Volt. Read this before you ship anything, or bookmark it for when something goes wrong.
+These are the failure modes that catch people. The runtime panics
+loudly for most of them — it'd rather give you a clear error than
+silently corrupt state — but understanding *why* they panic helps
+you fix them faster.
 
-## The `@"async"` / `@"await"` Syntax
-
-Zig reserves `async` and `await` as keywords. Volt uses Zig's standard identifier quoting syntax to work around this:
-
-```zig
-// Read these as "io dot async" and "future dot await"
-const future = try io.@"async"(myFunc, .{args});
-const result = future.@"await"(io);
-```
-
-This is not Volt-specific -- it is standard Zig. Any reserved keyword can be used as an identifier with `@""` quoting. You will see this throughout every Volt example.
-
-:::tip
-If your editor highlights `@"async"` oddly, that is an editor issue, not a Volt issue. The code is valid Zig.
-:::
-
----
-
-## Forgetting `deinit()` on Channel and BroadcastChannel
-
-**Rule: if you passed an allocator, you must call `deinit()`.**
-
-`Channel` and `BroadcastChannel` allocate a ring buffer. `Oneshot` and `Watch` are zero-allocation. The consequence of forgetting `deinit()` is a memory leak.
+## Calling Volt code outside `volt.run`
 
 ```zig
-// BAD: leaks the ring buffer
-var ch = try volt.channel.bounded(u32, allocator, 100);
-// ... use ch ...
-// oops, forgot deinit
-
-// GOOD: defer deinit immediately after creation
-var ch = try volt.channel.bounded(u32, allocator, 100);
-defer ch.deinit();
-
-// Oneshot and Watch: no deinit needed
-var os = volt.channel.oneshot(u32);       // zero allocation
-var wt = volt.channel.watch(Config, cfg); // zero allocation
-```
-
-| Type | Needs allocator | Needs `deinit()` |
-|------|:-:|:-:|
-| `Channel(T)` | Yes | Yes |
-| `BroadcastChannel(T)` | Yes | Yes |
-| `Oneshot(T)` | No | No |
-| `Watch(T)` | No | No |
-
----
-
-## The Three-Way I/O Pattern
-
-Every non-blocking read/accept/recv in Volt returns one of **four** outcomes. If you handle only two (data and error), your server will have bugs.
-
-| Result | Meaning | What to do |
-|--------|---------|-----------|
-| `n > 0` | Got data | Process it |
-| `null` | Would block | Retry later (`orelse continue`) |
-| `n == 0` | Peer closed (FIN) | Clean up and return |
-| `error` | Connection reset / failure | Log and return |
-
-**Copy-paste template** -- use this pattern for every `tryRead`/`tryAccept`/`tryRecv`:
-
-```zig
-while (true) {
-    const n = stream.tryRead(&buf) catch |err| {
-        // Connection error (RST, broken pipe, etc.)
-        log.err("read error: {}", .{err});
-        return;
-    } orelse continue; // Would block -- retry
-
-    if (n == 0) return; // Peer disconnected (FIN)
-
-    // Process buf[0..n]
-    processData(buf[0..n]);
+pub fn main() !void {
+    try volt.sleep(volt.Duration.fromSecs(1));   // PANIC
 }
 ```
 
-The idiomatic one-liner:
+Every Volt-suspending call panics if it can't find a current
+runtime in TLS. The error message tells you exactly what happened:
 
-```zig
-const n = stream.tryRead(&buf) catch return orelse continue;
-if (n == 0) return;
+```
+thread panic: volt.sleep called outside a runtime
 ```
 
-:::caution
-The most common bug: treating `null` (would-block) as an error or EOF. It just means "no data right now, try again."
-:::
-
----
-
-## Operations That Block the Thread
-
-Some Volt APIs are **synchronous** -- they block the OS thread, not just the task. If you call them on a worker thread, every other task on that worker stalls.
-
-### Blocking APIs (run on main thread or blocking pool)
-
-| API | What it does | Async alternative |
-|-----|-------------|-------------------|
-| `volt.run(fn)` | Blocks main thread until runtime exits | N/A (this is intentional) |
-| `volt.net.resolve()` | DNS lookup via `getaddrinfo` | Wrap in `io.concurrent()` |
-| `volt.fs.readFile()` | Synchronous file read | `io.concurrent(volt.fs.readFile, .{...})` |
-| `volt.fs.writeFile()` | Synchronous file write | `io.concurrent(volt.fs.writeFile, .{...})` |
-| `volt.fs.File.open()` | Synchronous file open | `io.concurrent(...)` |
-
-### Safe on worker threads
-
-| API | Why it's safe |
-|-----|--------------|
-| `mutex.lock(io)` | Yields task to scheduler, doesn't block thread |
-| `ch.send(io, val)` | Yields task to scheduler |
-| `ch.recv(io)` | Yields task to scheduler |
-| `sem.acquire(io, n)` | Yields task to scheduler |
-| `volt.time.sleep(dur)` | Yields task to scheduler |
-| `stream.tryRead()` | Non-blocking (returns null if would block) |
-| `stream.tryWrite()` | Non-blocking |
-| `mutex.tryLock()` | Non-blocking (returns immediately) |
-
-:::tip[Rule of thumb]
-If it takes `io: volt.Runtime`, it yields the task. If it doesn't take `io`, check whether it does I/O -- if so, wrap it in `io.concurrent()`.
-:::
-
----
-
-## DNS Resolution Is Blocking
-
-`volt.net.resolve()` and `volt.net.resolveFirst()` call the system's `getaddrinfo`, which blocks the calling thread. On a worker thread, this stalls all tasks on that worker.
-
-**Fix: wrap DNS calls in `io.concurrent()`:**
+Fix: wrap your entry point in `volt.run`:
 
 ```zig
-// BAD: blocks the worker thread during DNS lookup
-const addr = try volt.net.resolveFirst(allocator, "example.com", 443);
+pub fn main() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    try volt.run(.{ .allocator = gpa.allocator() }, app, .{});
+}
+fn app() !void {
+    try volt.sleep(volt.Duration.fromSecs(1));
+}
+```
 
-// GOOD: runs on the blocking pool
-var f = try io.concurrent(struct {
-    fn resolve() !volt.net.Address {
-        return volt.net.resolveFirst(std.heap.page_allocator, "example.com", 443);
+This applies to library code too. If you write a library that uses
+Volt internally, your library's users have to call `volt.run`
+themselves — there's no way to hide it.
+
+## Forgetting `destroyJob` / `destroyTask`
+
+```zig
+const j = try volt.launch(work, .{});
+try j.join();
+// ← Job handle leaks!
+```
+
+The `*Job` handle is heap-allocated. The runtime owns the
+coroutine; *you* own the handle. Always pair `launch` / `spawn`
+with `destroyJob` / `destroyTask`:
+
+```zig
+const j = try volt.launch(work, .{});
+defer volt.destroyJob(j);
+try j.join();
+```
+
+Better: use `volt.scope` and never see a Job handle at all:
+
+```zig
+try volt.scope(struct {
+    fn body(s: *volt.Scope) !void {
+        try s.spawn(work, .{});
     }
-}.resolve, .{});
-const addr = try f.@"await"(io);
+}.body);
 ```
 
-Note: `volt.net.connectHost()` already handles this internally. Prefer it for simple client connections:
+## Holding a Mutex across a suspension
 
 ```zig
-var stream = try volt.net.connectHost(allocator, "example.com", 443);
+mu.lock();
+defer mu.unlock();
+const v = try ch.recv();   // suspends WHILE HOLDING THE LOCK
+process(v);
 ```
 
----
+This works (Volt locks are coroutine-aware), but it usually means
+you got the design wrong. Holding a lock across a suspension can
+serialize unrelated coroutines that just want the lock, including
+the producer that would have sent into `ch`.
 
-## Using `const` Instead of `var` for Futures
-
-Futures are mutated during polling -- `.@"await"(io)` calls `poll()` internally, which updates the future's state machine. Declaring a future as `const` is a compile error.
+The fix is almost always:
 
 ```zig
-// BAD: won't compile -- @"await" mutates the future
-const f = try io.@"async"(myFunc, .{});
-const result = f.@"await"(io);
-
-// GOOD: use var
-var f = try io.@"async"(myFunc, .{});
-const result = f.@"await"(io);
+const v = try ch.recv();   // outside the lock
+mu.lock();
+defer mu.unlock();
+process(v);
 ```
 
-This also applies to sync primitive futures:
+If you genuinely need to hold the lock across the suspension
+(e.g., guarded enqueue with notify), that's a Notify pattern, not
+a Mutex pattern.
+
+## Spawning instead of scoping
 
 ```zig
-// BAD
-const lock_future = mutex.lockFuture();
-
-// GOOD
-var lock_future = mutex.lockFuture();
+fn parent() !void {
+    _ = try volt.launch(child, .{});   // ← outlives parent
+    return;
+}
 ```
 
----
+`volt.launch` returns a `*Job`. If you don't keep it and join it,
+the child outlives the parent — you've created a fire-and-forget
+that may still be running when the parent's caller assumes it's
+done. Resources the child references can be freed underneath it.
 
-## Discarding Futures Silently Loses Panics
+For static-N children: use `volt.scope`. For dynamic-N: use
+`volt.JoinSet`. Reach for `volt.launch` only when the child
+genuinely needs to outlive the parent (e.g., per-connection
+handlers in a TCP server).
 
-When you spawn a task with `io.@"async"()` and discard the returned future, any panic in that task is silently lost. The task runs and panics, but nobody observes it.
+## Using `std.Thread.sleep` inside a coroutine
 
 ```zig
-// BAD: if processItem panics, nobody knows
-_ = try io.@"async"(processItem, .{item});
-
-// GOOD: await the result (or use a Group)
-var f = try io.@"async"(processItem, .{item});
-f.@"await"(io); // Panic surfaces here
-
-// GOOD: Group tracks all tasks
-var group = volt.Group.init(io);
-_ = group.spawn(processItem, .{item1});
-_ = group.spawn(processItem, .{item2});
-group.wait(); // Panics surface here
+fn worker() void {
+    std.Thread.sleep(1_000_000_000);   // ← blocks the WORKER, not just this coroutine
+}
 ```
 
-Discarding futures is fine for fire-and-forget tasks that you are confident won't fail. But if in doubt, keep the handle.
+`std.Thread.sleep` blocks the OS thread. That OS thread is a Volt
+worker; while it's blocked, no other coroutines on that worker
+make progress.
 
----
-
-## Blocking the Worker Thread
-
-Worker threads run the cooperative scheduler. If you block one, every task assigned to it stops making progress.
-
-**Things that block the worker thread:**
-
-| Bad | Good alternative |
-|-----|-----------------|
-| `std.Thread.sleep(ns)` | `volt.time.sleep(Duration)` (yields to scheduler) |
-| Tight CPU loop | `io.concurrent(fn, args)` (blocking pool) |
-| Synchronous file I/O (`std.fs`) | `io.concurrent(fn, args)` or Volt's `fs` module |
-| `std.net` blocking calls | Volt's `net` module with `tryX()` APIs |
+Use `volt.sleep`:
 
 ```zig
-// BAD: blocks the worker for 1 second
-std.Thread.sleep(1_000_000_000);
-
-// GOOD: create a sleep and register with timer driver
-var slp = volt.time.sleep(volt.Duration.fromSecs(1));
-_ = slp; // Register with timer driver in async context
+try volt.sleep(volt.Duration.fromSecs(1));
 ```
 
----
+Same applies to any blocking call in `std.posix.*` or `std.Thread.*`
+— if it blocks, it blocks a worker. Either swap to a Volt-aware
+equivalent or wrap the call in `volt.spawnBlocking`.
 
-## Channel API Return Types Differ by Type
+## Calling `std.posix.read` / `write` directly on a registered fd
 
-Each channel type has different return types for send and receive. Don't assume they're the same.
+```zig
+const conn = try listener.accept();
+const n = try std.posix.read(conn.fd, &buf);   // ← BAD; bypasses reactor
+```
 
-| Channel | `trySend` returns | `tryRecv` returns |
-|---------|------------------|------------------|
-| `Channel(T)` | `.ok`, `.full`, `.closed` | `.value`, `.empty`, `.closed` |
-| `Oneshot(T)` | `bool` (via `sender.send()`) | `?T` (via `receiver.tryRecv()`) |
-| `BroadcastChannel(T)` | `.ok(usize)`, `.closed` | `.value`, `.empty`, `.lagged(usize)`, `.closed` |
-| `Watch(T)` | `void` (via `send()`) | Borrow via `rx.borrow()`, check `rx.hasChanged()` |
+`TcpStream.read` does the non-blocking read + reactor wait dance.
+Calling `std.posix.read` directly returns `EWOULDBLOCK` on the
+non-blocking fd — your code would have to do the wait itself.
+Use `conn.read(&buf)` instead.
 
-The async convenience APIs also differ:
+## Mutating `args` after `volt.launch`
 
-| Channel | `recv(io)` returns |
-|---------|-------------------|
-| `Channel(T)` | `?T` (null if closed) |
-| `Oneshot(T)` | `RecvResult`: `.value` or `.closed` |
-| `BroadcastChannel(T)` | `RecvResult`: `.value`, `.empty`, `.lagged`, `.closed` |
-| `Watch(T)` | `ChangedResult`: `.changed` or `.closed` (via `rx.changed(io)`) |
+```zig
+var args = MyArgs{ .x = 1 };
+const j = try volt.launch(handler, .{&args});
+args.x = 2;   // ← did the handler observe x=1 or x=2?
+try j.join();
+```
 
----
+`volt.launch` and `volt.spawn` copy the args tuple by value into
+the coroutine's stack. Pointer arguments are copied too — the
+*pointer* is captured, but it still points at the caller's
+mutable storage. So the example above is racy: the handler sees
+whatever `args.x` happens to be when it reads.
 
-## Summary Checklist
+If you need a snapshot: copy `args.x` into a local before passing
+the pointer, or pass the value directly (not via pointer).
 
-Before shipping, verify:
+## Sending to a closed channel
 
-1. Every `Channel` and `BroadcastChannel` has a matching `defer ch.deinit()`
-2. Every `tryRead`/`tryAccept` handles all four outcomes (data, null, zero, error)
-3. No `std.Thread.sleep` or raw blocking I/O on worker threads
-4. DNS resolution (`net.resolve`) is wrapped in `io.concurrent()`
-5. Futures you care about are awaited, not discarded with `_ =`
+```zig
+ch.close();
+try ch.send(42);   // returns error.Closed
+```
+
+Not actually a bug per se — `error.Closed` is a normal return
+value. But programs sometimes treat `error.Closed` as fatal when
+it's actually expected (e.g., the receiver finished early). The
+right pattern:
+
+```zig
+ch.send(42) catch |err| switch (err) {
+    error.Closed => return,    // receiver gone; we're done
+    error.Cancelled => return,
+};
+```
+
+## Multi-Volt-runtime mistakes
+
+```zig
+try volt.run(.{ .allocator = a }, outer, .{});
+
+fn outer() !void {
+    try volt.run(.{ .allocator = a }, inner, .{});   // ← PANIC
+}
+```
+
+You can't nest `volt.run`. The runtime uses TLS to track current
+coroutine / worker / runtime; the inner `volt.run` would clobber
+the outer's TLS. If you need multiple "Volt-like" islands, run
+them in separate processes.
+
+## Spawning from a non-coroutine thread
+
+```zig
+const t = std.Thread.spawn(.{}, struct {
+    fn run() void {
+        _ = volt.launch(work, .{});   // PANIC
+    }
+}.run, .{});
+```
+
+`volt.launch` requires a current runtime in TLS, which only exists
+on coroutines and Volt workers. If you need to send work into Volt
+from outside (e.g., from a callback in another runtime), use a
+`Channel(T).trySend` (lock-free, callable anywhere) and have a
+Volt coroutine consume from it.
+
+## Forgetting to deinit a Channel / Broadcast / JoinSet
+
+```zig
+fn root() !void {
+    var ch = try volt.channel.Channel(u32).init(alloc, 64);
+    // ... use ch ...
+    // ← never deinit'd; ring buffer + waiter list leak
+}
+```
+
+Always:
+
+```zig
+var ch = try volt.channel.Channel(u32).init(alloc, 64);
+defer ch.deinit();
+```
+
+Same for `Broadcast`, `JoinSet`, `Watch`, `Mutex` — though the
+last three are zero-allocation, so their `deinit` is a no-op or
+defensive assertion (Watch).
+
+## Cancelling without joining
+
+```zig
+j.cancel();
+volt.destroyJob(j);   // ← coroutine may still be running!
+```
+
+`cancel()` sets a flag and unparks the coroutine. The coroutine
+hasn't finished — it's about to wake up and observe the cancel.
+Destroying its handle now (and its underlying Coroutine) leads to
+use-after-free.
+
+Always:
+
+```zig
+j.cancel();
+_ = j.join() catch {};
+volt.destroyJob(j);
+```
+
+## Concurrent Job/Task on the same join_park
+
+The Park inside a coroutine's `join_park` is single-waiter. If two
+different coroutines both `j.join()` the same Job concurrently,
+the second panics with `concurrent waiter on Park`.
+
+Fix: only one coroutine should `join` a given Job. If you need
+multiple consumers to wait for completion, use a `Notify` or
+`Oneshot` instead.
+
+## Long-running CPU loops without yield
+
+```zig
+fn cpuLoop() void {
+    while (true) {
+        for (data) |x| heavyComputation(x);
+        // never yields, never suspends
+    }
+}
+```
+
+This blocks the worker indefinitely. Other coroutines on that
+worker never run. Cancellation can never propagate (no suspension
+point to surface `error.Cancelled`).
+
+Fixes:
+
+- Add `try volt.yield();` periodically — gives other coroutines a
+  chance and acts as a cancellation point.
+- Move the work to `volt.spawnBlocking` — runs on a dedicated
+  pool thread, doesn't tie up a worker.
+
+## Using `volt.io.read(fd, buf)` instead of `stream.read(buf)`
+
+```zig
+const n = try volt.io.lowlevel.read(conn.fd, &buf);
+```
+
+This works but it's the wrong layer. `lowlevel` is for FFI and
+custom-fd integrations; `TcpStream.read` is what application code
+should use. The difference is documentation more than behavior —
+new readers of your code will be confused why you're reaching
+through to `.fd`.
+
+## "It works in tests but hangs in production"
+
+Almost always one of:
+
+- A `Mutex` deadlock you didn't trip in single-threaded tests
+  because two coroutines never raced on the same lock.
+- A `Channel` that's never closed; receivers park forever.
+- A `Job.join()` on something that errored out before the join
+  could see it (rare; usually a misuse of structured concurrency).
+
+Run with `--workers 1 --deterministic` for tests:
+
+```zig
+try volt.run(.{
+    .allocator = std.testing.allocator,
+    .deterministic = true,
+}, test_root, .{});
+```
+
+That makes test traces reproducible. Then add multi-worker stress
+tests separately to surface concurrency-only bugs.

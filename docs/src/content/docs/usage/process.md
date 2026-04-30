@@ -1,254 +1,157 @@
 ---
-title: Process Management
-description: Spawning and managing child processes with Volt's process module.
+title: Subprocess Management
+description: volt.process.Command — spawn external programs and capture their output without blocking a worker.
 ---
 
-Volt provides subprocess management through a builder pattern. All APIs are under `volt.process`.
+`volt.process.Command` is a builder for spawning external programs.
+v1.0 ships a minimal first cut: argv, capture stdout, wait for exit.
 
-:::note[No runtime needed]
-Process spawning and I/O are synchronous operations. They work without starting a runtime. For non-blocking process management inside the runtime, wrap long-running process waits in `io.concurrent()`.
-:::
-
-## Quick Start
-
-### Run a command and wait
+## Basic usage
 
 ```zig
-const volt = @import("volt");
+var cmd = try volt.process.Command.init(allocator, "git");
+defer cmd.deinit();
 
-// Run and wait for completion
-const status = try volt.process.run(&.{ "ls", "-la" });
-if (!status.isSuccess()) {
-    // handle failure
+try cmd.arg("rev-parse");
+try cmd.arg("HEAD");
+
+const result = try cmd.output();
+defer result.deinit(allocator);
+
+switch (result.term) {
+    .Exited => |code| std.debug.print("exit code: {}\n", .{code}),
+    .Signal => |sig| std.debug.print("killed by signal: {}\n", .{sig}),
+    .Stopped, .Unknown => {},
 }
+std.debug.print("stdout: {s}\n", .{ result.stdout });
 ```
 
-### Collect output
+## API
+
+### `Command.init(allocator, program)`
+
+Creates a Command builder for the named program. Looks up `program`
+on `PATH` (uses `execve`'s search behavior internally).
+
+### `Command.arg(value)`
+
+Appends one argument. Each call adds one positional arg.
+
+### `Command.output()`
+
+Spawns the process, reads its stdout to EOF, waits for exit, and
+returns an `Output`:
 
 ```zig
-const result = try volt.process.output(allocator, &.{ "git", "status", "--short" });
-defer allocator.free(result.stdout);
-defer allocator.free(result.stderr);
-
-if (result.status.isSuccess()) {
-    // result.stdout contains the output
-}
+pub const Output = struct {
+    term: Term,            // Exited | Signal | Stopped | Unknown
+    stdout: []const u8,    // captured to EOF; owner: caller
+};
 ```
 
-### Shell commands
+`output()` runs on the **blocking thread pool** — `fork` / `execve`
+/ `waitpid` are blocking calls, so doing them on a regular Volt
+worker would block all other coroutines on that worker. The
+calling coroutine parks; a pool thread does the work; the coroutine
+resumes when the child exits.
+
+This means `output()` is fully concurrent-safe: launching N
+subprocesses simultaneously from N coroutines runs them in parallel
+because each is on its own pool thread.
+
+### `Output.deinit(allocator)`
+
+Frees the captured stdout buffer. Always pair with `output()`.
+
+### `Term` variants
 
 ```zig
-// Run a shell command (uses /bin/sh -c on Unix)
-const status = try volt.process.shell("echo hello && date");
-
-// Collect shell output
-const result = try volt.process.shellOutput(allocator, "ls -la | wc -l");
-defer allocator.free(result.stdout);
-defer allocator.free(result.stderr);
+pub const Term = union(enum) {
+    Exited: u8,        // normal exit; field is exit code
+    Signal: u8,        // killed by signal; field is signal number
+    Stopped: u8,       // SIGSTOP'd
+    Unknown: u32,      // raw waitpid status bits we couldn't classify
+};
 ```
 
-## Command Builder
+## Patterns
 
-For full control, use the `Command` builder:
-
-```zig
-var cmd = volt.process.Command.init("cargo");
-cmd = cmd.arg("build").arg("--release");
-cmd = cmd.currentDir("/path/to/project");
-cmd = cmd.env("RUST_LOG", "debug");
-cmd = cmd.stdout(.pipe);
-cmd = cmd.stderr(.pipe);
-
-var child = try cmd.spawn();
-```
-
-### Adding arguments
+### Run-and-capture pipeline
 
 ```zig
-var cmd = volt.process.Command.init("gcc");
+fn captureGitInfo(alloc: std.mem.Allocator) ![]const u8 {
+    var cmd = try volt.process.Command.init(alloc, "git");
+    defer cmd.deinit();
+    try cmd.arg("log");
+    try cmd.arg("--oneline");
+    try cmd.arg("-n");
+    try cmd.arg("10");
 
-// One at a time
-cmd = cmd.arg("-Wall").arg("-O2").arg("-o").arg("output");
-
-// Multiple at once
-cmd = cmd.args(&.{ "main.c", "util.c" });
-```
-
-### Environment variables
-
-```zig
-var cmd = volt.process.Command.init("node");
-cmd = cmd.arg("server.js");
-cmd = cmd.env("PORT", "3000");
-cmd = cmd.env("NODE_ENV", "production");
-
-// Or clear inherited environment entirely
-cmd = cmd.envClear();
-cmd = cmd.env("PATH", "/usr/bin");
-```
-
-### Standard I/O configuration
-
-Each of stdin, stdout, and stderr can be set to:
-
-| Value | Behavior |
-|-------|----------|
-| `.inherit` | Shares parent's file descriptor (default) |
-| `.pipe` | Creates a pipe for programmatic I/O |
-| `.null` | Discards output / provides empty input |
-
-```zig
-var cmd = volt.process.Command.init("my-tool");
-cmd = cmd.stdin(.pipe);    // we'll write to it
-cmd = cmd.stdout(.pipe);   // we'll read from it
-cmd = cmd.stderr(.null);   // discard stderr
-```
-
-## Working with Child Processes
-
-### Reading output
-
-```zig
-var cmd = volt.process.Command.init("echo");
-cmd = cmd.arg("hello world").stdout(.pipe);
-
-var child = try cmd.spawn();
-
-// Read all stdout
-const stdout_data = try child.stdout.?.readAll(allocator);
-defer allocator.free(stdout_data);
-
-const status = try child.waitBlocking();
-```
-
-### Writing to stdin
-
-```zig
-var cmd = volt.process.Command.init("sort");
-cmd = cmd.stdin(.pipe).stdout(.pipe);
-
-var child = try cmd.spawn();
-
-// Write data to the process
-try child.stdin.?.writeAll("banana\napple\ncherry\n");
-child.stdin.?.close();
-
-// Read sorted output
-const sorted = try child.stdout.?.readAll(allocator);
-defer allocator.free(sorted);
-
-const status = try child.waitBlocking();
-```
-
-### Waiting and collecting output
-
-```zig
-var child = try cmd.spawn();
-
-// Blocking wait (returns ExitStatus)
-const status = try child.waitBlocking();
-
-// Or collect all output at once
-var child2 = try cmd.spawn();
-const output = try child2.waitWithOutput(allocator);
-defer allocator.free(output.stdout);
-defer allocator.free(output.stderr);
-```
-
-### Non-blocking check
-
-```zig
-var child = try cmd.spawn();
-
-// Poll without blocking
-if (try child.tryWait()) |status| {
-    // Process has exited
-    if (status.isSuccess()) {
-        // ...
+    const r = try cmd.output();
+    if (r.term != .Exited or r.term.Exited != 0) {
+        r.deinit(alloc);
+        return error.GitFailed;
     }
-} else {
-    // Still running
+    return r.stdout;  // caller owns; remember to free
 }
 ```
 
-## Signals and Termination
+### Concurrent subprocesses
 
 ```zig
-var child = try cmd.spawn();
-
-// Graceful termination (SIGTERM on Unix)
-try child.terminate();
-
-// Forceful kill (SIGKILL on Unix)
-try child.kill();
-
-// Send specific signal (Unix only)
-try child.signal(std.posix.SIG.USR1);
-```
-
-## Exit Status
-
-```zig
-const status = try child.waitBlocking();
-
-if (status.isSuccess()) {
-    // exited with code 0
-}
-
-if (status.code()) |exit_code| {
-    // exited normally with this code
-}
-
-if (status.wasSignaled()) {
-    if (status.signal()) |sig| {
-        // terminated by this signal
+fn runEach(scope: *volt.Scope, items: []const []const u8) !void {
+    for (items) |item| {
+        try scope.spawn(runOne, .{item});
     }
 }
-```
 
-## Process Pipelines
-
-Chain processes together by piping stdout to stdin:
-
-```zig
-// ls -la | grep ".zig" | wc -l
-// Easiest with shell():
-const result = try volt.process.shellOutput(allocator, "ls -la | grep '.zig' | wc -l");
-defer allocator.free(result.stdout);
-defer allocator.free(result.stderr);
-```
-
-For programmatic pipelines, spawn processes with `.pipe` I/O and connect them manually, or use the shell approach above.
-
-## Async Process Management
-
-Inside the runtime, wrap blocking waits with `io.concurrent()`:
-
-```zig
-fn runBuild(io: volt.Runtime) !volt.process.ExitStatus {
-    var f = try io.concurrent(struct {
-        fn run() !volt.process.ExitStatus {
-            return volt.process.run(&.{ "cargo", "build", "--release" });
-        }
-    }.run, .{});
-    return try f.@"await"(io);
+fn runOne(item: []const u8) !void {
+    const alloc = volt.currentRuntime().?.allocator;
+    var cmd = try volt.process.Command.init(alloc, "process-item");
+    defer cmd.deinit();
+    try cmd.arg(item);
+    const r = try cmd.output();
+    defer r.deinit(alloc);
+    // ... handle r ...
 }
 ```
 
-## API Summary
+Each `runOne` parks on its own subprocess; the blocking pool
+services them in parallel.
 
-| Function | Description |
-|----------|-------------|
-| `process.run(argv)` | Run command and wait |
-| `process.output(alloc, argv)` | Run and collect output |
-| `process.shell(cmd)` | Run shell command |
-| `process.shellOutput(alloc, cmd)` | Run shell command and collect output |
-| `Command.init(program)` | Create command builder |
-| `cmd.arg(a)` / `cmd.args(list)` | Add arguments |
-| `cmd.env(k, v)` | Set environment variable |
-| `cmd.stdin/stdout/stderr(cfg)` | Configure I/O |
-| `cmd.spawn()` | Start the process |
-| `child.waitBlocking()` | Wait for exit |
-| `child.tryWait()` | Non-blocking poll |
-| `child.kill()` / `child.terminate()` | Stop the process |
-| `child.waitWithOutput(alloc)` | Wait and collect output |
+### Timeout on subprocess
+
+```zig
+const r = volt.withTimeout(
+    volt.Duration.fromSecs(30),
+    runIt,
+    .{cmd_path, args},
+) catch |err| switch (err) {
+    error.Timeout => return error.SubprocessHung,
+    else => return err,
+};
+```
+
+Cancelling the calling coroutine cancels its park on the blocking
+pool thread — but the subprocess itself keeps running until it
+exits. v1.0 doesn't kill the child on cancel; that's a v1.x add.
+For now, time-bound subprocess work at the application level.
+
+## What's NOT here yet
+
+The v1.0 `Command` is intentionally minimal — `output()` is the
+only execution method. Planned additions:
+
+- `Command.spawn() !Child` — async wait + per-stream pipe access.
+- `Command.stdin.write(...)` — feed data to a child via stdin.
+- `Command.kill()` — send a signal to the child on cancel.
+- Environment variable inheritance / override.
+- Working directory override.
+- Async wait via `signalfd(SIGCHLD)` — no blocking-pool thread per
+  subprocess, lets you have thousands of children if you really
+  want.
+
+If your use case needs any of these, drop down to `std.posix.fork`
++ `std.posix.execve` and use `volt.spawnBlocking(waitpid, .{pid})`
+to wait — it's not pretty but it's a tractable workaround until
+the API expands.

@@ -63,62 +63,82 @@ waitable type (channel, mutex, join handle, reactor wait, timer).
 ```zig
 pub const Park = struct {
     es: EventSource = .{ .subscribe_fn = &subscribe },
-    state: atomic.Value(bool) = .init(false),       // unpark fired
-    wait_co: atomic.Value(?*Coroutine) = .init(null),
+    /// Single-atomic state. See encoding below.
+    state: atomic.Value(usize) = .init(0),
 };
 ```
+
+### State encoding
+
+The state is a single `usize` atomic. Bit 0 is the `NOTIFIED` flag
+(`*Coroutine` alignment is ≥ 16, so we steal the low bit). Bits 1+ hold
+either zero or a coroutine pointer.
+
+| State value | Meaning |
+|---|---|
+| `0` | empty — no waiter, no pending notification |
+| `NOTIFIED` (`= 1`) | unpark fired, no waiter registered |
+| `coro_ptr` (low bit clear) | coroutine registered, no notification yet |
+
+> **Why one atomic, not two.** The original "two atomics — `state: bool` +
+> `wait_co: ?*Coroutine`" design (left visible in the case-analysis below
+> for context) failed the IRIW litmus on ARM64: under release/acquire,
+> `subscribe` could see `state == false` and `unpark` could see
+> `wait_co == null` simultaneously, both returning without scheduling
+> the coroutine — a lost wake. Collapsing into one atomic puts every
+> transition into a single modification order, which is total. No
+> cross-atomic interleavings exist.
 
 ### Park flow (the calling coroutine):
 
 ```
 parkCurrent(park):
-  if park.state.swap(false): return         # unpark already arrived
-  yieldWith(&park.es)                        # swap to scheduler
-  _ = park.state.swap(false)                 # drain residue
+  if cmpxchg(state, NOTIFIED, 0) succeeded: return    # consume pending
+  pending_event = &park.es
+  swap to scheduler                                    # subscribe runs there
+  # On resume, state is already 0 (cleared by whichever side scheduled us).
 ```
 
 ### Park.subscribe (runs on the worker, post-yield):
 
 ```
 subscribe(park, coro):
-  park.wait_co.store(coro)                   # register
-  if park.state.load:                        # unpark slipped in?
-    if c = park.wait_co.swap(null):          # take back
-      schedule(c)                            # fast-wake
+  loop on CAS over state:
+    if state == 0:        cmpxchg(state, 0, coro_ptr) — install
+    if state == NOTIFIED: cmpxchg(state, NOTIFIED, 0) — consume + fast-wake
+    else: panic (concurrent waiter — single-waiter invariant violated)
 ```
 
 ### Park.unpark (called by the waker):
 
 ```
 unpark(park):
-  if !park.state.swap(true):                 # we're the first unpark
-    if c = park.wait_co.swap(null):          # take registered coro
-      schedule(c)                            # wake
+  loop on CAS over state:
+    if state has NOTIFIED bit: return (idempotent)
+    if state == 0:           cmpxchg(state, 0, NOTIFIED) — buffer
+    if state == coro_ptr:    cmpxchg(state, coro_ptr, 0) — take + schedule
 ```
 
 ### Why this is race-free
 
-Every interleaving of `subscribe` and `unpark` is safe:
+Every transition is a CAS-loop on the same atomic. The modification order
+is total. For each pair (subscribe, unpark) interleaving, the CAS that
+lands first picks an unambiguous next state, and the loser retries against
+the new state. Exactly one of subscribe and unpark schedules the coroutine.
 
-**Case A: subscribe completes, then unpark.** subscribe stores `coro` in
-`wait_co`, sees `state == false`, returns. unpark swaps `state` to true,
-takes `coro` from `wait_co`, schedules. ✓
+**Case A: subscribe lands first.** state: `0 → coro_ptr`. unpark observes
+`coro_ptr`, CAS-takes (`coro_ptr → 0`), schedules. ✓
 
-**Case B: unpark completes, then subscribe.** unpark sets `state = true`
-(no wait_co to take). subscribe stores `coro`, sees `state == true`, takes
-`coro` back from `wait_co`, fast-wakes. ✓
+**Case B: unpark lands first.** state: `0 → NOTIFIED`. subscribe observes
+`NOTIFIED`, CAS-consumes (`NOTIFIED → 0`), fast-wakes. ✓
 
-**Case C: subscribe and unpark interleave.** Both atomic operations on
-`state` and `wait_co` happen. Whichever order they land:
-- Either unpark's `state.swap(true)` returns false AND its `wait_co.swap(null)` returns the coro → unpark schedules.
-- Or unpark's `wait_co.swap(null)` returns null AND subscribe's `state.load` returns true → subscribe fast-wakes.
+**Case C: lost CAS retry.** Both subscribe and unpark observe stale state,
+race to CAS. Whichever wins moves the state forward. Loser re-reads under
+the new state and converges into Case A or B. ✓
 
-The atomic happens-before from `state.swap` (release on unpark, acquire on
-subscribe) and `wait_co.swap` (release on subscribe, acquire on unpark)
-guarantees one of the two paths schedules the coroutine.
-
-**Case D: multiple unparks.** Only the first `state.swap(true)` returns
-false, so only one unpark performs the wake. Idempotent.
+**Case D: multiple unparks.** First unpark: `0 → NOTIFIED` (or
+`coro_ptr → 0`). Subsequent unparks observe the NOTIFIED bit set (or
+state already cleared) and return. Idempotent.
 
 ## Schedule — placing a runnable coroutine
 

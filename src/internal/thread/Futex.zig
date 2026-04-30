@@ -107,14 +107,14 @@ fn waitInner(ptr: *const u32, expected: u32, timeout_ns: ?u64) TimedWaitError!vo
             const ms: std.os.windows.DWORD = if (timeout_ns) |ns|
                 @intCast(@min(ns / std.time.ns_per_ms, std.math.maxInt(std.os.windows.DWORD) - 1))
             else
-                std.os.windows.INFINITE;
+                0xFFFFFFFF; // INFINITE — std.os.windows dropped the constant in 0.16
             const rc = WaitOnAddress(
                 @ptrCast(@constCast(ptr)),
                 @ptrCast(@constCast(&expected)),
                 @sizeOf(u32),
                 ms,
             );
-            if (rc == 0) {
+            if (rc == .FALSE) {
                 // WAIT_FAILED — check GetLastError; on timeout returns ERROR_TIMEOUT
                 const err = std.os.windows.GetLastError();
                 if (err == .TIMEOUT) return error.Timeout;

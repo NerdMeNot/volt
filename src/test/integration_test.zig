@@ -19,7 +19,7 @@ fn rootReturnsValue() i32 {
 }
 
 test "v0.1: volt.run returns root fn value" {
-    const result = volt.run(std.testing.allocator, rootReturnsValue, .{});
+    const result = volt.run(.{ .allocator = std.testing.allocator }, rootReturnsValue, .{});
     try std.testing.expectEqual(@as(i32, 42), result);
 }
 
@@ -35,8 +35,8 @@ fn rootMaybeErrors(should_fail: bool) !i32 {
 }
 
 test "v0.1: volt.run propagates errors from root fn" {
-    try std.testing.expectError(error.Boom, volt.run(std.testing.allocator, rootMaybeErrors, .{true}));
-    const r = try volt.run(std.testing.allocator, rootMaybeErrors, .{false});
+    try std.testing.expectError(error.Boom, volt.run(.{ .allocator = std.testing.allocator }, rootMaybeErrors, .{true}));
+    const r = try volt.run(.{ .allocator = std.testing.allocator }, rootMaybeErrors, .{false});
     try std.testing.expectEqual(@as(i32, 7), r);
 }
 
@@ -55,7 +55,7 @@ fn parentSpawn() !i32 {
 }
 
 test "v0.1: spawn + Task.join returns child's value" {
-    const r = try volt.run(std.testing.allocator, parentSpawn, .{});
+    const r = try volt.run(.{ .allocator = std.testing.allocator }, parentSpawn, .{});
     try std.testing.expectEqual(@as(i32, 42), r);
 }
 
@@ -76,7 +76,7 @@ fn parentLaunch() !void {
 }
 
 test "v0.1: launch + Job.join executes the child" {
-    try volt.run(std.testing.allocator, parentLaunch, .{});
+    try volt.run(.{ .allocator = std.testing.allocator }, parentLaunch, .{});
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -114,7 +114,7 @@ fn yieldRoot() !YieldTrace {
 }
 
 test "v0.1: three coroutines yield and each records its full sequence" {
-    const trace = try volt.run(std.testing.allocator, yieldRoot, .{});
+    const trace = try volt.run(.{ .allocator = std.testing.allocator }, yieldRoot, .{});
     // Each yielder must have recorded all 4 of its own ticks. The interleaving
     // across the three coroutines is non-deterministic under multi-worker
     // work-stealing, but each coroutine's own writes happen in order.
@@ -132,11 +132,15 @@ test "v0.1: three coroutines yield and each records its full sequence" {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn cancellable(observed: *bool) !void {
-    var i: u32 = 0;
-    while (i < 1000) : (i += 1) {
+    // Loop forever until cancelled — this way cancel is the ONLY exit and
+    // the test isn't timing-dependent. (Earlier the loop was bounded at
+    // 1000 yields, which on a fast multi-worker scheduler the body can
+    // finish before `t.cancel()` even arrives — so the cancel-propagation
+    // signal we're testing wouldn't actually get exercised.)
+    while (true) {
         try volt.yield();
     }
-    observed.* = true; // shouldn't reach if cancelled before all yields
+    observed.* = true; // unreachable; only set if cancel never arrives
 }
 
 fn cancelRoot() !bool {
@@ -159,39 +163,45 @@ fn cancelRoot() !bool {
 }
 
 test "v0.1: cancellation propagates via error.Cancelled" {
-    const observed = try volt.run(std.testing.allocator, cancelRoot, .{});
-    try std.testing.expect(!observed); // cancelled before reaching the end
+    const observed = try volt.run(.{ .allocator = std.testing.allocator }, cancelRoot, .{});
+    try std.testing.expect(!observed); // unreachable in body — must be false
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6b. Cancel-before-first-dispatch — the trampoline short-circuits before
-//     invoking the user fn at all.
+// 6b. Cancel-after-spawn — join always reports cancelled, body is best-effort.
+//
+//     `Job.join` returns `error.Cancelled` whenever the joinee's
+//     `cancel_flag` is set, regardless of whether the user fn ran. With
+//     multi-worker scheduling, a sibling can steal and dispatch the child
+//     between `volt.spawn` and `t.cancel()` — cancellation on a stackful
+//     coroutine doesn't unwind a running body. So:
+//       - `t.join()` always returns `error.Cancelled` here (we did cancel).
+//       - The body MAY have run (sibling won) or NOT (cancel won at entry).
+//     Both are legal. (Tokio, Kotlin coroutines, Trio: same best-effort
+//     contract.)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn neverRuns(flag: *bool) !void {
     flag.* = true;
 }
 
-fn cancelBeforeStartRoot() !bool {
+fn cancelBeforeStartRoot() !void {
+    // `ran` is intentionally unobserved — sibling-vs-cancel race makes
+    // either body-ran-or-not legal. We only assert join's surface.
     var ran = false;
     var t = try volt.spawn(neverRuns, .{&ran});
     defer volt.destroyTask(t);
 
-    // Cancel immediately, before the scheduler has a chance to dispatch the
-    // child. The closure trampoline should observe the cancel flag at entry
-    // and skip the user fn entirely.
     t.cancel();
 
     const result = t.join();
     if (result) |_| return error.ExpectedCancelled else |e| {
         if (e != error.Cancelled) return error.WrongError;
     }
-    return ran;
 }
 
-test "v0.1: cancel-before-first-dispatch skips the user fn entirely" {
-    const ran = try volt.run(std.testing.allocator, cancelBeforeStartRoot, .{});
-    try std.testing.expect(!ran);
+test "v0.1: cancel-after-spawn surfaces error.Cancelled (body is best-effort)" {
+    try volt.run(.{ .allocator = std.testing.allocator }, cancelBeforeStartRoot, .{});
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -215,6 +225,6 @@ fn manyRoot() !u32 {
 }
 
 test "v0.1: 100 launched coroutines all complete" {
-    const result = try volt.run(std.testing.allocator, manyRoot, .{});
+    const result = try volt.run(.{ .allocator = std.testing.allocator }, manyRoot, .{});
     try std.testing.expectEqual(@as(u32, 100), result);
 }

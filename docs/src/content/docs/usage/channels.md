@@ -1,488 +1,231 @@
 ---
 title: Channels
-description: Message passing between async tasks with Channel, Oneshot, Broadcast, and Watch.
+description: Channel, Oneshot, Watch, Broadcast, and select — message passing primitives in Volt.
 ---
 
-Channels are the primary mechanism for passing data between tasks in Volt. Four channel types cover the common communication patterns.
+Volt has four channel types and a `select`. They share a unified
+error vocabulary — `error.Closed` and `error.Cancelled` — so a
+single `catch` can cover the whole family.
 
-## Channel overview
+| Type | Pattern | Allocates | Use case |
+|---|---|---|---|
+| `Channel(T)` | MPMC bounded queue | yes (init) | Work queues, pipelines with backpressure |
+| `Oneshot(T)` | 1:1, single value | no | Hand a single result from producer to consumer |
+| `Watch(T)` | 1:N, latest value | no | Config hot-reload, current-state propagation |
+| `Broadcast(T)` | 1:N, history-aware | yes (init) | Pub/sub fan-out, event streams |
 
-| Type | Pattern | Allocation | Close required |
-|------|---------|------------|----------------|
-| `Channel(T)` | Bounded MPMC (multi-producer, multi-consumer) | Yes (ring buffer) | `deinit()` |
-| `Oneshot(T)` | Single value, one sender, one receiver | No | No |
-| `BroadcastChannel(T)` | Fan-out, all receivers get every message | Yes (ring buffer) | `deinit()` |
-| `Watch(T)` | Single value with change notification | No | No |
+```
+Channel(T):  many → ring buffer → many
+   P1 ──┐                      ┌── C1
+   P2 ──┼──[ A B C D E . . ]──┼── C2     bounded; full → backpressure
+   P3 ──┘  cap-sized ring     └── C3
 
-:::danger[Channel and BroadcastChannel require `deinit()`]
-**Rule: if you passed an allocator to create it, you must call `deinit()`.**
+Oneshot(T):  single → slot → single
+   P  ──── [   v   ] ──── C                 once; second send → Closed
+
+Watch(T):  single → latest-value cell → many independent receivers
+                  ┌── R1 (cursor=v3)
+   P ── [v3] ─────┼── R2 (cursor=v2)        each rx polls rx.changed()
+                  └── R3 (cursor=v3)         missed values → silent skip
+
+Broadcast(T):  single → ring buffer → many independent receivers
+                            ┌── R1 (cursor=4)
+   P ── [3 4 5 6 7 8 9 10] ─┼── R2 (cursor=8)   slow rx → .lagged(N) tag
+        cap-sized ring      └── R3 (cursor=10)  no producer backpressure
+```
+
+## Channel(T) — bounded MPMC
 
 ```zig
-// These allocate — ALWAYS defer deinit()
-var ch = try volt.channel.bounded(u32, allocator, 100);
+var ch = try volt.channel.Channel(u32).init(allocator, 64);
 defer ch.deinit();
 
-var bc = try volt.channel.broadcast(Event, allocator, 16);
-defer bc.deinit();
+// Producer (any coroutine):
+try ch.send(7);                 // suspends if full; error.Closed | Cancelled
 
-// These are zero-allocation — no deinit needed
-var os = volt.channel.oneshot(u32);
-var wt = volt.channel.watch(Config, defaults);
-```
+// Consumer (any coroutine):
+const v = try ch.recv();        // suspends if empty; error.Closed | Cancelled
 
-Forgetting `deinit()` on `Channel` or `BroadcastChannel` leaks the ring buffer. See [Common Pitfalls](/guides/common-pitfalls/#forgetting-deinit-on-channel-and-broadcastchannel) for more details.
-:::
-
-### Return type differences
-
-Each channel type has different return types for send and receive operations. Don't assume they work the same way.
-
-| Channel | `trySend` returns | `tryRecv` returns |
-|---------|------------------|------------------|
-| `Channel(T)` | `.ok`, `.full`, `.closed` | `.value`, `.empty`, `.closed` |
-| `Oneshot(T)` | `bool` (via `sender.send()`) | `?T` (via `receiver.tryRecv()`) |
-| `BroadcastChannel(T)` | `.ok(usize)`, `.closed` | `.value`, `.empty`, `.lagged(usize)`, `.closed` |
-| `Watch(T)` | `void` (via `send()`) | Borrow via `rx.borrow()`, check `rx.hasChanged()` |
-
-## Channel (bounded MPMC)
-
-A bounded channel backed by a lock-free Vyukov/crossbeam-style ring buffer. Multiple producers and multiple consumers can operate concurrently. When the buffer is full, senders are suspended (not the OS thread); when empty, receivers are suspended.
-
-### Creation
-
-```zig
-const volt = @import("volt");
-
-// Using the factory function
-var ch = try volt.channel.bounded(u32, allocator, 100);
-defer ch.deinit();
-
-// Or directly
-var ch2 = try volt.channel.Channel(u32).init(allocator, 100);
-defer ch2.deinit();
-```
-
-### Non-blocking API
-
-```zig
-// Send
-switch (ch.trySend(42)) {
-    .ok => {},       // Value was placed in the buffer
-    .full => {},     // Buffer is full, try again later
-    .closed => {},   // Channel was closed
-}
-
-// Receive
-switch (ch.tryRecv()) {
-    .value => |v| processValue(v),
-    .empty => {},     // No values available
-    .closed => {},    // Channel closed, no more values
-}
-```
-
-### Async API
-
-```zig
-// Send -- yields until a slot is available
-ch.send(io, 42);
-
-// Receive -- yields until a value is available (returns null if closed)
-if (ch.recv(io)) |value| {
-    processValue(value);
-} else {
-    // Channel closed and drained
-}
-```
-
-Pass the `io: volt.Runtime` handle so the channel can yield to the scheduler when the buffer is full (send) or empty (recv) and resume the task when the operation can proceed.
-
-### Advanced: sendFuture / recvFuture
-
-For manual future composition or custom schedulers, use the `Future`-returning variants:
-
-```zig
-var send_future = ch.sendFuture(42);
-// Poll through your scheduler...
-
-var recv_future = ch.recvFuture();
-// When future.poll() returns .ready, you have the value.
-```
-
-### Closing
-
-Close the channel to signal that no more values will be sent:
-
-```zig
+// Close — wakes all waiters:
 ch.close();
 ```
 
-After closing, `trySend` returns `.closed`. `tryRecv` continues to drain buffered values, then returns `.closed`.
+Capacity is rounded up to the next power of two with a floor of 2.
+The implementation is a Vyukov MPMC ring with a closed-bit packed
+into the tail counter; the fast path is one CAS.
 
-### Waiter API
-
-For custom scheduler integration:
-
-```zig
-// Receive with waiter
-var waiter = volt.channel.channel_mod.RecvWaiter.init();
-waiter.setWaker(@ptrCast(&my_ctx), myWakeCallback);
-ch.recvWait(&waiter);
-// Yield to scheduler. When woken, check waiter.status.load(.acquire):
-// WAITER_COMPLETE (1) = success, WAITER_CLOSED (2) = channel closed.
-
-// Send with waiter
-var send_waiter = volt.channel.channel_mod.SendWaiter.init();
-send_waiter.setWaker(@ptrCast(&my_ctx), myWakeCallback);
-ch.sendWait(value, &send_waiter);
-```
-
----
-
-## Oneshot
-
-A oneshot channel delivers exactly one value from a sender to a receiver. It is zero-allocation and ideal for returning results from spawned tasks.
-
-### Creation
+### Non-blocking variants
 
 ```zig
-var os = volt.channel.oneshot(u32);
-// os.sender -- use to send one value
-// os.receiver -- use to receive the value
-```
-
-### Sending
-
-The sender can send exactly one value. `send` returns `true` if the value was delivered to a waiting receiver or stored for later pickup:
-
-```zig
-_ = os.sender.send(42);
-```
-
-If the sender is dropped without sending, the receiver sees the channel as closed.
-
-### Receiving
-
-```zig
-// Non-blocking
-if (os.receiver.tryRecv()) |value| {
-    // Got the value
-} else {
-    // Not sent yet (or sender closed without sending)
-}
-```
-
-### Async receive
-
-```zig
-// Yields until the value arrives or the sender closes
-switch (os.receiver.recv(io)) {
-    .value => |v| {
-        // Got the value
-        useResult(v);
-    },
-    .closed => {
-        // Sender dropped without sending
-    },
-}
-```
-
-### Advanced: recvFuture (low-level waiter)
-
-For manual future composition:
-
-```zig
-var waiter = volt.channel.oneshot_mod.Oneshot(u32).RecvWaiter.init();
-waiter.setWaker(@ptrCast(&my_ctx), myWakeCallback);
-
-if (!os.receiver.recvWait(&waiter)) {
-    // Yield to scheduler. Woken when value arrives or sender closes.
-}
-
-if (waiter.value) |v| {
-    // Got the value
-} else if (waiter.closed.load(.acquire)) {
-    // Sender closed without sending
-}
-```
-
-### Pattern: task result delivery
-
-```zig
-fn deliverResult(io: volt.Runtime) void {
-    var os = volt.channel.oneshot(ComputeResult);
-
-    // Spawn computation
-    const f = try io.@"async"(struct {
-        fn run() void {
-            const result = expensiveComputation();
-            _ = os.sender.send(result);
-        }
-    }.run, .{});
-    _ = f;
-
-    // ... do other work ...
-
-    // Collect result (async -- yields until value arrives)
-    switch (os.receiver.recv(io)) {
-        .value => |result| useResult(result),
-        .closed => {},
-    }
-}
-```
-
----
-
-## BroadcastChannel
-
-A broadcast channel delivers every sent message to **all** subscribed receivers. It uses a ring buffer, and slow receivers that fall behind may miss messages.
-
-### Creation
-
-```zig
-var bc = try volt.channel.broadcast(Event, allocator, 16);
-defer bc.deinit();
-```
-
-The capacity (16) is the size of the ring buffer.
-
-### Subscribing
-
-Create receivers by subscribing to the channel:
-
-```zig
-var rx1 = bc.subscribe();
-var rx2 = bc.subscribe();
-```
-
-Each receiver maintains its own read position in the ring buffer.
-
-### Sending
-
-Sends are non-blocking and never fail (unless the channel is closed):
-
-```zig
-_ = bc.send(Event{ .kind = .user_joined, .user_id = 42 });
-```
-
-If a receiver is too slow and the ring buffer wraps, that receiver's oldest unread messages are overwritten.
-
-### Receiving
-
-```zig
-switch (rx1.tryRecv()) {
-    .value => |event| handleEvent(event),
-    .empty => {},     // No new messages
-    .lagged => |n| {
-        // Missed n messages due to slow consumption
-        // The next tryRecv will return the oldest available message
-    },
-    .closed => {},    // Channel was closed
-}
-```
-
-### Async receive
-
-```zig
-// Yields until a new message is available
-switch (rx1.recv(io)) {
-    .value => |event| handleEvent(event),
-    .empty => {},      // No messages available yet
-    .lagged => |n| {
-        // Missed n messages due to slow consumption
-    },
-    .closed => {},     // Channel was closed
-}
-```
-
-### Advanced: recvFuture (low-level waiter)
-
-```zig
-var waiter = volt.channel.broadcast_mod.RecvWaiter.init();
-waiter.setWaker(@ptrCast(&my_ctx), myWakeCallback);
-rx1.recvWait(&waiter);
-// Yield until a new message arrives.
-```
-
----
-
-## Watch
-
-A watch channel holds a single value and notifies receivers when it changes. Only the latest value is kept -- there is no history. This is perfect for configuration or state that changes over time.
-
-### Creation
-
-```zig
-var watch = volt.channel.watch(Config, default_config);
-```
-
-Zero-allocation, no `deinit` required.
-
-### Updating the value
-
-```zig
-watch.send(Config{
-    .max_connections = 200,
-    .timeout_ms = 5000,
-});
-```
-
-### Observing changes
-
-```zig
-var rx = watch.subscribe();
-
-// Check if value changed since last read
-if (rx.hasChanged()) {
-    const config = rx.borrow();
-    applyConfig(config.*);
-    rx.markSeen();
-}
-```
-
-### Async: wait for changes
-
-```zig
-// Yields until the value is updated
-switch (rx.changed(io)) {
-    .changed => {
-        const config = rx.borrow();
-        applyConfig(config.*);
-        rx.markSeen();
-    },
+switch (ch.trySend(value)) {
+    .sent => {},
+    .full => { /* backpressure — drop, retry, ... */ },
     .closed => {},
 }
-```
 
-### Advanced: changedFuture (low-level waiter)
-
-```zig
-var waiter = volt.channel.watch_mod.ChangeWaiter.init();
-waiter.setWaker(@ptrCast(&my_ctx), myWakeCallback);
-rx.waitForChange(&waiter);
-// Yield to scheduler. Woken when value is updated.
-```
-
-### Pattern: config hot-reload
-
-```zig
-var config_watch = volt.channel.watch(AppConfig, default_config);
-
-// Config reloader task
-fn reloadLoop() void {
-    while (running) {
-        const new_config = loadConfigFromFile("config.toml");
-        config_watch.send(new_config);
-        sleep(Duration.fromSecs(30));
-    }
-}
-
-// Worker task
-fn workerLoop() void {
-    var rx = config_watch.subscribe();
-    while (running) {
-        if (rx.hasChanged()) {
-            const cfg = rx.borrow();
-            updateWorkerSettings(cfg.*);
-            rx.markSeen();
-        }
-        doWork();
-    }
-}
-```
-
----
-
-## Backpressure and Slow Consumers
-
-Bounded channels provide natural **backpressure**: when the buffer is full, senders are forced to slow down. Understanding this behavior is essential for building reliable pipelines.
-
-### What happens when the channel is full
-
-| API | Behavior when full |
-|-----|-------------------|
-| `trySend(val)` | Returns `.full` immediately -- the caller decides what to do |
-| `send(io, val)` | Suspends the task until a slot opens (another task calls `tryRecv`/`recv`) |
-| `sendFuture(val)` | Returns a future that resolves when the value is accepted |
-
-### Strategies for handling full channels
-
-**Drop oldest (lossy).** If freshness matters more than completeness (e.g., metrics, telemetry), use `trySend` and discard on `.full`:
-
-```zig
-switch (ch.trySend(metric)) {
-    .ok => {},
-    .full => {}, // Drop this metric -- better than blocking the producer
+switch (ch.tryRecv()) {
+    .value => |v| handle(v),
+    .empty => {},
     .closed => return,
 }
 ```
 
-**Exponential backoff.** For producers that should slow down but not block forever:
+`trySend` / `tryRecv` are lock-free and callable from any thread.
+The blocking `send` / `recv` variants are coroutine-only.
+
+### When to use Channel
+
+- Producer/consumer pipelines (fixed-buffer backpressure).
+- Job queues where workers pull units of work.
+- Anywhere the queue depth itself is the load-shedding signal.
+
+## Oneshot(T) — single hand-off
 
 ```zig
-var delay = volt.Duration.fromMillis(1);
+var os = volt.channel.Oneshot(Result){};
+
+// Sender:
+try os.send(.{ .ok = 42 });    // first send wins; subsequent → error.Closed
+
+// Receiver:
+const r = try os.recv();        // suspends; returns value or error.Closed
+```
+
+Zero allocation. Useful for:
+
+- "Eventual result" patterns — one task hands a value back to its
+  parent.
+- Race-style fan-out (`select`/`scope` first-wins).
+- Building higher-level futures.
+
+If you call `send` twice or `send` after `close`, the second call
+returns `error.Closed` — the channel is "closed" from the
+second-sender's perspective once the first send wins.
+
+## Watch(T) — latest-value broadcast
+
+```zig
+var w = volt.channel.Watch(Config).init(initial_cfg);
+defer w.deinit();
+
+// Producer:
+w.send(new_cfg);           // overwrites; doesn't queue
+
+// Each consumer holds its own Receiver:
+var rx = w.subscribe();
 while (true) {
-    switch (ch.trySend(item)) {
-        .ok => break,
-        .full => {
-            // Back off, doubling each time (capped at 1 second)
-            const sleep_f = volt.time.sleep(delay);
-            _ = sleep_f;
-            delay = volt.Duration.fromNanos(@min(
-                delay.toNanos() * 2,
-                volt.Duration.fromSecs(1).toNanos(),
-            ));
-        },
+    try rx.changed();           // suspend until value updates
+    const cfg = rx.current();   // snapshot copy
+    applyConfig(cfg);
+}
+```
+
+Receiver methods:
+
+| Method | Returns |
+|---|---|
+| `current()` | Snapshot copy of the latest value |
+| `hasChanged()` | True iff version > seen_version |
+| `markSeen()` | Update seen_version without waiting |
+| `changed()` | Suspend until version advances; `error.Closed` / `error.Cancelled` |
+
+Watch is the right tool when you have a value that changes
+periodically and consumers always want the latest — not history.
+Slow consumers don't backpressure producers; they just see fewer
+intermediate values.
+
+Closing a Watch wakes all parked `changed()` calls with
+`error.Closed`.
+
+## Broadcast(T) — fan-out with history
+
+```zig
+var b = try volt.channel.Broadcast(Event).init(allocator, 128);
+defer b.deinit();
+
+// Producer:
+try b.send(event);         // error.Closed if closed
+
+// Each consumer subscribes:
+var rx = b.subscribe();
+while (true) {
+    switch (try rx.recv()) {
+        .value => |v| handle(v),
+        .lagged => |n| std.log.warn("dropped {} events", .{n}),
         .closed => return,
     }
 }
 ```
 
-**Blocking send.** When every message matters, use `send(io, val)` to let the runtime manage the wait:
+Capacity is the maximum lag tolerance. If a receiver falls more
+than `capacity` messages behind, the next `recv` returns
+`.lagged(N)` with `N` = number of dropped messages, and the
+receiver's cursor jumps to the oldest available message. Slow
+consumers don't backpressure producers.
+
+The error path on `recv` is just `error.Cancelled` — `closed` is a
+tagged-union return because consumers usually want to distinguish
+"channel closed cleanly" from "I was cancelled."
+
+## select — wait on the first ready
 
 ```zig
-ch.send(io, important_event); // Suspends until space is available
+switch (try volt.select(.{
+    .msg = volt.channel.OnRecv(u32){ .ch = &cmd_ch },
+    .quit = volt.channel.OnRecv(void){ .ch = &shutdown_ch },
+    .timeout = volt.channel.OnRecv(void){ .ch = &timeout_ch },
+})) {
+    .msg => |v| try handle(v),
+    .quit => return,
+    .timeout => continue,
+}
 ```
 
-### Deadlocks with multiple channels
+The result is a tagged union with one variant per branch (named
+after the branch's field name). `OnRecv(T)` is currently the only
+branch type; `OnSend` and `OnTimeout` are planned.
 
-A classic deadlock occurs when two tasks send to each other through full channels:
+Up to 16 branches. The implementation spawns one forwarder
+coroutine per branch and races them; the first to receive a value
+sends it into a Oneshot, main parks on that Oneshot, losers are
+cancelled. Cancellable parks make the cleanup prompt.
 
-```
-Task A: ch_x.send(io, val);  // Blocks -- ch_x is full
-         ch_y.recv(io);       // Never reached
-Task B: ch_y.send(io, val);  // Blocks -- ch_y is full
-         ch_x.recv(io);       // Never reached
-```
+### Lossy on simultaneous publish
 
-**Prevention:** Ensure at least one direction uses `trySend` with a fallback, or design your pipeline as a DAG (no cycles between channels).
+If two branches publish at exactly the same instant and both
+forwarders consume their values before main wakes and cancels them,
+**one of those values is lost** — the loser's value was consumed
+from its channel but never delivered to main. For most workloads
+this is fine; if you can't tolerate lost values, use a `Channel(T)`
+with manual multiplexing instead.
 
----
+A lossless `select` with two-phase claim-before-consume is planned
+once the model checker validates the interleavings.
 
-## Choosing the right channel
+## Closing semantics
 
-| Need | Channel type |
-|------|-------------|
-| Work queue with backpressure | `Channel` (bounded MPMC) |
-| Return a single result from a task | `Oneshot` |
-| Configuration that changes at runtime | `Watch` |
-| Event fan-out to multiple consumers | `BroadcastChannel` |
-| Multiple producers, single consumer | `Channel` |
-| Multiple producers, multiple consumers | `Channel` |
-| Fire-and-forget notifications | `BroadcastChannel` |
-| Latest-value observation | `Watch` |
+| Channel | `close()` effect |
+|---|---|
+| `Channel(T)` | Wakes all parked senders + receivers with `error.Closed` |
+| `Oneshot(T)` | Wakes parked receiver with `error.Closed`; subsequent sends fail |
+| `Watch(T)` | Wakes all parked `changed()` calls with `error.Closed` |
+| `Broadcast(T)` | All subsequent `recv()` return `.closed` (tagged-union, not error) |
 
-### Resource management summary
+Once closed, a channel cannot be reopened. Subsequent `send` calls
+return `error.Closed` (or `.closed` for `Channel.trySend`).
 
-| Type | Needs allocator | Needs `deinit()` |
-|------|:---------------:|:----------------:|
-| `Channel(T)` | Yes | Yes |
-| `BroadcastChannel(T)` | Yes | Yes |
-| `Oneshot(T)` | No | No |
-| `Watch(T)` | No | No |
+## Picking the right channel
 
-### Performance notes
+- One value, one consumer? `Oneshot`.
+- Many producers and/or consumers, backpressure desired? `Channel`.
+- Slow consumers OK to miss intermediate values, all want latest?
+  `Watch`.
+- Slow consumers should see history but not block producers?
+  `Broadcast`.
 
-- `Channel` uses a lock-free ring buffer for `trySend`/`tryRecv`. The waiter queue uses a separate mutex that never touches the data path.
-- `Oneshot` is entirely lock-free (atomic state machine).
-- `BroadcastChannel` uses atomic sequence numbers per slot for lock-free reads.
-- `Watch` uses a version counter with atomic compare-and-swap.
+If you find yourself wanting "all messages, no drops, multiple
+consumers" — that's not a single channel. It's a fan-out of N
+independent `Channel`s, one per consumer, and a producer that
+sends to all of them. Volt does not provide a "lossless broadcast"
+type because the right structure depends on what you want to do
+when one consumer falls behind.

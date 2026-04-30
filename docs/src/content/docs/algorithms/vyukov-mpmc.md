@@ -1,331 +1,192 @@
 ---
-title: Vyukov MPMC Bounded Queue
-description: The lock-free multi-producer multi-consumer channel algorithm used in Volt, based on Dmitry Vyukov's bounded queue with per-slot sequence numbers.
+title: Vyukov MPMC Queue
+description: The bounded multi-producer multi-consumer ring buffer that powers volt.channel.Channel(T).
 ---
 
-Volt's `Channel(T)` implements a bounded MPMC (multi-producer, multi-consumer) queue using Dmitry Vyukov's lock-free ring buffer algorithm. This is the same algorithm used by crossbeam-channel in the Rust ecosystem. The data path (send/receive) is fully lock-free; a separate mutex protects only the waiter lists for async operations.
+`volt.channel.Channel(T)` is a bounded MPMC queue. The underlying
+ring buffer uses Dmitry Vyukov's well-known design: per-slot
+sequence numbers as the synchronization point, with the head and
+tail counters as separate atomics. Lock-free fast path; one CAS
+per send and per receive in the uncontended case.
 
-## The Core Idea
-
-Each slot in the ring buffer has a **sequence number** that encodes the slot's state. Producers and consumers use CAS (compare-and-swap) on shared `head` and `tail` positions to claim slots, then use the sequence number to confirm the slot is in the expected state. No locks are needed on the data path.
+## The design
 
 ```
-Ring buffer with capacity 4:
-
-  slot[0]          slot[1]          slot[2]          slot[3]
-+----------+     +----------+     +----------+     +----------+
-| seq: 0   |     | seq: 1   |     | seq: 2   |     | seq: 3   |
-| value: - |     | value: - |     | value: - |     | value: - |
-+----------+     +----------+     +----------+     +----------+
-  ^                                                  ^
-  head=0                                             tail=0
+slots[i]: { value: T, seq: u64 }
+head: u64    // index of the next item to consume
+tail: u64    // index where the next item will be produced
 ```
 
-Initially, each slot's sequence equals its index. This means all slots are "writable" from the producer's perspective.
+Each slot carries its own sequence number. The ring is power-of-2
+sized; the slot for index `i` is `slots[i & mask]`.
 
-## The Algorithm
+```
+                         tail (next producer slot)
+                          │
+                          ▼
+   ┌───────┬───────┬───────┬───────┬───────┬───────┬───────┬───────┐
+   │ seq=8 │ seq=9 │ seq=2 │ seq=3 │ seq=4 │ seq=5 │ seq=6 │ seq=7 │
+   │  V    │  V    │   _   │   _   │   _   │   _   │   _   │   _   │
+   └───────┴───────┴───────┴───────┴───────┴───────┴───────┴───────┘
+                  ▲
+                  │
+                head (next consumer slot)
 
-### Send (Producer)
+  slot[i].seq tracks the lifecycle of slot i:
+   • seq == pos      → empty AND it's producer's turn at index pos
+   • seq == pos + 1  → full AND it's consumer's turn at index pos
+   • seq == pos + cap → empty AND ready for the NEXT producer wrap
+```
 
-To send a value at position `tail`:
+## Producer (send)
 
-1. Load the current `tail` position.
-2. Compute `idx = tail & buf_mask` (bitmask — buffer is always power-of-2).
-3. Load `slot[idx].sequence`.
-4. Compare `sequence` with `tail`:
-   - If `sequence == tail`: The slot is writable. CAS `tail` to `tail + 1` to claim it.
-   - If `sequence < tail` (as signed difference): The slot still has unconsumed data. Queue is **full**.
-   - If `sequence > tail`: Another producer claimed this slot. Reload `tail` and retry.
-5. After claiming: write the value, then store `sequence = tail + 1` (marking "has data").
+```
+loop {
+    let pos = tail.load(acquire)
+    let slot = &slots[pos & mask]
+    let seq = slot.seq.load(acquire)
+    let diff = seq - pos
 
-```zig
-pub fn trySend(self: *Self, value: T) SendResult {
-    var tail = self.tail.load(.monotonic);
-    while (true) {
-        // Closed state encoded in tail bit 63 — free check on already-loaded value
-        if (isClosedBit(tail)) return .closed;
-
-        // Bitmask index: 1 cycle vs ~20 for modulo on ARM64
-        const idx: usize = @intCast(tail & self.buf_mask);
-        const slot = &self.slots[idx];
-        const seq = slot.sequence.load(.acquire);
-
-        const diff: i64 = @bitCast(seq -% tail);
-
-        if (diff == 0) {
-            // Slot writable -- claim by advancing tail
-            if (self.tail.cmpxchgWeak(tail, tail +% 1, .acq_rel, .monotonic)) |new_tail| {
-                tail = new_tail;
-                continue;
-            }
-            // Claimed! Write value and publish
-            slot.value = value;
-            slot.sequence.store(tail +% 1, .release);
-
-            // seq_cst: Dekker protocol — pairs with seq_cst store
-            // in recvWait(). See design/channel-wakeup-protocol.
-            if (self.has_recv_waiters.load(.seq_cst)) {
-                self.wakeOneRecvWaiter();
-            }
-            return .ok;
-        } else if (diff < 0) {
-            return .full;
-        } else {
-            tail = self.tail.load(.monotonic);
-        }
-    }
+    if diff == 0:
+        // Slot is empty AND it's our turn (seq matches expected).
+        if tail.cmpxchg(pos, pos + 1, monotonic):
+            slot.value = item
+            slot.seq.store(pos + 1, release)   // mark slot full for consumer
+            return ok
+        // CAS lost — retry.
+    elif diff < 0:
+        return full
+    else:
+        // diff > 0: another producer beat us; reload pos.
+        continue
 }
 ```
 
-### Receive (Consumer)
+The trick: `seq - pos` distinguishes states.
 
-To receive a value at position `head`:
+- `seq == pos` means "this slot is empty AND it's the slot for
+  this producer's turn." Only one producer at this exact pos.
+- `seq < pos` means "the consumer hasn't read the previous wrap
+  yet." Queue is full.
+- `seq > pos` means "another producer already filled this and the
+  consumer is mid-read or the slot wrapped." Reload tail and retry.
 
-1. Load the current `head` position.
-2. Compute `idx = head & buf_mask` (bitmask — buffer is always power-of-2).
-3. Load `slot[idx].sequence`.
-4. Compare `sequence` with `head + 1`:
-   - If `sequence == head + 1`: The slot has data. CAS `head` to `head + 1` to claim it.
-   - If `sequence < head + 1` (as signed difference): The slot is empty. Queue is **empty**.
-   - If `sequence > head + 1`: Another consumer claimed this slot. Reload `head` and retry.
-5. After claiming: read the value, then store `sequence = head + capacity` (marking "writable again").
+The CAS on `tail` is what serializes producers — only one can
+advance `tail` from any given value. Once you've successfully
+CASed, the slot is yours; you write the value and bump the seq
+to mark it full.
 
-```zig
-pub fn tryRecv(self: *Self) RecvResult {
-    var head = self.head.load(.monotonic);
-    while (true) {
-        // Bitmask index: 1 cycle vs ~20 for modulo on ARM64
-        const idx: usize = @intCast(head & self.buf_mask);
-        const slot = &self.slots[idx];
-        const seq = slot.sequence.load(.acquire);
+## Consumer (recv)
 
-        const diff: i64 = @bitCast(seq -% (head +% 1));
+Mirror image:
 
-        if (diff == 0) {
-            // Slot has data -- claim by advancing head
-            if (self.head.cmpxchgWeak(head, head +% 1, .acq_rel, .monotonic)) |new_head| {
-                head = new_head;
-                continue;
-            }
-            // Claimed! Read value and release slot
-            const value = slot.value;
-            slot.sequence.store(head +% self.buf_cap, .release);
+```
+loop {
+    let pos = head.load(acquire)
+    let slot = &slots[pos & mask]
+    let seq = slot.seq.load(acquire)
+    let diff = seq - (pos + 1)
 
-            // seq_cst: Dekker protocol — pairs with seq_cst store
-            // in sendWait(). See design/channel-wakeup-protocol.
-            if (self.has_send_waiters.load(.seq_cst)) {
-                self.wakeOneSendWaiter();
-            }
-            return .{ .value = value };
-        } else if (diff < 0) {
-            if (isClosedBit(self.tail.load(.acquire))) return .closed;
-            return .empty;
-        } else {
-            head = self.head.load(.monotonic);
-        }
-    }
+    if diff == 0:
+        // Slot is full and it's our slot.
+        if head.cmpxchg(pos, pos + 1, monotonic):
+            let value = slot.value
+            slot.seq.store(pos + mask + 1, release)  // mark slot empty for next wrap
+            return ok(value)
+    elif diff < 0:
+        return empty
+    else:
+        continue
 }
 ```
 
-## Sequence Number State Machine
+The completed-empty marker `pos + mask + 1` puts the slot's seq
+exactly where the *next* producer wrap will expect "empty AND my
+turn." That's how producer and consumer leapfrog through the
+ring without explicit handoff signals.
 
-The sequence number cycles through states as the slot is used. For a slot at index `i` with channel capacity `C`:
+## The closed bit
 
-```
-                            Producer claims
-Writable: seq = i    --->   Has data: seq = tail + 1
-    ^                            |
-    |                            | Consumer claims
-    |                            v
-    +--- seq = head + C ---  Read complete
-```
-
-Each full cycle advances the sequence by `C`. After `N` complete send/receive cycles, the sequence for slot `i` is `i + N * C`. The wrapping arithmetic ensures this works correctly even when positions overflow u64.
-
-### Visual Walkthrough
-
-Starting state (capacity 4, all slots writable):
+Volt's `Channel(T)` packs a "closed" flag into the high bit of
+`tail`:
 
 ```
-slot[0].seq=0  slot[1].seq=1  slot[2].seq=2  slot[3].seq=3
-head=0, tail=0
+tail: AtomicU64
+   └─ bit 63: closed?
+   └─ bits 0-62: counter
 ```
 
-After `send(A)` at tail=0:
+Senders check the closed bit on every load of `tail`; if set,
+return `error.Closed`. Receivers check after every successful
+read; if the queue drains AND the bit is set, return
+`error.Closed` to subsequent recv calls.
+
+This is "free" because tail is loaded anyway — no extra atomic.
+
+## Capacity rounding
+
+The ring is power-of-2 sized so we can mask instead of mod.
+`Channel(T).init(allocator, requested_capacity)` rounds up:
 
 ```
-slot[0].seq=1  slot[1].seq=1  slot[2].seq=2  slot[3].seq=3
-         ^--- has data (seq == old_tail + 1)
-head=0, tail=1
+floored = max(requested_capacity, 2)   // floor of 2 (cap=1 has degenerate edge cases)
+cap = nextPowerOfTwo(floored)
 ```
 
-After `send(B)` at tail=1:
+So `Channel(T).init(alloc, 5)` actually has 8 slots; `init(alloc, 17)`
+has 32. Memory rounded up to the next power of two.
 
-```
-slot[0].seq=1  slot[1].seq=2  slot[2].seq=2  slot[3].seq=3
-head=0, tail=2
-```
+## Why floor of 2?
 
-After `recv()` at head=0, returns A:
+Capacity 1 has a pathological case: if a producer fills the slot
+and a consumer drains it without observing the slot's
+intermediate sequence transitions, the producer can spin
+indefinitely waiting for "my turn" even though the slot is
+logically free. Floor of 2 avoids the degenerate case at the
+cost of one extra slot for very small queues.
 
-```
-slot[0].seq=4  slot[1].seq=2  slot[2].seq=2  slot[3].seq=3
-         ^--- writable again (seq = head + capacity = 0 + 4)
-head=1, tail=2
-```
+## Volt's wrapper layer
 
-## ABA Prevention Through Sequence Numbers
+The pure ring is lock-free and lock-friendly, but `Channel(T)` is
+*more* than the ring — it also has waiter lists for
+`send`/`recv` (the blocking forms) when the ring is full or
+empty. Those waiters are managed under a `Mutex`:
 
-The classic ABA problem in lock-free data structures occurs when a CAS succeeds even though the value was changed and then changed back. The Vyukov queue is immune to ABA because sequence numbers monotonically increase.
+- `trySend` / `tryRecv` go through the ring directly. Lock-free,
+  fast.
+- `send` / `recv` do `tryX` first; on `.full` / `.empty`, take
+  the mutex, enqueue a waiter, park.
 
-Consider the scenario:
-1. Thread A reads `head=5`, `slot[5 & mask].seq = 6` (data ready, `6 == 5+1`).
-2. Thread A is preempted.
-3. Thread B receives from head=5, advances head to 6. Slot 5's seq becomes `5 + C`.
-4. Thread B sends again, slot wraps, seq becomes `5 + C + 1`.
-5. Thread A resumes, tries CAS on head from 5 to 6.
+The mutex is held briefly — push/pop a waiter, release. Waker
+notification (when a slot frees up or a value arrives) does the
+mutex briefly too. The hot path stays lock-free.
 
-At step 5, `head` is now 6, not 5. Thread A's CAS fails. Even if by some contortion `head` wrapped back to 5, the sequence number would be `5 + C` (writable), not `6` (has data), so Thread A would see `diff != 0` and retry. The sequence counter makes each slot visit unique.
+## Why not a queue without a mutex?
 
-## Cache Line Padding
+Lock-free MPMC with park-on-full is hard to get right; the
+classic Dekker-style "register intent before checking again"
+patterns have notoriously subtle missed-wake bugs. Volt
+deliberately uses an unconditional mutex on the wake path because
+"a few hundred nanoseconds per blocked call" is cheap compared to
+"a missed wake hangs forever."
 
-The `head` and `tail` fields are on separate cache lines to prevent false sharing between producers and consumers:
+A model-checked Dekker fast path is on the roadmap; it'd matter
+for super-high-throughput workloads but the simple version is
+plenty for what Volt targets.
 
-```zig
-head: std.atomic.Value(u64) align(CACHE_LINE_SIZE),
-tail: std.atomic.Value(u64) align(CACHE_LINE_SIZE),
-```
+## File
 
-Without this padding, every CAS on `head` would invalidate the cache line containing `tail` on other cores, and vice versa. Since producers write `tail` and consumers write `head`, false sharing would cause severe performance degradation under contention.
+`src/channel/Channel.zig`. The reference implementation is
+`attic/vyukov_channel_reference.zig` from Dmitry Vyukov's
+original C++ code.
 
-Each slot interleaves its sequence counter and value in a single struct:
+## Reference
 
-```zig
-const Slot = struct {
-    sequence: std.atomic.Value(u64),
-    value: T = undefined,
-};
-slots: []Slot,  // Interleaved sequence + value (crossbeam layout)
-```
+The original article:
 
-This interleaved layout gives spatial locality: the sequence check and value read/write hit the same cache line instead of bouncing between two separate arrays. This matches crossbeam-channel's slot layout.
+> Vyukov, D. *Bounded MPMC queue.*
+> https://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue
 
-## Power-of-2 Buffer Size
-
-The internal buffer size is always rounded up to the next power of 2 (minimum 2):
-
-```zig
-const buf_cap: u64 = nextPow2(@max(cap, 2));
-```
-
-This serves two purposes:
-
-1. **Bitmask indexing**: `tail & buf_mask` (1 cycle on ARM64) replaces `tail % buf_cap` (~20 cycles on ARM64). The mask is simply `buf_cap - 1`.
-
-2. **Minimum 2 slots for correctness**: With a single slot (buf_cap=1), the sequence number after a send would be `tail + 1 = 1`, and after a receive it would be `head + capacity = 0 + 1 = 1`. The "has data" state and "writable" state would have the same sequence number, making them indistinguishable.
-
-For non-power-of-2 user capacities (e.g., capacity=100 with buf_cap=128), an explicit capacity check ensures the channel does not exceed the user-requested limit:
-
-```zig
-if (self.buf_cap != self.capacity) {
-    const head = self.head.load(.acquire);
-    if (tail -% head >= self.capacity) return .full;
-}
-```
-
-This check is skipped when `buf_cap == capacity` (already power-of-2), so the common case of power-of-2 capacities pays no extra cost.
-
-## Waiter Integration for Async Operations
-
-The lock-free ring buffer handles the fast path. When the channel is full (for senders) or empty (for receivers), tasks must wait. This is handled by a separate waiter system that does not touch the lock-free data path:
-
-```
-Fast path (lock-free):          Slow path (mutex-protected):
-  trySend() / tryRecv()           waiter_mutex
-  CAS on head/tail                send_waiters: intrusive list
-  sequence number check           recv_waiters: intrusive list
-```
-
-The waiter system uses a "flag-before-check" protocol to prevent lost wakeups:
-
-1. Lock `waiter_mutex`.
-2. Set the `has_recv_waiters` (or `has_send_waiters`) flag with **seq_cst**.
-3. Re-check the ring buffer under lock (`trySend`/`tryRecv`).
-4. If the re-check succeeds, clear the flag and return immediately.
-5. If still blocked, add the waiter to the list and release the lock.
-
-After a successful `trySend`, the sender checks `has_recv_waiters` (seq_cst load) and wakes one receiver if set. After a successful `tryRecv`, the receiver checks `has_send_waiters` and wakes one sender. This ensures no waiter is stranded.
-
-### Why Sequential Consistency?
-
-The waiter flags implement a **Dekker pattern** — the fast path writes
-the buffer then reads the flag, while the slow path writes the flag then
-re-reads the buffer. These are two separate variables on different cache
-lines. With acquire/release, there is no cross-variable ordering
-guarantee: on ARM64, both sides can see stale values simultaneously,
-causing a lost wakeup that orphans a task forever.
-
-Sequential consistency (`.seq_cst`) provides a total order that prevents
-this: at least one side is guaranteed to see the other's write. This is
-the same approach used by crossbeam-channel's `SyncWaker::is_empty` flag.
-On x86 (TSO), the overhead is negligible (~1 cycle MFENCE on stores).
-On ARM64, it adds a DMB barrier that is essential for correctness.
-
-For a detailed walkthrough with step-by-step diagrams, see
-[Channel Wakeup Protocol](/design/channel-wakeup-protocol/).
-
-The wakeup avoids use-after-free by copying the waker function pointer and context **before** setting the `status` flag. A lock-free single-waiter fast slot (`fast_recv_waiter`) avoids the mutex entirely for the common case of one blocked consumer:
-
-```zig
-fn wakeOneRecvWaiter(self: *Self) void {
-    // Fast path: atomic swap on single-waiter slot (avoids mutex)
-    const fast_ptr = self.fast_recv_waiter.swap(0, .acq_rel);
-    if (fast_ptr != 0) {
-        const w: *RecvWaiter = @ptrFromInt(fast_ptr);
-        const waker_fn = w.waker;
-        const waker_ctx = w.waker_ctx;
-        w.status.store(WAITER_COMPLETE, .release); // Owner may destroy after this
-        // ... clear flag under mutex if no list waiters remain ...
-        if (waker_fn) |wf| if (waker_ctx) |ctx| wf(ctx);
-        return;
-    }
-
-    // Slow path: pop from linked list under mutex
-    self.waiter_mutex.lock();
-    const waiter = self.recv_waiters.popFront();
-    // ... clear has_recv_waiters flag if no waiters remain ...
-    self.waiter_mutex.unlock();
-
-    if (waiter) |w| {
-        const waker_fn = w.waker;
-        const waker_ctx = w.waker_ctx;
-        w.status.store(WAITER_COMPLETE, .release); // Owner may destroy after this
-        if (waker_fn) |wf| if (waker_ctx) |ctx| wf(ctx);
-    }
-}
-```
-
-## Comparison with Other Approaches
-
-| Approach | Send | Recv | Bounded | Lock-free |
-|----------|------|------|---------|-----------|
-| Vyukov bounded (Volt) | O(1) CAS | O(1) CAS | Yes | Yes (data path) |
-| Mutex + VecDeque | O(1) + lock | O(1) + lock | Optional | No |
-| Michael-Scott queue | O(1) CAS + alloc | O(1) CAS + free | No | Yes |
-| LCRQ (linked CRQs) | O(1) CAS | O(1) CAS | No | Yes |
-
-The Vyukov bounded queue is ideal for Volt's use case:
-- **Bounded**: provides backpressure (senders wait when full), preventing unbounded memory growth.
-- **Lock-free data path**: no mutex on send/receive, only on waiter management.
-- **No allocation per operation**: the ring buffer is pre-allocated.
-- **Efficient under both low and high contention**: low contention means CAS succeeds on first try; high contention means retry loops converge quickly because successful CAS operations advance the position.
-
-### Source Files
-
-- Channel implementation: `src/channel/Channel.zig`
-
-## References
-
-- Dmitry Vyukov, "Bounded MPMC Queue," *1024cores.net*, 2010. [http://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue](http://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue)
-- crossbeam-channel (Rust), which uses the same Vyukov bounded queue: [https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-channel](https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-channel)
-- Maurice Herlihy and Nir Shavit, *The Art of Multiprocessor Programming*, Morgan Kaufmann, 2012 — Chapter 10 (concurrent queues).
+The whole technique is in that one page. The seq-per-slot scheme
+generalizes well — variants of it show up in disruptor patterns,
+LMAX-style ring buffers, etc.

@@ -1,322 +1,115 @@
 ---
 title: Filesystem
-description: Reading, writing, and managing files and directories with Volt's filesystem module.
+description: volt.fs — coroutine-aware file I/O via the blocking pool.
 ---
 
-Volt provides synchronous filesystem operations that work **without a runtime**, plus async variants for use inside the runtime. All APIs are under `volt.fs`.
-
-:::note[No runtime needed for sync I/O]
-`volt.fs.readFile()`, `File.open()`, `readDir()`, and all other synchronous operations work without starting a runtime. They are thin wrappers around OS calls. For non-blocking I/O inside the runtime, wrap them in `io.concurrent()` or use `AsyncFile`.
-:::
-
-## Reading and Writing Files
-
-### One-shot convenience functions
+The v1.0 filesystem surface is intentionally tiny:
 
 ```zig
-const volt = @import("volt");
+pub fn readFile(allocator: std.mem.Allocator, path: [:0]const u8) ![]u8;
+pub fn writeFile(path: [:0]const u8, data: []const u8) !void;
+```
 
-// Read an entire file into an allocated buffer
-const data = try volt.fs.readFile(allocator, "config.json");
+Both run on the **blocking thread pool** — file syscalls are
+blocking on every platform Volt supports today (kqueue and epoll
+don't deliver readiness for regular files; that's an
+io_uring-only feature). The calling coroutine parks; a pool thread
+does the read or write; the coroutine resumes with the result.
+
+## readFile
+
+```zig
+const data = try volt.fs.readFile(allocator, "/etc/hostname");
 defer allocator.free(data);
-
-// Read as validated UTF-8 string
-const text = try volt.fs.readFileString(allocator, "README.md");
-defer allocator.free(text);
-
-// Write a file (creates or truncates)
-try volt.fs.writeFile("output.txt", "Hello, Volt!");
-
-// Append to a file (creates if needed)
-try volt.fs.appendFile("log.txt", "new entry\n");
 ```
 
-### File handle
+Reads the entire file into a heap-allocated buffer. Returns
+`error.FileNotFound`, `error.AccessDenied`, etc. on failure.
 
-For more control, open a `File` handle:
+## writeFile
 
 ```zig
-// Open for reading
-var file = try volt.fs.File.open("data.bin");
-defer file.close();
-
-var buf: [4096]u8 = undefined;
-const n = try file.read(&buf);
-// buf[0..n] contains the data
-
-// Positioned read (doesn't change file position)
-const m = try file.pread(&buf, 1024); // read from offset 1024
-
-// Create for writing
-var out = try volt.fs.File.create("output.bin");
-defer out.close();
-
-try out.writeAll("binary data here");
-try out.syncAll(); // flush to disk
+try volt.fs.writeFile("/tmp/output.txt", "hello\n");
 ```
 
-### OpenOptions builder
+Opens (creating if needed), writes, closes. Truncates existing
+files.
+
+## Concurrent file I/O
+
+Each `readFile` / `writeFile` call parks the *calling* coroutine on
+its own pool worker. To read N files in parallel, spawn N coroutines:
 
 ```zig
-var file = try volt.fs.File.getOptions()
-    .setRead(true)
-    .setWrite(true)
-    .setCreate(true)
-    .setTruncate(false)
-    .open("state.db");
-defer file.close();
-```
-
-### Seeking
-
-```zig
-var file = try volt.fs.File.open("data.bin");
-defer file.close();
-
-try file.seekTo(100);         // absolute position
-try file.seekBy(-10);         // relative offset
-try file.rewind();            // back to start
-const pos = try file.getPos(); // current position
-```
-
-## Directory Operations
-
-### Reading directories
-
-```zig
-var dir = try volt.fs.readDir("/tmp");
-defer dir.close();
-
-while (try dir.next()) |entry| {
-    if (entry.isFile()) {
-        // process file
-    } else if (entry.isDir()) {
-        // process subdirectory
-    }
-}
-```
-
-### Creating and removing directories
-
-```zig
-// Create a single directory
-try volt.fs.createDir("output");
-
-// Create nested directories (like mkdir -p)
-try volt.fs.createDirAll("output/reports/2024");
-
-// Remove empty directory
-try volt.fs.removeDir("output/old");
-
-// Remove directory and all contents recursively
-try volt.fs.removeDirAll(allocator, "output/temp");
-
-// Remove a file
-try volt.fs.removeFile("output/stale.txt");
-```
-
-## File Metadata
-
-```zig
-const meta = try volt.fs.metadata("config.json");
-
-const size = meta.size();
-const file_type = meta.fileType();
-const modified = meta.modified();
-const perms = meta.permissions();
-
-// Check existence
-if (volt.fs.exists("config.json")) {
-    // file exists
-}
-```
-
-## File Copy and Move
-
-```zig
-// Copy a file (returns bytes copied)
-const bytes = try volt.fs.copy("source.txt", "dest.txt");
-
-// Rename/move a file or directory
-try volt.fs.rename("old_name.txt", "new_name.txt");
-
-// Symbolic links
-try volt.fs.symlink("target.txt", "link.txt");
-const target = try volt.fs.readLink(allocator, "link.txt");
-defer allocator.free(target);
-
-// Hard links
-try volt.fs.hardLink("original.txt", "hardlink.txt");
-```
-
-## Memory-Mapped Files
-
-Memory mapping lets the OS page file data in and out on demand. Only the pages being actively accessed are in physical memory -- no buffer allocation or copy needed. Multiple threads can read the same mapping concurrently.
-
-```zig
-const volt = @import("volt");
-
-// Map a file read-only -- zero copy, kernel handles paging
-var mapped = try volt.fs.mmapFile("data.csv", .{});
-defer mapped.unmap();
-
-// mapped.slice() is []const u8 -- pass directly to any parser
-const data = mapped.slice();
-```
-
-### Read-write mapping
-
-Changes to a read-write mapping are backed by the file on disk via `MAP_SHARED`:
-
-```zig
-var mapped = try volt.fs.mmapFile("output.dat", .{ .protection = .read_write });
-defer mapped.unmap();
-
-const buf = try mapped.sliceMut();
-@memcpy(buf[offset..][0..chunk.len], chunk);
-try mapped.sync(); // flush to disk
-```
-
-### Access pattern hints
-
-Tell the kernel how you plan to access the data:
-
-```zig
-// Sequential scan -- kernel increases read-ahead
-var mapped = try volt.fs.mmapFile("data.csv", .{ .sequential = true });
-defer mapped.unmap();
-
-// Random access -- kernel disables read-ahead
-var mapped2 = try volt.fs.mmapFile("index.db", .{ .random = true });
-defer mapped2.unmap();
-
-// Eager population -- pre-fault all pages (avoids page faults during access)
-var mapped3 = try volt.fs.mmapFile("hot_data.bin", .{ .populate = true });
-defer mapped3.unmap();
-```
-
-### Mapping from an open file handle
-
-If you already have an open `File`, map it without re-opening:
-
-```zig
-var file = try volt.fs.File.open("data.parquet");
-defer file.close();
-
-var mapped = try volt.fs.mmapHandle(&file, .{});
-defer mapped.unmap();
-
-// Both file handle and mapping are usable
-const header = mapped.slice()[0..4];
-```
-
-### Advising mapped regions
-
-After mapping, give the kernel fine-grained hints for specific byte ranges:
-
-```zig
-var mapped = try volt.fs.mmapFile("data.parquet", .{});
-defer mapped.unmap();
-
-// Prefetch the row group we're about to decode
-try mapped.advise(rg_offset, rg_size, .will_need);
-
-// Release pages we're done with
-try mapped.advise(prev_rg_offset, prev_rg_size, .dont_need);
-```
-
-## Advisory File Hints
-
-For regular (non-mapped) files, advise the kernel about your access pattern. On Linux this calls `posix_fadvise`; on macOS it uses `fcntl(F_RDAHEAD)`.
-
-```zig
-var file = try volt.fs.File.open("data.parquet");
-defer file.close();
-
-// Sequential scan -- kernel doubles read-ahead window
-try file.advise(.sequential);
-
-// Or advise a specific byte range
-try file.adviseRange(rg_offset, rg_size, .will_need);
-try file.adviseRange(skipped_offset, skipped_size, .dont_need);
-```
-
-:::note[Platform differences]
-On macOS, only `.sequential` and `.random` have effect (via `F_RDAHEAD`). Range-specific hints like `.will_need` and `.dont_need` are no-ops on regular files -- use memory-mapped files with `madvise` for range-level control. On Linux, all hints and ranges work via `posix_fadvise`.
-:::
-
-## File Size Without Opening
-
-Get a file's size in one call without opening a handle:
-
-```zig
-const size = try volt.fs.fileSize("data.csv");
-const buf = try allocator.alloc(u8, size);
-```
-
-## Reading Into a Pre-Allocated Buffer
-
-`readFull` fills a buffer as much as possible without erroring on EOF:
-
-```zig
-var file = try volt.fs.File.open("data.bin");
-defer file.close();
-
-var buf: [256 * 1024]u8 = undefined;
-const n = try file.readFull(&buf);
-// n <= buf.len, no error if file is shorter than buffer
-```
-
-Unlike `readAll` (which returns `error.EndOfStream` if the buffer can't be filled), `readFull` simply returns however many bytes were available.
-
-## Async File I/O
-
-Inside the runtime, use `AsyncFile` for non-blocking operations (uses io_uring on Linux, blocking pool elsewhere):
-
-```zig
-fn processFiles(io: volt.Runtime) !void {
-    // Async read
-    const data = try volt.fs.readFileAsync(io.runtime, allocator, "large_file.bin");
-    defer allocator.free(data);
-
-    // Async write
-    try volt.fs.writeFileAsync(io.runtime, "output.bin", data);
-}
-```
-
-Or wrap synchronous operations with `io.concurrent()` to avoid blocking worker threads:
-
-```zig
-fn readConfig(io: volt.Runtime) ![]const u8 {
-    var f = try io.concurrent(struct {
-        fn run() ![]const u8 {
-            return volt.fs.readFile(std.heap.page_allocator, "config.json");
+fn loadAll(paths: []const [:0]const u8) !void {
+    const alloc = volt.currentRuntime().?.allocator;
+    try volt.scope(struct {
+        fn body(s: *volt.Scope) !void {
+            const args_paths = scope_arg.?;
+            for (args_paths) |path| {
+                try s.spawn(loadOne, .{path});
+            }
         }
-    }.run, .{});
-    return try f.@"await"(io);
+    }.body);
+}
+
+fn loadOne(path: [:0]const u8) !void {
+    const alloc = volt.currentRuntime().?.allocator;
+    const data = try volt.fs.readFile(alloc, path);
+    defer alloc.free(data);
+    // ... process ...
 }
 ```
 
-## API Summary
+The blocking pool services them in parallel up to its thread cap
+(currently large enough that you won't hit it for normal file I/O).
 
-| Function | Runtime needed? | Notes |
-|----------|:-:|-------|
-| `readFile(allocator, path)` | No | Read entire file |
-| `writeFile(path, data)` | No | Create/truncate and write |
-| `appendFile(path, data)` | No | Append to file |
-| `fileSize(path)` | No | Get file size in bytes |
-| `File.open(path)` | No | Open file handle |
-| `File.readFull(buf)` | No | Fill buffer, no error on EOF |
-| `File.advise(hint)` | No | Advise kernel about access pattern |
-| `File.adviseRange(off, len, hint)` | No | Advise for a specific byte range |
-| `mmapFile(path, opts)` | No | Memory-map a file |
-| `mmapHandle(file, opts)` | No | Memory-map an open file handle |
-| `readDir(path)` | No | Iterate directory entries |
-| `createDirAll(path)` | No | Create nested directories |
-| `copy(src, dst)` | No | Copy file |
-| `rename(old, new)` | No | Move/rename |
-| `metadata(path)` | No | Get file metadata |
-| `exists(path)` | No | Check existence |
-| `readFileAsync(rt, alloc, path)` | **Yes** | Async read (io_uring or pool) |
-| `writeFileAsync(rt, path, data)` | **Yes** | Async write |
-| `AsyncFile.open(rt, path)` | **Yes** | Async file handle |
+## What's NOT here
+
+v1.0 does not yet ship:
+
+- **`File` handle type**: open once, do many reads/writes, close.
+- **Streaming reads**: read in chunks rather than all-at-once.
+- **`mkdir` / `readDir` / `stat` / etc.**
+- **`mmapFile`** — zero-copy file access via mmap.
+- **Direct io_uring file ops on Linux** — would skip the blocking
+  pool entirely. The infrastructure is in place
+  (`reactor_iouring.zig`); the file API hasn't been wired up yet.
+
+For anything beyond `readFile` / `writeFile`, drop to `std.posix`
+or `std.fs.cwd().openFile` and use `volt.spawnBlocking` for the
+syscalls:
+
+```zig
+const result = try volt.spawnBlocking(struct {
+    fn body() ![]u8 {
+        const f = try std.fs.cwd().openFile("path", .{});
+        defer f.close();
+        // ... read ...
+    }
+}.body, .{});
+```
+
+That gets you the full `std.fs` surface with coroutine-friendly
+parking. The dedicated `volt.fs` API will grow as it gets
+real-world use; if you have a specific need, the simplest path is
+to file an issue describing the operation.
+
+## Why no streaming readers
+
+A stackful runtime has a tempting "just write blocking code"
+shortcut for streaming I/O — call `readFile` in a loop, line by
+line, like you would with `BufReader` in std. The catch: each
+syscall parks on the blocking pool, which means each line costs
+one round-trip through the pool. For a 100MB log file with 1M
+lines, that's a million pool round-trips.
+
+A proper streaming reader needs either:
+- io_uring (real async file I/O on Linux ≥ 5.1), so the reactor
+  drives the I/O directly; or
+- A buffered reader that does fewer, larger pool round-trips and
+  parses lines from the buffer.
+
+Both are planned. Until then, slurp full files with `readFile` and
+parse in memory, or use `volt.spawnBlocking` for the whole
+file-processing function so the parsing happens off-loop.

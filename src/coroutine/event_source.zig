@@ -45,11 +45,20 @@ fn yieldSubscribe(opaque_self: *anyopaque, coro: *Coroutine) void {
 // The trampoline (in coroutine/spawn.zig) sets `pending_event = &done_singleton`
 // before its final swap to the scheduler. The worker calls `subscribe`, which:
 //   1. Sets `coro.done_flag` (visible to handles via Job.isCompleted etc.)
-//   2. Unparks any joiner waiting on `coro.join_park`.
+//   2. Unparks any joiner waiting on `coro.join_park` (the unpark routes
+//      via `Runtime.schedule` and `wakeOneSibling`, so a sibling worker
+//      gets nudged for steal naturally).
+//   3. If this is the root coroutine, wakes worker 0 specifically so the
+//      bootstrap loop in `Runtime.runUntilDone` observes the completion.
 //
-// The coroutine's memory remains valid (owned by the spawning worker's
-// `spawned` list) until runtime teardown. After Done runs, no one holds a
-// schedulable reference to the coro.
+// We deliberately do NOT broadcast a wake to all workers here. Earlier
+// designs called `notifyAllWorkers` on every Done — the textbook
+// thundering herd. With many short-lived coroutines that's N parker.unpark
+// calls per completion, most of them no-ops because the woken worker
+// finds nothing to do and re-parks immediately. Tokio (`num_searching`)
+// and Go (`nmspinning`) both avoid this with a "one searcher is enough"
+// invariant; we adopt the same shape via `Runtime.num_searching` and a
+// targeted bootstrap wake.
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub const done_singleton: EventSource = .{ .subscribe_fn = &doneSubscribe };
@@ -58,11 +67,40 @@ fn doneSubscribe(opaque_self: *anyopaque, coro: *Coroutine) void {
     _ = opaque_self;
     coro.done_flag.store(true, .release);
     coro.join_park.unpark();
-    // Notify ALL workers. The bootstrap thread polls `until_done.isDone()`
-    // in its run loop's `shouldStop`, and only observes the completion
-    // when it (re)checks. notifyOneWorker may pick a non-bootstrap worker
-    // as its victim and the bootstrap could race into parker.park without
-    // any unpark_pending set. Notifying everyone is cheap (N atomic stores
-    // in the no-op case for running workers) and correct.
-    if (runtime_mod.currentRuntime()) |rt| rt.notifyAllWorkers();
+
+    // Recycle the coroutine's stack into the runtime's stack pool —
+    // the user's Job/Task handle still references the Coroutine
+    // struct (for state queries), but no one re-enters the stack
+    // memory. `Worker.deinit` will see `stack_pooled = true` and
+    // skip freeing.
+    //
+    // We DON'T recycle the root coroutine's stack — the bootstrap
+    // thread runs on it and keeps polling `until_done` from worker.run
+    // after this returns; if we recycled, a fresh spawn could overwrite
+    // pages worker 0 is about to read.
+    if (!coro.is_root) {
+        if (runtime_mod.currentRuntime()) |rt| {
+            const stack_mod = @import("stack.zig");
+            const base: usize = @intFromPtr(coro.stack.ptr);
+            const reserved = coro.stack.len;
+            const cb = coro.stack_committed_bottom.load(.acquire);
+            const page = stack_mod.pageSize();
+            const gs: stack_mod.GrowableStack = .{
+                .base = base,
+                .top = base + reserved,
+                .reserved_size = reserved,
+                .committed_bottom = cb,
+                .floor = base + page,
+            };
+            coro.stack_pooled.store(true, .release);
+            rt.stack_pool.release(gs);
+        }
+    }
+
+    if (coro.is_root) {
+        // The bootstrap thread in `runUntilDone` polls `until_done.isDone()`
+        // and may currently be parked. Wake worker 0 specifically — this
+        // is the ONE thread we know has to observe the root's completion.
+        if (runtime_mod.currentRuntime()) |rt| rt.workers[0].unpark();
+    }
 }

@@ -1,314 +1,228 @@
 ---
-title: Chase-Lev Work-Stealing Deque
-description: The lock-free ring buffer at the heart of Volt's per-worker task queue, based on the Chase-Lev deque algorithm with a packed dual-head design.
+title: Chase-Lev Deque
+description: The lock-free work-stealing deque Volt uses for per-worker queues. Owner pushes/pops one end, thieves steal from the other.
 ---
 
-Each worker in Volt owns a `WorkStealQueue` -- a 256-slot lock-free ring buffer based on the Chase-Lev work-stealing deque. The owner thread has fast, uncontested access for push and pop operations, while other threads can safely steal half the queue without locks.
+A work-stealing deque is a queue with **two access modes**:
 
-## The Chase-Lev Algorithm
+- The **owner** (one specific thread) pushes and pops from the
+  *bottom*. LIFO from its perspective.
+- **Thieves** (any other thread) steal from the *top*. FIFO from
+  the deque's perspective.
 
-The Chase-Lev deque (David Chase and Yossi Lev, 2005) is the standard data structure for work-stealing schedulers. It provides:
+The Chase-Lev algorithm makes both operations lock-free using
+only atomic operations on two indices. Volt uses one Chase-Lev
+deque per worker; the worker is the owner, every other worker is
+a potential thief.
 
-- **Push (owner only):** O(1) amortized, wait-free in the common case
-- **Pop (owner only):** O(1), lock-free (CAS may retry on steal contention)
-- **Steal (any thread):** O(1), lock-free (single CAS to claim tasks)
-
-The key insight is that the owner thread and stealers operate on opposite ends of the deque, so they rarely contend. The owner pushes and pops from the **back** (tail), while stealers take from the **front** (head).
-
-```
-            stealers                              owner
-               |                                    |
-               v                                    v
-         +---+---+---+---+---+---+---+---+---+
- head -> | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |   <- tail
-         +---+---+---+---+---+---+---+---+---+
-         FIFO (steal from front)    LIFO (push/pop at back)
-```
-
-In Volt's variant, the local queue is used in **FIFO** order (pop from head) for fairness, with LIFO behavior provided by a separate `lifo_slot` atomic pointer on the `Worker` struct. This separation simplifies the ring buffer logic.
-
-## The Packed Dual-Head Design
-
-The standard Chase-Lev deque uses separate atomic variables for head and tail. Volt packs **two head values** into a single 64-bit atomic to support a three-phase steal protocol:
-
-```
-head (u64) = [ steal_head (upper 32 bits) | real_head (lower 32 bits) ]
-tail (u32) = separate atomic, only written by owner
-```
-
-- **`real_head`**: The true consumer position. The owner pops from here.
-- **`steal_head`**: Tracks how far stealers have confirmed their steals. During a steal, `steal_head` lags behind `real_head`.
-- When `steal_head == real_head`: No steal in progress.
-- When `steal_head != real_head`: A steal is active. The stealer has claimed slots `[steal_head, real_head)` but has not yet finished copying them.
-
-This design enables the three-phase steal protocol without requiring additional synchronization.
+## The interface
 
 ```zig
-pub const WorkStealQueue = struct {
-    pub const CAPACITY: u32 = 256;
-    const MASK: u32 = CAPACITY - 1;
+pub fn Deque(comptime T: type, comptime capacity: usize) type {
+    return struct {
+        // Owner-only operations:
+        pub fn push(self: *Self, value: T) void;
+        pub fn pop(self: *Self) ?T;
 
-    head: std.atomic.Value(u64) align(CACHE_LINE_SIZE),
-    tail: std.atomic.Value(u32) align(CACHE_LINE_SIZE),
-    buffer: [CAPACITY]std.atomic.Value(?*Header) align(CACHE_LINE_SIZE),
+        // Any-thread operations:
+        pub fn steal(self: *Self) StealResult;
+    };
+}
 
-    pub inline fn pack(steal: u32, real: u32) u64 {
-        return (@as(u64, steal) << 32) | @as(u64, real);
-    }
-
-    pub inline fn unpack(val: u64) struct { steal: u32, real: u32 } {
-        return .{
-            .steal = @truncate(val >> 32),
-            .real = @truncate(val),
-        };
-    }
+pub const StealResult = union(enum) {
+    success: T,
+    empty,
+    abort,    // contended; retry
 };
 ```
 
-## Owner Operations
+`push` and `pop` are called only by the owning worker. `steal` is
+called by anyone.
 
-### Push (to back)
-
-The owner pushes a new task to the tail of the ring buffer. This is wait-free in the common case (just a store and tail increment). If the buffer is full, the owner overflows half the queue to the global queue.
+## State
 
 ```zig
-pub fn push(self: *Self, task: *Header, global_queue: *GlobalTaskQueue) void {
-    var tail = self.tail.load(.monotonic);
+const Self = struct {
+    top: Atomic(usize),       // index where steals happen (lowest)
+    bottom: Atomic(usize),    // index where push/pop happen (highest)
+    buffer: [capacity]T,
+};
+```
 
-    while (true) {
-        const head_packed = self.head.load(.acquire);
-        const head = unpack(head_packed);
+`top` and `bottom` are 64-bit indices that grow monotonically. The
+actual array slot for index `i` is `buffer[i % capacity]`. As
+long as `bottom - top <= capacity`, the deque has work in
+`[top, bottom)`.
 
-        if (tail -% head.steal < CAPACITY) {
-            // Room available -- write and advance tail
-            self.buffer[tail & MASK].store(task, .release);
-            self.tail.store(tail +% 1, .release);
-            return;
-        }
+## push (owner-only)
 
-        if (head.steal != head.real) {
-            // Stealer active -- can't safely overflow, push to global
-            global_queue.push(task);
-            return;
-        }
-
-        // No stealer -- overflow half to global queue, then retry
-        const half = CAPACITY / 2;
-        const new_head = pack(head.steal +% half, head.real +% half);
-        if (self.head.cmpxchgWeak(head_packed, new_head, .release, .acquire)) |_| {
-            tail = self.tail.load(.monotonic);
-            continue;
-        }
-
-        // Push overflowed tasks to global queue
-        var i: u32 = 0;
-        while (i < half) : (i += 1) {
-            const idx = (head.real +% i) & MASK;
-            const t = self.buffer[idx].load(.acquire) orelse continue;
-            global_queue.push(t);
-        }
-
-        self.buffer[tail & MASK].store(task, .release);
-        self.tail.store(tail +% 1, .release);
-        return;
-    }
+```zig
+pub fn push(self: *Self, value: T) void {
+    const b = self.bottom.load(.monotonic);
+    self.buffer[b % capacity] = value;
+    // Release ordering: thieves observing the new bottom must see
+    // the value already written.
+    self.bottom.store(b + 1, .release);
 }
 ```
 
-**Overflow handling:** When the queue is full and no stealer is active, the owner atomically advances both heads by `CAPACITY / 2 = 128`, effectively discarding the oldest 128 entries from the ring buffer. Those 128 tasks are then pushed to the global queue in a batch. This amortizes the cost of global queue mutex acquisition over 128 tasks.
+No CAS needed because there's only one owner. The release-store
+is paired with thieves' acquire-load on `bottom`.
 
-If a stealer is active (heads differ), the owner cannot safely overflow because the stealer is still reading from those slots. In this case, the single new task goes directly to the global queue.
+## pop (owner-only)
 
-### Pop (from front, FIFO)
-
-The owner pops from the head for FIFO ordering. This ensures tasks are executed in roughly the order they were enqueued, providing fairness. LIFO behavior (executing the newest task first for cache locality) is handled by the separate `lifo_slot` on the Worker struct.
+The interesting operation. The owner wants to take from the
+bottom (LIFO), but a thief might be racing to take from the top.
+The trick is to *speculatively* claim the bottom slot, then check
+if a thief beat you.
 
 ```zig
-pub fn pop(self: *Self) ?*Header {
-    var head_packed = self.head.load(.acquire);
+pub fn pop(self: *Self) ?T {
+    const b = self.bottom.load(.monotonic) - 1;
+    self.bottom.store(b, .seq_cst);
 
-    while (true) {
-        const head = unpack(head_packed);
-        const tail = self.tail.load(.monotonic);
-
-        if (head.real == tail) return null;  // Empty
-
-        const idx = head.real & MASK;
-        const next_real = head.real +% 1;
-        const new_head = if (head.steal == head.real)
-            pack(next_real, next_real)      // No stealer: advance both
-        else
-            pack(head.steal, next_real);    // Stealer active: only advance real
-
-        if (self.head.cmpxchgWeak(head_packed, new_head, .release, .acquire)) |actual| {
-            head_packed = actual;
-            continue;  // Lost race with stealer, retry
-        }
-
-        return self.buffer[idx].load(.acquire);
+    const t = self.top.load(.seq_cst);
+    if (t > b) {
+        // Empty: restore bottom.
+        self.bottom.store(b + 1, .monotonic);
+        return null;
     }
+
+    const value = self.buffer[b % capacity];
+    if (t < b) {
+        // No race; the value is ours.
+        return value;
+    }
+
+    // t == b: exactly one item, racing with a thief.
+    // CAS top to claim it; whoever wins gets it.
+    if (self.top.cmpxchgStrong(t, t + 1, .seq_cst, .monotonic) != null) {
+        // Thief got it.
+        self.bottom.store(b + 1, .monotonic);
+        return null;
+    }
+    self.bottom.store(b + 1, .monotonic);
+    return value;
 }
 ```
 
-## Stealer Operations
+The seq_cst ordering on the speculative `bottom` decrement and
+the `top` load is the synchronization point. The classic Chase-Lev
+paper proves this is correct against concurrent steals.
 
-### Three-Phase Steal Protocol
-
-Stealing is the most complex operation. It transfers half of the victim's queue into the stealer's queue. The protocol uses three CAS operations to ensure correctness without locks.
-
-```
-Phase 1 (Claim):     Advance victim's real_head, keep steal_head
-Phase 2 (Copy):      Copy tasks from victim's buffer to stealer's buffer
-Phase 3 (Release):   Advance victim's steal_head to match real_head
-
-Victim's head during steal:
-
-  Before:   [steal=5 | real=5]     (no steal in progress)
-  Phase 1:  [steal=5 | real=9]     (claimed 4 tasks: slots 5,6,7,8)
-  Phase 2:  (copy slots 5,6,7,8 to stealer's buffer)
-  Phase 3:  [steal=9 | real=9]     (steal complete)
-```
-
-The full implementation:
+## steal (any thread)
 
 ```zig
-pub fn stealInto(src: *Self, dst: *Self) ?*Header {
-    const dst_tail = dst.tail.load(.monotonic);
-    const src_head_packed = src.head.load(.acquire);
-    const src_head = unpack(src_head_packed);
+pub fn steal(self: *Self) StealResult {
+    const t = self.top.load(.acquire);
+    // Synchronization fence: ensure we observe the most recent
+    // bottom value.
+    std.atomic.fence(.seq_cst);
+    const b = self.bottom.load(.acquire);
 
-    // A steal is already in progress
-    if (src_head.steal != src_head.real) return null;
+    if (t >= b) return .empty;
 
-    const src_tail = src.tail.load(.acquire);
-    const available = src_tail -% src_head.real;
-    if (available == 0) return null;
-
-    // Steal half (ceiling), capped to CAPACITY/2
-    var to_steal = available -% (available / 2);
-    if (to_steal > CAPACITY / 2) to_steal = CAPACITY / 2;
-
-    // Phase 1: CAS to claim -- advance real_head, keep steal_head
-    const new_src_head = pack(src_head.steal, src_head.real +% to_steal);
-    if (src.head.cmpxchgWeak(src_head_packed, new_src_head, .acq_rel, .acquire)) |_| {
-        return null;  // Lost race
+    const value = self.buffer[t % capacity];
+    if (self.top.cmpxchgStrong(t, t + 1, .seq_cst, .monotonic) != null) {
+        // Another thief beat us.
+        return .abort;
     }
-
-    // Phase 2: Copy tasks
-    const first_task = src.buffer[src_head.real & MASK].load(.acquire);
-    var i: u32 = 1;
-    while (i < to_steal) : (i += 1) {
-        const src_idx = (src_head.real +% i) & MASK;
-        const dst_idx = (dst_tail +% (i - 1)) & MASK;
-        const task = src.buffer[src_idx].load(.acquire);
-        dst.buffer[dst_idx].store(task, .release);
-    }
-    if (to_steal > 1) {
-        dst.tail.store(dst_tail +% (to_steal - 1), .release);
-    }
-
-    // Phase 3: Release -- advance steal_head to match real_head
-    var release_head_packed = src.head.load(.acquire);
-    while (true) {
-        const release_head = unpack(release_head_packed);
-        const final_head = pack(release_head.real, release_head.real);
-        if (src.head.cmpxchgWeak(
-            release_head_packed, final_head, .acq_rel, .acquire
-        )) |actual| {
-            release_head_packed = actual;
-            continue;
-        }
-        break;
-    }
-
-    return first_task;
+    return .{ .success = value };
 }
 ```
 
-**Why three phases?** A single CAS cannot atomically claim, copy, and release. The two-head design allows the claim and release to be separate atomic operations, with the copy happening in between. During the copy phase, the victim's `push` can still proceed as long as the tail does not wrap past `steal_head`. The victim's `pop` CAS may fail and retry, but this is safe.
+Each thief tries to CAS `top` from its observed value to `top+1`,
+claiming exactly one item. Only one thief can win per `top` value.
 
-## Memory Ordering Rationale
+The `.abort` return is intentional — it tells the caller "the
+deque had work but I lost the race; retry or pick another
+victim." Volt's worker loop treats `.abort` as "try a different
+victim" rather than spinning.
 
-Each atomic operation uses the minimum ordering needed for correctness:
+## Why this is fast
 
-| Operation | Ordering | Rationale |
-|-----------|----------|-----------|
-| `tail.load` (owner) | `monotonic` | Only the owner writes tail; reading own writes needs no fence |
-| `tail.store` (owner) | `release` | Stealers must see the buffer write before the tail update |
-| `head.load` (owner or stealer) | `acquire` | Must see all buffer writes that happened before the head was updated |
-| `head.cmpxchgWeak` (claim) | `acq_rel` | Release: publish our claim. Acquire: see current state |
-| `buffer[i].store` (push) | `release` | Pair with acquire loads in pop/steal |
-| `buffer[i].load` (pop/steal) | `acquire` | See the value written by the pusher |
+- **No locks**. All synchronization is via atomics on two indices.
+- **No contention between owner ops**. Push/pop only touch
+  `bottom`; thieves only CAS `top`. The owner-vs-thief race is
+  rare (only when there's exactly one item left).
+- **Cache-friendly**. Owner ops are LIFO — the most recently
+  pushed value is reused first, while it's still in cache.
+- **Bounded memory**. Fixed-size circular buffer; no allocator on
+  the hot path.
 
-The `head` and `tail` fields are aligned to separate cache lines (`CACHE_LINE_SIZE`) to prevent false sharing between the owner thread (writing `tail`) and stealer threads (reading/writing `head`).
+The trade-off is the fixed capacity. Volt sets each worker's
+deque to 256 slots; if a worker tries to push when full, the
+overflow goes to the global injection queue. In practice this
+is rare — coroutines are consumed faster than they're produced
+unless you're spawning in a tight loop.
 
-## The 256-Slot Fixed Ring Buffer
+## What "FIFO from the deque's perspective" means
 
-The capacity of 256 is a compile-time constant chosen for several reasons:
-
-1. **Power of two** enables bitwise masking (`idx & 0xFF`) instead of modulo division.
-2. **Small enough** to fit in L1/L2 cache (256 pointers = 2KB on 64-bit).
-3. **Large enough** to absorb bursts without immediate overflow.
-4. **Matches Tokio** which also uses 256 slots, enabling direct performance comparison.
-
-The buffer stores `std.atomic.Value(?*Header)` -- nullable pointers to type-erased task headers. The nullable type allows detecting empty slots.
-
-## Overflow to Global Queue
-
-When the ring buffer is full, the overflow strategy depends on whether a steal is in progress:
+The owner pushes new items at `bottom` and pops from `bottom-1`
+(LIFO). Thieves take from `top` (FIFO):
 
 ```
-Queue full, no stealer:
-  1. Atomically advance head by CAPACITY/2 (claim 128 tasks)
-  2. Push those 128 tasks to global queue (single lock acquisition)
-  3. Write new task to buffer, advance tail
-  Result: 128 tasks moved to global, buffer half empty
-
-Queue full, stealer active:
-  1. Push new task directly to global queue
-  Result: Single task to global, no disruption to stealer
+                  ┌─── thieves steal from here (FIFO)
+                  ▼
+            top ──┐
+                  │
+       ┌───┬───┬───┬───┬───┬───┬───┬───┐
+       │   │ T3│ T7│ T9│ T12│ T13│   │   │   buffer (cap=8, masked)
+       └───┴───┴───┴───┴───┴───┴───┴───┘
+                              │
+                       bottom ┘
+                  ▲
+                  └─── owner pushes / pops from here (LIFO)
 ```
 
-This design ensures that overflow is always possible and that the global queue absorbs excess work. The batch overflow of 128 tasks amortizes the mutex cost of the global queue, making it negligible per task.
+After a `push(T14)`:
 
 ```
-Before overflow (full):
-+---+---+---+---+---+---+   ...   +---+---+
-| 0 | 1 | 2 | 3 | 4 | 5 |        |254|255|
-+---+---+---+---+---+---+   ...   +---+---+
-  ^                                         ^
-  head=0                                    tail=256
-
-After overflow:
-+---+---+---+---+---+---+   ...   +---+---+
-|   |   |   |128|129|130|        |254|255| NEW
-+---+---+---+---+---+---+   ...   +---+---+
-              ^                              ^
-              head=128                       tail=257
-
-Tasks 0-127 moved to global queue
+       ┌───┬───┬───┬───┬───┬───┬───┬───┐
+       │   │ T3│ T7│ T9│T12│T13│T14│   │
+       └───┴───┴───┴───┴───┴───┴───┴───┘
+        top↑                      bottom↑
 ```
 
-## Integration with the LIFO Slot
-
-The `WorkStealQueue` itself is a FIFO queue. LIFO behavior comes from the separate `lifo_slot` on each `Worker`. When the worker receives a new task (e.g., from a waker callback), the new task goes into the LIFO slot, and any previously held LIFO task is evicted to the ring buffer:
+After a thief `steal()`:
 
 ```
-Worker receives task C:
-
-Before:  LIFO: [B]    Ring: [... A ...]
-After:   LIFO: [C]    Ring: [... A ... B]   (B evicted to ring)
+       ┌───┬───┬───┬───┬───┬───┬───┬───┐
+       │   │   │ T7│ T9│T12│T13│T14│   │   T3 went to thief
+       └───┴───┴───┴───┴───┴───┴───┴───┘
+            top↑                  bottom↑
 ```
 
-This separation means the ring buffer is pure FIFO, stealers always get the oldest tasks (fairest), and the owner always executes the newest task first (best cache locality).
+The owner sees its own work as a stack (most recent first).
+Thieves see the deque as a queue (oldest first). Same data
+structure, two views — top advances on steal, bottom advances on
+push, neither index ever decreases (`top - bottom` always ≤ cap).
 
-### Source Files
+## Why FIFO for thieves
 
-- `WorkStealQueue`: `src/internal/scheduler/Header.zig`
-- Worker integration: `src/internal/scheduler/Scheduler.zig`
+A worker's own coroutines tend to be cache-hot if they were just
+pushed. Thieves take older items the owner is less likely to
+revisit. This minimizes the cache cost of stealing — you don't
+poach items the owner was about to use anyway.
 
-## References
+The owner's LIFO mode also helps: the very next coroutine the
+owner runs is the one it just spawned, which often depends on
+data the owner just produced.
 
-- David Chase and Yossi Lev, "Dynamic Circular Work-Stealing Deque," *SPAA '05*, 2005. [doi:10.1145/1073970.1073974](https://doi.org/10.1145/1073970.1073974)
-- Nhat Minh Lê, Antoniu Pop, Albert Cohen, and Francesco Zappa Nardelli, "Correct and Efficient Work-Stealing for Weak Memory Models," *PPoPP '13*, 2013. [doi:10.1145/2442516.2442524](https://doi.org/10.1145/2442516.2442524)
-- Tokio's Chase-Lev implementation: [`tokio/src/runtime/scheduler/multi_thread/queue.rs`](https://github.com/tokio-rs/tokio/blob/master/tokio/src/runtime/scheduler/multi_thread/queue.rs)
+## File
+
+`src/scheduler/deque.zig`. ~150 lines, self-contained, with
+inline tests.
+
+## Reference
+
+The original paper:
+
+> Chase, D. and Lev, Y. *Dynamic circular work-stealing deque.*
+> SPAA '05.
+
+The key insight in the paper is that the owner can speculatively
+"claim" an item by decrementing `bottom` *before* checking the
+race with thieves. If the race happened, restoring `bottom`
+costs one more atomic. The expected case (no race) is just two
+atomic ops total per pop.

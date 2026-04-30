@@ -17,7 +17,7 @@ const PipeCtx = struct {
 
 fn pipeReader(ctx: *PipeCtx) !void {
     var buf: [16]u8 = undefined;
-    const n = try volt.io.read(ctx.rfd, &buf);
+    const n = try volt.io.lowlevel.read(ctx.rfd, &buf);
     @memcpy(ctx.received[0..n], buf[0..n]);
     ctx.received_len = n;
 }
@@ -25,7 +25,7 @@ fn pipeReader(ctx: *PipeCtx) !void {
 fn pipeWriter(ctx: *PipeCtx) !void {
     // Yield once so the reader has a chance to register on the reactor first.
     try volt.yield();
-    try volt.io.writeAll(ctx.wfd, "hello reactor!");
+    try volt.io.lowlevel.writeAll(ctx.wfd, "hello reactor!");
 }
 
 fn pipeRoot() !PipeCtx {
@@ -33,8 +33,8 @@ fn pipeRoot() !PipeCtx {
     errdefer syscall.close(fds[0]);
     errdefer syscall.close(fds[1]);
 
-    try volt.io.setNonblock(fds[0]);
-    try volt.io.setNonblock(fds[1]);
+    try volt.io.lowlevel.setNonblock(fds[0]);
+    try volt.io.lowlevel.setNonblock(fds[1]);
 
     var ctx = PipeCtx{ .rfd = fds[0], .wfd = fds[1] };
 
@@ -53,7 +53,7 @@ fn pipeRoot() !PipeCtx {
 }
 
 test "v0.2: async pipe read/write across coroutines" {
-    const ctx = try volt.run(std.testing.allocator, pipeRoot, .{});
+    const ctx = try volt.run(.{ .allocator = std.testing.allocator }, pipeRoot, .{});
     try std.testing.expectEqual(@as(usize, 14), ctx.received_len);
     try std.testing.expectEqualStrings("hello reactor!", ctx.received[0..ctx.received_len]);
 }
@@ -66,7 +66,7 @@ test "v0.2: async pipe read/write across coroutines" {
 
 fn pipeReaderEager(ctx: *PipeCtx) !void {
     var buf: [16]u8 = undefined;
-    const n = try volt.io.read(ctx.rfd, &buf);
+    const n = try volt.io.lowlevel.read(ctx.rfd, &buf);
     @memcpy(ctx.received[0..n], buf[0..n]);
     ctx.received_len = n;
 }
@@ -75,13 +75,13 @@ fn pipeWriterEager(ctx: *PipeCtx) !void {
     // No yield — write immediately. Without async we'd need timing luck;
     // with the reactor, the reader either parks (and reactor wakes it) or
     // the data was buffered before the reader even tried.
-    try volt.io.writeAll(ctx.wfd, "abc");
+    try volt.io.lowlevel.writeAll(ctx.wfd, "abc");
 }
 
 fn pipeRootEager() !PipeCtx {
     const fds = try syscall.pipe();
-    try volt.io.setNonblock(fds[0]);
-    try volt.io.setNonblock(fds[1]);
+    try volt.io.lowlevel.setNonblock(fds[0]);
+    try volt.io.lowlevel.setNonblock(fds[1]);
 
     var ctx = PipeCtx{ .rfd = fds[0], .wfd = fds[1] };
 
@@ -99,6 +99,6 @@ fn pipeRootEager() !PipeCtx {
 }
 
 test "v0.2: pipe write before reader parks (reactor handles either order)" {
-    const ctx = try volt.run(std.testing.allocator, pipeRootEager, .{});
+    const ctx = try volt.run(.{ .allocator = std.testing.allocator }, pipeRootEager, .{});
     try std.testing.expectEqualStrings("abc", ctx.received[0..ctx.received_len]);
 }

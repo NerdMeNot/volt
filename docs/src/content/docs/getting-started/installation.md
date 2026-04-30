@@ -1,56 +1,39 @@
 ---
 title: Installation
-description: How to add Volt to your Zig project using the package manager, or build from source.
-sidebar:
-  order: 1
+description: Add Volt to your Zig project and verify the install with a one-line program.
 ---
 
 ## Requirements
 
-| Requirement | Version |
-|-------------|---------|
-| **Zig** | 0.15.0 or later (0.15.2 recommended) |
-| **Linux** | Kernel 5.1+ for io_uring, 4.x+ for epoll fallback |
-| **macOS** | 10.12+ (x86_64 and Apple Silicon) |
-| **Windows** | Windows 10+ for IOCP |
+- **Zig 0.16.0**. Volt pins to one Zig minor per release; the version
+  is part of the tag (`vX.Y.Z-zigA.B.C`).
+- **macOS** (arm64 or x86_64) or **Linux** (x86_64 or arm64). Windows
+  cross-compiles cleanly today; runtime port is pending.
+- **libc**. Volt uses `sigsetjmp` / `siglongjmp` / `mprotect` /
+  `signalfd` directly; the build helper links libc automatically.
 
-Volt auto-detects the best I/O backend for your platform at startup. No compile-time flags are needed.
+## Add the dependency
 
----
-
-## Using the Zig Package Manager
-
-### Step 1: Add the dependency
-
-Add Volt to your `build.zig.zon`:
+In your `build.zig.zon`:
 
 ```zig
 .{
     .name = .my_project,
     .version = "0.1.0",
-    .minimum_zig_version = "0.15.0",
+    .minimum_zig_version = "0.16.0",
 
     .dependencies = .{
         .volt = .{
-            .url = "https://github.com/NerdMeNot/volt/archive/refs/tags/v1.0.0-zig0.15.2.tar.gz",
-            .hash = "volt-1.0.0-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-            // Run `zig build` once to get the correct hash from the error message
+            .url = "https://github.com/NerdMeNot/volt/archive/refs/tags/v1.0.0-zig0.16.0.tar.gz",
+            .hash = "...", // run `zig build` once and paste the hash Zig prints
         },
     },
 
-    .paths = .{
-        "build.zig",
-        "build.zig.zon",
-        "src",
-    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
 }
 ```
 
-On first build, Zig will print the correct hash value if the placeholder does not match. Copy the real hash from the error message and replace the placeholder.
-
-### Step 2: Wire up `build.zig`
-
-Import the Volt module in your `build.zig`:
+In your `build.zig`:
 
 ```zig
 const std = @import("std");
@@ -59,201 +42,83 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Fetch the Volt dependency
     const volt_dep = b.dependency("volt", .{
         .target = target,
         .optimize = optimize,
     });
 
-    // Create your executable
     const exe = b.addExecutable(.{
         .name = "my_app",
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-
-    // Add the Volt module so you can @import("volt")
     exe.root_module.addImport("volt", volt_dep.module("volt"));
+    exe.root_module.link_libc = true; // sigsetjmp/mprotect/signalfd
 
     b.installArtifact(exe);
-
-    // Optional: add a run step
-    const run_cmd = b.addRunArtifact(exe);
-    const run_step = b.step("run", "Run the application");
-    run_step.dependOn(&run_cmd.step);
 }
 ```
 
-### Step 3: Verify it works
+## Verify
 
-Create a minimal `src/main.zig`:
+`src/main.zig`:
 
 ```zig
 const std = @import("std");
 const volt = @import("volt");
 
 pub fn main() !void {
-    std.debug.print("Volt v{s} loaded\n", .{volt.version.string});
-    std.debug.print("Runtime, sync, channel, net, time modules available.\n", .{});
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    try volt.run(.{ .allocator = gpa.allocator() }, hello, .{});
+}
+
+fn hello() !void {
+    try volt.sleep(volt.Duration.fromMillis(50));
+    std.debug.print("hello from a coroutine\n", .{});
 }
 ```
 
-Build and run:
-
-```bash
+```sh
 zig build run
+# hello from a coroutine
 ```
 
-Expected output:
+If that prints, you're set up. The `volt.sleep(50ms)` call suspended
+the coroutine, the reactor woke it, and it continued. No `async`,
+no callback, no state machine.
 
-```
-Volt v1.0.0 loaded
-Runtime, sync, channel, net, time modules available.
-```
+## Building from source
 
-If you see this, Volt is correctly installed and linked.
+If you're hacking on Volt itself:
 
----
-
-## Building from Source
-
-Clone the repository and build directly:
-
-```bash
+```sh
 git clone https://github.com/NerdMeNot/volt.git
 cd volt
+zig build              # build the library
+zig build test         # run the test suite (~200+ tests)
+zig build bench        # core benchmarks (ReleaseFast)
+
+zig build run-echo            # cookbook examples
+zig build run-fan-out
+zig build run-work-offload
+zig build run-timeout-retry
 ```
 
-### Build the library
+## Cross-compile sanity check
 
-```bash
-zig build
+Volt's CI matrix runs `zig build-lib` for six target triples on every
+commit. You can do the same locally:
+
+```sh
+zig build-lib src/lib.zig -target x86_64-linux-gnu     -lc -fno-emit-bin
+zig build-lib src/lib.zig -target aarch64-linux-gnu    -lc -fno-emit-bin
+zig build-lib src/lib.zig -target x86_64-windows-gnu   -lc -fno-emit-bin
+zig build-lib src/lib.zig -target aarch64-windows-gnu  -lc -fno-emit-bin
+zig build-lib src/lib.zig -target x86_64-macos         -lc -fno-emit-bin
+zig build-lib src/lib.zig -target aarch64-macos        -lc -fno-emit-bin
 ```
 
-### Run the test suites
-
-Volt ships with extensive tests:
-
-| Command | What it runs |
-|---------|-------------|
-| `zig build test` | Unit tests (588+ inline tests across all modules) |
-| `zig build test-concurrency` | Loom-style concurrency tests (83 tests) |
-| `zig build test-robustness` | Edge case and robustness tests (35+ tests) |
-| `zig build test-stress` | Stress tests with real threads |
-| `zig build test-all` | All of the above |
-
-```bash
-# Quick validation
-zig build test
-
-# Full suite
-zig build test-all
-```
-
-### Run benchmarks
-
-```bash
-zig build bench               # Run Volt benchmarks
-zig build compare             # Side-by-side comparison with Tokio (requires Rust)
-```
-
-### Generate API documentation
-
-```bash
-zig build docs
-# Output in zig-out/docs/
-```
-
----
-
-## Optional: Blitz Integration
-
-Volt pairs with [Blitz](https://github.com/NerdMeNot/blitz) for CPU parallelism -- see the [Blitz integration guide](/guides/blitz-integration/). Most users do not need this; the blocking pool (`io.concurrent`) handles CPU-intensive work without Blitz.
-
----
-
-## Project Structure
-
-When building from source, here is the repository layout:
-
-```
-volt/
-├── build.zig           # Build configuration
-├── build.zig.zon       # Package metadata and dependencies
-├── src/
-│   ├── lib.zig         # Public API entry point (@import("volt"))
-│   ├── runtime.zig     # Runtime lifecycle (init, run, deinit)
-│   ├── task.zig        # Task spawning (async, concurrent, Future, Group)
-│   ├── sync.zig        # Sync primitives (Mutex, RwLock, Semaphore, ...)
-│   ├── channel.zig     # Channels (Channel, Oneshot, Broadcast, Watch)
-│   ├── future.zig      # Future/Poll/Waker types
-│   ├── net.zig         # Networking (TCP, UDP, Unix)
-│   ├── fs.zig          # Filesystem
-│   ├── time.zig        # Duration, Instant, Sleep, Interval
-│   ├── signal.zig      # Signal handling
-│   ├── process.zig     # Process spawning
-│   ├── shutdown.zig    # Graceful shutdown
-│   ├── async.zig       # Async operations namespace
-│   ├── stream.zig      # I/O streams
-│   └── internal/       # Scheduler, backends, blocking pool
-├── tests/              # Integration, stress, concurrency tests
-└── bench/              # Benchmarks
-```
-
----
-
-## Troubleshooting
-
-### Hash mismatch on first build
-
-This is expected. Run `zig build` once, copy the correct hash from the error message, and paste it into your `build.zig.zon`.
-
-### "Not running inside a Volt runtime"
-
-This error comes from attempting to use runtime features outside a runtime context. All async operations go through the `io` handle, which prevents this error at compile time -- you cannot call `io.@"async"()` without an `io` handle:
-
-```zig
-// Preferred: io.@"async"() is compile-time safe
-pub fn main() !void {
-    try volt.run(myApp);
-}
-
-fn myApp(io: volt.Runtime) !void {
-    var f = try io.@"async"(myFunc, .{});  // can't be called without io
-    const result = f.@"await"(io);
-}
-```
-
-If you need an explicit runtime handle:
-
-```zig
-pub fn main() !void {
-    var io = try volt.Runtime.init(allocator, .{});
-    defer io.deinit();
-    try io.run(myApp);
-}
-```
-
-### Linux: io_uring not available
-
-On kernels older than 5.1, Volt falls back to epoll automatically. No code changes are needed. To check your kernel version:
-
-```bash
-uname -r
-```
-
-### Build errors with Zig version
-
-Volt requires Zig 0.15.0 or later. Key 0.15.x API differences from earlier versions:
-
-- Atomics use `std.atomic.Value(T)`, not `std.atomic.Atomic`
-- POSIX calls use `std.posix`, not `std.os`
-- No `@fence` builtin -- use `fetchAdd(0, .seq_cst)` for fences
-- No async/await keywords -- Volt uses explicit `Runtime` handle and manual state machines (similar to Zig's upcoming `std.Io` approach)
-
-Check your version with:
-
-```bash
-zig version
-```
+All six should exit `0`. Windows compiles but does not yet run — see
+the platform-status table in the [introduction](/).

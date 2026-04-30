@@ -1,117 +1,145 @@
 ---
 title: Glossary
-description: Definitions of key terms used throughout the Volt documentation.
-sidebar:
-  order: 4
+description: Terms used throughout the Volt docs and source. Read this when you're not sure what a word means.
 ---
 
-Quick reference for terminology used in the Volt documentation and codebase.
+## Coroutine
 
-## Runtime Concepts
+A function plus a stack the runtime can suspend and resume. In Volt
+every concurrent unit of work is a coroutine. Spawned via
+`volt.launch(fn, args)` (returns `*Job`) or `volt.spawn(fn, args)`
+(returns `*Task(T)`).
 
-**Runtime**
-The engine that drives async tasks to completion. Owns the scheduler, I/O driver, timer wheel, and blocking pool. Created via `volt.run()` or `Io.init()`.
+Coroutines are *stackful*: each owns a real (growable) stack, so
+ordinary control flow — recursion, exception unwinding,
+stack-allocated locals — works across suspensions.
 
-**Io**
-The runtime handle, passed explicitly to functions like an `Allocator`. Provides `@"async"()`, `concurrent()`, and access to the runtime's subsystems. The type system ensures you have a running runtime before calling async APIs.
+## Worker
 
-**Worker**
-An OS thread managed by the scheduler. Each worker has a local task queue and participates in work stealing. Default count: one per logical CPU core.
+An OS thread that runs coroutines. Volt creates `getCpuCount()`
+workers by default. The bootstrap thread (caller of `volt.run`) is
+worker 0; the rest are spawned by the runtime. Each worker owns a
+Chase-Lev work-stealing deque.
 
-**Blocking Pool**
-A separate pool of OS threads for CPU-intensive or synchronous blocking work. Threads are spawned on demand (up to 512) and reclaimed after 10 seconds of idleness. Accessed via `io.concurrent()`.
+## Reactor
 
-## Task Model
+The OS-level readiness or completion source. Per platform: kqueue
+(Darwin/BSD), epoll (Linux), io_uring (Linux 5.4+, parallel
+backend), IOCP (Windows, cross-compile only today). The reactor
+parks coroutines waiting on I/O or timers and wakes them when the
+kernel signals.
 
-**Task**
-A lightweight unit of concurrent work scheduled on the runtime. Each task is a state machine weighing ~256-512 bytes, not a full coroutine stack.
+Volt uses one reactor per runtime, with a "single-poller-claim" — at
+most one worker calls `reactor.poll()` at a time; events are pushed
+to that worker's deque.
 
-**Future**
-A type that represents an async operation in progress. Implements a `poll()` method that returns `.ready` (with a result) or `.pending` (not yet complete). Volt's futures are stackless state machines.
+## Park
 
-**Future(T)**
-The handle returned by `io.@"async"()`. Call `.@"await"(io)` to get the result or `.cancel(io)` to cancel the operation. Alias: `volt.Future(T)`.
+The universal suspension primitive. A `Park` is a single atomic
+that holds either zero, the parked coroutine pointer, or a "wake
+already arrived" sentinel. Every blocking primitive in Volt is built
+on Park: channels, mutexes, semaphores, joins, sleeps, I/O waits.
 
-**FutureTask**
-The internal wrapper that combines a `Future` with a task header (state, ref count, waker). You never interact with `FutureTask` directly.
+Cancelling a coroutine pokes its current Park (tracked via the
+`current_park` field on `Coroutine`), which is what makes
+cancellation propagate through arbitrary blocking calls.
 
-**Poll / PollResult**
-The return type of `Future.poll()`. Either `.ready` (with the output value) or `.pending` (not done yet, will be woken later).
+## Stack pool
 
-## Scheduling
+A per-runtime pool of recycled coroutine stacks. When a coroutine
+finishes, its stack returns to the pool instead of being unmapped.
+The next `volt.launch` / `volt.spawn` pops from the pool before
+falling back to `mmap` / `VirtualAlloc`. Drastically reduces the
+spawn cost for steady-state spawn-and-complete workloads.
 
-**LIFO Slot**
-A per-worker single-task slot for the most recently spawned task. Provides temporal locality (the child likely touches the same cache lines as the parent). Capped at 3 consecutive polls per tick to prevent starvation.
+## Injection queue
 
-**Local Queue**
-A per-worker 256-slot lock-free ring buffer ([Chase-Lev deque](/algorithms/chase-lev-deque/)) holding pending tasks. The owner thread has fast, uncontested access; other threads can steal from it.
+A mutex-protected global queue used for cross-thread spawns and
+reactor wakes. When a coroutine is unparked from a different worker
+than the one that dispatched it, it goes here. Workers check the
+injection queue after their local deque before stealing.
 
-**Global Queue**
-A mutex-protected injection queue shared by all workers. Tasks overflow here when local queues are full, and external code (timers, I/O completions) injects tasks here.
+## Job vs Task
 
-**Work Stealing**
-When a worker runs out of local tasks, it steals half the queue from a randomly chosen victim worker. See [Work Stealing](/algorithms/work-stealing/).
+- `Job` is the handle from `volt.launch`. It can be cancelled and
+  joined; join returns `error.Cancelled` / `error.StackOverflow` /
+  void.
+- `Task(T)` is the handle from `volt.spawn`. It wraps a `Job` and
+  adds a typed `join()` that returns the user fn's value (or its
+  error union plus the runtime errors).
 
-**Cooperative Budget**
-Each worker is allowed 128 polls per tick. After exhausting the budget, the current task is rescheduled to prevent starvation of other tasks.
+## Scope
 
-## Wakers and Notification
+A structured-concurrency region. `volt.scope(body)` runs `body(*Scope)`;
+when `body` returns or errors, the scope joins every child it
+spawned. Child coroutines cannot outlive the scope's body. Equivalent
+to Trio's nursery or Kotlin's `coroutineScope`.
 
-**Waker**
-A 16-byte callback that reschedules a task when an async event fires. Created by the scheduler, stored by async primitives (mutexes, channels, timers), and invoked when conditions are met.
+## Channel family
 
-**Callback / WakerFn**
-The function pointer inside a waker. When called, it puts the associated task back on the scheduler's run queue.
+Volt's message-passing types, all under `volt.channel.*`:
 
-## Sync Primitives
+- `Channel(T)` — bounded MPMC queue (Vyukov ring).
+- `Oneshot(T)` — single-sender, single-receiver, single-value.
+- `Watch(T)` — single-slot "latest value" with change notification.
+- `Broadcast(T)` — fan-out ring buffer; slow receivers get `.lagged(N)`.
 
-**Waiter**
-An intrusive struct embedded directly in a future (e.g., `LockFuture`, `AcquireFuture`). Contains list pointers, a waker reference, and completion state. Zero-allocation: no heap alloc per contended wait.
+All four share a unified error vocabulary (`error.Closed`,
+`error.Cancelled`) — defined in `src/channel/errors.zig` and
+re-exported as `volt.channel.{SendError, RecvError}`.
 
-**Intrusive List**
-A linked list where the nodes are embedded in the data structures themselves (not separately allocated). Used for waiter queues in mutexes, semaphores, and channels.
+## select
 
-## Channel Types
+`volt.select(.{...})` waits for the first of several channel
+operations to complete. Returns a tagged union whose variant matches
+the winning branch's field name. Cancels losing branches when one
+wins.
 
-**Channel(T)**
-Bounded MPMC (multi-producer, multi-consumer) channel backed by a lock-free [Vyukov ring buffer](/algorithms/vyukov-mpmc/). Requires an allocator and `deinit()`.
+## withTimeout
 
-**Oneshot(T)**
-A single-value channel: one sender, one receiver. Zero-allocation. Ideal for returning results from spawned tasks.
+`volt.withTimeout(duration, fn, args)` runs `fn(args)` as a child
+coroutine and races it against a deadline. Returns the value, or
+`error.Timeout` if the deadline fires first; the child is cancelled
+on timeout.
 
-**BroadcastChannel(T)**
-Fan-out channel: every subscribed receiver gets a copy of every sent message. Slow receivers may miss messages (ring buffer overwrites).
+## Slab pool
 
-**Watch(T)**
-Single-value channel with change notification. Only the latest value is kept. Ideal for configuration that changes at runtime.
+The per-runtime stack-recycling pool. See **Stack pool** above —
+"slab" is the implementation strategy (chunked allocation with a
+mutex-protected free list, cap=256).
 
-## Two-Tier API
+## Trampoline
 
-**tryX() (Tier 1)**
-Non-blocking operations that work anywhere, with or without a runtime. Examples: `tryLock()`, `tryAcquire()`, `trySend()`, `tryRecv()`. Return immediately with success/failure.
+The naked-asm function (`voltCoroEntry` on x86_64 / arm64) that runs
+the first time a freshly-spawned coroutine resumes. Its only job is
+to invoke the user's closure on the new stack. After this initial
+call, the coroutine takes over.
 
-**x(io) (Tier 2)**
-Convenience methods that take the `io: volt.Runtime` handle and suspend the task until the operation completes. Examples: `mutex.lock(io)`, `ch.send(io, val)`, `sem.acquire(io, n)`.
+## EventSource
 
-## Additional Terms
+The "subscribe-to-this-and-park" interface. A reactor wait, a Park
+unpark, a channel waiter list — all expose an EventSource the
+worker uses post-yield. `Coroutine.pending_event` points at the
+current EventSource the coroutine is parked on. Internal; you
+shouldn't see it.
 
-**Convenience API**
-The "Tier 2" methods that take `io: volt.Runtime` and suspend the calling task until the operation completes. For example, `mutex.lock(io)` and `ch.send(io, val)`. This is the recommended starting point for async code.
+## Cancellation point
 
-**Future API**
-The lower-level API that returns `Future` objects for manual composition. For example, `mutex.lockFuture()` and `ch.sendFuture(val)`. Use when building combinators or integrating with custom schedulers.
+A spot in your code where the cancel flag is checked. Every
+suspension point is a cancellation point — Park surfaces
+`error.Cancelled` if the coroutine was cancelled before or during the
+park. For CPU-only loops, call `volt.yield()` to make an explicit
+cancellation point.
 
-**Waiter API**
-The lowest-level API for direct intrusive list manipulation. For example, `ch.recvWait(&waiter)`. Intended for library authors building custom scheduler integrations.
+## Stackful vs Stackless
 
-**`@""` Syntax (Identifier Quoting)**
-Standard Zig syntax for using reserved keywords as identifiers. Volt uses `@"async"` and `@"await"` because `async` and `await` are reserved keywords in Zig. Read `io.@"async"(fn, args)` as "io dot async". This is not Volt-specific.
+- **Stackless**: each task is a state machine ~256-512 bytes.
+  Requires `async`/`await` syntax. Function coloring; types differ
+  per `async fn`. Pin-and-state-machine memory model.
+- **Stackful**: each task owns a real growable stack ~4-16 KiB
+  resident. No syntax change. Code reads like blocking I/O.
 
-**deinit Required**
-Types that allocate memory (via an `Allocator` parameter) must have `deinit()` called to free it. In Volt, `Channel` and `BroadcastChannel` require `deinit()`. `Oneshot`, `Watch`, and all sync primitives do not.
-
-**Zero-Allocation**
-A design where no heap allocation occurs per operation. Volt's sync primitives embed waiter structs directly in futures instead of heap-allocating them. This is why Volt achieves 282 B/op vs Tokio's 1,868 B/op total across all benchmarks.
-
-**Blocking Operation**
-An operation that blocks the OS thread (not just the task). On a Volt worker thread, blocking stalls every task on that worker. Examples: `std.Thread.sleep`, `volt.net.resolve()`, `volt.fs.readFile()`. See [Common Pitfalls](/guides/common-pitfalls/#operations-that-block-the-thread).
+Volt is stackful. Tokio is stackless. Go is stackful. Rust async is
+stackless. The choice is determined by language ergonomics; Zig has
+no `async`/`await`, which is what makes stackful the right choice
+here.

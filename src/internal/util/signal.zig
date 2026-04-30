@@ -128,7 +128,14 @@ pub const SignalSet = struct {
         inline for (std.meta.fields(Signal)) |field| {
             const sig: Signal = @enumFromInt(field.value);
             if (self.contains(sig)) {
-                posix.sigaddset(&sigset, sig.toInt());
+                // On Linux, posix.SIG is an `enum(u32)`; on Darwin/BSD
+                // it's a u32 plain alias. Cast appropriately.
+                if (comptime builtin.os.tag == .linux) {
+                    const SigT = @TypeOf(posix.SIG.HUP);
+                    posix.sigaddset(&sigset, @as(SigT, @enumFromInt(sig.toInt())));
+                } else {
+                    posix.sigaddset(&sigset, sig.toInt());
+                }
             }
         }
         return sigset;
@@ -234,10 +241,12 @@ pub const SignalHandler = struct {
         // Block signals so they go to signalfd instead of default handler
         _ = posix.sigprocmask(std.os.linux.SIG.BLOCK, &sigset, null);
 
-        // Create signalfd
-        const fd = std.os.linux.signalfd(-1, &sigset, std.os.linux.SFD.NONBLOCK | std.os.linux.SFD.CLOEXEC);
-
-        if (@as(isize, @bitCast(fd)) < 0) {
+        // Use libc's signalfd: the libc sigset_t matches what we got
+        // from `posix.sigemptyset()`/`sigaddset()`. The kernel-shape
+        // `std.os.linux.signalfd` wants a `[1]c_ulong` sigset that's
+        // a different type from libc's.
+        const fd = std.c.signalfd(-1, &sigset, std.os.linux.SFD.NONBLOCK | std.os.linux.SFD.CLOEXEC);
+        if (fd < 0) {
             return error.SignalfdFailed;
         }
 

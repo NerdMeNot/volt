@@ -1,218 +1,199 @@
 ---
 title: Performance Tuning
-description: Optimize Volt for your workload — worker count, LIFO slots, cooperative budgeting, contention reduction, and benchmark-driven workflow.
+description: Where Volt's overhead lives, what's worth measuring, and the knobs you can turn.
 ---
 
-Volt is designed to be fast by default, but real workloads benefit from tuning. This guide covers the knobs available and when to turn them.
+This guide is for the case where Volt is in your hot path and
+you've decided you need to make it faster. Most programs won't
+need any of it.
 
-## Worker Count
+## Measure first
 
-The `num_workers` config controls how many OS threads run the async scheduler. The default (`0`) auto-detects based on CPU count.
+Volt ships `zig build bench`, which runs core benchmarks in
+`ReleaseFast`:
 
-```zig
-const volt = @import("volt");
-
-// Auto-detect (one worker per CPU core)
-try volt.runWith(allocator, .{}, myServer);
-
-// Explicit: 4 workers
-try volt.runWith(allocator, .{ .num_workers = 4 }, myServer);
-
-// Manual runtime setup
-var io = try volt.Runtime.init(allocator, .{
-    .num_workers = 8,
-    .max_blocking_threads = 256,
-});
-defer io.deinit();
-```
-
-### Guidelines
-
-| Workload | Recommended Workers |
-|----------|-------------------|
-| I/O-bound (web server, proxy) | CPU count (default) |
-| Mixed I/O + compute | CPU count - 1 (leave room for blocking pool) |
-| Compute-heavy with I/O | CPU count / 2 (offload compute to blocking pool) |
-| Testing / debugging | 1 (deterministic execution) |
-
-More workers is not always better. Each worker adds memory overhead (local queue, stack, LIFO slot) and increases contention on the global queue.
-
-## LIFO Slot and Cache Locality
-
-Each worker has a **LIFO slot** -- a single-task fast path that bypasses the local queue entirely. When a task wakes another task on the same worker, the woken task goes into the LIFO slot and runs next.
-
-This matters because:
-
-- The woken task likely accesses the same cache lines as the waker (temporal locality).
-- Skipping the queue reduces latency for ping-pong patterns (mutex lock/unlock, channel send/recv).
-- The scheduler caps LIFO polls at `MAX_LIFO_POLLS_PER_TICK = 3` to prevent starvation of queued tasks.
-
-### When LIFO Helps
-
-- **Mutex contention**: `unlock()` wakes the next waiter. If that waiter runs immediately on the same core, the mutex's memory is still hot in L1 cache.
-- **Channel ping-pong**: Producer sends, consumer runs on same worker, consumes, producer runs again.
-- **Barrier release**: Leader wakes all participants; the first one runs via LIFO.
-
-### When LIFO Hurts
-
-If many tasks constantly wake each other, LIFO can cause a small set of tasks to monopolize workers while other tasks starve. The `MAX_LIFO_POLLS_PER_TICK` cap exists for this reason.
-
-You cannot disable LIFO via config -- it is always active. If you see starvation in profiling, redesign the wake pattern (e.g., batch work into fewer tasks).
-
-## Cooperative Budgeting
-
-The scheduler enforces a budget of **128 polls per tick** (`BUDGET_PER_TICK`). After 128 task polls, the worker performs maintenance:
-
-1. Check the global queue for new tasks
-2. Process I/O completions from the backend
-3. Fire expired timers
-4. Update the adaptive global queue interval
-
-This prevents a single long-running future chain from starving I/O and timers.
-
-### Implications for Your Code
-
-- Futures that call many sub-futures in a single `poll()` consume budget rapidly.
-- If your future does O(1000) work per poll, consider yielding manually.
-- `volt.task.yield()` is an engine internal -- it is a no-op hint that the scheduler may use to preempt.
-
-### Adaptive Global Queue Interval
-
-The scheduler uses EWMA (exponentially weighted moving average) to estimate average task poll duration. It adjusts how often it checks the global queue:
-
-- Fast tasks (< 1us each) --> check every ~128 polls
-- Slow tasks (> 100us each) --> check every ~8 polls
-
-This self-tuning happens automatically. You do not need to configure it.
-
-## Reducing Contention
-
-Contention is the primary bottleneck in async runtimes. Here is how to minimize it.
-
-### Choose the Right Primitive
-
-| Pattern | Wrong Choice | Right Choice |
-|---------|-------------|-------------|
-| Shared config | `Mutex` protecting a struct | `Watch` channel |
-| Request/response | `Channel` with capacity 1 | `Oneshot` |
-| Rate limiting | `Mutex` + counter | `Semaphore` |
-| One-time init | `Mutex` + `bool` flag | `OnceCell` |
-| Read-heavy data | `Mutex` | `RwLock` |
-
-See the [Choosing a Primitive](/guides/choosing-primitive/) guide for a full decision tree.
-
-### Avoid Shared State When Possible
-
-Channels move data between tasks without sharing. If you can model your problem as message passing instead of shared state, do it.
-
-```zig
-// WORSE: Shared state with mutex
-var mutex = volt.sync.Mutex.init();
-var shared_counter: u64 = 0;
-
-fn incrementCounter() void {
-    if (mutex.tryLock()) {
-        defer mutex.unlock();
-        shared_counter += 1;
-    }
-}
-
-// BETTER: Channel-based accumulation
-var ch = try volt.channel.bounded(u64, allocator, 1024);
-
-fn sendIncrement() void {
-    _ = ch.trySend(1);
-}
-
-fn accumulator() void {
-    var total: u64 = 0;
-    while (true) {
-        switch (ch.tryRecv()) {
-            .value => |v| total += v,
-            .empty => return,
-            .closed => return,
-        }
-    }
-}
-```
-
-### Partition State Across Workers
-
-Instead of one `Mutex`-protected map, use N maps (one per worker) and route by key hash:
-
-```zig
-const NUM_SHARDS = 16;
-var shards: [NUM_SHARDS]struct {
-    mutex: volt.sync.Mutex,
-    data: SomeMap,
-} = undefined;
-
-fn getShard(key: u64) *@TypeOf(shards[0]) {
-    return &shards[key % NUM_SHARDS];
-}
-```
-
-## Memory Allocation in Hot Paths
-
-Allocation is the hidden enemy of async performance. Each `std.heap.page_allocator.alloc()` is a syscall. In hot paths:
-
-1. **Pre-allocate buffers** before entering the event loop.
-2. **Use arena allocators** for request-scoped data.
-3. **Pool long-lived objects** (connections, task contexts).
-4. **Avoid `ArrayList.append` in poll functions** -- it may reallocate.
-
-```zig
-// Pre-allocate a buffer pool before the event loop
-var pool: [256][4096]u8 = undefined;
-var free_list: std.ArrayList(usize) = .empty;
-try free_list.ensureTotalCapacity(allocator, 256);
-for (0..256) |i| free_list.appendAssumeCapacity(i);
-```
-
-The blocking pool (`io.concurrent`) is the right place for allocation-heavy work. It runs on separate threads that will not starve the async scheduler.
-
-## Blocking Pool Tuning
-
-The blocking pool spawns OS threads on demand for CPU-intensive or blocking I/O work.
-
-```zig
-var io = try volt.Runtime.init(allocator, .{
-    .max_blocking_threads = 512,          // Max concurrent blocking tasks
-    .blocking_keep_alive_ns = 10 * std.time.ns_per_s, // Idle thread timeout
-});
-```
-
-- **`max_blocking_threads`**: Upper bound on OS threads. Default 512. Lower this if memory is constrained.
-- **`blocking_keep_alive_ns`**: How long idle blocking threads survive before exiting. Default 10 seconds. Increase for bursty workloads; decrease to reclaim memory faster.
-
-## Benchmark-Driven Optimization Workflow
-
-Never optimize without measuring. Follow this workflow:
-
-1. **Establish a baseline** using `zig build bench` or a custom benchmark.
-2. **Profile** with `perf record` (Linux) or Instruments (macOS).
-3. **Identify the bottleneck** -- is it lock contention? Allocation? Syscalls? Cache misses?
-4. **Make one change** and re-benchmark.
-5. **Run correctness tests** (`zig build test-all`) after every optimization.
-
-### Built-in Benchmarks
-
-```bash
-# Full benchmark suite (sync, channel, async, task scheduling)
+```sh
 zig build bench
-
-# Compare against Tokio (Rust) baselines
-zig build compare
 ```
 
-### What to Look For
+Output is a small table — spawn cost, yield cost, channel SPSC
+throughput, mutex lock/unlock cost on the host. Treat the numbers
+as your **baseline**: if your application's costs are within 2-3×
+of the bench numbers, the runtime isn't the bottleneck — your
+work is.
 
-| Metric | Healthy | Concerning |
-|--------|---------|------------|
-| Uncontended mutex | < 15ns | > 50ns |
-| Channel send/recv roundtrip | < 10ns | > 100ns |
-| Semaphore acquire/release | < 15ns | > 50ns |
-| Contended mutex (4 threads) | < 200ns | > 1000ns |
-| Task spawn + await | < 10,000ns | > 50,000ns |
+If you're well above bench numbers, profile. Volt's source is
+small enough that walking through the dispatch path with a
+profiler usually surfaces the cause.
 
-The benchmarks under `bench/` compare Volt against Tokio. Volt wins 17/21 benchmarks. Tokio leads in contended semaphore (1.2x), MPMC channel (2.2x), and blocking pool spawn (2.2x). Volt's architecture is [derived from Tokio's design](https://github.com/NerdMeNot/volt/blob/main/BENCHMARKS.md#standing-on-tokios-shoulders).
+## The knobs
+
+### Worker count
+
+```zig
+try volt.run(.{ .allocator = a, .workers = 4 }, root, .{});
+```
+
+Default is `getCpuCount()`. Tune up or down based on:
+
+- **CPU-bound workloads**: workers = physical cores. Hyperthreads
+  rarely help with stackful coroutines because the dispatch
+  overhead doesn't parallelize well across SMT.
+- **I/O-bound workloads**: workers = somewhere between 1 and
+  CPU count. More workers = more reactor-claim contention; fewer
+  workers = fewer steal targets.
+- **Latency-sensitive**: workers = CPU count, plus `pin_workers
+  = true` to keep each worker on its own core.
+
+For most workloads, the default is fine. Tuning matters mainly when
+you've measured a clear bottleneck.
+
+### Worker pinning
+
+```zig
+try volt.run(.{ .allocator = a, .pin_workers = true }, root, .{});
+```
+
+Linux only. Pins worker `i` to CPU `i % cpu_count` via
+`pthread_setaffinity_np`. Reduces cross-core cache traffic for
+hot data; increases tail latency if a high-priority task arrives
+on a busy worker (no migration possible).
+
+Pin if your workload has clearly hot per-coroutine data and
+near-zero load imbalance. Don't pin if you have bursty traffic
+where load imbalance is the bigger problem.
+
+### Stack size
+
+Volt commits 1 page (4-16 KiB) up front per coroutine and grows in
+place to 8 MiB on guard-page faults. The cap is a compile-time
+constant (`default_reserved` in `src/coroutine/stack.zig`). If
+you're handling truly recursive workloads (regex backtracking,
+recursive-descent parsers) and hitting `error.StackOverflow`,
+raise it.
+
+For most workloads, the 1-page initial commit is what you want —
+zero physical memory until the coroutine actually uses stack.
+
+## What's actually expensive
+
+In rough order, biggest first:
+
+1. **`mmap` / `mprotect` syscalls on coroutine spawn.** Per spawn
+   we reserve 8 MiB virtual address space + commit 1 page +
+   protect a guard page. That's 2-3 syscalls per spawn. The slab
+   pool eliminates this for steady-state workloads (recycles
+   stacks across spawns), but the first N spawns of the runtime
+   pay the syscall cost.
+
+   *Mitigation*: pre-warm the pool by spawning + finishing N
+   coroutines before your hot path. Subsequent spawns are
+   essentially free.
+
+2. **Context switches.** ~10-15 ns on Apple Silicon for the
+   assembly switch. Plus park/unpark bookkeeping (a few atomic
+   ops). The dominant cost in a "ping-pong between two
+   coroutines" benchmark.
+
+   *Mitigation*: batch work. If you have an iteration that does
+   1 ns of compute and then yields, you're paying 10ns+ of
+   overhead per item. Restructure to do hundreds of items per
+   suspend.
+
+3. **Mutex contention under high core counts.** Volt's Mutex is
+   FIFO-fair; on a 64-core machine with all 64 contending, the
+   waiter-list overhead dominates. Std's `std.Thread.Mutex` is
+   fair-ish via parking_lot internals; for small uncontended
+   sections it can be faster.
+
+   *Mitigation*: shard. Per-core counters with a periodic
+   aggregator. Per-key locks instead of one global lock. The
+   classic "shard your hash table" pattern.
+
+4. **Channel ring contention.** `Channel(T)` is a Vyukov MPMC
+   ring; its fast path is a single CAS, but contention on the
+   tail counter under heavy multi-producer load shows up.
+
+   *Mitigation*: shard channels. N producers each writing to
+   their own channel that one consumer multiplexes is faster
+   than N producers contending on one channel.
+
+5. **Reactor poll dispatch.** Every wake event causes a
+   single-poller-claim dance: try to claim, poll, dispatch. With
+   thousands of events per second this is fine; with millions
+   you start seeing the claim contention on the bitmap.
+
+   *Mitigation*: io_uring's batched submission helps if your I/O
+   is on Linux and you can flip the reactor backend (currently a
+   one-line edit in `reactor.zig` until the runtime
+   `Config.reactor_backend` ships).
+
+## Measuring per-operation cost
+
+Wrap a hot path with `volt.tracing.span`:
+
+```zig
+const result = try volt.tracing.span(.{
+    .name = "process_request",
+}, struct {
+    fn body() !Response { ... }
+}.body);
+```
+
+The default sink emits OTel-shaped JSON Lines to stderr with
+nanosecond start/end timestamps. Pipe to a collector for
+aggregation, or set a custom sink:
+
+```zig
+fn mySink(e: volt.tracing.Event) void { /* aggregate */ }
+volt.tracing.setSink(&mySink);
+```
+
+For lower-level "what are workers doing" questions:
+
+```zig
+const m = try volt.observability.metrics(allocator, rt);
+defer m.deinit(allocator);
+for (m.workers) |w| {
+    std.log.debug("w{d}: pushed={d} stolen={d} parked={d} ctx_sw={d}", .{
+        w.id, w.pushes, w.steals, w.parks, w.context_switches,
+    });
+}
+```
+
+High `parks` count means workers are idle a lot — your work
+isn't keeping them busy. High `steals` means good load
+distribution. High `context_switches` per second is normal under
+I/O load; it's only a problem if it's coming with high yields
+from CPU code that should be batching.
+
+## Snapshot the live runtime
+
+```zig
+const snaps = try volt.observability.snapshot(alloc, rt);
+defer alloc.free(snaps);
+```
+
+Each `TaskSnapshot` has the task's name, spawn site, current
+state, and accumulated CPU time. Useful in production for "what
+are my long-running tasks doing right now" — pipe to your
+operational dashboard.
+
+## When the runtime *isn't* the bottleneck
+
+Most performance problems aren't Volt's. Common ones:
+
+- **Allocator pressure**. `std.heap.DebugAllocator` is for
+  development; use `std.heap.smp_allocator` or arena-per-request
+  in production.
+- **Logging in the hot path**. `std.debug.print` synchronously
+  formats and writes; in a request handler that's measurable
+  overhead.
+- **Heavy computation on the worker thread**. Move it to
+  `volt.spawnBlocking`.
+- **JSON parsing per request**. Use stack-allocated parser state
+  + reuse buffers across requests.
+
+Profile, don't guess. Volt's source is ~10K lines and readable —
+if you see Volt's code dominating a profile, file an issue with
+the trace; we want to know.

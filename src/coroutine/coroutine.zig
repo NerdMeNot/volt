@@ -13,7 +13,7 @@
 //! `*Coroutine` pointer IS the state — see `docs/design/scheduler-protocol.md`.
 
 const std = @import("std");
-const ctx = @import("context_arm64.zig");
+const ctx = @import("context.zig");
 const event_source = @import("event_source.zig");
 const Park = @import("../scheduler/park.zig").Park;
 
@@ -55,8 +55,60 @@ pub const Coroutine = struct {
     /// points (volt.yield, Park.parkCurrent) which return error.Cancelled.
     cancel_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    /// Owned stack allocation (mmap'd with PROT_NONE guard at the bottom).
+    /// Currently-parked-on Park, set by `Park.parkCurrent` on entry and
+    /// cleared on resume. `cancel()` reads this and `unpark()`s the
+    /// Park, so a parked coroutine wakes promptly on cancellation
+    /// (it then observes `cancel_flag` in parkCurrent's post-resume
+    /// check and returns `error.Cancelled`).
+    ///
+    /// `usize` (not `?*Park`) for atomic access without needing
+    /// optional-pointer atomic support.
+    current_park: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    /// Set by the SIGSEGV handler when this coroutine writes past the
+    /// permanent floor of its reserved stack range. When true, the
+    /// coroutine's result is reported as `error.StackOverflow`; the
+    /// process keeps running. (The growable stack handles small
+    /// overflows transparently — this flag is set only when the entire
+    /// reserved range is exhausted.)
+    overflow_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// True iff this is the root coroutine watched by `Runtime.runUntilDone`.
+    /// `Done.subscribe` performs a targeted wake of worker 0 when set,
+    /// avoiding a `notifyAllWorkers` broadcast on every completion.
+    is_root: bool = false,
+
+    /// Optional human-readable name set by `volt.coroutine.setCurrentName`
+    /// or by spawn-site annotation. Surfaces in `TaskSnapshot.name`.
+    name: []const u8 = "",
+
+    /// Optional source-location of the spawn site (set via
+    /// `volt.spawnAt` / `volt.launchAt`). Surfaces in
+    /// `TaskSnapshot.spawn_site` for async backtraces.
+    spawn_site: ?std.builtin.SourceLocation = null,
+
+    /// `id` of the coroutine that called `volt.spawn`/`volt.launch`
+    /// to create this one. Forms an ancestry chain for async
+    /// backtraces. `0` for the root coroutine (or any coro spawned
+    /// from a non-coroutine context).
+    parent_id: usize = 0,
+
+    /// True after `Done.subscribe` has handed this coroutine's stack
+    /// region back to the runtime stack pool. `Worker.deinit` skips
+    /// freeing the stack again — the pool now owns it.
+    stack_pooled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// Owned stack reservation (whole virtual range, mmap'd PROT_NONE
+    /// with a small initial committed region at the top). The runtime
+    /// grows the committed portion on demand via the SIGSEGV handler.
     stack: []align(16) u8,
+
+    /// Lowest currently-committed address within `stack`. The page
+    /// below this is the guard. Updated atomically by the SIGSEGV
+    /// handler when it commits a new page on overflow. Initial value
+    /// is `stack.ptr + stack.len - initial_commit`.
+    stack_committed_bottom: std.atomic.Value(usize) =
+        std.atomic.Value(usize).init(0),
 
     /// Per-(user_fn, args) destroy callback — knows the type, can free
     /// closure + args correctly.
@@ -75,11 +127,17 @@ pub const Coroutine = struct {
 
     pub fn cancel(self: *Coroutine) void {
         self.cancel_flag.store(true, .release);
-        // Note: cancel does NOT unpark the coroutine. A coroutine parked on
-        // an unrelated wake source (Mutex, channel, reactor, join) needs
-        // the structured-concurrency cleanup at v0.5 to deterministically
-        // observe cancellation. For now, the cancelled coro observes the
-        // flag at its next yield/park point AFTER it's woken normally.
+        // If the coroutine is currently parked on a Park (channel
+        // waiter, mutex queue, sleep timer, etc.), wake it now so
+        // it observes the cancellation immediately at its
+        // post-resume check. Without this nudge it'd wait until
+        // some unrelated wake source fires (or never, if the wake
+        // source is gone).
+        const park_addr = self.current_park.load(.acquire);
+        if (park_addr != 0) {
+            const park: *Park = @ptrFromInt(park_addr);
+            park.unpark();
+        }
     }
 
     pub fn isDone(self: *const Coroutine) bool {

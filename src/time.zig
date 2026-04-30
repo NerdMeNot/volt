@@ -19,6 +19,23 @@ const thr = @import("internal/thread.zig");
 /// Monotonic-clock nanosecond timestamp. Replaces std.time.nanoTimestamp
 /// (removed in Zig 0.16, where time queries moved into std.Io).
 pub fn nanoTimestamp() i128 {
+    if (@import("builtin").os.tag == .windows) {
+        // Windows: QueryPerformanceCounter / QueryPerformanceFrequency,
+        // scaled to nanoseconds. The frequency is process-stable so we
+        // cache it on first call.
+        const W = struct {
+            extern "kernel32" fn QueryPerformanceCounter(perf_counter: *i64) callconv(.winapi) i32;
+            extern "kernel32" fn QueryPerformanceFrequency(freq: *i64) callconv(.winapi) i32;
+            var freq_cache: i64 = 0;
+        };
+        if (W.freq_cache == 0) {
+            _ = W.QueryPerformanceFrequency(&W.freq_cache);
+        }
+        var counter: i64 = 0;
+        _ = W.QueryPerformanceCounter(&counter);
+        // ns = counter * 1e9 / freq, computed in i128 to avoid overflow.
+        return @divTrunc(@as(i128, counter) * std.time.ns_per_s, @as(i128, W.freq_cache));
+    }
     var ts: std.posix.timespec = undefined;
     _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
     return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
@@ -290,7 +307,7 @@ test "Instant - ordering" {
     try std.testing.expect(b.isAfter(a));
 }
 
-// Async time primitives (Sleep, Interval, Deadline, TimerDriver) are
-// intentionally removed. They were Future/Poll-coupled in the stackless
-// tree; the stackful rebuild replaces them with coroutine-suspending
-// equivalents (volt.sleep, volt.interval, volt.withTimeout) at v0.7.
+// Async time primitives live alongside this file: `volt.sleep`,
+// `volt.withTimeout`, and `volt.Interval` (`time/Sleep.zig`,
+// `time/Timeout.zig`, `time/Interval.zig`). This file holds only the
+// model-agnostic Duration/Instant value types.

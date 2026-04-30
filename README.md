@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <strong>Async I/O runtime for Zig. Work-stealing scheduler, zero-alloc sync primitives, lock-free channels.</strong>
+  <strong>Stackful coroutine runtime for Zig. No async/await. Code reads like blocking I/O; the runtime suspends at every wait point and resumes you on whichever worker the reactor wakes first.</strong>
 </p>
 
 <p align="center">
@@ -16,539 +16,188 @@
   <a href="https://volt.nerdmenot.in"><img src="https://img.shields.io/badge/docs-volt.nerdmenot.in-blue" alt="Docs"></a>
 </p>
 
-Volt is an async I/O runtime for Zig. It provides a work-stealing task scheduler, synchronization primitives, channels, networking, filesystem, timers, and process management -- everything you need to build concurrent servers and services.
-
-Volt follows the architecture of [Tokio](https://tokio.rs/), adapted for Zig's value semantics and comptime specialization. It is the I/O counterpart to [Blitz](https://github.com/NerdMeNot/blitz) (CPU parallelism), the same way Tokio complements Rayon.
-
-- **Work-stealing scheduler**: LIFO slot + local ring buffer + global injection, cooperative budgeting (128 polls/tick), O(1) bitmap worker waking
-- **Cross-platform I/O**: io_uring (Linux), kqueue (macOS), IOCP (Windows), epoll (fallback) -- auto-detected at startup
-- **Zero-allocation primitives**: Mutex, RwLock, Semaphore, Barrier, Notify, OnceCell -- intrusive waiters embedded in futures, no heap per wait
-- **Lock-free channels**: MPSC/MPMC (Vyukov ring buffer), Oneshot, Broadcast, Watch, Select -- 284 B/op total vs 1,868 B/op (Tokio) across all benchmarks
-
 ```zig
+const std = @import("std");
 const volt = @import("volt");
 
 pub fn main() !void {
-    try volt.run(serve);
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    try volt.run(.{ .allocator = gpa.allocator() }, serve, .{});
 }
 
-fn serve(io: volt.Runtime) void {
-    var listener = volt.net.listen("0.0.0.0:8080") catch return;
+fn serve() !void {
+    var listener = try volt.io.TcpListener.bind(volt.io.Address.any4(8080));
     defer listener.close();
-    while (listener.tryAccept() catch null) |conn| {
-        _ = io.spawn(echo, .{conn.stream}) catch continue;
+    while (true) {
+        const conn = try listener.accept();
+        _ = try volt.launch(echo, .{conn});
     }
 }
 
-fn echo(stream: volt.net.TcpStream) void {
-    var s = stream;
+fn echo(conn: volt.io.TcpStream) void {
+    var s = conn;
     defer s.close();
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = s.tryRead(&buf) catch return orelse continue;
+        const n = s.read(&buf) catch return;
         if (n == 0) return;
         s.writeAll(buf[0..n]) catch return;
     }
 }
 ```
 
-## Table of Contents
+That's the whole shape. No `async`, no `await`, no `Future`, no `.poll()`, no manual state machines. The `s.read(&buf)` call suspends the coroutine when the socket isn't ready and resumes it when the reactor delivers readiness — possibly on a different worker thread.
 
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [API Reference](#api-reference)
-  - [Modules](#modules)
-  - [Task Spawning](#task-spawning)
-  - [Synchronization](#synchronization)
-  - [Channels](#channels)
-  - [Networking](#networking)
-  - [Time](#time)
-- [Performance](#performance)
-- [Architecture](#architecture)
-- [Best Practices](#best-practices)
-- [Limitations](#limitations)
-- [Contributing](#contributing)
-- [Documentation](#documentation)
-- [Acknowledgments](#acknowledgments)
+## What it is
 
-## Installation
+- **Stackful coroutines.** Each task owns a growable virtual stack: 1 page committed up-front, grows in place via `mprotect` (POSIX) or `VirtualAlloc(MEM_COMMIT)` (Windows) on guard-page hit, capped at 8 MiB and surfaced as `error.StackOverflow`. Pointers to stack-locals stay valid across suspension; no compiler stackmaps required.
+- **Multi-worker work-stealing scheduler.** Per-worker Chase-Lev deque, LIFO slot, global injection queue. `volt.run(.{ .allocator = ..., .workers = 4 }, ...)` lets you tune; default is `getCpuCount()`.
+- **Park-based primitives, zero allocation per wait.** `Mutex`, `RwLock`, `Semaphore`, `Notify`, `Barrier`, `OnceCell`, `Channel`, `Oneshot`, `Watch`, `Broadcast`, `select`, `withTimeout`, `Scope`, `JoinSet`, `CancellationToken` — all built on a single `Park` substrate; intrusive waiter lists; no allocator on the hot path.
+- **Cancellable from anywhere.** Cancelling a task wakes it from any park (sleep / I/O / channel / sync) and surfaces `error.Cancelled`. Timeouts propagate cleanly even through uncooperative blocking calls.
+- **Per-OS reactor.** kqueue (Darwin/BSD), epoll (Linux), with parallel io_uring + IOCP backends compiled in. The default backend is selected at compile time.
 
-### Requirements
+## Status
 
-- Zig 0.15.0 or later
-- Linux, macOS, or Windows
+Volt is at v1.0.0 against Zig 0.16.0. Version tags follow `vX.Y.Z-zigA.B.C` so the Zig version is always explicit.
 
-### Using Zig Package Manager
+| Target | Backend | Status |
+|---|---|---|
+| macOS arm64 / x86_64 | kqueue | runtime + CI |
+| Linux x86_64 / arm64 | epoll | runtime + CI |
+| Linux x86_64 | io_uring | parallel backend; cross-compile clean |
+| Windows x86_64 / arm64 | IOCP | cross-compile clean; runtime port pending |
 
-Add to your `build.zig.zon`:
+The Windows IOCP backend itself, the VirtualAlloc-backed stack, the `WaitOnAddress` futex, and `QueryPerformanceCounter` time all compile and link cleanly for Windows. What's still missing for runtime-default: ioctlsocket / WriteFile / CreateProcess arms in `io/net.zig`, `io/io.zig`, `process/Command.zig`, and a Windows CI runner. See `src/io/reactor.zig` for the punch list.
+
+## Install
 
 ```zig
+// build.zig.zon
 .{
     .name = .my_project,
     .version = "0.1.0",
-    .minimum_zig_version = "0.15.0",
-
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .volt = .{
-            .url = "https://github.com/NerdMeNot/volt/archive/refs/tags/v1.0.0-zig0.15.2.tar.gz",
-            .hash = "volt-1.0.0-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-            // Run `zig build` to get the correct hash
+            .url = "https://github.com/NerdMeNot/volt/archive/refs/tags/v1.0.0-zig0.16.0.tar.gz",
+            .hash = "...", // run `zig build` to get the correct hash
         },
     },
-
-    .paths = .{
-        "build.zig",
-        "build.zig.zon",
-        "src",
-    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
 }
 ```
-
-Add to your `build.zig`:
 
 ```zig
-pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
-
-    // Get Volt dependency
-    const volt_dep = b.dependency("volt", .{
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // Create your executable
-    const exe = b.addExecutable(.{
-        .name = "my_app",
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // Add Volt module
-    exe.root_module.addImport("volt", volt_dep.module("volt"));
-
-    b.installArtifact(exe);
-}
+// build.zig
+const volt_dep = b.dependency("volt", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("volt", volt_dep.module("volt"));
 ```
 
-### Building from Source
+Volt requires libc (the `sigsetjmp` / `mprotect` / `signalfd` paths), which Zig links automatically when the consuming module sets `link_libc = true` or imports a Volt-aware build helper.
 
-```bash
-git clone https://github.com/NerdMeNot/volt.git
-cd volt
-zig build              # Build library
-zig build test         # Run unit tests (588+ tests)
-zig build test-stress  # Run stress tests
-zig build test-all     # Run all test suites
-```
-
-## Quick Start
-
-### TCP Echo Server
+## API at a glance
 
 ```zig
-const volt = @import("volt");
+// Bootstrap.
+volt.run(.{ .allocator = a }, fn, args)                // run a root coroutine to completion
+volt.run(.{ .allocator = a, .workers = 4 }, fn, args)  // override defaults
 
-pub fn main() !void {
-    try volt.run(serve);
-}
+// Spawning.
+const j = try volt.launch(handler, .{conn});           // *Job — fire-and-forget
+const t = try volt.spawn(parse, .{buf});               // *Task(T) — returns a typed value
+const v = try volt.spawnBlocking(sha256, .{data});     // off the loop, on a thread pool
 
-fn serve(io: volt.Runtime) void {
-    var listener = volt.net.listen("0.0.0.0:8080") catch return;
-    defer listener.close();
+// Job / Task.
+j.cancel(); j.state(); j.setName("name"); try j.join();
+const v = try t.join();
 
-    while (listener.tryAccept() catch null) |result| {
-        _ = io.spawn(handleClient, .{result.stream}) catch continue;
+// Structured concurrency.
+try volt.scope(struct {
+    fn body(s: *volt.Scope) !void {
+        try s.spawn(workerA, .{});
+        try s.spawn(workerB, .{});
     }
-}
+}.body);
 
-fn handleClient(conn: volt.net.TcpStream) void {
-    var stream = conn;
-    defer stream.close();
+// Channels.
+var ch = try volt.channel.Channel(u32).init(alloc, 64);
+try ch.send(7);                  const v = try ch.recv();
+var os = volt.channel.Oneshot(Result){};
+try os.send(.ok);                const r = try os.recv();
+var w = volt.channel.Watch(Cfg).init(initial); var rx = w.subscribe();
+w.send(new_cfg);                 try rx.changed(); const cfg = rx.current();
+var b = try volt.channel.Broadcast(Event).init(alloc, 128); var brx = b.subscribe();
 
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = stream.tryRead(&buf) catch return orelse continue;
-        if (n == 0) return;
-        stream.writeAll(buf[0..n]) catch return;
-    }
-}
+// Select first-ready over channels.
+switch (try volt.select(.{
+    .msg = volt.channel.OnRecv(u32){ .ch = &ch },
+    .quit = volt.channel.OnRecv(void){ .ch = &shutdown_ch },
+})) { .msg => |v| ..., .quit => return }
+
+// Synchronization.
+var mu: volt.sync.Mutex = .{};       mu.lock(); defer mu.unlock();
+var sem = volt.sync.Semaphore.init(8); sem.acquire(1); defer sem.release(1);
+var notify: volt.sync.Notify = .{};  notify.notifyOne(); try notify.wait();
+var barrier = volt.sync.Barrier.init(4);
+switch (barrier.wait()) { .leader => ..., .follower => ... }
+
+// Time.
+try volt.sleep(volt.Duration.fromMillis(50));
+const v = try volt.withTimeout(volt.Duration.fromSecs(2), fetchUser, .{42});
+var tick = volt.Interval.start(volt.Duration.fromMillis(100));
+while (true) { try tick.tick(); try emit(); }
+
+// I/O.
+var listener = try volt.io.TcpListener.bind(volt.io.Address.any4(8080));
+const conn = try listener.accept();
+const n = try conn.read(&buf); try conn.writeAll(buf[0..n]);
 ```
 
-### Concurrent Tasks
+For the full surface see `src/lib.zig`. For runnable end-to-end programs see `examples/`.
 
-```zig
-const volt = @import("volt");
+## Run it locally
 
-pub fn main() !void {
-    try volt.run(fetchAll);
-}
+```sh
+zig build              # build the library
+zig build test         # run the unit + integration test suite
+zig build bench        # core perf benchmarks (ReleaseFast)
 
-fn fetchAll(io: volt.Runtime) !void {
-    // Spawn concurrent tasks
-    const user_h = try io.spawn(fetchUser, .{42});
-    const posts_h = try io.spawn(fetchPosts, .{42});
-
-    // Wait for both
-    const user, const posts = try io.joinAll(.{ user_h, posts_h });
-    _ = user;
-    _ = posts;
-}
+zig build run-echo            # examples
+zig build run-fan-out
+zig build run-work-offload
+zig build run-timeout-retry
 ```
 
-### Graceful Shutdown
+## Cancellation, in one paragraph
 
-```zig
-const volt = @import("volt");
+There is no `context.Context` to thread through every function and no `?` operator on every call. Cancelling a `Job` or `Task` sets the cancel flag *and* unparks whatever the task is currently parked on — sleep, I/O wait, channel recv, mutex acquire — so the task wakes promptly and surfaces `error.Cancelled` from its current suspension point. `volt.withTimeout(dur, fn, args)` is a watcher built on this. `volt.CancellationToken` provides a hierarchical handle for chained cancellation when you need it. If you have a CPU-only loop with no implicit suspension points, call `volt.yield()` periodically — that's the explicit cancellation point.
 
-pub fn main() !void {
-    var shutdown = try volt.shutdown.Shutdown.init();
-    defer shutdown.deinit();
+## Why stackful
 
-    var listener = try volt.net.listen("0.0.0.0:8080");
-    defer listener.close();
+The honest tradeoff: stackful coroutines pay ~4-16 KiB resident per coroutine for "code looks synchronous, no function coloring, no Pin, no manual state machines." Stackless futures pay ~256-512 bytes per coroutine for "every async function has a different type, the language needs `async`/`await`, lifetimes follow the state machine."
 
-    while (!shutdown.isShutdown()) {
-        if (listener.tryAccept() catch null) |result| {
-            var work = shutdown.startWork();
-            defer work.deinit();
-            handleConnection(result.stream);
-        }
-    }
+Zig has no `async`/`await` keyword and (by maintainer statement) won't add one again. That removes stackless's main ergonomic argument in this language. Stackful gives Zig users the synchronous-shape API that Tokio gives Rust users — without the surface tax that compiling Tokio without `async fn` would require.
 
-    shutdown.waitForPending();
-}
-```
+The cost is real: one million parked coroutines costs ~4 GiB of resident memory if every page is touched. For workloads that genuinely need 1M+ concurrent waiters with tiny per-task state, stackless is the right tool. For everything else — HTTP servers, pipelines, CLIs, system tools, service meshes — stackful's ergonomics dominate, and Volt is targeting that majority.
 
-## API Reference
+## What's intentionally NOT here
 
-### Modules
-
-| Module | Description |
-|--------|-------------|
-| `volt.Runtime` | Runtime handle passed to tasks that need to spawn (Tier 2 API) |
-| `volt.sync` | Synchronization: Mutex, RwLock, Semaphore, Notify, Barrier, OnceCell |
-| `volt.channel` | Message passing: Channel, Oneshot, Broadcast, Watch, Select |
-| `volt.net` | Networking: TCP, UDP, Unix sockets, DNS resolution |
-| `volt.fs` | Filesystem operations |
-| `volt.stream` | I/O streams: Reader, Writer, buffered I/O |
-| `volt.time` | Duration, Instant, Sleep, Timeout, Interval |
-| `volt.signal` | Signal handling (SIGINT, SIGTERM) |
-| `volt.process` | Process spawning and piped I/O |
-| `volt.shutdown` | Graceful shutdown coordination |
-| `volt.async_ops` | Future combinators: Timeout, Select, Join, Race |
-| `volt.future` | Low-level future types: Poll, Waker, Context |
-
-### Task Spawning
-
-These functions require a `volt.Runtime` handle (received as a parameter by functions passed to `volt.run()`).
-
-| Function | Description |
-|----------|-------------|
-| `io.spawn(fn, args)` | Spawn async task, returns `JoinHandle` |
-| `io.spawnFuture(future)` | Spawn a Future directly |
-| `io.spawnBlocking(fn, args)` | Run on dedicated blocking pool thread |
-| `io.sleep(duration)` | Async-aware sleep |
-| `io.yield()` | Yield to scheduler |
-| `io.joinAll(handles)` | Wait for all tasks, return results tuple |
-| `io.tryJoinAll(handles)` | Wait for all, collect results and errors |
-| `io.race(handles)` | First to complete wins, cancel others |
-| `io.select(handles)` | First to complete, keep others running |
-
-### Synchronization
-
-All primitives are zero-allocation and require no `deinit()`. Each provides two tiers: `tryX()` (non-blocking, returns immediately) and `x()` (returns a Future for the scheduler).
-
-| Primitive | Use Case | API |
-|-----------|----------|-----|
-| `Mutex` | Protect shared state | `tryLock()`, `lock()` -> Future |
-| `RwLock` | Many readers, one writer | `tryReadLock()`, `readLock()` / `writeLock()` |
-| `Semaphore` | Limit concurrent access | `tryAcquire(n)`, `acquire(n)` -> Future |
-| `Notify` | Task wake-up signal | `notifyOne()`, `notifyAll()`, `wait()` |
-| `Barrier` | Wait for N tasks | `wait()` -> leader/follower result |
-| `OnceCell` | Lazy one-time init | `get()`, `getOrInit(fn)` |
-
-### Channels
-
-| Channel | Pattern | Allocation | Description |
-|---------|---------|------------|-------------|
-| `Channel(T)` | MPSC / MPMC | Heap (bounded) | Bounded work queue with backpressure |
-| `Oneshot(T)` | 1:1 | None | Single-value delivery |
-| `BroadcastChannel(T)` | 1:N | Heap (bounded) | All receivers get all messages |
-| `Watch(T)` | 1:N | None | Single value with change notification |
-
-Each channel provides `trySend()`/`tryRecv()` (non-blocking) and `send()`/`recv()` (Future-based).
-
-```zig
-// Bounded channel
-var ch = try volt.channel.bounded(Task, allocator, 100);
-defer ch.deinit();
-
-switch (ch.trySend(task)) {
-    .ok => {},
-    .full => {},     // backpressure
-    .closed => {},   // receiver dropped
-}
-
-// Oneshot
-var os = volt.channel.oneshot(Result);
-os.sender.send(computeResult());
-if (os.receiver.tryRecv()) |result| { ... }
-
-// Watch
-var config = volt.channel.watch(Config, default_config);
-config.send(new_config);
-```
-
-### Networking
-
-| Type | Description |
-|------|-------------|
-| `TcpListener` | Accept incoming TCP connections |
-| `TcpStream` | Bidirectional TCP connection |
-| `TcpSocket` | Socket builder for custom configuration |
-| `UdpSocket` | Connectionless datagram socket |
-| `UnixStream` | Unix domain stream socket |
-| `UnixListener` | Unix domain socket listener |
-| `UnixDatagram` | Unix domain datagram socket |
-| `Address` | IPv4/IPv6 socket address |
-
-Convenience functions: `volt.net.listen(addr)`, `volt.net.connect(addr)`, `volt.net.listenPort(port)`, `volt.net.resolve(host, port)`, `volt.net.connectHost(host, port)`.
-
-### Time
-
-| Type / Function | Description |
-|-----------------|-------------|
-| `Duration` | Span of time (nanosecond precision) |
-| `Instant` | Point in time (monotonic clock) |
-| `Sleep` | Async-aware sleep future |
-| `Interval` | Recurring timer |
-| `Deadline` | Timeout tracking |
-
-```zig
-const dur = volt.time.Duration.fromSecs(5);
-const start = volt.time.Instant.now();
-io.sleep(dur);  // requires volt.Runtime handle
-const elapsed = start.elapsed();
-```
-
-## Performance
-
-Benchmarks on Apple M3 Pro, comparing Volt to Tokio (Rust). All measurements: median of 10 iterations, 5 warmup discarded, 4 worker threads. Run `zig build compare` to reproduce.
-
-### Synchronization
-
-| Benchmark | Volt | Tokio | Winner |
-|-----------|------|-------|--------|
-| Mutex (uncontended) | 31.8 ns | 28.2 ns | Tokio +1.1x |
-| RwLock read (uncontended) | 25.3 ns | 27.1 ns | Volt +1.1x |
-| RwLock write (uncontended) | 20.7 ns | 25.2 ns | Volt +1.2x |
-| Semaphore (uncontended) | 22.7 ns | 33.7 ns | Volt +1.5x |
-| Mutex (4 tasks) | 91.7 ns | 207.9 ns | Volt +2.3x |
-| RwLock (4R + 2W) | 149.5 ns | 247.4 ns | Volt +1.7x |
-| Semaphore (8T, 2 permits) | 139.4 ns | 323.0 ns | Volt +2.3x |
-
-### Channels
-
-| Benchmark | Volt | Tokio | Winner |
-|-----------|------|-------|--------|
-| Channel send | 11.1 ns | 16.3 ns | Volt +1.5x |
-| Channel recv | 11.4 ns | 22.3 ns | Volt +2.0x |
-| Channel roundtrip | 23.1 ns | 37.8 ns | Volt +1.6x |
-| MPMC (4P + 4C) | 73.3 ns | 132.8 ns | Volt +1.8x |
-| Oneshot | 27.1 ns | 51.5 ns | Volt +1.9x |
-| Broadcast (4 recv) | 95.2 ns | 143.8 ns | Volt +1.5x |
-| Watch | 45.7 ns | 145.4 ns | Volt +3.2x |
-
-### Coordination and Scheduling
-
-| Benchmark | Volt | Tokio | Winner |
-|-----------|------|-------|--------|
-| OnceCell get | 2.0 ns | 1.0 ns | Tokio +2.0x |
-| OnceCell set | 41.8 ns | 90.8 ns | Volt +2.2x |
-| Barrier | 50.9 ns | 1,312.8 ns | Volt +25.8x |
-| Notify | 15.6 ns | 18.9 ns | Volt +1.2x |
-| Spawn + await | 29,597 ns | 18,946 ns | Tokio +1.6x |
-| Spawn batch (per task) | 601.0 ns | 611.4 ns | Tie |
-| Blocking spawn | 25,037 ns | 12,483 ns | Tokio +2.0x |
-
-### Summary
-
-**Volt wins 16/21 benchmarks, Tokio wins 4/21, 1 tie.**
-
-Memory: Volt **284 B/op** total vs Tokio's **1,868 B/op** -- 6.6x less allocation overhead. See [BENCHMARKS.md](BENCHMARKS.md) for full analysis.
-
-## Architecture
-
-```
-+-----------------------------------------------------------------+
-|                       User Application                          |
-|        volt.run(fn) / Io.init() + io.run()                      |
-+-----------------------------------------------------------------+
-                              |
-+-----------------------------------------------------------------+
-|                        Public API                               |
-|  volt.Runtime      volt.sync    volt.channel   volt.net   volt.fs   |
-|  volt.time    volt.signal  volt.process   volt.stream           |
-|  volt.shutdown             volt.async_ops                       |
-+-----------------------------------------------------------------+
-                              |
-+-----------------------------------------------------------------+
-|                     Runtime Core                                |
-|  +------------------+  +---------------+  +------------------+  |
-|  |    Scheduler     |  |   I/O Driver  |  |   Timer Wheel    |  |
-|  |                  |  |               |  |                  |  |
-|  | - LIFO slot      |  | - Submit ops  |  | - Hierarchical   |  |
-|  | - Local queue    |  | - Poll events |  | - Tick-based     |  |
-|  |   (256-slot ring)|  | - Complete    |  | - Cancel support |  |
-|  | - Global inject  |  |               |  |                  |  |
-|  | - Work stealing  |  |               |  |                  |  |
-|  | - Coop budget    |  |               |  |                  |  |
-|  |   (128 polls)    |  |               |  |                  |  |
-|  +------------------+  +---------------+  +------------------+  |
-|                              |                                  |
-|  +----------------------------------------------------------+  |
-|  |                   Blocking Pool                           |  |
-|  |  - Dedicated threads for CPU-heavy / blocking work        |  |
-|  |  - Auto-scaling up to 512 threads                         |  |
-|  |  - 10s idle timeout                                       |  |
-|  +----------------------------------------------------------+  |
-+-----------------------------------------------------------------+
-                              |
-+-----------------------------------------------------------------+
-|                    Platform Backend                              |
-|  +----------+  +----------+  +----------+  +----------+        |
-|  | io_uring |  |  kqueue  |  |   IOCP   |  |  epoll   |        |
-|  | (Linux)  |  | (macOS)  |  | (Windows)|  |(fallback)|        |
-|  +----------+  +----------+  +----------+  +----------+        |
-+-----------------------------------------------------------------+
-```
-
-### Key Design Decisions
-
-1. **Stackless futures**: Each task is a state machine at ~256-512 bytes, not a coroutine stack (16-64 KB). Predictable memory, cache-friendly layout, millions of concurrent tasks. Same tradeoff Tokio made.
-
-2. **Tokio-style state machine**: Single 64-bit packed atomic with CAS transitions for task state. The `notified` bit is cleared atomically in `transitionToIdle`, returning previous state to detect missed wakeups.
-
-3. **Work-stealing scheduler**: LIFO slot for hot-path locality, local FIFO ring buffer (256 slots), global injection queue with mutex. O(1) worker waking via bitmap with `@ctz`.
-
-4. **Cooperative budgeting**: 128 polls per tick (matching Tokio). Prevents a single task from starving others.
-
-5. **Zero-allocation waiters**: Waiter structs are embedded directly in `LockFuture`/`AcquireFuture` types. No heap allocation per contended wait.
-
-6. **Two-tier API**: `tryX()` methods (non-blocking) work without a runtime. `x(io)` methods (async, Future-based) require a `volt.Runtime` handle from `volt.run()`. The type system enforces this at compile time.
-
-## Best Practices
-
-### Do
-
-```zig
-// DO: Use volt.run() for simple programs
-pub fn main() !void {
-    try volt.run(myApp);
-}
-
-// DO: Wrap operations with timeouts
-var timeout_future = volt.async_ops.Timeout(MyFuture).init(
-    my_future,
-    volt.time.Duration.fromSecs(5),
-);
-
-// DO: Use spawnBlocking for CPU-intensive work (requires volt.Runtime)
-const hash = try io.spawnBlocking(computeExpensiveHash, .{data});
-
-// DO: Use tryX() when you can handle failure immediately (no Io needed)
-if (mutex.tryLock()) {
-    defer mutex.unlock();
-    // critical section
-}
-
-// DO: Track in-flight work for graceful shutdown
-var work = shutdown.startWork();
-defer work.deinit();
-handleRequest(conn);
-
-// DO: Use bounded channels for backpressure
-var ch = try volt.channel.bounded(Job, allocator, 1000);
-```
-
-### Don't
-
-```zig
-// DON'T: Block the I/O thread with CPU-heavy work
-fn handleRequest(io: volt.Runtime, conn: volt.net.TcpStream) void {
-    // BAD: This blocks a scheduler worker thread
-    const hash = expensiveSha256(huge_payload);
-    // GOOD: Offload to blocking pool
-    const hash = try io.spawnBlocking(expensiveSha256, .{huge_payload});
-}
-
-// DON'T: Use OS blocking primitives inside async tasks
-fn badTask(io: volt.Runtime) void {
-    std.Thread.sleep(1_000_000_000);  // BAD: blocks worker thread
-    io.sleep(volt.time.Duration.fromSecs(1));  // GOOD: yields to scheduler
-}
-
-// DON'T: Forget to close resources
-fn leaky() void {
-    var listener = volt.net.listen("0.0.0.0:8080") catch return;
-    // BAD: listener never closed!
-    // GOOD: defer listener.close();
-}
-
-// DON'T: Ignore channel backpressure
-switch (ch.trySend(item)) {
-    .ok => {},
-    .full => {},     // BAD: silently dropping work
-    .closed => {},
-}
-```
-
-## Limitations
-
-### Current Limitations
-
-1. **No coroutine/async-await syntax**: Zig 0.15.x does not have async/await. All async operations use manual state machines and the Future/Poll interface. This will improve when Zig adds language-level async support.
-
-2. **No TLS/SSL**: Volt provides raw TCP/UDP/Unix sockets. TLS must be handled by a separate library layered on top.
-
-3. **DNS resolution is blocking**: `volt.net.resolve()` and `volt.net.connectHost()` use blocking OS calls. Use `io.spawnBlocking()` to avoid stalling I/O workers.
-
-4. **No HTTP protocol**: Volt is a runtime, not a web framework. HTTP servers/clients should be built on top of `volt.net`.
-
-5. **Single runtime per process**: The runtime uses thread-local state. Running multiple `Runtime` instances concurrently is not supported.
-
-6. **Task scheduling overhead**: Tokio's spawn + await (1.6x) and blocking pool spawn (2.0x) are faster due to years of `RawTask` optimization and thread pool tuning respectively.
-
-### Platform-Specific Notes
-
-- **Linux**: Full support. io_uring (kernel 5.1+) preferred, epoll fallback for older kernels.
-- **macOS**: Full support via kqueue. Tested on both x86_64 and Apple Silicon.
-- **Windows**: IOCP backend. Requires Windows 10+.
+- **No HTTP / TLS / DNS** in the runtime. Volt is a runtime, not a framework. Build those on top.
+- **No global runtime.** `volt.run` owns the worker pool and the reactor. Library code that wants to suspend has to be called from within `volt.run`. There is no init-on-first-use mode.
+- **No async-await syntax.** That's the point. Code that suspends looks identical to code that doesn't.
+- **No goroutine-style "spawn and forget."** Use `volt.scope` (structured concurrency) by default; reach for `volt.launch` only when the lifetime genuinely needs to outlive the current scope.
 
 ## Documentation
 
-- **Website**: [volt.nerdmenot.in](https://volt.nerdmenot.in) -- guides, API reference, cookbook, architecture internals
-- **Benchmarks**: [BENCHMARKS.md](BENCHMARKS.md) -- full Volt vs Tokio comparison with analysis
-- **Tests**: `zig build test-all` runs all test suites (588+ unit, 83 concurrency, 35+ robustness)
+- **Docs site**: [volt.nerdmenot.in](https://volt.nerdmenot.in) — guides, API reference, internals.
+- **Examples**: `examples/` in this repo. Each is a runnable cookbook recipe.
+- **Source**: `src/lib.zig` is the public surface; every primitive's source has inline tests that double as usage demos.
+- **CHANGELOG**: see `CHANGELOG.md` for what shipped in v1.0.0-zig0.16.0 and what's pending.
 
 ## Contributing
 
-Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide. Here's the short version:
-
-1. Fork and create a branch from `main`
-2. Make your changes following the [code style guidelines](CONTRIBUTING.md#code-style)
-3. Run the tests:
-   ```bash
-   zig build test              # Unit tests (588+)
-   zig build test-concurrency  # Loom-style concurrency tests (83)
-   zig build test-all          # Everything
-   ```
-4. Commit with [Conventional Commits](https://www.conventionalcommits.org/) style (`feat:`, `fix:`, `docs:`, etc.)
-5. Open a pull request with a clear description
-
-For concurrency or lock-free contributions, add tests in `tests/concurrency/` that exercise interleavings systematically. See [CONTRIBUTING.md](CONTRIBUTING.md) for details on test filtering, intensity configuration, and bug reporting.
+PRs welcome. Conventional Commits (`feat:`, `fix:`, `docs:`, `refactor:`). Don't add `Co-Authored-By` lines. Tests for new primitives must include a multi-worker stress harness — see `src/sync/Mutex.zig` for the pattern. See `CONTRIBUTING.md` for the full guide.
 
 ## License
 
@@ -556,11 +205,8 @@ Apache 2.0. See [LICENSE](LICENSE).
 
 ## Acknowledgments
 
-Volt would not exist without the work of the teams and individuals behind these projects:
-
-- [Tokio](https://github.com/tokio-rs/tokio) -- Volt's architecture is inspired by Tokio's. The work-stealing scheduler, the sync primitive designs, cooperative budgeting, and the task state protocol were all informed by studying Tokio's source code and documentation. Where Volt is fast, it's because Tokio's team figured out the right architecture first and we applied it in a language with different tradeoffs. Where Tokio is faster (task scheduling, blocking pool), it's because of years of production tuning we haven't done yet. Thank you to the Tokio team for building the runtime that showed us how async I/O should work.
-- [Mio](https://github.com/tokio-rs/mio) -- Platform I/O abstraction that informed our backend implementations.
-- [Crossbeam](https://github.com/crossbeam-rs/crossbeam) -- Lock-free channel designs and the epoch-based memory reclamation patterns.
-- [parking_lot](https://github.com/Amanieu/parking_lot) -- Adaptive locking strategies that inspired our contention handling.
-- [Blitz](https://github.com/NerdMeNot/blitz) -- Sibling project for CPU-bound parallelism. Volt handles I/O; Blitz handles compute.
-- The Zig community for building a language that makes systems programming accessible without sacrificing control.
+- [Tokio](https://github.com/tokio-rs/tokio) — the async-runtime architecture this is built on. The work-stealing scheduler design, the parking-lot-style waiter lists, the cooperative budgeting idea all come from Tokio's playbook.
+- [may](https://github.com/Xudong-Huang/may) — the Rust stackful coroutine library whose EventSource protocol Volt's wake protocol mirrors.
+- [Trio](https://trio.readthedocs.io/) — `volt.scope` is a direct port of Trio's nursery concept; Kotlin's `coroutineScope` is the same idea via a different language.
+- [Vyukov's MPMC bounded queue](https://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue) — `Channel(T)`'s ring is a direct port.
+- The Zig community for building a language where this kind of runtime fits in 10K lines and stays explainable.

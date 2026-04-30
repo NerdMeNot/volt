@@ -1,4 +1,4 @@
-//! `volt.io.waitReadable(fd)` and `waitWritable(fd)` — async readiness.
+//! `volt.io.lowlevel.waitReadable(fd)` and `waitWritable(fd)` — async readiness.
 //!
 //! Allocates a per-call Park on the calling coroutine's stack, registers
 //! it with the reactor as the wake target for (fd, kind), and parks the
@@ -13,8 +13,19 @@ const tls = @import("../scheduler/tls.zig");
 const Park = @import("../scheduler/park.zig").Park;
 const reactor_mod = @import("reactor.zig");
 
-pub const WaitError = error{ Cancelled, OutOfMemory } ||
-    @import("../internal/syscall.zig").KeventError;
+/// Errors `Reactor.registerWait` can produce on any backend (kqueue
+/// or epoll), plus `Cancelled` from `parkCurrent`.
+pub const WaitError = error{
+    Cancelled,
+    OutOfMemory,
+    // kqueue paths
+    AccessDenied,
+    EventNotFound,
+    SystemResources,
+    Unexpected,
+    // epoll paths
+    EpollCtlFailed,
+};
 
 fn waitOn(fd: posix.fd_t, kind: reactor_mod.EventKind) WaitError!void {
     const rt = runtime_mod.currentRuntime() orelse

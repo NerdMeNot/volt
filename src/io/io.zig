@@ -1,11 +1,14 @@
-//! `volt.io.read` / `write` — coroutine-aware fd I/O.
+//! `volt.io.lowlevel.read` / `write` / `writeAll` — coroutine-aware fd I/O.
+//!
+//! These are the low-level fd-taking primitives. Most application code
+//! should reach for `TcpStream.read` / `writeAll` (or filesystem
+//! equivalents) instead — those wrap these calls with the typed handle.
 //!
 //! Performs a non-blocking read or write. On `WouldBlock`, parks the current
 //! coroutine on reactor readiness and retries when woken.
 //!
-//! These wrappers assume the fd has already been put in non-blocking mode by
-//! the caller (typically via `volt.io.setNonblock(fd)`). Future versions may
-//! detect that automatically.
+//! Assumes the fd has already been put in non-blocking mode by the caller
+//! (typically via `volt.io.lowlevel.setNonblock(fd)`).
 
 const std = @import("std");
 const posix = std.posix;

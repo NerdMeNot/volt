@@ -23,10 +23,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const ctx = @import("../coroutine/context_arm64.zig");
+const ctx = @import("../coroutine/context.zig");
 const co = @import("../coroutine/coroutine.zig");
 const Coroutine = co.Coroutine;
 const stack_mod = @import("../coroutine/stack.zig");
+const stack_overflow = @import("../coroutine/stack_overflow.zig");
+const event_source = @import("../coroutine/event_source.zig");
 const Deque = @import("deque.zig").Deque;
 const tls = @import("tls.zig");
 const thread = @import("../internal/thread.zig");
@@ -35,41 +37,90 @@ const runtime_mod = @import("../runtime.zig");
 
 const INITIAL_DEQUE_CAPACITY: usize = 256;
 
+/// Pin the current OS thread to CPU `core_idx % cpu_count`. Linux
+/// only for v1.0; Darwin no-ops (its affinity APIs are coarser-grained
+/// and require Mach API plumbing — v1.x add-on).
+fn pinToCore(core_idx: usize) !void {
+    if (comptime builtin.os.tag != .linux) return;
+    const cpus = std.Thread.getCpuCount() catch 1;
+    const core: usize = core_idx % @max(cpus, 1);
+    var cpuset: std.os.linux.cpu_set_t = std.mem.zeroes(std.os.linux.cpu_set_t);
+    const idx_bits: usize = core / @bitSizeOf(usize);
+    const bit_in: u6 = @intCast(core % @bitSizeOf(usize));
+    cpuset[idx_bits] |= @as(usize, 1) << bit_in;
+    const tid: i32 = @intCast(std.os.linux.gettid());
+    std.os.linux.sched_setaffinity(tid, &cpuset) catch return error.AffinityFailed;
+}
+
 /// Maximum reactor poll block time. With EV_USER tickle wired up via
 /// `Runtime.notify*`, the polling worker returns immediately on new work
 /// or shutdown — this timeout is effectively a watchdog for stuck conditions.
 const REACTOR_POLL_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
 
-/// Per-worker idle parker. Mutex + condvar; wake-up coordination via two
-/// flags (`parked` for the fast-path "nobody to wake" check, `unpark_pending`
-/// to swallow a missed-wake race when unpark arrives just before park).
+/// Per-worker idle parker. Single-atomic state machine — one modification
+/// order means no cross-atomic IRIW race.
+///
+/// States: `empty` | `notified` | `waiting`.
+/// All transitions linearize through `state` with seq_cst on the slow
+/// path (see comment in `park`).
 const Parker = struct {
     mutex: thread.Mutex = .{},
     condition: thread.Condition = .{},
-    parked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    unpark_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(EMPTY),
+
+    /// Optional registration into the runtime's parked-workers bitmap.
+    /// Set by `Worker.bindBitmap`. Toggled inside `park` so the bit is
+    /// set iff this worker is actually inside `cond.wait`.
+    bitmap: ?*std.atomic.Value(u64) = null,
+    bit: u64 = 0,
+
+    const EMPTY: u8 = 0;
+    const NOTIFIED: u8 = 1;
+    const WAITING: u8 = 2;
 
     fn park(self: *Parker) void {
+        // Fast path: a notification was stored before we entered park —
+        // consume it and return without taking the mutex.
+        if (self.state.cmpxchgStrong(NOTIFIED, EMPTY, .acquire, .monotonic) == null) {
+            return;
+        }
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (self.unpark_pending.swap(false, .acq_rel)) return;
+        // Register in the parked-workers bitmap BEFORE the WAITING
+        // transition so a concurrent waker can find us via O(1) bitmap
+        // lookup. Cleared on exit.
+        if (self.bitmap) |bm| _ = bm.fetchOr(self.bit, .release);
+        defer {
+            if (self.bitmap) |bm| _ = bm.fetchAnd(~self.bit, .release);
+        }
 
-        self.parked.store(true, .release);
-        defer self.parked.store(false, .release);
-        while (!self.unpark_pending.swap(false, .acq_rel)) {
+        // Transition empty → waiting. seq_cst so this RMW linearizes
+        // with unpark's seq_cst swap below.
+        if (self.state.cmpxchgStrong(EMPTY, WAITING, .seq_cst, .acquire)) |observed| {
+            std.debug.assert(observed == NOTIFIED);
+            self.state.store(EMPTY, .release);
+            return;
+        }
+
+        while (self.state.load(.acquire) == WAITING) {
             self.condition.wait(&self.mutex);
         }
+        self.state.store(EMPTY, .release);
     }
 
     fn unpark(self: *Parker) void {
-        // Stash the unpark intention even if the thread isn't blocked yet —
-        // the next park() drains it before sleeping.
-        self.unpark_pending.store(true, .release);
-        if (!self.parked.load(.acquire)) return;
-        self.mutex.lock();
-        self.condition.signal();
-        self.mutex.unlock();
+        const old = self.state.swap(NOTIFIED, .seq_cst);
+        if (old == WAITING) {
+            self.mutex.lock();
+            self.condition.signal();
+            self.mutex.unlock();
+        }
+    }
+
+    fn isParked(self: *const Parker) bool {
+        return self.state.load(.acquire) == WAITING;
     }
 };
 
@@ -77,6 +128,19 @@ pub const Worker = struct {
     id: usize,
     runtime: *runtime_mod.Runtime,
     run_queue: Deque(*Coroutine),
+
+    /// Per-worker monotonic counters. Lock-free atomics. Written by
+    /// the worker (and one other thread for `steals_from_me`); read
+    /// by `volt.observability.metrics(rt)` for diagnostic dashboards.
+    /// All counters monotonically increase over the worker's lifetime.
+    dispatch_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    park_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    steal_success_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    steal_attempt_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// LIFO slot — single-coroutine cache-warm priority for `Park.unpark`
+    /// continuations (request/response chains). Owner-only; thieves see
+    /// only the deque. Tokio-style.
+    lifo_slot: ?*Coroutine = null,
     /// Coroutines this worker created. Worker frees them at deinit. Workers
     /// don't deinit until ALL workers have exited their loops, so by deinit
     /// time nothing is executing on any thread.
@@ -110,22 +174,42 @@ pub const Worker = struct {
     pub fn deinit(self: *Worker, allocator: std.mem.Allocator) void {
         for (self.spawned.items) |coro| {
             coro.destroy_extras_fn(allocator, coro);
-            stack_mod.free(allocator, coro.stack);
+            // If `Done.subscribe` already released this coroutine's
+            // stack to the runtime's stack pool, skip freeing it
+            // again — the pool's `deinit` will munmap.
+            if (!coro.stack_pooled.load(.acquire)) {
+                stack_mod.free(allocator, coro.stack);
+            }
             allocator.destroy(coro);
         }
         self.spawned.deinit();
         self.run_queue.deinit();
     }
 
-    /// Track ownership of a freshly-created coroutine and push it onto the
-    /// local run queue. Owner-only.
+    /// Track ownership of a freshly-created coroutine and place it on the
+    /// deque (NOT the LIFO slot). Owner-only.
+    ///
+    /// Fresh spawns go to the deque so siblings can steal them. Routing
+    /// fresh spawns through the LIFO slot would hide them from thieves
+    /// and bottleneck burst spawns on a single worker.
     pub fn pushOwned(self: *Worker, coro: *Coroutine) !void {
         try self.spawned.append(coro);
         self.run_queue.push(coro);
     }
 
-    /// Push a runnable coro onto this worker's run queue. Owner-only.
-    /// Used by the worker's own dispatch loop and reactor wake callback.
+    /// Cache-warm enqueue: install in the LIFO slot, evicting any
+    /// existing occupant to the deque. Used by the schedule path
+    /// (`Runtime.schedule` for Park.unpark continuations) — the
+    /// request/response chain stays hot in L1 on the same core.
+    pub fn enqueueLocal(self: *Worker, coro: *Coroutine) void {
+        if (self.lifo_slot) |evicted| {
+            self.run_queue.push(evicted);
+        }
+        self.lifo_slot = coro;
+    }
+
+    /// Plain deque push, bypassing the LIFO slot. Used by `volt.yield`
+    /// so a yielder doesn't displace a continuation. Owner-only.
     pub fn pushLocal(self: *Worker, coro: *Coroutine) void {
         self.run_queue.push(coro);
     }
@@ -137,7 +221,14 @@ pub const Worker = struct {
     /// Cheap probe of whether this worker is currently sleeping on its
     /// parker. Used by the runtime to avoid waking already-running workers.
     pub fn isParked(self: *const Worker) bool {
-        return self.parker.parked.load(.acquire);
+        return self.parker.isParked();
+    }
+
+    /// Register this worker into the runtime's parked-workers bitmap.
+    /// Called once by `Runtime.bindWorkers` before workers start.
+    pub fn bindBitmap(self: *Worker, word: *std.atomic.Value(u64), bit: u64) void {
+        self.parker.bitmap = word;
+        self.parker.bit = bit;
     }
 
     /// Main loop. If `until_done` is non-null, exits when that coroutine
@@ -149,6 +240,20 @@ pub const Worker = struct {
         defer tls.clearCurrentWorker();
         defer tls.clearRuntime();
 
+        // Install the SIGSEGV handler + per-thread sigaltstack so guard-
+        // page hits inside coroutines turn into either a stack-grow or
+        // a graceful `error.StackOverflow` instead of a process crash.
+        // Idempotent — the handler install is one-shot process-wide,
+        // the alt stack is per-thread.
+        stack_overflow.installPerThread() catch |err| {
+            std.debug.panic("worker {d}: stack_overflow.installPerThread failed: {}", .{ self.id, err });
+        };
+
+        // Optional CPU pinning (Config.pin_workers).
+        if (self.runtime.config.pin_workers) {
+            pinToCore(self.id) catch {}; // best-effort; no fatal on failure
+        }
+
         while (true) {
             if (self.shouldStop(until_done)) return;
 
@@ -157,12 +262,7 @@ pub const Worker = struct {
                 continue;
             }
 
-            // No work in any queue. Decide between blocking on the reactor
-            // (if there's pending I/O and no one else is polling) or
-            // sleeping on the parker.
             self.idleStep();
-
-            if (self.shouldStop(until_done)) return;
         }
     }
 
@@ -174,8 +274,16 @@ pub const Worker = struct {
     }
 
     fn findWork(self: *Worker) ?*Coroutine {
+        // 1. LIFO slot — wake-driven continuations, hottest priority.
+        if (self.lifo_slot) |c| {
+            self.lifo_slot = null;
+            return c;
+        }
+        // 2. Local deque — owner-LIFO pop.
         if (self.run_queue.pop()) |c| return c;
+        // 3. Injection — cross-thread spawns/wakes.
         if (self.runtime.injection.tryPop()) |c| return c;
+        // 4. Steal from siblings.
         if (self.tryStealFromSibling()) |c| return c;
         return null;
     }
@@ -189,7 +297,11 @@ pub const Worker = struct {
         while (attempts < workers.len) : (attempts += 1) {
             const idx = (start + attempts) % workers.len;
             if (idx == self.id) continue;
-            if (workers[idx].run_queue.stealLoop()) |c| return c;
+            _ = self.steal_attempt_count.fetchAdd(1, .monotonic);
+            if (workers[idx].run_queue.stealLoop()) |c| {
+                _ = self.steal_success_count.fetchAdd(1, .monotonic);
+                return c;
+            }
         }
         return null;
     }
@@ -220,12 +332,32 @@ pub const Worker = struct {
         }
 
         // No reactor work or already being polled — sleep on the parker.
+        _ = self.park_count.fetchAdd(1, .monotonic);
         self.parker.park();
     }
 
     fn dispatch(self: *Worker, coro: *Coroutine) void {
+        _ = self.dispatch_count.fetchAdd(1, .monotonic);
         tls.setCurrent(coro, @ptrCast(self.runtime));
         coro.scheduler_ctx = &self.main_ctx;
+
+        // Stack-overflow recovery checkpoint. If the coroutine writes
+        // past the floor of its 1 MiB reservation, the SIGSEGV handler
+        // sets `overflow_flag` and `siglongjmp`s back here; we route
+        // through Done with `error.StackOverflow`. Sub-floor faults
+        // are absorbed transparently by `stack.tryGrow` (commit one
+        // more page, retry the instruction).
+        var dispatch_cp: stack_overflow.DispatchCheckpoint = .{};
+        stack_overflow.beginDispatch(&dispatch_cp);
+        defer stack_overflow.endDispatch();
+
+        if (stack_overflow.setjmpDispatch(&dispatch_cp)) {
+            // Coroutine's stack is unsafe to re-enter. Route through Done.
+            tls.clearCurrent();
+            const done_es = &event_source.done_singleton;
+            done_es.subscribe_fn(@ptrCast(@constCast(done_es)), coro);
+            return;
+        }
 
         ctx.swap(&self.main_ctx, &coro.ctx);
         // Coroutine yielded, parked, or finished. It set `pending_event`

@@ -1,10 +1,11 @@
 //! Runtime: top-level handle to the Volt scheduler + reactor.
 //!
 //! Owns the worker pool, the global injection queue, the I/O reactor, and
-//! the shutdown signal. Users construct a Runtime via `volt.run(allocator,
+//! the shutdown signal. Users construct a Runtime via `volt.run(config,
 //! root_fn, args)` — they don't usually touch this type directly.
 //!
-//! v0.3 multi-worker model:
+//! ## Scheduler model
+//!
 //!   - N OS threads. Worker 0 is the bootstrap thread (the caller of
 //!     `volt.run`). Workers 1..N-1 are dedicated threads spawned by `start`.
 //!   - Each worker owns a Chase-Lev work-stealing deque (LIFO push/pop for
@@ -14,12 +15,9 @@
 //!   - Shared reactor with single-poller-at-a-time claim. Whichever worker
 //!     idles first claims the lock and polls; events are pushed to that
 //!     worker's local deque.
-//!
-//! Multi-worker work-stealing is the v0.3+ baseline. Per-worker io_uring
-//! arrives at v0.9.
 
 const std = @import("std");
-const ctx = @import("coroutine/context_arm64.zig");
+const ctx = @import("coroutine/context.zig");
 const Coroutine = @import("coroutine/coroutine.zig").Coroutine;
 const spawn_mod = @import("coroutine/spawn.zig");
 const stack_mod = @import("coroutine/stack.zig");
@@ -29,13 +27,48 @@ const Worker = @import("scheduler/worker.zig").Worker;
 const Injection = @import("scheduler/injection.zig").Injection;
 const time_mod = @import("time.zig");
 
+/// Maximum supported worker count. Sharded across `BITMAP_WORDS` 64-bit
+/// atomics in `parked_workers`. Raise both constants together.
+pub const MAX_WORKERS: usize = 256;
+pub const BITMAP_WORDS: usize = (MAX_WORKERS + 63) / 64;
+
+/// Volt's per-coroutine stack model is opinionated and not configurable
+/// — like Go's 2 KiB initial stack. Each coroutine gets:
+///   - **1 MiB reserved** virtual address space (cheap on 64-bit).
+///   - **1 page committed** at the top (4 KiB on Linux/Intel, 16 KiB
+///     on Apple Silicon — the smallest unit `mprotect` operates on,
+///     and equivalent in spirit to Go's 2 KiB minimum).
+///   - **Grow-on-demand** via the SIGSEGV handler (`coroutine/stack.zig`),
+///     transparent to user code, no compiler help required.
+///   - **Graceful failure** when the 1 MiB ceiling is hit — joiners
+///     receive `error.StackOverflow`; the runtime keeps running.
 pub const Config = struct {
-    /// Default stack size for spawned coroutines.
-    default_stack_size: usize = stack_mod.default_size,
-    /// Number of worker threads. `null` = use the CPU count (with a floor
-    /// of 1). Multi-worker is the default — set to 1 only for deterministic
-    /// tests / debugging.
+    /// Allocator used for the worker pool, the injection queue, the
+    /// reactor, and per-coroutine stacks. Required.
+    allocator: std.mem.Allocator,
+
+    /// Number of worker threads. `null` = use the CPU count (with a
+    /// floor of 1). Multi-worker is the default — set to 1 only for
+    /// deterministic tests / debugging.
     workers: ?usize = null,
+
+    /// Deterministic mode: single worker, fixed RNG seed (`steal-rng`
+    /// becomes pure-pseudo), no time-based jitter. Pairs with the
+    /// loom-style model checker. Forces `workers = 1` if set; the
+    /// `workers` field is ignored in this mode.
+    ///
+    /// NB: this doesn't fully eliminate non-determinism (the OS thread
+    /// scheduler still nudges futex wakes, the syscall layer can
+    /// re-order). But it removes Volt's own contributions, which is
+    /// enough for "same seed → same scheduler trace" for most tests.
+    deterministic: bool = false,
+
+    /// Pin each worker thread to a CPU core (worker `i` → core
+    /// `i % cpu_count`). Reduces cross-core cache traffic on
+    /// latency-sensitive workloads. Linux: `pthread_setaffinity_np`.
+    /// Darwin: a no-op (Darwin's QoS-class APIs aren't a clean fit;
+    /// Future releases may add opt-in support via `thread_policy_set`).
+    pin_workers: bool = false,
 };
 
 pub const Runtime = struct {
@@ -57,13 +90,44 @@ pub const Runtime = struct {
     /// notifyOneWorker to absorb the about-to-park race).
     notify_rr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
-    pub fn init(allocator: std.mem.Allocator, config: Config) !Runtime {
+    /// Bitmap of currently parked workers, sharded across `BITMAP_WORDS`
+    /// 64-bit atomics. Bit `i` (= `1 << (i % 64)` in word `i / 64`) is set
+    /// iff worker `i` is inside `cond.wait`. Each Parker maintains its
+    /// own bit.
+    ///
+    /// `MAX_WORKERS = 256` covers EPYC/Threadripper (192 cores) with room.
+    /// To extend further, raise `BITMAP_WORDS`. O(1) wake selection still
+    /// holds: at most `BITMAP_WORDS` word-loads + a CAS to claim a bit.
+    parked_workers: [BITMAP_WORDS]std.atomic.Value(u64) =
+        .{std.atomic.Value(u64).init(0)} ** BITMAP_WORDS,
+
+    /// Lazily-initialized blocking-thread pool for `spawnBlocking`.
+    /// First `spawnBlocking` call creates it; runtime deinit shuts it
+    /// down. Pointer-not-null is the "initialized" check (CAS-based
+    /// install for thread safety).
+    blocking_pool: std.atomic.Value(?*@import("blocking/Pool.zig").Pool) =
+        std.atomic.Value(?*@import("blocking/Pool.zig").Pool).init(null),
+
+    /// Recycled coroutine stacks. `Done.subscribe` pushes here; new
+    /// `createCoroutine` calls pop from here before falling back to
+    /// `mmap`. Drastically reduces spawn-cost syscalls under steady-
+    /// state spawn-and-complete workloads.
+    stack_pool: @import("coroutine/stack_pool.zig").StackPool,
+
+    pub fn init(config: Config) !Runtime {
+        const allocator = config.allocator;
         const num_workers = blk: {
+            // Determinism mode: force single worker, ignore `workers`.
+            if (config.deterministic) break :blk @as(usize, 1);
             if (config.workers) |n| {
                 if (n == 0) return error.InvalidWorkerCount;
+                if (n > MAX_WORKERS) return error.TooManyWorkers;
                 break :blk n;
             }
-            break :blk @max(1, std.Thread.getCpuCount() catch 1);
+            const detected = @max(1, std.Thread.getCpuCount() catch 1);
+            // Cap at MAX_WORKERS so we always fit in the parked-workers
+            // bitmap. Future systems above this — extend `BITMAP_WORDS`.
+            break :blk @min(detected, MAX_WORKERS);
         };
 
         var rt: Runtime = .{
@@ -72,6 +136,7 @@ pub const Runtime = struct {
             .workers = try allocator.alloc(Worker, num_workers),
             .injection = Injection.init(allocator),
             .reactor = try reactor_mod.Reactor.init(allocator),
+            .stack_pool = @import("coroutine/stack_pool.zig").StackPool.init(allocator),
         };
         errdefer allocator.free(rt.workers);
         errdefer rt.injection.deinit();
@@ -82,7 +147,9 @@ pub const Runtime = struct {
         // it can hand out a stable address before workers start running.
         var initialized: usize = 0;
         errdefer for (rt.workers[0..initialized]) |*w| w.deinit(allocator);
-        const base_seed: i128 = time_mod.nanoTimestamp();
+        // Deterministic mode uses a fixed seed; otherwise a time-based
+        // one for steal-victim variation across runs.
+        const base_seed: i128 = if (config.deterministic) 0xC0FFEE else time_mod.nanoTimestamp();
         for (rt.workers, 0..) |*w, i| {
             const seed: u64 = @as(u64, @bitCast(@as(i64, @truncate(base_seed ^ @as(i128, @intCast(i))))));
             w.* = try Worker.init(allocator, i, undefined, seed);
@@ -93,17 +160,46 @@ pub const Runtime = struct {
     }
 
     /// Patch each worker's `runtime` pointer to point at our final stable
-    /// location. Called by `volt.run` after the Runtime value has been
-    /// stored at its long-lived address (typically a stack slot in `run`).
+    /// location, and register each into the parked-workers bitmap. Called
+    /// by `volt.run` after the Runtime value has been stored at its
+    /// long-lived address (typically a stack slot in `run`).
     pub fn bindWorkers(self: *Runtime) void {
-        for (self.workers) |*w| w.runtime = self;
+        for (self.workers) |*w| {
+            w.runtime = self;
+            const word_idx = w.id / 64;
+            const bit_in_word = w.id % 64;
+            w.bindBitmap(&self.parked_workers[word_idx], @as(u64, 1) << @intCast(bit_in_word));
+        }
     }
 
     pub fn deinit(self: *Runtime) void {
+        if (self.blocking_pool.load(.acquire)) |pool| pool.deinit();
+        // Workers free any stack that wasn't pooled (i.e. coroutines
+        // still alive at runtime tear-down). After workers, the pool's
+        // own deinit munmaps everything that was pooled.
         for (self.workers) |*w| w.deinit(self.allocator);
         self.allocator.free(self.workers);
+        self.stack_pool.deinit();
         self.injection.deinit();
         self.reactor.deinit();
+    }
+
+    /// Default thread count for the blocking pool (Tokio default — 512
+    /// is enough for most workloads without exhausting OS thread limits).
+    pub const DEFAULT_BLOCKING_THREADS: usize = 512;
+
+    /// Get (or lazily create) the blocking-thread pool.
+    pub fn blockingPool(self: *Runtime) !*@import("blocking/Pool.zig").Pool {
+        if (self.blocking_pool.load(.acquire)) |p| return p;
+        // Race-safe lazy init: build the pool, CAS-install. If we lose
+        // the race, free our copy and use the winner's.
+        const Pool = @import("blocking/Pool.zig").Pool;
+        const new_pool = try Pool.init(self.allocator, @ptrCast(self), DEFAULT_BLOCKING_THREADS);
+        if (self.blocking_pool.cmpxchgStrong(null, new_pool, .acq_rel, .acquire)) |existing| {
+            new_pool.deinit();
+            return existing.?;
+        }
+        return new_pool;
     }
 
     pub fn shutdownRequested(self: *const Runtime) bool {
@@ -124,32 +220,32 @@ pub const Runtime = struct {
     }
 
     /// Wake one parked worker — used when new work appears on the injection
-    /// queue or a coroutine completes (its waiter may now be runnable).
-    /// Wake one worker. Two races to absorb:
-    ///   1. A worker is between findWork and parker.park (parked flag not
-    ///      yet set). We must not lose the wake — `unpark` sets the parker's
-    ///      `unpark_pending` flag which the worker drains before sleeping.
-    ///   2. The reactor poller is blocked in `kevent`. EV_USER tickle
-    ///      returns it immediately.
+    /// queue or shutdown is signaled.
     ///
-    /// Strategy: scan for an actually-parked worker first (avoids waking a
-    /// running one — no thundering herd in the common case). If none
-    /// observed parked, call `unpark` on a round-robin victim — that sets
-    /// `unpark_pending` and absorbs the about-to-park race.
+    /// Anti-herd invariant: skip the wake entirely if a worker is already
+    /// "searching" (woken, scanning, hasn't found work yet) — the searcher
+    /// will discover the new push on its next iteration. Otherwise pick a
+    /// parked worker via the O(1) bitmap and atomically reserve a search
+    /// slot before unparking.
+    ///
+    /// Two paths to absorb:
+    ///   1. The reactor poller is blocked in `kevent`. `EV_USER` tickle
+    ///      returns it immediately.
+    ///   2. A worker is in `cond.wait` — find it via `parked_workers` and
+    ///      atomically claim it.
+    ///
+    /// If nothing is parked AND nothing is searching, buffer the wake on a
+    /// round-robin victim (its `Parker.unpark` stores NOTIFIED, drained by
+    /// the next park). This absorbs the worker-between-findWork-and-park
+    /// race that the bitmap can't see.
     pub fn notifyOneWorker(self: *Runtime) void {
         if (self.poll_claim.load(.acquire)) self.reactor.tickle();
-
-        const rr = self.notify_rr.fetchAdd(1, .monotonic);
-        var i: usize = 0;
-        while (i < self.workers.len) : (i += 1) {
-            const idx = (rr + i) % self.workers.len;
-            if (self.workers[idx].isParked()) {
-                self.workers[idx].unpark();
-                return;
-            }
+        // No exclusion — any parked worker is fair game.
+        if (self.takeOneFromBitmap(no_exclude_word, 0)) |idx| {
+            self.workers[idx].unpark();
+            return;
         }
-        // No worker observed as parked — set unpark_pending on a round-
-        // robin victim to absorb the about-to-park race.
+        const rr = self.notify_rr.fetchAdd(1, .monotonic);
         self.workers[rr % self.workers.len].unpark();
     }
 
@@ -162,18 +258,161 @@ pub const Runtime = struct {
     ///
     /// Strategy: if we're on a worker thread, push to the calling worker's
     /// own deque (cache-warm; safe under Chase-Lev because owner-only
-    /// pushes are legal). Otherwise inject globally and wake a worker.
+    /// pushes are legal) AND nudge one parked sibling so it has a chance
+    /// to steal. Without the sibling nudge, parked workers stay parked
+    /// until a `Done` event fires — which is after the work has run, by
+    /// which time the deque is empty. That collapses parallelism: small
+    /// bursts of spawns end up running serially on one worker.
+    ///
+    /// If we're not on a worker thread (cross-thread wake), inject
+    /// globally and wake one parked worker via `notifyOneWorker`.
     ///
     /// This is the single chokepoint for "I have a runnable coroutine,
     /// please run it." Park.unpark, the bootstrap, and any future cross-
     /// thread wake all funnel through here.
     pub fn schedule(self: *Runtime, coro: *Coroutine) void {
         if (currentWorker()) |me| {
-            me.run_queue.push(coro);
-            me.unpark();
+            // Schedule path = "I just made this runnable; run it next on
+            // my core." Goes through the LIFO slot for cache locality.
+            me.enqueueLocal(coro);
+            self.wakeOneSibling(me.id);
             return;
         }
         self.injectGlobal(coro);
+    }
+
+    /// Nudge one parked sibling so it can steal from the current worker.
+    ///
+    /// History (M1): an earlier anti-herd check (`if num_searching != 0
+    /// skip`) modelled after Tokio/Go was removed during early debugging
+    /// of a re-entrant mutex bug in Channel's blocking-path recheck;
+    /// restoring it is gated on the model-checker stress harness so the
+    /// missed-wake corner cases can be flushed out properly. For now we
+    /// wake unconditionally — a few extra futex-wakes per scheduling
+    /// event, but obviously correct.
+    ///
+    /// Race absorption: if `takeOneFromBitmap` returns null (no worker
+    /// is observably in the bitmap right now), we fall back to a
+    /// round-robin unpark. This buffers a NOTIFIED on the target
+    /// parker so a worker that's mid-park (between findWork and
+    /// bitmap.fetchOr) consumes it on its next state CAS instead of
+    /// missing the wake. Same shape `notifyOneWorker` uses for cross-
+    /// thread injection.
+    pub fn wakeOneSibling(self: *Runtime, self_id: usize) void {
+        if (self.workers.len <= 1) return;
+        const exclude_word = self_id / 64;
+        const exclude_bit = @as(u64, 1) << @intCast(self_id % 64);
+        if (self.takeOneFromBitmap(exclude_word, exclude_bit)) |idx| {
+            self.workers[idx].unpark();
+            return;
+        }
+        // Fallback: a worker may be mid-park (no bit set yet). Buffer
+        // a NOTIFIED on a round-robin target so its next state CAS
+        // sees it.
+        const rr = self.notify_rr.fetchAdd(1, .monotonic);
+        var idx = rr % self.workers.len;
+        if (idx == self_id) idx = (idx + 1) % self.workers.len;
+        self.workers[idx].unpark();
+    }
+
+    /// Sentinel for `takeOneFromBitmap` — out-of-range word index meaning
+    /// "no worker is excluded."
+    const no_exclude_word: usize = std.math.maxInt(usize);
+
+    /// Atomically pick and clear one parked-worker bit, optionally
+    /// excluding the specific (word, bit) of the calling worker. Returns
+    /// the worker index if claimed, null if no parked worker exists
+    /// (excluding the exclusion).
+    ///
+    /// Walks the sharded bitmap starting from a round-robin position,
+    /// preferring bits at or above the start (within the first word) and
+    /// continuing into subsequent words on wrap-around. The RR rotation
+    /// spreads wakes across workers rather than hammering the lowest-
+    /// indexed parked sibling.
+    ///
+    /// O(BITMAP_WORDS) word loads in the worst case (typical: 1). The
+    /// CAS-loop within a word converges in 1–2 iterations under typical
+    /// contention.
+    fn takeOneFromBitmap(self: *Runtime, exclude_word: usize, exclude_bit: u64) ?usize {
+        const rr = self.notify_rr.fetchAdd(1, .monotonic);
+        const start_global: usize = rr % @max(@as(usize, 1), self.workers.len);
+        const start_word: usize = start_global / 64;
+        const start_bit_in_word: u6 = @intCast(start_global % 64);
+
+        // Pass 1: from `start_word` forward (wrapping), prefer at-or-above
+        // start_bit_in_word in the first word.
+        var i: usize = 0;
+        while (i < BITMAP_WORDS) : (i += 1) {
+            const word_idx = (start_word + i) % BITMAP_WORDS;
+            if (self.tryClaimInWord(word_idx, exclude_word, exclude_bit, if (i == 0) start_bit_in_word else 0)) |idx| {
+                return idx;
+            }
+        }
+        // Pass 2 (wrap): the first word's bits BELOW start_bit_in_word
+        // weren't checked. Try them now.
+        if (start_bit_in_word != 0) {
+            if (self.tryClaimBelow(start_word, exclude_word, exclude_bit, start_bit_in_word)) |idx| {
+                return idx;
+            }
+        }
+        return null;
+    }
+
+    /// Try to claim a bit in `word_idx` at or above `min_bit`. Returns the
+    /// worker index on success.
+    fn tryClaimInWord(
+        self: *Runtime,
+        word_idx: usize,
+        exclude_word: usize,
+        exclude_bit: u64,
+        min_bit: u6,
+    ) ?usize {
+        var current = self.parked_workers[word_idx].load(.acquire);
+        while (true) {
+            var candidates = current;
+            if (word_idx == exclude_word) candidates &= ~exclude_bit;
+            // Restrict to bits at or above min_bit.
+            candidates &= ~@as(u64, 0) << min_bit;
+            if (candidates == 0) return null;
+
+            const target_bit = candidates & (~candidates +% 1);
+            const next = current & ~target_bit;
+            if (self.parked_workers[word_idx].cmpxchgWeak(current, next, .acq_rel, .acquire)) |observed| {
+                current = observed;
+                continue;
+            }
+            const bit_in_word: u6 = @intCast(@ctz(target_bit));
+            return word_idx * 64 + bit_in_word;
+        }
+    }
+
+    /// Try to claim a bit in `word_idx` strictly below `max_bit`.
+    fn tryClaimBelow(
+        self: *Runtime,
+        word_idx: usize,
+        exclude_word: usize,
+        exclude_bit: u64,
+        max_bit: u6,
+    ) ?usize {
+        var current = self.parked_workers[word_idx].load(.acquire);
+        while (true) {
+            var candidates = current;
+            if (word_idx == exclude_word) candidates &= ~exclude_bit;
+            // Restrict to bits below max_bit.
+            const max_bit_wide: u7 = max_bit;
+            const below_mask: u64 = (@as(u64, 1) << @intCast(max_bit_wide)) - 1;
+            candidates &= below_mask;
+            if (candidates == 0) return null;
+
+            const target_bit = candidates & (~candidates +% 1);
+            const next = current & ~target_bit;
+            if (self.parked_workers[word_idx].cmpxchgWeak(current, next, .acq_rel, .acquire)) |observed| {
+                current = observed;
+                continue;
+            }
+            const bit_in_word: u6 = @intCast(@ctz(target_bit));
+            return word_idx * 64 + bit_in_word;
+        }
     }
 
     /// Push a coroutine onto the global injection queue and wake a worker.
@@ -214,18 +453,27 @@ pub const Runtime = struct {
         comptime user_fn: anytype,
         args: anytype,
     ) !spawn_mod.Created(@TypeOf(user_fn)) {
+        const recycled = self.stack_pool.acquire(stack_mod.default_reserved);
         const created = try spawn_mod.create(
             self.allocator,
-            self.config.default_stack_size,
+            .{ .reserved = stack_mod.default_reserved },
+            recycled,
             user_fn,
             args,
         );
+        // Capture the parent for async-backtrace ancestry.
+        if (tls.currentCoroutine()) |parent| {
+            created.coro.parent_id = @intFromPtr(parent);
+        }
         const w = currentWorker() orelse @panic(
             "Runtime.createCoroutine called outside a worker thread. " ++
                 "Use Runtime.spawnRoot from the bootstrap thread instead.",
         );
         try w.pushOwned(created.coro);
-        w.unpark();
+        // Wake a parked sibling so it has a chance to steal. Same reasoning
+        // as `schedule`: without this, parallelism collapses on bursty
+        // spawn patterns.
+        self.wakeOneSibling(w.id);
         return created;
     }
 
@@ -239,10 +487,15 @@ pub const Runtime = struct {
     ) !spawn_mod.Created(@TypeOf(user_fn)) {
         const created = try spawn_mod.create(
             self.allocator,
-            self.config.default_stack_size,
+            .{ .reserved = stack_mod.default_reserved },
+            null, // root never recycles — pool is empty at startup
             user_fn,
             args,
         );
+        // Mark as the until-done watch target. Done.subscribe uses this to
+        // wake worker 0 (the bootstrap watcher) on completion — without
+        // having to broadcast a wake to every worker.
+        created.coro.is_root = true;
         try self.workers[0].pushOwned(created.coro);
         return created;
     }
@@ -275,6 +528,7 @@ pub const Runtime = struct {
 
         // Root finished — signal shutdown and reap the other workers.
         self.requestShutdown();
+
         for (self.workers[1..]) |*w| {
             if (w.thread) |t| {
                 t.join();
@@ -300,8 +554,7 @@ pub fn currentWorker() ?*Worker {
 }
 
 test "runtime: init/deinit cycle" {
-    var rt = try Runtime.init(std.testing.allocator, .{ .workers = 2 });
+    var rt = try Runtime.init(.{ .allocator = std.testing.allocator, .workers = 2 });
     defer rt.deinit();
-    try std.testing.expectEqual(stack_mod.default_size, rt.config.default_stack_size);
     try std.testing.expectEqual(@as(usize, 2), rt.workers.len);
 }

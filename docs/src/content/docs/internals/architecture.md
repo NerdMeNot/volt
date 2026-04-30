@@ -1,411 +1,254 @@
 ---
-title: Architecture Overview
-description: High-level architecture of the Volt runtime -- how the scheduler, I/O driver, timer wheel, and blocking pool fit together.
+title: Architecture
+description: How Volt fits together — Runtime, Worker, Reactor, Coroutine, Park, and how a typical wake travels through the system.
 ---
 
-Volt is a production-grade async I/O runtime for Zig, modeled after Tokio's battle-tested architecture. It uses stackless futures (~256--512 bytes per task) instead of stackful coroutines (16--64KB per task), enabling millions of concurrent tasks on commodity hardware.
+This is the system map. If you're trying to understand a stack
+trace, debug a missed wake, or contribute to the runtime, start
+here.
 
-## Layered architecture
+## The shape
 
 ```
-+=====================================================================+
-|                        User Application                             |
-|        volt.run(myServer)  /  io.@"async"(...)  /  io.concurrent() |
-+=====================================================================+
-                                |
-                                v
-+=====================================================================+
-|                      User-Facing API                                |
-|                                                                     |
-|  volt.Runtime       volt.Future   volt.Group      volt.sync.*            |
-|  volt.channel.*  volt.net.*  volt.time.*     volt.fs.*              |
-|  volt.signal   volt.process  volt.stream     volt.shutdown          |
-+=====================================================================+
-                                |
-                                v
-+=====================================================================+
-|                   Engine Internals (not user-facing)                 |
-|                                                                     |
-|  volt.task.*    volt.future.*    volt.async_ops.*                   |
-|  (Timeout, Select, Join, Race, FnFuture, FutureTask)                |
-+=====================================================================+
-                                |
-                                v
-+=====================================================================+
-|                         Runtime Layer                                |
-|                                                                     |
-|  +------------------+  +---------------+  +-------------------+     |
-|  | Work-Stealing    |  | I/O Driver    |  | Timer Wheel       |     |
-|  | Scheduler        |  |               |  |                   |     |
-|  |                  |  | Platform      |  | 5 levels, 64      |     |
-|  | N workers with   |  | backend       |  | slots/level       |     |
-|  | 256-slot ring    |  | abstraction   |  | O(1) insert/poll  |     |
-|  | buffers, LIFO    |  |               |  |                   |     |
-|  | slot, global     |  +---------------+  +-------------------+     |
-|  | injection queue  |                                               |
-|  +------------------+  +---------------------------------------+    |
-|                        | Blocking Pool                         |    |
-|                        | On-demand threads (up to 512)         |    |
-|                        | 10s idle timeout, auto-shrink         |    |
-|                        +---------------------------------------+    |
-+=====================================================================+
-                                |
-                                v
-+=====================================================================+
-|                       Platform Backends                             |
-|                                                                     |
-|  +----------+  +---------+  +--------+  +----------+               |
-|  | io_uring |  | kqueue  |  |  IOCP  |  |  epoll   |               |
-|  | Linux    |  | macOS   |  | Windows|  | Linux    |               |
-|  | 5.1+     |  | 10.12+  |  | 10+    |  | fallback |               |
-|  +----------+  +---------+  +--------+  +----------+               |
-+=====================================================================+
+            ┌────────────────────────────────────────────────────────────┐
+            │                       volt.run(...)                        │
+            │            (owns Runtime; tears down on return)            │
+            └────────────────────────────────────────────────────────────┘
+                                       │
+            ┌──────────────────────────▼──────────────────────────┐
+            │                      Runtime                         │
+            │   workers[] · reactor · injection · stack_pool       │
+            │   shutdown_flag · parked_workers bitmap              │
+            └──────────────────────────┬──────────────────────────┘
+                                       │
+   ┌───────────────────────────────────┼───────────────────────────────────┐
+   │                                   │                                   │
+   ▼                                   ▼                                   ▼
+┌─────┐  steal       ┌─────┐  inject  ┌──────────┐  poll        ┌──────────┐
+│ W0  │ ◄──────────► │ W1  │ ────►    │Injection │              │ Reactor  │
+│LIFO │              │LIFO │          │  queue   │              │ (kqueue/ │
+│deque│              │deque│          └──────────┘              │  epoll/  │
+└─────┘              └─────┘                                    │   IOCP)  │
+                                                                └──────────┘
+                                                                      ▲
+                                                                      │ park / wake
+                                                                      │
+                                                                ┌──────────┐
+                                                                │Coroutine │
+                                                                │ stack +  │
+                                                                │ context  │
+                                                                │ + Park   │
+                                                                └──────────┘
 ```
 
-```mermaid
-graph TD
-    subgraph User["User Application"]
-        A["volt.run / io.async / io.concurrent"]
-    end
-    subgraph API["User-Facing API"]
-        B["Io · Future · Group · sync.*\nchannel.* · net.* · time.* · fs.*\nsignal · process · stream · shutdown"]
-    end
-    subgraph Engine["Engine Internals"]
-        C["task.* · future.* · async_ops.*\nTimeout · Select · Join · Race · FutureTask"]
-    end
-    subgraph Runtime["Runtime Layer"]
-        D["Work-Stealing\nScheduler"]
-        E["I/O Driver"]
-        F["Timer Wheel"]
-        G["Blocking Pool"]
-    end
-    subgraph Platform["Platform Backends"]
-        H["io_uring\nLinux 5.1+"]
-        I["kqueue\nmacOS"]
-        J["IOCP\nWindows"]
-        K["epoll\nLinux"]
-    end
+Five things, the rest is composition:
 
-    User --> API --> Engine --> Runtime
-    Runtime --> Platform
+- **Runtime** (`src/runtime.zig`) — Owns everything. Created by
+  `volt.run`. Holds the worker array, the reactor, the global
+  injection queue, the stack pool, the parked-workers bitmap, and
+  the shutdown flag.
+- **Worker** (`src/scheduler/worker.zig`) — An OS thread plus a
+  Chase-Lev work-stealing deque, a LIFO slot, and a Parker. Each
+  worker has an ID and a bit in the runtime's `parked_workers`
+  bitmap.
+- **Reactor** (`src/io/reactor.zig` → `reactor_kqueue.zig` /
+  `reactor_epoll.zig` / `reactor_iouring.zig` / `reactor_iocp.zig`)
+  — The OS-level readiness/completion source. One per runtime,
+  with single-poller-claim (only one worker calls
+  `reactor.poll()` at a time).
+- **Injection queue** (`src/scheduler/injection.zig`) — A
+  mutex-protected global queue. Cross-thread spawns and reactor
+  wakes go here; workers check it after their local deque before
+  stealing.
+- **Coroutine** (`src/coroutine/coroutine.zig`) — A function plus
+  a stack plus saved registers (`Context`) plus a
+  `current_park` field for cancellation propagation.
 
-    style User fill:#1e40af,color:#fff
-    style API fill:#1e3a5f,color:#fff
-    style Engine fill:#1e3a5f,color:#fff
-    style Runtime fill:#1e3a5f,color:#fff
-    style Platform fill:#374151,color:#fff
+## Spawning a coroutine
+
+`volt.launch(fn, args)`:
+
+1. Comptime-specialize a closure for `fn` + `args` (one type per
+   call site, see `src/coroutine/spawn.zig`).
+2. `Runtime.createCoroutine`:
+   - Pop a stack from `stack_pool` if available; otherwise `mmap` /
+     `VirtualAlloc` a fresh 8 MiB reservation with 1 page committed.
+   - Allocate the Coroutine struct with the closure pointer in the
+     stack-top slot the trampoline reads.
+   - Initialize the saved-context (registers + SP) so first dispatch
+     lands in `voltCoroEntry`.
+3. Push the Coroutine onto the calling worker's LIFO slot
+   (or onto worker 0's deque if called outside a coroutine, e.g.
+   from `volt.run`).
+4. If the LIFO slot displaces an existing coroutine, push that one
+   onto the local deque tail.
+5. Return a `*Job` heap-allocated alongside the Coroutine.
+
+## Dispatching: the worker loop
+
+```
+loop {
+    1. Have a coroutine ready in the LIFO slot? swap-into it.
+    2. Pop the local deque (LIFO for owner, FIFO for thieves).
+       Got one? swap-into it.
+    3. Drain a small burst from the injection queue. Got any?
+       Push to local deque, retry from step 1.
+    4. Try to steal from another worker's deque (random victim).
+       Got one? swap-into it.
+    5. Try to claim the reactor. If we own the claim:
+       reactor.poll(timeout) → wakes deliver coroutines onto our
+       deque. Release the claim; retry from step 1.
+    6. Park: set our bit in parked_workers, condvar-wait.
+}
 ```
 
-## Key components
+The "swap-into" step is the assembly context switch
+(`voltCtxSwap` in `src/coroutine/context_arm64.zig` /
+`context_x86_64.S`). It saves the worker's callee-saved registers,
+loads the coroutine's callee-saved registers, and `ret`s into
+whatever address was at the top of the coroutine's saved stack —
+either a normal return-point (if resuming) or the trampoline (if
+first-dispatch).
 
-### Runtime (`src/runtime.zig`)
+## Suspending: the coroutine side
 
-The `Runtime` struct is the top-level entry point. It owns and coordinates all other components:
+When a coroutine calls `volt.sleep`, `Channel.recv`, `Mutex.lock`,
+or any blocking primitive:
+
+1. The primitive registers an "I want to wake when X happens" with
+   the appropriate **EventSource** — a reactor wait, a channel
+   waiter list, a mutex waiter list, etc.
+2. The primitive sets `coroutine.current_park = &this_park`. This
+   is what makes cancellation work: cancelling pokes whatever Park
+   the coroutine is currently parked on.
+3. The coroutine calls `voltCtxSwap(&coro.ctx, coro.scheduler_ctx)`.
+   This saves the coroutine's registers into `coro.ctx`, loads the
+   worker's registers from `scheduler_ctx`, and `ret`s into the
+   worker loop right after the previous swap-in.
+4. The coroutine is now suspended. Worker continues from step 1
+   above.
+
+When the wake fires (reactor delivers, channel sends, mutex
+unlocks), the EventSource pushes the coroutine back onto a worker's
+deque. On next dispatch, the coroutine swap-ins, returns from
+`voltCtxSwap`, and continues from right after the suspension call.
+
+## Cancellation propagation
+
+`Job.cancel()` does two things:
 
 ```zig
-pub const Runtime = struct {
-    allocator: Allocator,
-    sched_runtime: *SchedulerRuntime,  // Owns the scheduler
-    blocking_pool: BlockingPool,        // Dedicated blocking threads
-    shutdown: std.atomic.Value(bool),
-};
+pub fn cancel(self: *Coroutine) void {
+    self.cancel_flag.store(true, .release);
+    const park_addr = self.current_park.load(.acquire);
+    if (park_addr != 0) {
+        const park: *Park = @ptrFromInt(park_addr);
+        park.unpark();
+    }
+}
 ```
 
-Users interact with the runtime through `init`, `@"async"`, and `deinit`:
+The flag store causes the next `parkCurrent()` call to return
+`error.Cancelled` immediately. The unpark wakes the coroutine if
+it's currently parked. So:
 
-```zig
-var io = try Io.init(allocator, .{
-    .num_workers = 0,              // Auto-detect (CPU count)
-    .max_blocking_threads = 512,
-    .backend = null,               // Auto-detect I/O backend
-});
-defer io.deinit();
+- Cancelled before the next suspend: caller sees `error.Cancelled`
+  on next park.
+- Cancelled while parked on I/O / sleep / channel / mutex: park
+  surfaces `error.Cancelled` immediately.
 
-var f = try io.@"async"(compute, .{42});
-const result = f.@"await"(io);
-```
+This is what makes `volt.withTimeout(dur, fn, args)` work without
+any cooperation from `fn`. The watcher calls `child.cancel()` when
+the timer fires; whatever the child was parked on releases.
 
-### Scheduler (`src/internal/scheduler/Scheduler.zig`)
+## I/O wake path
 
-The heart of the runtime. A multi-threaded, work-stealing task scheduler derived from Tokio's multi-threaded scheduler. Each worker thread owns a local task queue and participates in cooperative work stealing when idle. See the [Scheduler](/internals/scheduler/) page for full details.
-
-Worker threads can also execute tasks while waiting for a join to complete (work-stealing join pattern). When `JoinHandle.join()` is called from a worker, `helpUntilComplete()` pops tasks from the worker's queues -- including the LIFO slot where the target task likely sits -- instead of spinning. Non-worker threads use `blockOnComplete()`, which pulls from the global queue and executes tasks inline.
-
-### I/O driver (`src/internal/backend.zig`)
-
-Abstracts platform-specific async I/O behind a unified `Backend` interface. The scheduler owns the I/O backend and polls for completions on each tick. See the [I/O Driver](/internals/io-driver/) page.
-
-### Timer wheel (`src/internal/scheduler/TimerWheel.zig`)
-
-A hierarchical timer wheel with 5 levels and 64 slots per level, providing O(1) insertion and O(1) next-expiry lookup using bit-manipulation. Covers durations from 1ms to ~10.7 days, with an overflow list for longer timers.
+A typical TCP read:
 
 ```
-Level 0:  64 slots x   1ms =    64ms range
-Level 1:  64 slots x  64ms =   4.1s range
-Level 2:  64 slots x   4s  =   4.3m range
-Level 3:  64 slots x   4m  =   4.5h range
-Level 4:  64 slots x   4h  =  10.7d range
-Overflow: linked list for timers beyond ~10 days
+coroutine: stream.read(&buf)
+    │  syscall → EWOULDBLOCK
+    │  reactor.registerWait(fd, .readable, target=&coro)
+    │  coro.current_park = &this_park
+    │  voltCtxSwap(&coro.ctx, scheduler_ctx)   ─── coroutine suspends here
+    ▼
+    [scheduler dispatches other work]
+    [reactor.poll() blocks on kqueue_kevent / epoll_wait]
+    [kernel delivers EVFILT_READ / EPOLLIN for fd]
+    [reactor unparks the target coro]
+    [coro lands back on a worker's deque]
+    │
+    ▼
+    [worker swap-ins coro]
+    │  voltCtxSwap returns
+    │  reactor read syscall now succeeds
+    │  return n bytes
+    └──► caller continues
 ```
 
-Worker 0 is the primary timer driver. It polls the timer wheel at the start of each tick. Other workers contribute to I/O polling but not timer polling, avoiding contention on the timer mutex.
+The "lands back on a worker's deque" step might be on a *different*
+worker than the one the coroutine was last on. That's fine —
+coroutines are not pinned to workers. Anything that was on the
+coroutine's stack still works because the stack is virtual memory
+that hasn't moved.
 
-### Blocking pool (`src/internal/blocking.zig`)
+## Stack pool
 
-A separate thread pool for CPU-intensive or synchronous blocking work. Threads are spawned on demand and exit after 10 seconds of idleness. See the [Blocking Pool](/internals/blocking-pool/) page.
+`Done.subscribe` (in `src/coroutine/event_source.zig`) handles
+coroutine completion. When a coroutine returns from its top-level
+function:
 
-## Thread model
+1. The trampoline writes the result into the result slot.
+2. Sets the coroutine's state to `.done`.
+3. Wakes the joiner (if any) parked on `join_park`.
+4. Pushes the coroutine's stack onto `Runtime.stack_pool` (skipping
+   root coroutines, which `volt.run` owns).
 
-Volt uses three categories of threads:
+The next `createCoroutine` call pops from the pool first. Saves a
+~µs `mmap` / `mprotect` syscall pair per spawn, which is the
+dominant cost in a tight spawn-and-complete loop.
 
-```
-+--------------------------------------------+
-|  Worker Threads (N, default = CPU count)   |
-|  - Run the scheduler loop                  |
-|  - Poll futures (async tasks)              |
-|  - Poll I/O completions                    |
-|  - Poll timers (worker 0 only)             |
-+--------------------------------------------+
+## Worker waking
 
-+--------------------------------------------+
-|  Blocking Pool Threads (0 to 512)          |
-|  - Spawned on demand                       |
-|  - CPU-intensive or blocking I/O           |
-|  - 10s idle timeout, auto-shrink           |
-+--------------------------------------------+
-```
+Idle workers don't poll. They condvar-wait with their bit set in
+`Runtime.parked_workers` (a 256-bit bitmap sharded across 4 atomic
+u64 words, indexed by `@ctz` for O(1) wake-one).
 
-```mermaid
-graph LR
-    subgraph Workers["Worker Threads (N = CPU count)"]
-        W1["Scheduler loop\nPoll futures\nPoll I/O\nPoll timers"]
-    end
-    subgraph Blocking["Blocking Pool (0–512)"]
-        B1["On-demand spawn\nCPU / blocking I/O\n10s idle timeout"]
-    end
+When a coroutine becomes runnable on a worker that's currently
+busy, the runtime:
 
-    Workers -.- |"work-stealing"| Workers
-    Workers --> |"spawnBlocking"| Blocking
-```
+1. Pushes onto a worker's deque (or the injection queue if no
+   worker is identifiable).
+2. Calls `notifyOneWorker()` → pick a parked worker via `@ctz` on
+   the bitmap, clear its bit, signal its condvar.
+3. The woken worker rejoins the dispatch loop from step 1.
 
-Worker threads are created during `Io.init()` and run until `deinit()`. Blocking pool threads are created dynamically when `concurrent()` is called and no idle thread is available.
+Multi-worker wakes always go through this path, which is why
+cross-thread spawns and reactor wakes touch the injection queue
+unconditionally — local-deque pushes alone wouldn't notify a
+parked worker.
 
-### Thread-local context
+## File map
 
-Each worker thread has thread-local storage for runtime context:
+| Concept | Source |
+|---|---|
+| Runtime + Config | `src/runtime.zig` |
+| Worker, dispatch loop | `src/scheduler/worker.zig` |
+| Chase-Lev deque | `src/scheduler/deque.zig` |
+| Injection queue | `src/scheduler/injection.zig` |
+| TLS (current coro/worker/runtime) | `src/scheduler/tls.zig` |
+| Park primitive | `src/scheduler/park.zig` |
+| Coroutine | `src/coroutine/coroutine.zig` |
+| Context switch (asm) | `src/coroutine/context_{arm64.zig, x86_64.S}` |
+| Stack alloc / pool | `src/coroutine/stack.zig`, `stack_pool.zig` |
+| Stack overflow recovery | `src/coroutine/stack_overflow.zig` |
+| Event sources | `src/coroutine/event_source.zig` |
+| Reactor dispatcher | `src/io/reactor.zig` |
+| kqueue backend | `src/io/reactor_kqueue.zig` |
+| epoll backend | `src/io/reactor_epoll.zig` |
+| io_uring backend | `src/io/reactor_iouring.zig` |
+| IOCP backend | `src/io/reactor_iocp.zig` |
+| Public API surface | `src/lib.zig` |
 
-```zig
-threadlocal var current_worker_idx: ?usize = null;
-threadlocal var current_scheduler: ?*Scheduler = null;
-threadlocal var current_header: ?*Header = null;
-```
-
-- `current_worker_idx` -- Used by schedule callbacks to push to the local LIFO slot instead of the global queue.
-- `current_scheduler` -- Used by `io.@"async"()` and sleep/timeout to access the scheduler from within a task.
-- `current_header` -- Used by async primitives (sleep, mutex.lock) to find the currently executing task and register wakers.
-
-## How components interact
-
-### Task spawning flow
-
-Internally, `io.@"async"(fn, args)` wraps the function in a `FnFuture` and
-calls into the engine's `Runtime.spawn`:
-
-```
-Runtime.spawn(F, future)
-    |
-    +--> FutureTask(F).create(allocator, future)
-    |        |
-    |        +--> Sets up vtable, result storage, scheduler callbacks
-    |
-    +--> Scheduler.spawn(&task.header)
-             |
-             +--> transitionToScheduled() (IDLE -> SCHEDULED)
-             +--> task.ref() (scheduler holds a reference)
-             +--> global_queue.push(task)
-             +--> wakeWorkerIfNeeded()
-
-    When spawning from a worker thread, Runtime.spawn() detects
-    the worker context and calls spawnFromWorker() instead:
-
-    +--> spawnFromWorker(worker_idx, &task.header)
-             |
-             +--> transitionToScheduled()
-             +--> task.ref()
-             +--> worker.tryScheduleLocal(task)  // LIFO slot
-                  (falls back to global queue if worker is parking)
-```
-
-The `spawnFromWorker` path is critical for the spawn+await fast path: the task lands in the LIFO slot, so the same worker executes it immediately without a round-trip through the global queue.
-
-### Task execution flow
-
-```
-Worker.executeTask(task)
-    |
-    +--> transitionFromSearching()    // Chain notification protocol
-    |
-    +--> task.transitionToRunning()   // SCHEDULED -> RUNNING
-    |
-    +--> task.poll()                  // Calls FutureTask.pollImpl()
-    |        |
-    |        +--> future.poll(&ctx)   // User's Future.poll()
-    |
-    +--> (result = .complete)
-    |        |
-    |        +--> task.transitionToComplete()
-    |        +--> task.unref() -> task.drop() if last ref
-    |
-    +--> (result = .pending)
-             |
-             +--> prev = task.transitionToIdle()  // RUNNING -> IDLE
-             |        (atomically clears notified, returns prev state)
-             |
-             +--> if prev.notified:
-                      task.transitionToScheduled()
-                      worker.tryScheduleLocal(task) or global_queue.push(task)
-```
-
-### I/O completion flow
-
-```
-Worker tick
-    |
-    +--> scheduler.pollIo()
-    |        |
-    |        +--> io_mutex.tryLock()  // Non-blocking, only one worker polls
-    |        +--> backend.wait(completions, timeout=0)
-    |        +--> for each completion:
-    |                 task = @ptrFromInt(completion.user_data)
-    |                 task.transitionToScheduled()
-    |                 global_queue.push(task)
-    |                 wakeWorkerIfNeeded()
-    |
-    +--> scheduler.pollTimers()  // Worker 0 only
-             |
-             +--> timer_mutex.lock()
-             +--> timer_wheel.poll()
-             +--> wake expired tasks
-```
-
-### Shutdown flow
-
-```
-Runtime.deinit()
-    |
-    +--> blocking_pool.deinit()      // Drain queue, join all threads
-    |
-    +--> scheduler.shutdown.store(true)
-    |
-    +--> Wake all workers (futex)
-    |
-    +--> Each worker:
-    |        +--> Drain LIFO slot (cancel + drop)
-    |        +--> Drain run queue (cancel + drop)
-    |        +--> Drain batch buffer (cancel + drop)
-    |        +--> Thread exits
-    |
-    +--> Join all worker threads
-    |
-    +--> timer_wheel.deinit() (free heap-allocated entries)
-    +--> backend.deinit()
-    +--> Free workers array, completions buffer
-```
-
-## Waker Lifecycle: End-to-End
-
-The following diagram shows how a task moves through the system when it suspends on an I/O operation and is later woken:
-
-```
-User Task              Scheduler              I/O Driver
-   |                      |                       |
-   | future.poll()        |                       |
-   |   -> .pending        |                       |
-   |                      |                       |
-   | store waker in       |                       |
-   | ScheduledIo          |                       |
-   +--------------------->|                       |
-   |                      |                       |
-   | (task suspended,     |                       |
-   |  worker runs other   |                       |
-   |  tasks)              |                       |
-   |                      |    [I/O event]        |
-   |                      |<----------------------+
-   |                      |                       |
-   |                      | waker.wake()          |
-   |                      | -> transitionToScheduled()
-   |                      | -> push to run queue  |
-   |                      |                       |
-   | future.poll()        |                       |
-   |<---------------------+                       |
-   |   -> .ready(value)   |                       |
-   |                      |                       |
-   | result returned      |                       |
-   | to caller            |                       |
-```
-
-The same flow applies to all waker-based operations: mutex unlock wakes a lock waiter, channel send wakes a recv waiter, timer expiry wakes a sleep future.
-
----
-
-## Comparison with Tokio
-
-Volt closely follows Tokio's architecture with Zig-specific adaptations:
-
-| Component | Tokio | Volt |
-|-----------|-------|----------|
-| Task state | `AtomicUsize` with bit packing | `packed struct(u64)` with CAS |
-| Work-steal queue | Chase-Lev deque (256 slots) | Chase-Lev deque (256 slots) |
-| LIFO slot | Separate atomic pointer | Separate atomic pointer |
-| Global queue | `Mutex<VecDeque>` | `Mutex` + intrusive linked list |
-| Timer wheel | Hierarchical (6 levels) | Hierarchical (5 levels) |
-| Worker parking | `AtomicUsize` packed state | Bitmap + futex |
-| Idle coordination | `num_searching` counter | `num_searching` + parked bitmap |
-| Worker wakeup | Linear scan for idle worker | O(1) `@ctz` on bitmap |
-| I/O driver | mio (epoll/kqueue/IOCP) | Direct platform backends |
-| Waker | `RawWaker` + vtable | `RawWaker` + vtable (same pattern) |
-| Blocking pool | `spawn_blocking()` | `concurrent()` (Volt user API) |
-| Cooperative budget | 128 polls per tick | 128 polls per tick |
-
-## Key constants
-
-| Constant | Value | Purpose |
-|----------|-------|---------|
-| `BUDGET_PER_TICK` | 128 | Max polls per tick per worker |
-| `MAX_LIFO_POLLS_PER_TICK` | 3 | LIFO cap to prevent starvation |
-| `MAX_GLOBAL_QUEUE_BATCH_SIZE` | 64 | Max tasks per global batch pull |
-| `MAX_WORKERS` | 64 | Max workers (bitmap width) |
-| `PARK_TIMEOUT_NS` | 10ms | Default park timeout |
-| `WorkStealQueue.CAPACITY` | 256 | Ring buffer slots per worker |
-| `NUM_LEVELS` | 5 | Timer wheel levels |
-| `SLOTS_PER_LEVEL` | 64 | Slots per timer wheel level |
-| `LEVEL_0_SLOT_NS` | 1ms | Level 0 timer resolution |
-
-## Zig's std.Io and Volt's Future
-
-Zig's [`std.Io`](https://github.com/ziglang/zig/tree/master/lib/std/Io) (in development, expected in 0.16) is a standard library I/O interface — an explicit handle passed like `Allocator`, with `async()`, `concurrent()`, and first-class cancellation via method calls (no async/await keywords). It ships with a `Threaded` backend (OS thread pool) plus proof-of-concept `IoUring` and `Kqueue` backends using stackful coroutines.
-
-`std.Io` provides I/O primitives (Mutex, Condition, Queue), but not a work-stealing scheduler, cooperative budgeting, or the rich sync/channel primitives Volt offers. Volt complements `std.Io` the same way Tokio complements Rust's `std::future`:
-
-- **Scheduling**: Volt's work-stealing scheduler with LIFO slot, Chase-Lev deque, and cooperative budgeting (128 polls/tick) — `std.Io.Threaded` uses a simple thread pool
-- **Sync primitives**: RwLock, Semaphore, Barrier, Notify, OnceCell with zero-allocation waiters — `std.Io` has Mutex and Condition
-- **Channels**: Vyukov MPMC Channel, Oneshot, Broadcast, Watch, Select — `std.Io` has Queue
-- **Structured concurrency**: `joinAll`, `race`, `select` combinators
-
-The goal is to complement the standard library, not compete with it. As `std.Io` stabilizes, Volt may adopt it as a backend while preserving the higher-level abstractions.
-
-## Source files
-
-| File | Purpose |
-|------|---------|
-| `src/runtime.zig` | Top-level Runtime struct |
-| `src/internal/scheduler/Scheduler.zig` | Work-stealing scheduler |
-| `src/internal/scheduler/Header.zig` | Task state machine + WorkStealQueue |
-| `src/internal/scheduler/TimerWheel.zig` | Hierarchical timer wheel |
-| `src/internal/scheduler/Runtime.zig` | Scheduler runtime wrapper |
-| `src/internal/blocking.zig` | Blocking thread pool |
-| `src/internal/backend.zig` | Platform I/O backend interface |
-| `src/internal/backend/kqueue.zig` | macOS kqueue backend |
-| `src/internal/backend/io_uring.zig` | Linux io_uring backend |
-| `src/internal/backend/epoll.zig` | Linux epoll backend |
-| `src/internal/backend/iocp.zig` | Windows IOCP backend |
+The whole runtime is ~10K lines. If you can read it, you can
+modify it.
