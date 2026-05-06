@@ -17,6 +17,7 @@ const syscall = @import("../internal/syscall.zig");
 const wait = @import("wait.zig");
 const io = @import("io.zig");
 const io_errors = @import("errors.zig");
+const traits = @import("traits/traits.zig");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Address — small wrapper around posix sockaddr_in / sockaddr_in6.
@@ -264,10 +265,76 @@ pub const TcpStream = struct {
     pub fn writeAll(self: *TcpStream, buf: []const u8) io.WriteError!void {
         return io.writeAll(self.fd, buf);
     }
+
+    // ── Trait surface ──────────────────────────────────────────────────
+    //
+    // `as_fd` is populated — a TcpStream is a real fd that participates
+    // in kernel-level zero-copy via `volt.io.copy`. Transforming
+    // wrappers (volt-tls future) MUST set `as_fd = null` even when
+    // they hold a TcpStream underneath, or `copy` will pipe raw bytes
+    // straight through and skip the TLS encrypt/decrypt step.
+
+    pub fn reader(self: *TcpStream) traits.Reader {
+        return .{ .ctx = @ptrCast(self), .vtable = &reader_vtable };
+    }
+
+    pub fn writer(self: *TcpStream) traits.Writer {
+        return .{ .ctx = @ptrCast(self), .vtable = &writer_vtable };
+    }
+
+    pub fn closer(self: *TcpStream) traits.Closer {
+        return .{ .ctx = @ptrCast(self), .vtable = &closer_vtable };
+    }
+
+    const reader_vtable: traits.Reader.VTable = .{
+        .read = &traitRead,
+        .as_fd = &traitAsFd,
+    };
+
+    const writer_vtable: traits.Writer.VTable = .{
+        .write = &traitWrite,
+        .as_fd = &traitAsFd,
+    };
+
+    const closer_vtable: traits.Closer.VTable = .{ .close = &traitClose };
+
+    fn traitRead(ctx: *anyopaque, buf: []u8) io_errors.ReadError!usize {
+        const self: *TcpStream = @ptrCast(@alignCast(ctx));
+        return io.read(self.fd, buf);
+    }
+
+    fn traitWrite(ctx: *anyopaque, buf: []const u8) io_errors.WriteError!usize {
+        const self: *TcpStream = @ptrCast(@alignCast(ctx));
+        return io.write(self.fd, buf);
+    }
+
+    fn traitClose(ctx: *anyopaque) void {
+        const self: *TcpStream = @ptrCast(@alignCast(ctx));
+        syscall.close(self.fd);
+    }
+
+    fn traitAsFd(ctx: *anyopaque) ?posix.fd_t {
+        const self: *TcpStream = @ptrCast(@alignCast(ctx));
+        return self.fd;
+    }
 };
 
 test "address: ip4 round-trip" {
     const addr = Address.initIp4(.{ 192, 168, 1, 50 }, 8080);
     try std.testing.expectEqual(@as(u16, posix.AF.INET), addr.family());
     try std.testing.expectEqual(@as(u16, 8080), addr.getPort());
+}
+
+test "TcpStream: trait surface compiles" {
+    // Structural check — verifies reader()/writer()/closer() exist and
+    // the vtable types align. Runtime behaviour exercised in
+    // src/test/io_traits_test.zig (P1.E) where a runtime is available.
+    var s: TcpStream = .{ .fd = -1 };
+    const r = s.reader();
+    const w = s.writer();
+    const c = s.closer();
+    // as_fd populated on both Reader and Writer.
+    try std.testing.expect(r.vtable.as_fd != null);
+    try std.testing.expect(w.vtable.as_fd != null);
+    _ = c; // Closer has no marker; just check the binding exists.
 }

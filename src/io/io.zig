@@ -15,6 +15,7 @@ const posix = std.posix;
 const syscall = @import("../internal/syscall.zig");
 const wait = @import("wait.zig");
 const io_errors = @import("errors.zig");
+const traits = @import("traits/traits.zig");
 
 pub const ReadError = io_errors.ReadError;
 pub const WriteError = io_errors.WriteError;
@@ -66,4 +67,82 @@ pub fn setNonblock(fd: posix.fd_t) FcntlError!void {
     const nonblock_bits: u32 = @bitCast(posix.O{ .NONBLOCK = true });
     if ((flags_raw & nonblock_bits) != 0) return;
     _ = try syscall.fcntl(fd, posix.F.SETFL, flags_raw | nonblock_bits);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Fd — generic non-blocking-fd-as-trait wrapper.
+//
+// Purpose: wrap a non-blocking fd Volt didn't open itself (a pipe,
+// an inherited socketpair, an FFI fd) as a Reader/Writer/Closer.
+// Useful for tests, FFI integrations, and the bench harnesses.
+//
+// Lifetime: Fd does NOT take ownership at init. `closer().close()`
+// DOES call close(), so don't hand a Closer for a borrowed fd. If
+// you only need read/write, skip closer() entirely.
+//
+// The fd MUST already be in non-blocking mode — the trait's read /
+// write delegate to volt.io.lowlevel.{read,write}, which assume
+// non-blocking and park on EAGAIN. Use setNonblock() before wrapping.
+// ─────────────────────────────────────────────────────────────────────
+
+pub const Fd = struct {
+    fd: posix.fd_t,
+
+    pub fn init(fd: posix.fd_t) Fd {
+        return .{ .fd = fd };
+    }
+
+    pub fn reader(self: *Fd) traits.Reader {
+        return .{ .ctx = @ptrCast(self), .vtable = &reader_vtable };
+    }
+
+    pub fn writer(self: *Fd) traits.Writer {
+        return .{ .ctx = @ptrCast(self), .vtable = &writer_vtable };
+    }
+
+    pub fn closer(self: *Fd) traits.Closer {
+        return .{ .ctx = @ptrCast(self), .vtable = &closer_vtable };
+    }
+
+    const reader_vtable: traits.Reader.VTable = .{
+        .read = &traitRead,
+        .as_fd = &traitAsFd,
+    };
+
+    const writer_vtable: traits.Writer.VTable = .{
+        .write = &traitWrite,
+        .as_fd = &traitAsFd,
+    };
+
+    const closer_vtable: traits.Closer.VTable = .{ .close = &traitClose };
+
+    fn traitRead(ctx: *anyopaque, buf: []u8) ReadError!usize {
+        const self: *Fd = @ptrCast(@alignCast(ctx));
+        return read(self.fd, buf);
+    }
+
+    fn traitWrite(ctx: *anyopaque, buf: []const u8) WriteError!usize {
+        const self: *Fd = @ptrCast(@alignCast(ctx));
+        return write(self.fd, buf);
+    }
+
+    fn traitClose(ctx: *anyopaque) void {
+        const self: *Fd = @ptrCast(@alignCast(ctx));
+        syscall.close(self.fd);
+    }
+
+    fn traitAsFd(ctx: *anyopaque) ?posix.fd_t {
+        const self: *Fd = @ptrCast(@alignCast(ctx));
+        return self.fd;
+    }
+};
+
+test "Fd: trait surface compiles" {
+    var f: Fd = .init(-1);
+    const r = f.reader();
+    const w = f.writer();
+    const c = f.closer();
+    try std.testing.expect(r.vtable.as_fd != null);
+    try std.testing.expect(w.vtable.as_fd != null);
+    _ = c;
 }

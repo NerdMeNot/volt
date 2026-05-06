@@ -270,6 +270,12 @@ pub const io = struct {
         pub const waitReadable = @import("io/wait.zig").waitReadable;
         pub const waitWritable = @import("io/wait.zig").waitWritable;
     };
+
+    /// Wrap a non-blocking fd as a Reader / Writer / Closer trait
+    /// value. For FFI and arbitrary-fd cases (pipes, inherited
+    /// socketpairs); TcpStream and File expose their own trait
+    /// methods directly. The fd must already be non-blocking.
+    pub const Fd = @import("io/io.zig").Fd;
 };
 
 pub const internal = struct {
