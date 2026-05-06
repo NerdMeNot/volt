@@ -371,6 +371,13 @@ pub const GetSockOptError = error{
     Unexpected,
 };
 
+pub const SetSockOptError = error{
+    SystemResources,
+    InvalidProtocolOption,
+    AccessDenied,
+    Unexpected,
+};
+
 pub const WaitError = error{
     Cancelled,
     OutOfMemory,

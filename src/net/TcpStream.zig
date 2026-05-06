@@ -14,7 +14,9 @@ const wait = @import("../io/wait.zig");
 const io = @import("../io/io.zig");
 const io_errors = @import("../io/errors.zig");
 const traits = @import("../io/traits/traits.zig");
+const sockopt = @import("sockopt.zig");
 const Address = @import("Address.zig").Address;
+const Duration = @import("../time.zig").Duration;
 
 pub const ConnectError =
     io_errors.SocketError ||
@@ -22,6 +24,9 @@ pub const ConnectError =
     io_errors.FcntlError ||
     io_errors.GetSockOptError ||
     error{ConnectFailed};
+
+/// Half-close direction for `TcpStream.shutdown`.
+pub const ShutdownHow = enum { read, write, both };
 
 pub const TcpStream = struct {
     fd: posix.socket_t,
@@ -61,6 +66,85 @@ pub const TcpStream = struct {
 
     pub fn writeAll(self: *TcpStream, buf: []const u8) io.WriteError!void {
         return io.writeAll(self.fd, buf);
+    }
+
+    /// Vectored read into a list of iovecs. Same EAGAIN-park pattern
+    /// as `read`. Returns total bytes copied across the iovecs.
+    pub fn readv(self: *TcpStream, iovs: []posix.iovec) io.ReadError!usize {
+        while (true) {
+            const r = syscall.readv(self.fd, iovs) catch |err| switch (err) {
+                error.WouldBlock => {
+                    try wait.waitReadable(self.fd);
+                    continue;
+                },
+                else => return err,
+            };
+            return r;
+        }
+    }
+
+    /// Vectored write. Returns bytes consumed across the iovecs (may
+    /// be less than the total — partial vectored writes split a vector).
+    pub fn writev(self: *TcpStream, iovs: []const posix.iovec_const) io.WriteError!usize {
+        while (true) {
+            const r = syscall.writev(self.fd, iovs) catch |err| switch (err) {
+                error.WouldBlock => {
+                    try wait.waitWritable(self.fd);
+                    continue;
+                },
+                else => return err,
+            };
+            return r;
+        }
+    }
+
+    /// Half-close one or both directions. After `shutdown(.write)`,
+    /// peer reads see EOF; after `shutdown(.read)`, further reads
+    /// return EOF locally. `shutdown(.both)` is the moral equivalent
+    /// of close() but leaves the fd valid for getsockname/getpeername
+    /// inspection.
+    pub fn shutdown(self: *TcpStream, how: ShutdownHow) io_errors.ShutdownError!void {
+        const how_syscall: syscall.ShutdownHow = switch (how) {
+            .read => .recv,
+            .write => .send,
+            .both => .both,
+        };
+        return syscall.shutdown(self.fd, how_syscall);
+    }
+
+    // ── Socket options ─────────────────────────────────────────────────
+    //
+    // Forwarders to volt.net.sockopt — convenience methods so callers
+    // don't have to reach for the raw fd. UDP / Unix sockets get the
+    // same shape.
+
+    pub fn setNoDelay(self: *TcpStream, value: bool) sockopt.SetOptionError!void {
+        return sockopt.setNoDelay(self.fd, value);
+    }
+
+    pub fn setKeepAlive(self: *TcpStream, value: bool) sockopt.SetOptionError!void {
+        return sockopt.setKeepAlive(self.fd, value);
+    }
+
+    pub fn setKeepAliveParams(
+        self: *TcpStream,
+        idle: Duration,
+        interval: Duration,
+        count: u32,
+    ) sockopt.SetOptionError!void {
+        return sockopt.setKeepAliveParams(self.fd, idle, interval, count);
+    }
+
+    pub fn setLinger(self: *TcpStream, value: ?Duration) sockopt.SetOptionError!void {
+        return sockopt.setLinger(self.fd, value);
+    }
+
+    pub fn setRecvBufSize(self: *TcpStream, bytes: usize) sockopt.SetOptionError!void {
+        return sockopt.setRecvBufSize(self.fd, bytes);
+    }
+
+    pub fn setSendBufSize(self: *TcpStream, bytes: usize) sockopt.SetOptionError!void {
+        return sockopt.setSendBufSize(self.fd, bytes);
     }
 
     // ── Trait surface ──────────────────────────────────────────────────

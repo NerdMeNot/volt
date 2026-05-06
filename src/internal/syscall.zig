@@ -654,6 +654,33 @@ pub fn getsockopt(
     }
 }
 
+pub const SetSockOptError = error{
+    SystemResources,
+    InvalidProtocolOption,
+    AccessDenied,
+} || std.posix.UnexpectedError;
+
+pub fn setsockopt(
+    fd: posix.socket_t,
+    level: i32,
+    optname: u32,
+    opt: []const u8,
+) SetSockOptError!void {
+    const len: posix.socklen_t = @intCast(opt.len);
+    switch (posix.errno(system.setsockopt(fd, level, @intCast(optname), opt.ptr, len))) {
+        .SUCCESS => return,
+        .BADF => unreachable,
+        .FAULT => unreachable,
+        .INVAL => return error.InvalidProtocolOption,
+        .NOMEM => return error.SystemResources,
+        .NOBUFS => return error.SystemResources,
+        .NOPROTOOPT => return error.InvalidProtocolOption,
+        .NOTSOCK => unreachable,
+        .ACCES, .PERM => return error.AccessDenied,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // unlinkatZ / fchmodat
 // ─────────────────────────────────────────────────────────────────────────────
