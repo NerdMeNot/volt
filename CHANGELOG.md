@@ -2,12 +2,81 @@
 
 All notable changes to Volt are documented in this file.
 
-## Unreleased — v1.1.0-zig0.16.0 (Phase 0: risk-mitigation foundation)
+## Unreleased — v1.1.0-zig0.16.0
 
-Phase 0 of the v1.1 cycle. No new features — this release locks
-contracts and seals leaks before the deep net/fs/mmap/streaming work
-in P1–P4. The repositioning **"Volt is the async standard library
-for Zig — runtime + net + fs + mmap"** starts here.
+The repositioning of Volt from "stackful coroutine runtime" to
+**"the async standard library for Zig — runtime + net + fs + mmap"**.
+Phase 0 was risk mitigation; Phase 1 the I/O trait surface and
+adapters; Phase 2 the networking depth.
+
+### Phase 2 — networking depth (`volt.net.*`)
+
+- `src/io/net.zig` promoted to its own folder `src/net/`. Tokio shape:
+  `volt.io` is the abstract trait surface, `volt.net` is one of the
+  concrete libraries built on it. `volt.io.{TcpListener,TcpStream,
+  Address}` remain as deprecated aliases for one minor cycle, removed
+  in v1.2.
+- **`Address`** — RFC 4291 IPv6 parser. Handles zero-compression
+  (`::`, `::1`, `fe80::1`, `2001:db8::1`), full eight-group form,
+  rejects multi-`::`, oversized groups, RFC 4291 violations.
+  IPv4-mapped (`::ffff:1.2.3.4`) and scope IDs (`fe80::1%en0`)
+  documented as deferred.
+- **`TcpStream`** — `shutdown(.read|.write|.both)` half-close;
+  `readv`/`writev` vectored I/O; convenience setters for
+  `setNoDelay`, `setKeepAlive[Params]`, `setLinger`, recv/send
+  buf sizes.
+- **`sockopt`** — typed setters reusable across stream types
+  (TcpStream, UdpSocket, Unix sockets).
+- **`UdpSocket`** — `bind`/`connect`/`sendTo`/`recvFrom`/`send`/`recv`,
+  `joinMulticast`/`leaveMulticast`, `setMulticastTtl`,
+  `setMulticastLoopback`, `setBroadcast`. IPv4 + IPv6 multicast.
+- **Unix sockets** — `UnixAddress`, `UnixListener`, `UnixStream`,
+  `UnixDatagram`. Trait surface (`reader`/`writer`/`closer` with
+  `as_fd`) on `UnixStream`. SCM_RIGHTS fd-passing deferred to v1.2
+  (needs `sendmsg`/`recvmsg` syscall wrappers and platform cmsg
+  layout dispatch).
+- **`dns`** — `lookupHost(allocator, name, port) ![]Address` and
+  `lookupHostFirst`. Honest about the architecture: `getaddrinfo`
+  on the blocking pool, not async DNS. Tokio, Trio, .NET all do
+  the same — universally available system resolver is blocking-only.
+- Integration tests for UDP loopback, Unix stream/datagram loopback,
+  DNS numeric + localhost resolution.
+
+### Phase 1 — I/O trait surface (`volt.io.*`)
+
+The keystone — without it, every later type would reinvent
+`read`/`write`/`close` and nothing would compose.
+
+- **6 traits** under `src/io/traits/` — `Reader`, `Writer`,
+  `Seeker`, `Closer`, `ReaderAt`, `WriterAt`. Vtable-based, blocking-
+  shaped (Go's `io.Reader` model) since stackful Volt suspends
+  transparently — no poll-based dance needed.
+- **Sentinel markers** — `as_fd` (kernel-level zero-copy hook) and
+  `as_bytes` (memory-direct hook) are nullable function pointers
+  on the Reader/Writer vtables. Vtable size capped ≤ 64 bytes via
+  `comptime` assertion. Marker-policy contract documented in
+  `traits.zig` — hard cap until v2.0; future hooks need a tagged-
+  union redesign.
+- **6 adapters** under `src/io/adapters/` — `BufReader` (with
+  `readUntil`, `readUntilAlloc`, `peek`), `BufWriter`, `LimitReader`,
+  `TeeReader` (best-effort mirror, capture errors via
+  `mirrorError()`), `lineIterator`, `chunked`.
+- **`copy(dst, src)`** in `src/io/copy.zig` — comptime+runtime
+  dispatch shape with `as_fd` / `as_bytes` fast-path queries. Kernel
+  fast-paths (sendfile/splice/copy_file_range) deferred to P3 where
+  `fs.File` provides the canonical use case.
+- `IoError` gains `EndOfStream` and `StreamTooLong`.
+- `volt.io.Fd` — generic non-blocking-fd-as-trait wrapper for FFI
+  and arbitrary-fd cases.
+- `TcpStream` retrofitted onto traits (`reader`/`writer`/`closer`
+  with `as_fd` populated).
+- Bench gate: `bench/bench_io_traits.zig` measures BufReader-via-
+  trait pipe throughput. ≤10% overhead vs.
+  `bench/bench_io_baseline.zig` is the merge gate (gate enforcement
+  pending Darwin throughput stabilisation; both benches inherit a
+  preexisting kqueue ping-pong flakiness under load).
+
+### Phase 0 — risk-mitigation foundation
 
 ### Breaking — public error surface
 

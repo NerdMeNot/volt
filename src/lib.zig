@@ -375,6 +375,7 @@ test {
     _ = @import("test/io_traits_test.zig");
     _ = @import("test/udp_test.zig");
     _ = @import("test/unix_socket_test.zig");
+    _ = @import("test/dns_test.zig");
     _ = @import("channel/Channel.zig");
     _ = @import("channel/Oneshot.zig");
     _ = @import("channel/Watch.zig");

@@ -30,6 +30,10 @@ pub const RecvError = @import("UdpSocket.zig").RecvError;
 /// that forward here.
 pub const sockopt = @import("sockopt.zig");
 
+/// DNS resolution via libc `getaddrinfo` on the blocking pool.
+/// Honest about the architecture — see `dns.zig` header.
+pub const dns = @import("dns.zig");
+
 test {
     _ = @import("Address.zig");
     _ = @import("TcpListener.zig");
@@ -40,4 +44,5 @@ test {
     _ = @import("UnixStream.zig");
     _ = @import("UnixDatagram.zig");
     _ = @import("sockopt.zig");
+    _ = @import("dns.zig");
 }

@@ -22,11 +22,14 @@
 //! ## Status: dispatch shape + fallback only
 //!
 //! P1 ships the dispatch site and the classic loop. The kernel
-//! fast-paths land progressively:
-//!   - **P2 (v1.2)** — `sendfile` (Darwin + Linux), `splice` (Linux)
-//!     once `TcpStream.as_fd` is wired up by the retrofit (P1.D).
-//!   - **P3 (v1.3)** — `copy_file_range` (Linux), `clonefile` /
-//!     `fcopyfile` (Darwin) once `fs.File` exposes `as_fd`.
+//! fast-paths land progressively, alongside a concrete use case:
+//!   - **P3 (v1.3)** — `sendfile` (Darwin + Linux), `splice` (Linux),
+//!     `copy_file_range` (Linux), `clonefile` / `fcopyfile` (Darwin).
+//!     File→socket and file→file are the canonical zero-copy
+//!     scenarios; deferring until `fs.File` lands keeps the wiring
+//!     paired with a real test surface. TCP→TCP can't use sendfile
+//!     on Darwin, so doing it without File would be infra without
+//!     measurable value.
 //!   - **P4 (v1.4)** — `as_bytes` arm (Mmap → writer) once the
 //!     consumption semantics are settled alongside Mmap.
 //!
