@@ -44,12 +44,18 @@ pub const Reader = struct {
         /// If the source is a contiguous in-memory byte slice (Mmap,
         /// in-RAM buffer), return it. Used by `volt.io.copy` to skip
         /// the read-loop entirely and write the slice directly.
-        as_byte_slice: ?*const fn (ctx: *anyopaque) ?[]const u8 = null,
+        as_bytes: ?*const fn (ctx: *anyopaque) ?[]const u8 = null,
 
         /// Optional vectored read. `Reader.readv` falls back to
         /// looping `read` if null.
         readv: ?*const fn (ctx: *anyopaque, iovs: []posix.iovec) ReadError!usize = null,
     };
+
+    comptime {
+        // Cap on vtable size: see traits.zig header for the marker
+        // policy. Catches future bloat before it ships.
+        std.debug.assert(@sizeOf(VTable) <= 64);
+    }
 
     /// Read up to `buf.len` bytes. Returns 0 on EOF.
     pub fn read(self: Reader, buf: []u8) ReadError!usize {
@@ -108,8 +114,8 @@ pub const Reader = struct {
     }
 
     /// True if the source is backed by a contiguous byte slice.
-    pub fn hasByteSlice(self: Reader) bool {
-        if (self.vtable.as_byte_slice) |fn_ptr| {
+    pub fn hasBytes(self: Reader) bool {
+        if (self.vtable.as_bytes) |fn_ptr| {
             return fn_ptr(self.ctx) != null;
         }
         return false;
@@ -130,7 +136,7 @@ pub const SliceReader = struct {
     pub fn reader(self: *SliceReader) Reader {
         return .{
             .ctx = @ptrCast(self),
-            .vtable = &.{ .read = &slice_read, .as_byte_slice = &slice_as_bytes },
+            .vtable = &.{ .read = &slice_read, .as_bytes = &slice_as_bytes },
         };
     }
 
@@ -177,8 +183,8 @@ test "Reader.discard: stops at EOF" {
     try std.testing.expectEqual(@as(u64, 6), try sr.reader().discard(100));
 }
 
-test "Reader.hasByteSlice: SliceReader exposes its backing" {
+test "Reader.hasBytes: SliceReader exposes its backing" {
     var sr = SliceReader{ .bytes = "data" };
-    try std.testing.expect(sr.reader().hasByteSlice());
+    try std.testing.expect(sr.reader().hasBytes());
     try std.testing.expect(!sr.reader().hasFd());
 }

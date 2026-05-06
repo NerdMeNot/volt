@@ -4,6 +4,23 @@
 //! trait lives in its own `*.zig` file for cohesion; this file is the
 //! single import point used by adapters (`BufReader`, `copy`, …) and
 //! by `lib.zig` for public re-export.
+//!
+//! ## Vtable marker policy
+//!
+//! Reader and Writer expose nullable function-pointer "markers"
+//! (`as_fd`, `as_bytes`) that fast-path consumers (`copy`) query for
+//! kernel-level zero-copy or memory-direct dispatch. The pattern is
+//! well-precedented (Go's `io.Copy` runtime type assertions, Rust's
+//! unstable specialisation) — this is the lowest-overhead version.
+//!
+//! **Hard cap until v2.0:** the current 2 markers + 1 op slot
+//! (`readv` / `writev` / `flush`). Each Reader/Writer vtable is
+//! comptime-asserted ≤ 64 bytes (see `Reader.zig` / `Writer.zig`).
+//! Any new optimisation hook beyond that requires a v2.0 trait
+//! redesign with a tagged-union `as_kind: ?KindTag` shape — adding
+//! `as_compressed`, `as_encrypted`, `as_chunked`, etc. ad-hoc would
+//! bloat every vtable for every consumer and tempt wrappers to lie
+//! about what they expose.
 
 pub const Reader = @import("Reader.zig").Reader;
 pub const ReadError = @import("Reader.zig").ReadError;

@@ -38,6 +38,12 @@ pub const Writer = struct {
         flush: ?*const fn (ctx: *anyopaque) WriteError!void = null,
     };
 
+    comptime {
+        // Cap on vtable size: see traits.zig header for the marker
+        // policy. Catches future bloat before it ships.
+        std.debug.assert(@sizeOf(VTable) <= 64);
+    }
+
     /// Write some prefix of `buf`. Returns bytes consumed.
     pub fn write(self: Writer, buf: []const u8) WriteError!usize {
         return self.vtable.write(self.ctx, buf);
