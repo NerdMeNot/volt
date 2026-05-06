@@ -245,6 +245,13 @@ pub const io = struct {
     pub const chunked = @import("io/adapters/chunked.zig").chunked;
     pub const ChunkIterator = @import("io/adapters/chunked.zig").ChunkIterator;
 
+    /// Trait-aware bulk transfer. Dispatches to kernel zero-copy
+    /// (sendfile/splice/copy_file_range) when both ends expose real
+    /// fds; falls through to a 64 KiB read+writeAll loop otherwise.
+    /// Single function — the kernel paths fill in across P2/P3/P4.
+    pub const copy = @import("io/copy.zig").copy;
+    pub const CopyError = @import("io/copy.zig").CopyError;
+
     /// Reactor types — exposed for users who want to register raw fds
     /// (e.g., custom OS resources, FFI integrations). Most code should
     /// reach for `TcpStream` / `TcpListener` instead.
@@ -332,6 +339,7 @@ test {
     _ = @import("io/adapters/TeeReader.zig");
     _ = @import("io/adapters/lines.zig");
     _ = @import("io/adapters/chunked.zig");
+    _ = @import("io/copy.zig");
     _ = Runtime;
     _ = Job;
     _ = @import("task/task.zig");
