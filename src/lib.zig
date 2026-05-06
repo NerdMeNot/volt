@@ -204,10 +204,20 @@ pub const CancellationToken = @import("sync/CancellationToken.zig").Cancellation
 /// losing branches when one wins.
 pub const select = @import("channel/select.zig").select;
 
+/// Networking — TcpListener, TcpStream, Address (P2.A: now lives
+/// under `volt.net`). Promoted out of `volt.io` since `volt.io` is
+/// the abstract trait surface and `volt.net` is one of the concrete
+/// libraries built on it. `volt.io.{TcpListener,TcpStream,Address}`
+/// remain as deprecated aliases for one minor cycle (removed in v1.2).
+pub const net = @import("net/net.zig");
+
 pub const io = struct {
-    pub const TcpListener = @import("io/net.zig").TcpListener;
-    pub const TcpStream = @import("io/net.zig").TcpStream;
-    pub const Address = @import("io/net.zig").Address;
+    /// Deprecated since v1.1 — moved to `volt.net.TcpListener`.
+    pub const TcpListener = @import("net/net.zig").TcpListener;
+    /// Deprecated since v1.1 — moved to `volt.net.TcpStream`.
+    pub const TcpStream = @import("net/net.zig").TcpStream;
+    /// Deprecated since v1.1 — moved to `volt.net.Address`.
+    pub const Address = @import("net/net.zig").Address;
 
     /// v1.1 error taxonomy. `IoError` is the master closed set; the
     /// per-operation aliases below (`ReadError`, `WriteError`, …) are
@@ -338,6 +348,7 @@ test {
     _ = @import("io/wait.zig");
     _ = @import("io/io.zig");
     _ = @import("io/net.zig");
+    _ = @import("net/net.zig");
     _ = @import("io/traits/traits.zig");
     _ = @import("io/adapters/BufReader.zig");
     _ = @import("io/adapters/BufWriter.zig");
