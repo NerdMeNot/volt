@@ -312,6 +312,7 @@ pub const RecvError = error{
     ConnectionRefused,
     ConnectionTimedOut,
     MessageTooBig,
+    AccessDenied,
     Cancelled,
     OutOfMemory,
     WaitRegistrationFailed,

@@ -373,6 +373,7 @@ test {
     _ = @import("test/scheduler_fuzz_test.zig");
     _ = @import("test/error_taxonomy_test.zig");
     _ = @import("test/io_traits_test.zig");
+    _ = @import("test/udp_test.zig");
     _ = @import("channel/Channel.zig");
     _ = @import("channel/Oneshot.zig");
     _ = @import("channel/Watch.zig");
