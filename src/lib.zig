@@ -70,14 +70,22 @@ pub const fs = struct {
     pub const readFile = @import("fs/fs.zig").readFile;
     pub const writeFile = @import("fs/fs.zig").writeFile;
 
-    /// P0 contract artifacts — type signatures for P3 (`Walker`) and
-    /// P4 (`Mmap`) are locked here so feature work can't renegotiate
-    /// them. Calling any method `@compileError`s with a pointer to the
-    /// implementing phase. See the file headers for the contracts.
+    /// P3 — file handle. All six trait surfaces (Reader, Writer,
+    /// Seeker, Closer, ReaderAt, WriterAt) implemented; I/O routes
+    /// through the blocking pool so workers stay responsive.
+    pub const File = @import("fs/File.zig").File;
+    pub const OpenOptions = @import("fs/OpenOptions.zig").OpenOptions;
+    pub const Metadata = @import("fs/Metadata.zig").Metadata;
+    pub const Kind = @import("fs/Metadata.zig").Kind;
+
+    /// P0 contract artifact (P4 implementation) — Mmap with locked
+    /// page-fault contract. Bodies @compileError until P4.
     pub const Mmap = @import("fs/Mmap.zig").Mmap;
     pub const MmapError = @import("fs/Mmap.zig").MmapError;
     pub const MapOptions = @import("fs/Mmap.zig").MapOptions;
     pub const AnonOptions = @import("fs/Mmap.zig").AnonOptions;
+
+    /// P0 contract artifact — Walker bodies fill in P3.B.
     pub const Walker = @import("fs/Walker.zig").Walker;
     pub const WalkOptions = @import("fs/Walker.zig").WalkOptions;
     pub const WalkError = @import("fs/Walker.zig").WalkError;
@@ -376,6 +384,7 @@ test {
     _ = @import("test/udp_test.zig");
     _ = @import("test/unix_socket_test.zig");
     _ = @import("test/dns_test.zig");
+    _ = @import("test/fs_file_test.zig");
     _ = @import("channel/Channel.zig");
     _ = @import("channel/Oneshot.zig");
     _ = @import("channel/Watch.zig");
@@ -397,6 +406,9 @@ test {
     _ = @import("blocking/Pool.zig");
     _ = @import("api/spawn_blocking.zig");
     _ = @import("fs/fs.zig");
+    _ = @import("fs/File.zig");
+    _ = @import("fs/OpenOptions.zig");
+    _ = @import("fs/Metadata.zig");
     _ = @import("process/Command.zig");
     _ = @import("observability/snapshot.zig");
     _ = @import("observability/metrics.zig");
