@@ -11,6 +11,12 @@ pub const ShutdownHow = @import("TcpStream.zig").ShutdownHow;
 pub const UdpSocket = @import("UdpSocket.zig").UdpSocket;
 pub const Datagram = @import("UdpSocket.zig").Datagram;
 
+pub const UnixAddress = @import("UnixAddress.zig").UnixAddress;
+pub const UnixListener = @import("UnixListener.zig").UnixListener;
+pub const UnixStream = @import("UnixStream.zig").UnixStream;
+pub const UnixDatagram = @import("UnixDatagram.zig").UnixDatagram;
+pub const UnixDatagramMessage = @import("UnixDatagram.zig").Datagram;
+
 pub const ListenError = @import("TcpListener.zig").ListenError;
 pub const AcceptError = @import("TcpListener.zig").AcceptError;
 pub const ConnectError = @import("TcpStream.zig").ConnectError;
@@ -29,5 +35,9 @@ test {
     _ = @import("TcpListener.zig");
     _ = @import("TcpStream.zig");
     _ = @import("UdpSocket.zig");
+    _ = @import("UnixAddress.zig");
+    _ = @import("UnixListener.zig");
+    _ = @import("UnixStream.zig");
+    _ = @import("UnixDatagram.zig");
     _ = @import("sockopt.zig");
 }
