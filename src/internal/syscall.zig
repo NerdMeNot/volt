@@ -35,7 +35,7 @@ inline fn errnoOf(signed: isize) std.posix.E {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub const SocketError = error{
-    PermissionDenied,
+    AccessDenied,
     AddressFamilyNotSupported,
     ProtocolFamilyNotAvailable,
     ProcessFdQuotaExceeded,
@@ -58,7 +58,7 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) SocketError!posix.sock
     const rc = system.socket(domain, native_type, protocol);
     switch (posix.errno(rc)) {
         .SUCCESS => {},
-        .ACCES => return error.PermissionDenied,
+        .ACCES => return error.AccessDenied,
         .AFNOSUPPORT => return error.AddressFamilyNotSupported,
         .INVAL => return error.ProtocolFamilyNotAvailable,
         .MFILE => return error.ProcessFdQuotaExceeded,
@@ -122,7 +122,7 @@ pub fn pipe() PipeError![2]posix.fd_t {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub const FcntlError = error{
-    PermissionDenied,
+    AccessDenied,
     FileBusy,
     ProcessFdQuotaExceeded,
     Locked,
@@ -147,7 +147,7 @@ pub fn fcntl(fd: posix.fd_t, cmd: i32, arg: usize) FcntlError!usize {
             .INVAL => unreachable,
             .MFILE => return error.ProcessFdQuotaExceeded,
             .NOTDIR => unreachable,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .SRCH => unreachable,
             .DEADLK => return error.DeadLock,
             .NOLCK => return error.LockedRegionLimitExceeded,
@@ -434,7 +434,6 @@ pub const ConnectError = error{
     AddressNotAvailable,
     AddressFamilyNotSupported,
     SystemResources,
-    PermissionDenied,
     ConnectionPending,
     ConnectionRefused,
     ConnectionResetByPeer,
@@ -449,7 +448,7 @@ pub fn connect(fd: posix.socket_t, addr: *const posix.sockaddr, len: posix.sockl
     while (true) {
         switch (posix.errno(system.connect(fd, addr, len))) {
             .SUCCESS => return,
-            .ACCES, .PERM => return error.PermissionDenied,
+            .ACCES, .PERM => return error.AccessDenied,
             .ADDRINUSE => return error.AddressInUse,
             .ADDRNOTAVAIL => return error.AddressNotAvailable,
             .AFNOSUPPORT => return error.AddressFamilyNotSupported,
@@ -632,7 +631,7 @@ pub const GetSockOptError = error{
     SystemResources,
     InvalidProtocolOption,
     TimeoutTooBig,
-    PermissionDenied,
+    AccessDenied,
 } || std.posix.UnexpectedError;
 
 pub fn getsockopt(

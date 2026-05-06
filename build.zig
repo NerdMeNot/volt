@@ -63,19 +63,28 @@ pub fn build(b: *std.Build) void {
     });
     b.step("docs", "Generate documentation").dependOn(&install_docs.step);
 
-    // Benchmarks — `zig build bench` runs `bench/bench_core.zig`.
-    const bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/bench_core.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    bench_mod.addImport("volt", b.modules.get("volt").?);
-    const bench_exe = b.addExecutable(.{
-        .name = "volt-bench",
-        .root_module = bench_mod,
-    });
-    const bench_run = b.addRunArtifact(bench_exe);
-    b.step("bench", "Run core benchmarks (ReleaseFast)").dependOn(&bench_run.step);
+    // Benchmarks — `zig build bench` runs `bench/bench_core.zig`,
+    // `zig build bench-io-baseline` runs the v1.1 I/O baseline used as
+    // the gate for P1's BufReader-via-trait acceptance criterion (≤10%
+    // overhead vs. raw `io.lowlevel.read`).
+    const benches = [_]struct { name: []const u8, src: []const u8, step: []const u8, desc: []const u8 }{
+        .{ .name = "core", .src = "bench/bench_core.zig", .step = "bench", .desc = "Run core benchmarks (ReleaseFast)" },
+        .{ .name = "io-baseline", .src = "bench/bench_io_baseline.zig", .step = "bench-io-baseline", .desc = "Run pipe-throughput baseline used as the P1 trait-overhead gate" },
+    };
+    for (benches) |b_| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(b_.src),
+            .target = target,
+            .optimize = .ReleaseFast,
+        });
+        mod.addImport("volt", b.modules.get("volt").?);
+        const exe = b.addExecutable(.{
+            .name = b.fmt("volt-bench-{s}", .{b_.name}),
+            .root_module = mod,
+        });
+        const run = b.addRunArtifact(exe);
+        b.step(b_.step, b_.desc).dependOn(&run.step);
+    }
 
     // Cookbook examples — `zig build run-echo`, `zig build run-fan-out`,
     // `zig build run-work-offload`, `zig build run-timeout-retry`.

@@ -2,6 +2,73 @@
 
 All notable changes to Volt are documented in this file.
 
+## Unreleased — v1.1.0-zig0.16.0 (Phase 0: risk-mitigation foundation)
+
+Phase 0 of the v1.1 cycle. No new features — this release locks
+contracts and seals leaks before the deep net/fs/mmap/streaming work
+in P1–P4. The repositioning **"Volt is the async standard library
+for Zig — runtime + net + fs + mmap"** starts here.
+
+### Breaking — public error surface
+
+Public types in `volt.io.{io,wait,net}` and `volt.fs` no longer leak
+`syscall.*Error` unions. They are re-typed against the new
+`volt.io.errors.IoError` master closed set and per-operation subsets
+(`ReadError`, `WriteError`, `ConnectError`, `AcceptError`, `BindError`,
+`ListenError`, `ShutdownError`, `SocketError`, `SendError`, `RecvError`,
+`OpenError`, `StatError`, `FcntlError`, `GetSockOptError`, `SyncError`,
+`SeekError`, `WaitError`).
+
+The taxonomy is platform-neutral: kqueue's `EventNotFound` and
+epoll's `EpollCtlFailed` / `TimerfdSettimeFailed` collapse to the
+single `error.WaitRegistrationFailed` so the public surface no longer
+reveals which reactor backend is active.
+
+`syscall.zig` standardises on `error.AccessDenied` everywhere it used
+to emit `error.PermissionDenied` — the duplicate name is gone.
+
+**Migration:** every error tag a v1.0 user could `catch |err| switch
+(err)` against still exists in the new sub-sets (verified by
+`src/test/error_taxonomy_test.zig`). The breakage is the concrete
+*type*, not the names — `error.BrokenPipe`, `error.ConnectionRefused`,
+`error.WouldBlock`, etc. all survive. No compat shim ships; no
+external consumers exist yet.
+
+### Added
+
+- `volt.io.errors` namespace, `volt.io.IoError`, `volt.io.fromErrno`
+  (errno → IoError translator).
+- `src/test/error_taxonomy_test.zig` — verifies `fromErrno` covers
+  every errno of interest and contains a historical-name compile-fence
+  that refuses to merge any change deleting a v1.0-era error name.
+- `bench/bench_io_baseline.zig` — pipe-throughput baseline for
+  `volt.io.lowlevel.read`. P1's BufReader-via-trait benchmark must
+  land within 10% of this number to merge. Wired as
+  `zig build bench-io-baseline`.
+
+### Contracts locked (stub only — implementations in P3 / P4)
+
+- `volt.fs.Mmap` — full API surface (`mapFile`, `anonymous`, `slice`,
+  `advise`, **`prefault`**, `lock`, `unlock`, `flush`, `protect`,
+  `remap`, `deinit`) with `@compileError` bodies. The page-fault
+  contract (Risk #3) and `remap`-returns-new-slice contract (Risk #4)
+  are documented in the file header and embedded in the type
+  signature respectively.
+- `volt.fs.Walker` — `WalkOptions { max_depth = 4096, follow_symlinks,
+  skip_hidden }`, `Walker.next` / `Walker.skipSubtree` / `Walker.deinit`,
+  `error.MaxDepthExceeded`. Risk #5 mitigation is in the API shape —
+  bodies fill in P3.
+
+### Risks status
+
+| Risk | Mitigation | Status |
+|---|---|---|
+| #1 Error taxonomy break | Volt-owned `IoError` + sub-sets + name preservation | **Mitigated** in this release |
+| #2 Vtable cost on hot reads | Baseline bench + 10% gate documented | **Gate landed**; trait-side bench in P1 |
+| #3 Mmap page faults | `prefault` API + honest doc header | **Contract locked**; impl in P4 |
+| #4 `remap` address move | Signature returns new slice | **Contract locked**; impl in P4 |
+| #5 Walker stack depth | `max_depth` cap + `skipSubtree` | **Contract locked**; impl in P3 |
+
 ## v1.0.0-zig0.16.0
 
 First release on the **stackful coroutine** architecture. The previous

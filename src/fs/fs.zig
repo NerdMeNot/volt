@@ -1,13 +1,21 @@
 //! `volt.fs` — async filesystem operations.
 //!
-//! v0.7 first cut: `readFile` and `writeFile`, both wrapping blocking
-//! posix syscalls via `spawnBlocking`. The blocking pool keeps the
-//! filesystem call off the worker thread; the calling coroutine parks
-//! and resumes when the syscall returns.
+//! v1.1 stub: `readFile` and `writeFile`, both wrapping blocking posix
+//! syscalls via `spawnBlocking`. The blocking pool keeps the filesystem
+//! call off the worker thread; the calling coroutine parks and resumes
+//! when the syscall returns.
 //!
-//! v0.9+ Linux build will route these through io_uring when the kernel
-//! supports it (kernel 5.6+ for IORING_OP_OPENAT/READ/WRITE), keeping
-//! the same public API.
+//! ## Error contract (P0 → P3)
+//!
+//! Public functions here currently return inferred error sets.
+//! `volt.io.errors` defines `OpenError`, `ReadError`, `WriteError`, etc.
+//! that the v1.3 `File` rewrite will narrow these to. Until then,
+//! callers should treat the surface as `anyerror!T` and rely on
+//! `volt.io.errors.fromErrno` if they need to translate manually.
+//!
+//! The narrowing is blocked on `spawnBlocking` adopting an
+//! `ErrorSetOf(user_fn)` return signature; today it widens to anyerror
+//! internally because `result_err: anyerror`. Out of P0 scope.
 
 const std = @import("std");
 const posix = std.posix;

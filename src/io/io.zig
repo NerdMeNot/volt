@@ -14,9 +14,11 @@ const std = @import("std");
 const posix = std.posix;
 const syscall = @import("../internal/syscall.zig");
 const wait = @import("wait.zig");
+const io_errors = @import("errors.zig");
 
-pub const ReadError = syscall.ReadError || wait.WaitError;
-pub const WriteError = syscall.WriteError || wait.WaitError;
+pub const ReadError = io_errors.ReadError;
+pub const WriteError = io_errors.WriteError;
+pub const FcntlError = io_errors.FcntlError;
 
 /// Async read. Returns 0 only on EOF; otherwise the bytes copied.
 pub fn read(fd: posix.fd_t, buf: []u8) ReadError!usize {
@@ -59,7 +61,7 @@ pub fn writeAll(fd: posix.fd_t, buf: []const u8) WriteError!void {
 
 /// Put `fd` into non-blocking mode (O_NONBLOCK). Idempotent — returns early
 /// if the flag is already set.
-pub fn setNonblock(fd: posix.fd_t) syscall.FcntlError!void {
+pub fn setNonblock(fd: posix.fd_t) FcntlError!void {
     const flags_raw = try syscall.fcntl(fd, posix.F.GETFL, 0);
     const nonblock_bits: u32 = @bitCast(posix.O{ .NONBLOCK = true });
     if ((flags_raw & nonblock_bits) != 0) return;

@@ -16,6 +16,7 @@ const builtin = @import("builtin");
 const syscall = @import("../internal/syscall.zig");
 const wait = @import("wait.zig");
 const io = @import("io.zig");
+const io_errors = @import("errors.zig");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Address — small wrapper around posix sockaddr_in / sockaddr_in6.
@@ -164,15 +165,14 @@ test "Address.any4/loopback4 round-trip port" {
 // Errors
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub const ListenError = syscall.SocketError || syscall.BindError ||
-    syscall.ListenError || syscall.FcntlError;
+pub const ListenError = io_errors.SocketError || io_errors.BindError ||
+    io_errors.ListenError || io_errors.FcntlError;
 
-pub const AcceptError = syscall.AcceptError || wait.WaitError ||
-    syscall.FcntlError;
+pub const AcceptError = io_errors.AcceptError || io_errors.FcntlError;
 
-pub const ConnectError = syscall.SocketError || syscall.ConnectError ||
-    syscall.FcntlError || syscall.GetSockOptError ||
-    wait.WaitError || error{ConnectFailed};
+pub const ConnectError = io_errors.SocketError || io_errors.ConnectError ||
+    io_errors.FcntlError || io_errors.GetSockOptError ||
+    error{ConnectFailed};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TcpListener

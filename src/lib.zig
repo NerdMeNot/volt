@@ -66,7 +66,22 @@ pub const Interval = @import("time/Interval.zig").Interval;
 pub const stream = @import("stream/Stream.zig");
 pub const Stream = stream.Stream;
 
-pub const fs = @import("fs/fs.zig");
+pub const fs = struct {
+    pub const readFile = @import("fs/fs.zig").readFile;
+    pub const writeFile = @import("fs/fs.zig").writeFile;
+
+    /// P0 contract artifacts — type signatures for P3 (`Walker`) and
+    /// P4 (`Mmap`) are locked here so feature work can't renegotiate
+    /// them. Calling any method `@compileError`s with a pointer to the
+    /// implementing phase. See the file headers for the contracts.
+    pub const Mmap = @import("fs/Mmap.zig").Mmap;
+    pub const MmapError = @import("fs/Mmap.zig").MmapError;
+    pub const MapOptions = @import("fs/Mmap.zig").MapOptions;
+    pub const AnonOptions = @import("fs/Mmap.zig").AnonOptions;
+    pub const Walker = @import("fs/Walker.zig").Walker;
+    pub const WalkOptions = @import("fs/Walker.zig").WalkOptions;
+    pub const WalkError = @import("fs/Walker.zig").WalkError;
+};
 
 pub const process = struct {
     const cmd_mod = @import("process/Command.zig");
@@ -125,8 +140,8 @@ pub const coroutine = struct {
     ///
     /// Prefer `Job.setName` / `Task.setName` when you have a handle.
     pub fn setCurrentName(name: []const u8) void {
-        const tls = @import("scheduler/tls.zig");
-        if (tls.currentCoroutine()) |coro| coro.name = name;
+        const current = @import("scheduler/current.zig");
+        if (current.currentCoroutine()) |coro| coro.name = name;
     }
 
     /// Annotate the *currently-running* coroutine with a spawn-site
@@ -134,13 +149,13 @@ pub const coroutine = struct {
     /// `Job.setSpawnSite` but reads the active coroutine from TLS —
     /// only callable from inside that coroutine itself.
     pub fn setCurrentSpawnSite(src: std.builtin.SourceLocation) void {
-        const tls = @import("scheduler/tls.zig");
-        if (tls.currentCoroutine()) |coro| coro.spawn_site = src;
+        const current = @import("scheduler/current.zig");
+        if (current.currentCoroutine()) |coro| coro.spawn_site = src;
     }
 };
 
 pub const scheduler = struct {
-    pub const tls = @import("scheduler/tls.zig");
+    pub const current = @import("scheduler/current.zig");
     pub const Worker = @import("scheduler/worker.zig").Worker;
     pub const Injection = @import("scheduler/injection.zig").Injection;
     pub const park = @import("scheduler/park.zig");
@@ -193,6 +208,14 @@ pub const io = struct {
     pub const TcpListener = @import("io/net.zig").TcpListener;
     pub const TcpStream = @import("io/net.zig").TcpStream;
     pub const Address = @import("io/net.zig").Address;
+
+    /// v1.1 error taxonomy. `IoError` is the master closed set; the
+    /// per-operation aliases below (`ReadError`, `WriteError`, …) are
+    /// curated subsets. Replaces the leaky `syscall.*Error` unions
+    /// from v1.0; see CHANGELOG for migration notes.
+    pub const errors = @import("io/errors.zig");
+    pub const IoError = errors.IoError;
+    pub const fromErrno = errors.fromErrno;
 
     /// Reactor types — exposed for users who want to register raw fds
     /// (e.g., custom OS resources, FFI integrations). Most code should
@@ -253,7 +276,7 @@ test {
     _ = coroutine.context;
     _ = coroutine.spawn_helper;
     _ = coroutine.event_source;
-    _ = scheduler.tls;
+    _ = scheduler.current;
     _ = scheduler.Worker;
     _ = scheduler.Injection;
     _ = scheduler.park;
@@ -288,6 +311,7 @@ test {
     _ = @import("test/scheduler_stress_test.zig");
     _ = @import("test/park_stress_test.zig");
     _ = @import("test/scheduler_fuzz_test.zig");
+    _ = @import("test/error_taxonomy_test.zig");
     _ = @import("channel/Channel.zig");
     _ = @import("channel/Oneshot.zig");
     _ = @import("channel/Watch.zig");
