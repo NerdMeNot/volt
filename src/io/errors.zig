@@ -37,6 +37,11 @@ pub const IoError = error{
     BrokenPipe,
     InputOutput,
     Unseekable,
+    /// Returned by helper methods like `Reader.readAll` / `Reader.readByte`
+    /// when EOF occurs before the requested byte count is satisfied.
+    /// The plain `read` method returns 0 on EOF — only the "must read N"
+    /// helpers convert that to an error.
+    EndOfStream,
 
     // Permissions
     AccessDenied,
@@ -148,6 +153,7 @@ pub const ReadError = error{
     OutOfMemory,
     SystemResources,
     WaitRegistrationFailed,
+    EndOfStream,
     Unexpected,
 };
 

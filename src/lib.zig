@@ -217,6 +217,20 @@ pub const io = struct {
     pub const IoError = errors.IoError;
     pub const fromErrno = errors.fromErrno;
 
+    /// v1.1 trait surface — vtable-based byte-level Reader / Writer /
+    /// Seeker / Closer / ReaderAt / WriterAt. Stackful Volt suspends
+    /// transparently at I/O sites, so these are blocking-shaped (Go's
+    /// `io.Reader` model) rather than poll-based. Adapters (BufReader,
+    /// copy, …) compose over the traits without knowing the concrete
+    /// source/sink type.
+    pub const traits = @import("io/traits/traits.zig");
+    pub const Reader = traits.Reader;
+    pub const Writer = traits.Writer;
+    pub const Seeker = traits.Seeker;
+    pub const Closer = traits.Closer;
+    pub const ReaderAt = traits.ReaderAt;
+    pub const WriterAt = traits.WriterAt;
+
     /// Reactor types — exposed for users who want to register raw fds
     /// (e.g., custom OS resources, FFI integrations). Most code should
     /// reach for `TcpStream` / `TcpListener` instead.
@@ -297,6 +311,7 @@ test {
     _ = @import("io/wait.zig");
     _ = @import("io/io.zig");
     _ = @import("io/net.zig");
+    _ = @import("io/traits/traits.zig");
     _ = Runtime;
     _ = Job;
     _ = @import("task/task.zig");
