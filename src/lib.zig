@@ -231,6 +231,20 @@ pub const io = struct {
     pub const ReaderAt = traits.ReaderAt;
     pub const WriterAt = traits.WriterAt;
 
+    /// Composable trait adapters. `BufReader` / `BufWriter` add
+    /// buffering. `LimitReader` caps total bytes (frame parsing).
+    /// `TeeReader` mirrors reads to a side writer (hashing, audit).
+    /// `lineIterator` and `chunked` are streaming iterators over
+    /// a `Reader`.
+    pub const BufReader = @import("io/adapters/BufReader.zig").BufReader;
+    pub const BufWriter = @import("io/adapters/BufWriter.zig").BufWriter;
+    pub const LimitReader = @import("io/adapters/LimitReader.zig").LimitReader;
+    pub const TeeReader = @import("io/adapters/TeeReader.zig").TeeReader;
+    pub const lineIterator = @import("io/adapters/lines.zig").lineIterator;
+    pub const LineIterator = @import("io/adapters/lines.zig").LineIterator;
+    pub const chunked = @import("io/adapters/chunked.zig").chunked;
+    pub const ChunkIterator = @import("io/adapters/chunked.zig").ChunkIterator;
+
     /// Reactor types — exposed for users who want to register raw fds
     /// (e.g., custom OS resources, FFI integrations). Most code should
     /// reach for `TcpStream` / `TcpListener` instead.
@@ -312,6 +326,12 @@ test {
     _ = @import("io/io.zig");
     _ = @import("io/net.zig");
     _ = @import("io/traits/traits.zig");
+    _ = @import("io/adapters/BufReader.zig");
+    _ = @import("io/adapters/BufWriter.zig");
+    _ = @import("io/adapters/LimitReader.zig");
+    _ = @import("io/adapters/TeeReader.zig");
+    _ = @import("io/adapters/lines.zig");
+    _ = @import("io/adapters/chunked.zig");
     _ = Runtime;
     _ = Job;
     _ = @import("task/task.zig");

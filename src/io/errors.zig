@@ -42,6 +42,11 @@ pub const IoError = error{
     /// The plain `read` method returns 0 on EOF — only the "must read N"
     /// helpers convert that to an error.
     EndOfStream,
+    /// Returned by `BufReader.readUntil` (and friends) when the
+    /// delimiter wasn't found within the caller's bound. Lets parsers
+    /// reject pathological / malicious inputs without unbounded
+    /// allocation.
+    StreamTooLong,
 
     // Permissions
     AccessDenied,
@@ -154,6 +159,7 @@ pub const ReadError = error{
     SystemResources,
     WaitRegistrationFailed,
     EndOfStream,
+    StreamTooLong,
     Unexpected,
 };
 
