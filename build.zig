@@ -70,6 +70,7 @@ pub fn build(b: *std.Build) void {
     const benches = [_]struct { name: []const u8, src: []const u8, step: []const u8, desc: []const u8 }{
         .{ .name = "core", .src = "bench/bench_core.zig", .step = "bench", .desc = "Run core benchmarks (ReleaseFast)" },
         .{ .name = "io-baseline", .src = "bench/bench_io_baseline.zig", .step = "bench-io-baseline", .desc = "Run pipe-throughput baseline used as the P1 trait-overhead gate" },
+        .{ .name = "io-traits", .src = "bench/bench_io_traits.zig", .step = "bench-io-traits", .desc = "Run BufReader-via-trait pipe throughput (compare to bench-io-baseline; ≤10% slower)" },
     };
     for (benches) |b_| {
         const mod = b.createModule(.{
