@@ -97,6 +97,15 @@ pub const fs = struct {
     pub const TempDir = @import("fs/temp.zig").TempDir;
     pub const TempFile = @import("fs/temp.zig").TempFile;
 
+    /// Filesystem change watcher. Linux: per-event granularity via
+    /// inotify. Darwin: coarse-grained "directory changed" events
+    /// via kqueue EVFILT_VNODE (per-file granularity is a v1.2
+    /// follow-up). See `Watcher.zig` header for the platform
+    /// asymmetry.
+    pub const Watcher = @import("fs/Watcher.zig").Watcher;
+    pub const WatchEvent = @import("fs/Watcher.zig").Event;
+    pub const WatchEventMask = @import("fs/Watcher.zig").EventMask;
+
     /// P0 contract artifact (P4 implementation) — Mmap with locked
     /// page-fault contract. Bodies @compileError until P4.
     pub const Mmap = @import("fs/Mmap.zig").Mmap;
@@ -410,6 +419,7 @@ test {
     _ = @import("test/fs_tree_test.zig");
     _ = @import("test/zero_copy_test.zig");
     _ = @import("test/scm_rights_test.zig");
+    _ = @import("test/watcher_test.zig");
     _ = @import("channel/Channel.zig");
     _ = @import("channel/Oneshot.zig");
     _ = @import("channel/Watch.zig");
