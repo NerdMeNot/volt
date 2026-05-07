@@ -130,8 +130,12 @@ pub const Reactor = struct {
     /// same dispatch shape as fd-based waits.
     ///
     /// Implementation: kqueue's EVFILT_TIMER with EV_ONESHOT + NOTE_NSECONDS.
-    /// `ident` is a per-reactor unique counter (NOT an fd).
-    pub fn registerTimer(self: *Reactor, duration_ns: u64, target: *anyopaque) !void {
+    /// `ident` is a per-reactor unique counter (NOT an fd). Returns
+    /// the id so callers can unregister on cancellation — without
+    /// this, a cancelled sleep leaks a kqueue registration AND a
+    /// pending-count increment, wedging idle workers in `poll`
+    /// (they wait the timer out, which can be hours).
+    pub fn registerTimer(self: *Reactor, duration_ns: u64, target: *anyopaque) !u64 {
         const id = self.timer_id.fetchAdd(1, .monotonic);
         const ev = posix.Kevent{
             .ident = @intCast(id),
@@ -145,6 +149,57 @@ pub const Reactor = struct {
         var dummy: [0]posix.Kevent = undefined;
         _ = try syscall.kevent(self.kq, &changes, &dummy, null);
         _ = self.pending.fetchAdd(1, .release);
+        return id;
+    }
+
+    /// Cancel a pending timer registration. If the timer hasn't
+    /// fired yet, EV_DELETE removes it and we decrement pending.
+    /// If it already fired (poll loop ran the wake), kqueue returns
+    /// EventNotFound — we swallow it (pending was already decremented
+    /// by the poll loop).
+    pub fn unregisterTimer(self: *Reactor, id: u64) void {
+        const ev = posix.Kevent{
+            .ident = @intCast(id),
+            .filter = system.EVFILT.TIMER,
+            .flags = system.EV.DELETE,
+            .fflags = 0,
+            .data = 0,
+            .udata = 0,
+        };
+        const changes = [_]posix.Kevent{ev};
+        var dummy: [0]posix.Kevent = undefined;
+        if (syscall.kevent(self.kq, &changes, &dummy, null)) |_| {
+            _ = self.pending.fetchSub(1, .release);
+        } else |err| switch (err) {
+            error.EventNotFound => {}, // already fired — poll decremented
+            else => {}, // best-effort; don't escalate cleanup errors
+        }
+    }
+
+    /// Cancel a pending fd wait registration. Same EV_DELETE
+    /// semantics as `unregisterTimer`. Used by `volt.io.wait*` on
+    /// cancellation to keep kqueue / pending counter in sync.
+    pub fn unregisterWait(self: *Reactor, fd: posix.fd_t, kind: EventKind) void {
+        const ev = posix.Kevent{
+            .ident = @intCast(fd),
+            .filter = filterFor(kind),
+            .flags = system.EV.DELETE,
+            .fflags = 0,
+            .data = 0,
+            .udata = 0,
+        };
+        const changes = [_]posix.Kevent{ev};
+        var dummy: [0]posix.Kevent = undefined;
+        if (syscall.kevent(self.kq, &changes, &dummy, null)) |_| {
+            self.mutex.lock();
+            const key = WaitKey{ .fd = @intCast(fd), .kind_tag = @intFromEnum(kind) };
+            _ = self.waiters.remove(key);
+            self.mutex.unlock();
+            _ = self.pending.fetchSub(1, .release);
+        } else |err| switch (err) {
+            error.EventNotFound => {},
+            else => {},
+        }
     }
 
     /// Arm a one-shot wait for (fd, kind). The `target` pointer is opaque

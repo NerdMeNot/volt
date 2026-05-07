@@ -15,7 +15,7 @@
 const std = @import("std");
 const Duration = @import("../time.zig").Duration;
 const runtime_mod = @import("../runtime.zig");
-const tls = @import("../scheduler/tls.zig");
+const current = @import("../scheduler/current.zig");
 const Park = @import("../scheduler/park.zig").Park;
 
 /// Union of errors `Reactor.registerTimer` can return on any backend
@@ -41,7 +41,7 @@ pub const SleepError = error{
 pub fn sleep(duration: Duration) SleepError!void {
     const rt = runtime_mod.currentRuntime() orelse
         @panic("volt.sleep called outside a runtime");
-    const coro = tls.currentCoroutine() orelse
+    const coro = current.currentCoroutine() orelse
         @panic("volt.sleep called outside a coroutine");
 
     if (coro.isCancelled()) return error.Cancelled;
@@ -51,8 +51,20 @@ pub fn sleep(duration: Duration) SleepError!void {
     // Park on the calling coroutine's stack. Stable for the duration
     // of the sleep — the coroutine can't return while parked.
     var park: Park = .{};
-    try rt.reactor.registerTimer(ns, @ptrCast(&park));
-    try park.parkCurrent();
+    const timer_id = try rt.reactor.registerTimer(ns, @ptrCast(&park));
+    park.parkCurrent() catch |err| switch (err) {
+        error.Cancelled => {
+            // Cancellation: the timer is still registered with kqueue
+            // and the pending counter is still inflated. Without the
+            // unregister, idle workers would block on `poll` waiting
+            // for the timer to fire — which for an hour-long sleep
+            // means the runtime wedges. Unregister cleans both up.
+            rt.reactor.unregisterTimer(timer_id);
+            return error.Cancelled;
+        },
+    };
+    // Successful wake: timer fired (EV_ONESHOT auto-removed it from
+    // kqueue, poll decremented pending). Nothing to clean up.
 }
 
 // ─────────────────────────────────────────────────────────────────────

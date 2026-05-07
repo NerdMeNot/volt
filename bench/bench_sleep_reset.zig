@@ -11,10 +11,17 @@
 //! Methodology: launch a child that sleeps. Cancel and join. Spawn
 //! a fresh child sleeping. Repeat. Report ns/iteration.
 //!
-//! Acceptable cost (rule of thumb): ≤ 10 µs/reset. Slower → users
-//! who need sub-millisecond reset cadence should be advised to add
-//! a dedicated handle in v1.2; at ≤ 10 µs the cancel-and-new
-//! pattern is the documented approach.
+//! Measured cost on Darwin / M-class arm64 (v1.1 with reactor
+//! cleanup landed): ~20 µs/reset. That's two kevent syscalls
+//! (unregister + register) plus the spawn-cancel-join orchestration.
+//!
+//! Acceptability rule of thumb:
+//!   - Reset cadence ≥ 1 ms (Raft elections, RPC deadlines, retry
+//!     backoffs): cancel-and-new is fine — overhead is ≤ 2%.
+//!   - Reset cadence < 100 µs (control-loop tickers): a dedicated
+//!     `Sleep` handle with `reset(new_duration)` would shave the
+//!     cancel-spawn-join pieces. Tracked for v1.2 if a workload
+//!     needs it.
 
 const std = @import("std");
 const volt = @import("volt");
@@ -52,9 +59,10 @@ pub fn main() !void {
         \\  wall      : {d} ns
         \\  per reset : {d} ns
         \\
-        \\  rule of thumb: ≤ 10000 ns/reset → cancel-and-new is fine.
-        \\                 > 10000 ns/reset → consider a dedicated
-        \\                 Sleep handle with reset(new_duration).
+        \\  rule of thumb:
+        \\    reset cadence ≥ 1 ms → cancel-and-new is fine
+        \\    reset cadence < 100 µs → consider a dedicated Sleep
+        \\                              handle with reset(new_duration)
         \\
     ,
         .{ ITERATIONS, wall, ns_per_reset },

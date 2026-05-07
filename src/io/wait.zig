@@ -46,7 +46,16 @@ fn waitOn(fd: posix.fd_t, kind: reactor_mod.EventKind) WaitError!void {
     };
     // From here on, the reactor will call park.unpark() when the fd is
     // ready. parkCurrent suspends us; the wake brings us back here.
-    try park.parkCurrent();
+    park.parkCurrent() catch |err| switch (err) {
+        error.Cancelled => {
+            // Same leak story as Sleep: a cancelled wait leaves the
+            // kevent registered (would fire when fd becomes ready,
+            // but the park is gone) AND inflates pending. Unregister
+            // cleans both up.
+            rt.reactor.unregisterWait(fd, kind);
+            return error.Cancelled;
+        },
+    };
 }
 
 pub fn waitReadable(fd: posix.fd_t) WaitError!void {
