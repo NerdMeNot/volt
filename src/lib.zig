@@ -408,6 +408,7 @@ test {
     _ = @import("test/fs_file_test.zig");
     _ = @import("test/fs_dir_test.zig");
     _ = @import("test/fs_tree_test.zig");
+    _ = @import("test/zero_copy_test.zig");
     _ = @import("channel/Channel.zig");
     _ = @import("channel/Oneshot.zig");
     _ = @import("channel/Watch.zig");

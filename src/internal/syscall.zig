@@ -1008,6 +1008,146 @@ pub const SyncError = error{
     DiskQuota,
 } || std.posix.UnexpectedError;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// sendfile / copy_file_range — kernel zero-copy
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const SendfileError = error{
+    WouldBlock,
+    InputOutput,
+    BrokenPipe,
+    ConnectionResetByPeer,
+    OperationNotSupported,
+    InvalidArgument,
+    AccessDenied,
+    SystemResources,
+} || std.posix.UnexpectedError;
+
+/// Kernel sendfile wrapper. Transfers up to `count` bytes from
+/// `in_fd` (must be a regular file on Darwin; any seekable fd on
+/// Linux 2.6.33+) to `out_fd` (any fd on Linux; must be a socket
+/// on Darwin). `offset` advances the source's read cursor when
+/// non-null; pass null to read from / advance the existing cursor.
+/// Returns bytes sent.
+pub fn sendfile(
+    out_fd: posix.fd_t,
+    in_fd: posix.fd_t,
+    offset: ?*u64,
+    count: usize,
+) SendfileError!usize {
+    return switch (builtin.os.tag) {
+        .linux => sendfileLinux(out_fd, in_fd, offset, count),
+        .macos, .ios, .tvos, .watchos, .visionos, .driverkit => sendfileDarwin(out_fd, in_fd, offset, count),
+        else => error.OperationNotSupported,
+    };
+}
+
+fn sendfileLinux(out_fd: posix.fd_t, in_fd: posix.fd_t, offset: ?*u64, count: usize) SendfileError!usize {
+    var off_local: i64 = if (offset) |o| @intCast(o.*) else 0;
+    const off_ptr: ?*i64 = if (offset != null) &off_local else null;
+    while (true) {
+        const rc = std.c.sendfile(out_fd, in_fd, off_ptr, count);
+        if (rc >= 0) {
+            if (offset) |o| o.* = @intCast(off_local);
+            return @intCast(rc);
+        }
+        switch (posix.errno(rc)) {
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .IO => return error.InputOutput,
+            .PIPE => return error.BrokenPipe,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .OPNOTSUPP, .NOSYS => return error.OperationNotSupported,
+            .INVAL => return error.InvalidArgument,
+            .NOMEM => return error.SystemResources,
+            .ACCES, .PERM => return error.AccessDenied,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn sendfileDarwin(out_fd: posix.fd_t, in_fd: posix.fd_t, offset: ?*u64, count: usize) SendfileError!usize {
+    // Darwin's sendfile takes (in, out) — note the param order is
+    // SWAPPED relative to Linux. Returns 0 on success with *len
+    // updated; -1 on error, with *len reflecting bytes already
+    // transferred. EAGAIN is reported with *len > 0 if some bytes
+    // were sent before would-block.
+    while (true) {
+        const start_off: i64 = if (offset) |o| @intCast(o.*) else 0;
+        var len_inout: i64 = @intCast(count);
+        const rc = std.c.sendfile(in_fd, out_fd, start_off, &len_inout, null, 0);
+        if (rc == 0) {
+            if (offset) |o| o.* = @intCast(start_off + len_inout);
+            return @intCast(len_inout);
+        }
+        switch (posix.errno(rc)) {
+            .INTR => {
+                if (len_inout > 0) {
+                    if (offset) |o| o.* = @intCast(start_off + len_inout);
+                    return @intCast(len_inout);
+                }
+                continue;
+            },
+            .AGAIN => {
+                if (len_inout > 0) {
+                    // Partial transfer before would-block — surface
+                    // those bytes; caller's loop will park on
+                    // writable for the next batch.
+                    if (offset) |o| o.* = @intCast(start_off + len_inout);
+                    return @intCast(len_inout);
+                }
+                return error.WouldBlock;
+            },
+            .IO => return error.InputOutput,
+            .PIPE => return error.BrokenPipe,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .OPNOTSUPP => return error.OperationNotSupported,
+            .INVAL => return error.InvalidArgument,
+            .NOTSOCK => return error.OperationNotSupported,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+pub const CopyFileRangeError = error{
+    WouldBlock,
+    InputOutput,
+    OperationNotSupported,
+    CrossDevice,
+    InvalidArgument,
+    SystemResources,
+    AccessDenied,
+    NoSpaceLeft,
+} || std.posix.UnexpectedError;
+
+/// Linux-only `copy_file_range` — kernel-level file→file copy.
+/// Returns bytes copied. `error.OperationNotSupported` /
+/// `error.CrossDevice` mean "fall back to userspace loop." On
+/// non-Linux platforms returns `error.OperationNotSupported`.
+pub fn copyFileRange(
+    fd_in: posix.fd_t,
+    fd_out: posix.fd_t,
+    len: usize,
+) CopyFileRangeError!usize {
+    if (builtin.os.tag != .linux) return error.OperationNotSupported;
+    while (true) {
+        const rc = std.c.copy_file_range(fd_in, null, fd_out, null, len, 0);
+        if (rc >= 0) return @intCast(rc);
+        switch (posix.errno(rc)) {
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .XDEV => return error.CrossDevice,
+            .NOSYS, .OPNOTSUPP => return error.OperationNotSupported,
+            .INVAL => return error.InvalidArgument,
+            .IO => return error.InputOutput,
+            .NOMEM => return error.SystemResources,
+            .NOSPC => return error.NoSpaceLeft,
+            .ACCES, .PERM => return error.AccessDenied,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
 pub fn fsync(fd: posix.fd_t) SyncError!void {
     while (true) {
         switch (posix.errno(system.fsync(fd))) {

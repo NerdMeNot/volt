@@ -42,6 +42,8 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const traits = @import("traits/traits.zig");
 const io_errors = @import("errors.zig");
+const syscall = @import("../internal/syscall.zig");
+const wait = @import("wait.zig");
 
 const Reader = traits.Reader;
 const Writer = traits.Writer;
@@ -80,23 +82,92 @@ fn classicCopy(dst: Writer, src: Reader) CopyError!u64 {
 }
 
 /// Try a kernel-level zero-copy between two fds. Returns:
-///   - `null` — specialisation doesn't apply on this platform / for
-///     this fd pair. Caller falls through to the loop.
+///   - `null` — specialisation doesn't apply for this (src_kind,
+///     dst_kind, platform) combo. Caller falls through to the loop.
 ///   - `u64` — bytes copied.
 ///   - error — a real I/O error that the loop would also hit;
 ///     propagate.
-///
-/// P1 returns null unconditionally — every later phase fills in arms.
 fn fastFdCopy(src_fd: posix.fd_t, dst_fd: posix.fd_t) CopyError!?u64 {
-    // Suppressed until P2/P3 land platform-specific helpers (sendfile,
-    // splice, copy_file_range, clonefile). The dispatch shape is here;
-    // the dispatch targets are the only thing left.
-    _ = src_fd;
-    _ = dst_fd;
-    return switch (builtin.os.tag) {
-        .linux, .macos, .ios, .freebsd, .netbsd, .dragonfly, .openbsd => null,
-        else => null,
+    const src_kind = fdKind(src_fd) orelse return null;
+    const dst_kind = fdKind(dst_fd) orelse return null;
+
+    // Dispatch matrix — only the combos with a real kernel
+    // accelerator we ship get a fast path. Everything else returns
+    // null so the classic loop runs.
+    if (src_kind == .regular_file and dst_kind == .regular_file and builtin.os.tag == .linux) {
+        return copyFileRangeLoop(src_fd, dst_fd);
+    }
+    if (src_kind == .regular_file and dst_kind == .socket) {
+        return sendfileLoop(src_fd, dst_fd);
+    }
+    return null;
+}
+
+const FdKind = enum { regular_file, socket, pipe, other };
+
+fn fdKind(fd: posix.fd_t) ?FdKind {
+    const stat = syscall.fstat(fd) catch return null;
+    return switch (stat.mode & posix.S.IFMT) {
+        posix.S.IFREG => .regular_file,
+        posix.S.IFSOCK => .socket,
+        posix.S.IFIFO => .pipe,
+        else => .other,
     };
+}
+
+/// File→socket via `sendfile`. Loops until the source returns 0
+/// bytes (EOF). On `EAGAIN` parks on writable. On EINVAL / EOPNOTSUPP
+/// before any bytes are transferred, declines (returns null) so the
+/// caller falls back to the loop. After bytes have been transferred,
+/// errors propagate.
+fn sendfileLoop(src_fd: posix.fd_t, dst_fd: posix.fd_t) CopyError!?u64 {
+    const CHUNK: usize = 1 << 20; // 1 MiB per sendfile call — kernel
+    // can choose to send less, but a generous request lets it pack.
+    var total: u64 = 0;
+    var off: u64 = 0;
+    while (true) {
+        const sent = syscall.sendfile(dst_fd, src_fd, &off, CHUNK) catch |err| switch (err) {
+            error.WouldBlock => {
+                wait.waitWritable(dst_fd) catch return error.Cancelled;
+                continue;
+            },
+            error.OperationNotSupported, error.InvalidArgument => {
+                if (total == 0) return null;
+                return error.Unexpected;
+            },
+            error.BrokenPipe => return error.BrokenPipe,
+            error.ConnectionResetByPeer => return error.ConnectionResetByPeer,
+            error.InputOutput => return error.InputOutput,
+            error.AccessDenied => return error.AccessDenied,
+            error.SystemResources => return error.SystemResources,
+            error.Unexpected => return error.Unexpected,
+        };
+        if (sent == 0) return total; // EOF on source
+        total += sent;
+    }
+}
+
+/// File→file via Linux `copy_file_range`. Same decline-or-error
+/// semantics as `sendfileLoop`.
+fn copyFileRangeLoop(src_fd: posix.fd_t, dst_fd: posix.fd_t) CopyError!?u64 {
+    const CHUNK: usize = 1 << 20;
+    var total: u64 = 0;
+    while (true) {
+        const sent = syscall.copyFileRange(src_fd, dst_fd, CHUNK) catch |err| switch (err) {
+            error.OperationNotSupported, error.CrossDevice, error.InvalidArgument => {
+                if (total == 0) return null;
+                return error.Unexpected;
+            },
+            error.WouldBlock => return error.Unexpected, // copy_file_range on regular files shouldn't block
+            error.NoSpaceLeft => return error.NoSpaceLeft,
+            error.InputOutput => return error.InputOutput,
+            error.AccessDenied => return error.AccessDenied,
+            error.SystemResources => return error.SystemResources,
+            error.Unexpected => return error.Unexpected,
+        };
+        if (sent == 0) return total;
+        total += sent;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
