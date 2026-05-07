@@ -277,6 +277,7 @@ pub const io = struct {
     pub const BufWriter = @import("io/adapters/BufWriter.zig").BufWriter;
     pub const LimitReader = @import("io/adapters/LimitReader.zig").LimitReader;
     pub const TeeReader = @import("io/adapters/TeeReader.zig").TeeReader;
+    pub const MultiReader = @import("io/adapters/MultiReader.zig").MultiReader;
     pub const lineIterator = @import("io/adapters/lines.zig").lineIterator;
     pub const LineIterator = @import("io/adapters/lines.zig").LineIterator;
     pub const chunked = @import("io/adapters/chunked.zig").chunked;
@@ -381,6 +382,7 @@ test {
     _ = @import("io/adapters/BufWriter.zig");
     _ = @import("io/adapters/LimitReader.zig");
     _ = @import("io/adapters/TeeReader.zig");
+    _ = @import("io/adapters/MultiReader.zig");
     _ = @import("io/adapters/lines.zig");
     _ = @import("io/adapters/chunked.zig");
     _ = @import("io/copy.zig");
