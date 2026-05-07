@@ -251,43 +251,76 @@ pub const Mmap = struct {
         self.* = undefined;
     }
 
+    /// `madvise` over `range`. Hints don't affect correctness; they
+    /// guide the kernel's page-cache behaviour. Pass `Advice.free`
+    /// on anonymous regions you no longer need (pages can be
+    /// reclaimed without write-back).
     pub fn advise(self: *Mmap, range: Range, hint: Advice) MmapError!void {
-        _ = self;
-        _ = range;
-        _ = hint;
-        @compileError("Mmap.advise: P4.B");
+        try self.checkRange(range);
+        const advice: u32 = switch (hint) {
+            .sequential => std.c.MADV.SEQUENTIAL,
+            .random => std.c.MADV.RANDOM,
+            .will_need => std.c.MADV.WILLNEED,
+            .dont_need => std.c.MADV.DONTNEED,
+            .free => std.c.MADV.FREE,
+        };
+        const ptr: *align(std.heap.pageSize()) anyopaque = @ptrCast(@alignCast(self.ptr + range.offset));
+        const rc = std.c.madvise(ptr, range.length, advice);
+        if (rc != 0) return mmapErrno();
+    }
+
+    /// `mlock` over `range` — pin those pages in RAM until `unlock`
+    /// or `deinit`. The whole-mapping lock at `init` time uses this
+    /// path internally.
+    pub fn lock(self: *Mmap, range: Range) MmapError!void {
+        try self.checkRange(range);
+        const ptr: *align(std.heap.pageSize()) const anyopaque = @ptrCast(@alignCast(self.ptr + range.offset));
+        const rc = std.c.mlock(ptr, range.length);
+        if (rc != 0) return mmapErrno();
+    }
+
+    pub fn unlock(self: *Mmap, range: Range) MmapError!void {
+        try self.checkRange(range);
+        const ptr: *align(std.heap.pageSize()) const anyopaque = @ptrCast(@alignCast(self.ptr + range.offset));
+        const rc = std.c.munlock(ptr, range.length);
+        if (rc != 0) return mmapErrno();
+    }
+
+    /// `msync` — flush dirty pages to backing storage. `sync_`
+    /// blocks until pages hit storage; `async_` schedules and
+    /// returns immediately. No-op on anonymous mappings.
+    pub fn flush(self: *Mmap, range: Range, sync: FlushSync) MmapError!void {
+        try self.checkRange(range);
+        if (self.backing_fd == null) return; // anonymous — nothing to flush
+        const flags: c_int = switch (sync) {
+            .async_ => MS_ASYNC,
+            .sync_ => MS_SYNC,
+        };
+        const ptr: *align(std.heap.pageSize()) const anyopaque = @ptrCast(@alignCast(self.ptr + range.offset));
+        const rc = std.c.msync(ptr, range.length, flags);
+        if (rc != 0) return mmapErrno();
+    }
+
+    /// `mprotect` — change page-table permissions over `range`. Use
+    /// to e.g. mark a region read-only after writing it.
+    pub fn protect(self: *Mmap, range: Range, perms: Perms) MmapError!void {
+        try self.checkRange(range);
+        const prot = makeProt(perms);
+        const ptr: *align(std.heap.pageSize()) anyopaque = @ptrCast(@alignCast(self.ptr + range.offset));
+        const rc = std.c.mprotect(ptr, range.length, prot);
+        if (rc != 0) return mmapErrno();
+    }
+
+    fn checkRange(self: *Mmap, range: Range) MmapError!void {
+        if (range.offset > self.len or range.length > self.len - range.offset) {
+            return error.InvalidRange;
+        }
     }
 
     pub fn prefault(self: *Mmap, range: Range) MmapError!void {
         _ = self;
         _ = range;
         @compileError("Mmap.prefault: P4.C");
-    }
-
-    pub fn lock(self: *Mmap, range: Range) MmapError!void {
-        _ = self;
-        _ = range;
-        @compileError("Mmap.lock: P4.B");
-    }
-
-    pub fn unlock(self: *Mmap, range: Range) MmapError!void {
-        _ = self;
-        _ = range;
-        @compileError("Mmap.unlock: P4.B");
-    }
-
-    pub fn flush(self: *Mmap, range: Range, sync: FlushSync) MmapError!void {
-        _ = self;
-        _ = range;
-        _ = sync;
-        @compileError("Mmap.flush: P4.B");
-    }
-
-    pub fn protect(self: *Mmap, range: Range, perms: Perms) MmapError!void {
-        _ = self;
-        _ = range;
-        _ = perms;
-        @compileError("Mmap.protect: P4.B");
     }
 
     pub fn remap(self: *Mmap, new_len: usize) MmapError![]u8 {
@@ -327,6 +360,19 @@ fn makeAnonMap() std.c.MAP {
     @field(m, "ANONYMOUS") = true;
     return m;
 }
+
+// MS_* flags for msync. POSIX says implementation-defined; values
+// differ across platforms.
+const MS_ASYNC: c_int = switch (builtin.os.tag) {
+    .linux => 1,
+    .macos, .ios, .tvos, .watchos, .visionos, .driverkit => 1,
+    else => 1,
+};
+const MS_SYNC: c_int = switch (builtin.os.tag) {
+    .linux => 4,
+    .macos, .ios, .tvos, .watchos, .visionos, .driverkit => 0x10,
+    else => 4,
+};
 
 fn mmapErrno() MmapError {
     return switch (posix.errno(@as(c_int, -1))) {

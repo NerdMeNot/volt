@@ -73,3 +73,46 @@ fn anonRoot() !void {
 test "P4.A: Mmap.anonymous gives a writable region" {
     try volt.run(.{ .allocator = std.testing.allocator }, anonRoot, .{});
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// P4.B — advise / flush / protect smoke tests
+// ─────────────────────────────────────────────────────────────────────
+
+fn opsRoot(path: []const u8) !void {
+    cleanup(path);
+    {
+        var f = try volt.fs.File.create(path);
+        try f.writeAll("operations payload " ** 64); // ~1.2 KiB
+        f.close();
+    }
+    defer cleanup(path);
+
+    var f = try volt.fs.File.open(path, .{ .read = true, .write = true });
+    defer f.close();
+
+    var m = try volt.fs.Mmap.mapFile(&f, .{
+        .mode = .read_write,
+        .perms = .{ .read = true, .write = true },
+    });
+    defer m.deinit();
+
+    const range = volt.fs.MmapRange{ .offset = 0, .length = m.len };
+
+    // advise: hint sequential access. Should succeed without error.
+    try m.advise(range, .will_need);
+    try m.advise(range, .sequential);
+
+    // Mutate a byte then flush async.
+    m.slice()[0] = 'X';
+    try m.flush(range, .async_);
+
+    // Make the mapping read-only via protect; reading still works.
+    try m.protect(range, .{ .read = true, .write = false });
+    try std.testing.expectEqual(@as(u8, 'X'), m.sliceConst()[0]);
+}
+
+test "P4.B: advise / flush / protect" {
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/volt-mops-{d}.txt", .{std.posix.system.getpid()});
+    try volt.run(.{ .allocator = std.testing.allocator }, opsRoot, .{path});
+}

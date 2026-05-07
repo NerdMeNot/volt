@@ -112,6 +112,11 @@ pub const fs = struct {
     pub const MmapError = @import("fs/Mmap.zig").MmapError;
     pub const MapOptions = @import("fs/Mmap.zig").MapOptions;
     pub const AnonOptions = @import("fs/Mmap.zig").AnonOptions;
+    pub const MmapRange = @import("fs/Mmap.zig").Range;
+    pub const MmapAdvice = @import("fs/Mmap.zig").Advice;
+    pub const MmapPerms = @import("fs/Mmap.zig").Perms;
+    pub const MmapMode = @import("fs/Mmap.zig").Mode;
+    pub const FlushSync = @import("fs/Mmap.zig").FlushSync;
 
     /// P0 contract artifact — Walker bodies fill in P3.B.
     pub const Walker = @import("fs/Walker.zig").Walker;
