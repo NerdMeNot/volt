@@ -317,10 +317,36 @@ pub const Mmap = struct {
         }
     }
 
+    /// Risk-3 escape hatch: fault every page in `range` into RAM
+    /// **on the blocking pool**, so subsequent access from the
+    /// calling coroutine doesn't block the worker on disk.
+    ///
+    /// The calling coroutine parks while a blocking-pool thread
+    /// issues `madvise(MADV_WILLNEED)` and walks the range with
+    /// volatile reads, page by page. When this returns, every page
+    /// in `range` is RAM-resident; subsequent access (until the
+    /// kernel reclaims) is non-blocking.
     pub fn prefault(self: *Mmap, range: Range) MmapError!void {
-        _ = self;
-        _ = range;
-        @compileError("Mmap.prefault: P4.C");
+        try self.checkRange(range);
+        if (range.length == 0) return;
+
+        const Args = struct {
+            ptr: [*]u8,
+            offset: usize,
+            length: usize,
+        };
+        var args = Args{ .ptr = self.ptr, .offset = range.offset, .length = range.length };
+        spawnBlocking(struct {
+            fn run(a: *Args) !void {
+                const ptr_aligned: *align(std.heap.pageSize()) anyopaque =
+                    @ptrCast(@alignCast(a.ptr + a.offset));
+                _ = std.c.madvise(ptr_aligned, a.length, std.c.MADV.WILLNEED);
+                forceTouchPages(@ptrCast(a.ptr + a.offset), a.length);
+            }
+        }.run, .{&args}) catch |err| switch (err) {
+            error.Cancelled => return error.Cancelled,
+            else => return error.Unexpected,
+        };
     }
 
     pub fn remap(self: *Mmap, new_len: usize) MmapError![]u8 {

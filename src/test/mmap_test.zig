@@ -116,3 +116,45 @@ test "P4.B: advise / flush / protect" {
     const path = try std.fmt.bufPrint(&path_buf, "/tmp/volt-mops-{d}.txt", .{std.posix.system.getpid()});
     try volt.run(.{ .allocator = std.testing.allocator }, opsRoot, .{path});
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// P4.C — prefault round-trip. Verifies the blocking-pool dispatch
+// path completes; can't directly observe that pages are resident
+// without parsing /proc/self/smaps, so this is a smoke test.
+// ─────────────────────────────────────────────────────────────────────
+
+fn prefaultRoot(path: []const u8) !void {
+    cleanup(path);
+    {
+        var f = try volt.fs.File.create(path);
+        // Write 256 KiB so we have multiple pages.
+        const chunk: [4096]u8 = .{0xAB} ** 4096;
+        var i: u32 = 0;
+        while (i < 64) : (i += 1) try f.writeAll(&chunk);
+        f.close();
+    }
+    defer cleanup(path);
+
+    var f = try volt.fs.File.open(path, .{ .read = true });
+    defer f.close();
+
+    var m = try volt.fs.Mmap.mapFile(&f, .{
+        .mode = .read_only,
+        .perms = .{ .read = true },
+    });
+    defer m.deinit();
+
+    // Prefault the whole region. After this, reads should be
+    // RAM-only.
+    try m.prefault(.{ .offset = 0, .length = m.len });
+
+    // Verify a sample byte still reads back correctly.
+    try std.testing.expectEqual(@as(u8, 0xAB), m.sliceConst()[0]);
+    try std.testing.expectEqual(@as(u8, 0xAB), m.sliceConst()[m.len - 1]);
+}
+
+test "P4.C: prefault completes via blocking pool" {
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/volt-mpref-{d}.txt", .{std.posix.system.getpid()});
+    try volt.run(.{ .allocator = std.testing.allocator }, prefaultRoot, .{path});
+}
