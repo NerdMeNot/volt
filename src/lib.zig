@@ -420,6 +420,7 @@ test {
     _ = @import("test/zero_copy_test.zig");
     _ = @import("test/scm_rights_test.zig");
     _ = @import("test/watcher_test.zig");
+    _ = @import("test/mmap_test.zig");
     _ = @import("channel/Channel.zig");
     _ = @import("channel/Oneshot.zig");
     _ = @import("channel/Watch.zig");
