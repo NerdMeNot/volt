@@ -55,7 +55,21 @@ pub const CopyError = io_errors.ReadError || io_errors.WriteError;
 /// Copy bytes from `src` to `dst` until `src` reports EOF. Returns
 /// the total number of bytes copied.
 pub fn copy(dst: Writer, src: Reader) CopyError!u64 {
-    // 1. Fd-to-fd kernel zero-copy fast path.
+    // 1. Byte-slice fast path (Mmap, in-RAM buffer source). The
+    //    source exposes its remaining bytes contiguously; we write
+    //    them in one writeAll then advance the source via discard.
+    //    `as_bytes` does NOT consume on its own (P1 contract); we
+    //    pair it with discard to keep peek-vs-consume cleanly
+    //    separated.
+    if (src.vtable.as_bytes) |get_bytes| {
+        if (get_bytes(src.ctx)) |bytes| {
+            try dst.writeAll(bytes);
+            _ = src.discard(@intCast(bytes.len)) catch |err| return @errorCast(err);
+            return @intCast(bytes.len);
+        }
+    }
+
+    // 2. Fd-to-fd kernel zero-copy fast path.
     if (src.vtable.as_fd) |src_fd_fn| {
         if (dst.vtable.as_fd) |dst_fd_fn| {
             if (src_fd_fn(src.ctx)) |src_fd| {
@@ -66,7 +80,7 @@ pub fn copy(dst: Writer, src: Reader) CopyError!u64 {
         }
     }
 
-    // 2. Classic loop fallback.
+    // 3. Classic loop fallback.
     return classicCopy(dst, src);
 }
 

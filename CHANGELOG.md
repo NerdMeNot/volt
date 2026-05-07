@@ -9,6 +9,52 @@ The repositioning of Volt from "stackful coroutine runtime" to
 Phase 0 was risk mitigation; Phase 1 the I/O trait surface and
 adapters; Phase 2 the networking depth.
 
+### Phase 4 — memory mapping (`volt.fs.Mmap`)
+
+The user-flagged high-priority slot from the original conversation.
+P0 locked the API contract; P4 fills the bodies.
+
+- **`Mmap.mapFile(file, opts)`** — file-backed mmap. Dups the fd
+  internally so the caller's `File` can close independently. fstat
+  for length when `opts.len` is null. `MapOptions` carries
+  `mode` / `perms` / `len` / `populate` / `huge_pages` / `locked` /
+  `offset`.
+- **`Mmap.anonymous(len, opts)`** — `MAP_ANON` with no fd. Useful
+  for huge scratch buffers without going through the heap allocator.
+- **`Mmap.advise` / `lock` / `unlock` / `flush` / `protect`** —
+  one-call libc wrappers (madvise / mlock / munlock / msync /
+  mprotect). All take a `Range { offset, length }` within the
+  mapping.
+- **`Mmap.prefault(range)`** — **Risk #3 mitigation**. Runs on the
+  blocking pool: madvise(MADV_WILLNEED) + walk every page with
+  volatile reads to force-fault each one. The calling coroutine
+  parks; when it returns, the range is RAM-resident. Use before a
+  hot read loop over a file-backed map.
+- **`Mmap.remap(new_len)`** — **Risk #4 contract**. Linux:
+  `mremap(MREMAP_MAYMOVE)`; Darwin: unmap + remap. Returns the new
+  slice; signature forces callers to rebind any cached pointer.
+- **Trait surface** — `Mmap.reader()` and `Mmap.readerAt()`
+  populate `as_bytes` so `volt.io.copy(dst, mmap.reader())`
+  takes the byte-slice fast path: writes the whole region in one
+  `writeAll` then advances the cursor via `discard`. The third
+  `copy()` dispatch arm (P1.C) is now wired.
+- **`MapOptions.populate`** — Linux: `MAP_POPULATE` flag at mmap
+  time. Darwin: emulated by walking + volatile-touching every
+  page after mmap (no native equivalent).
+- **Honest doc header** — the file's opening paragraph is the
+  page-fault contract, exactly as locked in P0. mmap pages are
+  fundamentally synchronous on first touch; `prefault` is the
+  Volt tool that controls *where* the synchronous wait happens
+  (blocking pool, not worker thread).
+
+#### Deferred from P4 → v1.2
+
+- `huge_pages` request — returns `error.HugePagesUnsupported` for
+  now. Linux: needs MAP_HUGETLB + page-size encoding. Darwin:
+  needs `VM_FLAGS_SUPERPAGE_SIZE_2MB` via `mach_vm_map` (not
+  std.c.mmap). Both require platform-specific work; the API is
+  locked.
+
 ### Phase 3 — filesystem depth + streaming (`volt.fs.*`)
 
 - **`File`** — async file handle implementing all six `volt.io`

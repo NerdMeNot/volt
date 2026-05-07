@@ -145,6 +145,10 @@ pub const Mmap = struct {
     /// `File` at `mapFile` time so `file.close()` doesn't pull the
     /// rug. `null` for anonymous maps.
     backing_fd: ?posix.fd_t,
+    /// Cursor for the `Reader` trait. Bumped by each `read()` /
+    /// `discard()` call. `readerAt` is positional and ignores it.
+    /// Distinct from any kernel file-position; mmap doesn't have one.
+    read_pos: usize = 0,
 
     /// Map a region of `file` into the address space.
     ///
@@ -240,6 +244,56 @@ pub const Mmap = struct {
     /// Read-only view of the entire mapping.
     pub fn sliceConst(self: *const Mmap) []const u8 {
         return self.ptr[0..self.len];
+    }
+
+    // ── Trait surface ──────────────────────────────────────────────────
+    //
+    // `Reader` exposes both `read` (cursor-advancing) AND `as_bytes`
+    // (zero-cost peek for `volt.io.copy` to write the whole region in
+    // one call). `as_bytes` does NOT advance the cursor — copy()
+    // calls `discard` to consume after writing.
+
+    pub fn reader(self: *Mmap) traits.Reader {
+        return .{ .ctx = @ptrCast(self), .vtable = &reader_vtable };
+    }
+
+    pub fn readerAt(self: *Mmap) traits.ReaderAt {
+        return .{ .ctx = @ptrCast(self), .vtable = &reader_at_vtable };
+    }
+
+    const reader_vtable: traits.Reader.VTable = .{
+        .read = &traitRead,
+        .as_bytes = &traitAsBytes,
+    };
+
+    const reader_at_vtable: traits.ReaderAt.VTable = .{
+        .readAt = &traitReadAt,
+    };
+
+    fn traitRead(ctx: *anyopaque, buf: []u8) io_errors.ReadError!usize {
+        const self: *Mmap = @ptrCast(@alignCast(ctx));
+        const remaining = self.len - self.read_pos;
+        if (remaining == 0) return 0;
+        const n = @min(buf.len, remaining);
+        @memcpy(buf[0..n], self.ptr[self.read_pos .. self.read_pos + n]);
+        self.read_pos += n;
+        return n;
+    }
+
+    fn traitAsBytes(ctx: *anyopaque) ?[]const u8 {
+        const self: *Mmap = @ptrCast(@alignCast(ctx));
+        if (self.read_pos >= self.len) return null;
+        return self.ptr[self.read_pos..self.len];
+    }
+
+    fn traitReadAt(ctx: *anyopaque, buf: []u8, offset: u64) io_errors.ReadError!usize {
+        const self: *Mmap = @ptrCast(@alignCast(ctx));
+        const off: usize = @intCast(offset);
+        if (off >= self.len) return 0;
+        const remaining = self.len - off;
+        const n = @min(buf.len, remaining);
+        @memcpy(buf[0..n], self.ptr[off .. off + n]);
+        return n;
     }
 
     /// Unmap and close the backing fd (if any). Idempotent: calling

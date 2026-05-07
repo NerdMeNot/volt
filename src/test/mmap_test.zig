@@ -189,3 +189,105 @@ fn remapRoot() !void {
 test "P4.D: remap returns a fresh slice with the new length" {
     try volt.run(.{ .allocator = std.testing.allocator }, remapRoot, .{});
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// P4.E — Mmap.reader() composes with copy() via the as_bytes arm
+// ─────────────────────────────────────────────────────────────────────
+
+const MmapCopyArgs = struct {
+    src_path: []const u8,
+    dst_path: []const u8,
+    payload: []const u8,
+};
+
+fn mmapCopyRoot(args: MmapCopyArgs) !void {
+    cleanup(args.src_path);
+    cleanup(args.dst_path);
+
+    {
+        var f = try volt.fs.File.create(args.src_path);
+        try f.writeAll(args.payload);
+        f.close();
+    }
+    defer cleanup(args.src_path);
+    defer cleanup(args.dst_path);
+
+    var src_file = try volt.fs.File.openRead(args.src_path);
+    defer src_file.close();
+
+    var m = try volt.fs.Mmap.mapFile(&src_file, .{
+        .mode = .read_only,
+        .perms = .{ .read = true },
+    });
+    defer m.deinit();
+
+    {
+        var dst_file = try volt.fs.File.create(args.dst_path);
+        defer dst_file.close();
+        // copy() should take the as_bytes path here (Mmap exposes it).
+        const n = try volt.io.copy(dst_file.writer(), m.reader());
+        try std.testing.expectEqual(@as(u64, args.payload.len), n);
+    }
+
+    // Verify by reading the destination back.
+    var verify = try volt.fs.File.openRead(args.dst_path);
+    defer verify.close();
+    var buf: [256]u8 = undefined;
+    const r = try verify.read(&buf);
+    try std.testing.expectEqualStrings(args.payload, buf[0..r]);
+}
+
+test "P4.E: copy(file.writer(), mmap.reader()) — as_bytes dispatch" {
+    var src_buf: [128]u8 = undefined;
+    var dst_buf: [128]u8 = undefined;
+    const pid = std.posix.system.getpid();
+    const src = try std.fmt.bufPrint(&src_buf, "/tmp/volt-mc-{d}-src.txt", .{pid});
+    const dst = try std.fmt.bufPrint(&dst_buf, "/tmp/volt-mc-{d}-dst.txt", .{pid});
+
+    try volt.run(.{ .allocator = std.testing.allocator }, mmapCopyRoot, .{
+        MmapCopyArgs{ .src_path = src, .dst_path = dst, .payload = "memory-mapped → file via copy()" },
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// P4.E — Mmap.readerAt() positional read
+// ─────────────────────────────────────────────────────────────────────
+
+fn mmapReaderAtRoot(path: []const u8) !void {
+    cleanup(path);
+    {
+        var f = try volt.fs.File.create(path);
+        try f.writeAll("0123456789abcdef");
+        f.close();
+    }
+    defer cleanup(path);
+
+    var f = try volt.fs.File.openRead(path);
+    defer f.close();
+    var m = try volt.fs.Mmap.mapFile(&f, .{
+        .mode = .read_only,
+        .perms = .{ .read = true },
+    });
+    defer m.deinit();
+
+    // Read 4 bytes at offset 6.
+    const r_at = m.readerAt();
+    var buf: [4]u8 = undefined;
+    const n = try r_at.readAt(&buf, 6);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqualStrings("6789", &buf);
+
+    // readerAt is positional — calling read on a separate Reader
+    // (with cursor) shouldn't see those bytes consumed.
+    const r = m.reader();
+    var buf2: [4]u8 = undefined;
+    const n2 = try r.read(&buf2);
+    try std.testing.expectEqual(@as(usize, 4), n2);
+    try std.testing.expectEqualStrings("0123", &buf2);
+}
+
+test "P4.E: Mmap.readerAt() positional read independent of cursor" {
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/volt-mat-{d}.txt", .{std.posix.system.getpid()});
+    try volt.run(.{ .allocator = std.testing.allocator }, mmapReaderAtRoot, .{path});
+}
