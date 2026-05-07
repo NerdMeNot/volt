@@ -84,6 +84,13 @@ pub const fs = struct {
     pub const Dir = @import("fs/Dir.zig").Dir;
     pub const DirEntry = @import("fs/DirEntry.zig").DirEntry;
 
+    /// Tree operations: mkdirAll, removeFile, removeDir, rename,
+    /// symlink, readlinkAlloc, copy. All blocking-pool-dispatched.
+    pub const tree = @import("fs/tree.zig");
+
+    /// Path manipulation — pure string ops, no syscalls.
+    pub const path = @import("fs/path.zig");
+
     /// P0 contract artifact (P4 implementation) — Mmap with locked
     /// page-fault contract. Bodies @compileError until P4.
     pub const Mmap = @import("fs/Mmap.zig").Mmap;
@@ -392,6 +399,7 @@ test {
     _ = @import("test/dns_test.zig");
     _ = @import("test/fs_file_test.zig");
     _ = @import("test/fs_dir_test.zig");
+    _ = @import("test/fs_tree_test.zig");
     _ = @import("channel/Channel.zig");
     _ = @import("channel/Oneshot.zig");
     _ = @import("channel/Watch.zig");
@@ -419,6 +427,8 @@ test {
     _ = @import("fs/Dir.zig");
     _ = @import("fs/DirEntry.zig");
     _ = @import("fs/Walker.zig");
+    _ = @import("fs/tree.zig");
+    _ = @import("fs/path.zig");
     _ = @import("process/Command.zig");
     _ = @import("observability/snapshot.zig");
     _ = @import("observability/metrics.zig");
