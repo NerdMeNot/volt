@@ -1,89 +1,52 @@
-//! `volt.fs` — async filesystem operations.
+//! `volt.fs` — async filesystem facade.
 //!
-//! v1.1 stub: `readFile` and `writeFile`, both wrapping blocking posix
-//! syscalls via `spawnBlocking`. The blocking pool keeps the filesystem
-//! call off the worker thread; the calling coroutine parks and resumes
-//! when the syscall returns.
+//! `readFile` and `writeFile` are convenience wrappers over the
+//! `volt.fs.File` handle. As of P3.E (v1.1), they're built on top
+//! of `File`, NOT bypassing it via raw syscalls — pre-allocates
+//! based on file size, then loops `read` / `writeAll`. Calling
+//! coroutine parks during the underlying blocking-pool dispatch.
 //!
-//! ## Error contract (P0 → P3)
-//!
-//! Public functions here currently return inferred error sets.
-//! `volt.io.errors` defines `OpenError`, `ReadError`, `WriteError`, etc.
-//! that the v1.3 `File` rewrite will narrow these to. Until then,
-//! callers should treat the surface as `anyerror!T` and rely on
-//! `volt.io.errors.fromErrno` if they need to translate manually.
-//!
-//! The narrowing is blocked on `spawnBlocking` adopting an
-//! `ErrorSetOf(user_fn)` return signature; today it widens to anyerror
-//! internally because `result_err: anyerror`. Out of P0 scope.
+//! For streaming patterns (large files, line iteration, framed
+//! protocol bodies), reach for `File` directly + `BufReader` /
+//! `lineIterator`. `readFile` slurps the whole file; bounded by
+//! the 1 GiB safety cap.
 
 const std = @import("std");
-const posix = std.posix;
-const syscall = @import("../internal/syscall.zig");
-const spawnBlocking = @import("../api/spawn_blocking.zig").spawnBlocking;
+const File = @import("File.zig").File;
 
 const MAX_FILE_SIZE: usize = 1 * 1024 * 1024 * 1024; // 1 GiB safety cap
 
-const ReadFileArgs = struct {
-    allocator: std.mem.Allocator,
-    path: [:0]const u8,
-};
-
-fn readFileBlocking(args: *ReadFileArgs) ![]u8 {
-    const fd = try posix.openatZ(posix.AT.FDCWD, args.path.ptr, .{ .ACCMODE = .RDONLY }, 0);
-    defer syscall.close(fd);
-
-    // Read into a growing buffer; we don't fstat (avoid the syscall
-    // and a stale-size race) — read until EOF.
-    var buf: std.array_list.Managed(u8) = std.array_list.Managed(u8).init(args.allocator);
-    errdefer buf.deinit();
-    var chunk: [64 * 1024]u8 = undefined;
-    while (true) {
-        const n = try syscall.read(fd, &chunk);
-        if (n == 0) break;
-        if (buf.items.len + n > MAX_FILE_SIZE) return error.FileTooLarge;
-        try buf.appendSlice(chunk[0..n]);
-    }
-    return buf.toOwnedSlice();
-}
-
 /// Read the entire file at `path` into a freshly-allocated slice.
-/// The calling coroutine parks while the read completes on the
-/// blocking pool; the worker thread is free to run other coroutines.
-///
-/// `path` is null-terminated for direct use with `openZ`. Caller owns
-/// the returned slice.
-pub fn readFile(allocator: std.mem.Allocator, path: [:0]const u8) ![]u8 {
-    var args = ReadFileArgs{ .allocator = allocator, .path = path };
-    return try spawnBlocking(readFileBlocking, .{&args});
-}
+/// Caller owns the returned slice.
+pub fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var f = try File.openRead(path);
+    defer f.close();
 
-const WriteFileArgs = struct {
-    path: [:0]const u8,
-    data: []const u8,
-};
+    const meta = try f.metadata();
+    const size_u64 = meta.size;
+    if (size_u64 > MAX_FILE_SIZE) return error.FileTooLarge;
+    const size: usize = @intCast(size_u64);
 
-fn writeFileBlocking(args: *WriteFileArgs) !void {
-    const fd = try posix.openatZ(
-        posix.AT.FDCWD,
-        args.path.ptr,
-        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
-        0o644,
-    );
-    defer syscall.close(fd);
+    const buf = try allocator.alloc(u8, size);
+    errdefer allocator.free(buf);
 
-    var written: usize = 0;
-    while (written < args.data.len) {
-        const n = try syscall.write(fd, args.data[written..]);
-        if (n == 0) return error.WriteFailed;
-        written += n;
+    var got: usize = 0;
+    while (got < size) {
+        const n = try f.read(buf[got..]);
+        if (n == 0) break; // truncated since fstat — return what we got
+        got += n;
     }
+    if (got < size) {
+        return allocator.realloc(buf, got);
+    }
+    return buf;
 }
 
 /// Write `data` to `path`, creating or truncating the file.
-pub fn writeFile(path: [:0]const u8, data: []const u8) !void {
-    var args = WriteFileArgs{ .path = path, .data = data };
-    return try spawnBlocking(writeFileBlocking, .{&args});
+pub fn writeFile(path: []const u8, data: []const u8) !void {
+    var f = try File.create(path);
+    defer f.close();
+    try f.writeAll(data);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -93,7 +56,7 @@ pub fn writeFile(path: [:0]const u8, data: []const u8) !void {
 const volt = @import("../lib.zig");
 
 fn rwRoundTripRoot() !void {
-    const tmp_path: [:0]const u8 = "/tmp/volt_fs_test.txt";
+    const tmp_path = "/tmp/volt_fs_test.txt";
     const data = "hello volt fs\n";
 
     try writeFile(tmp_path, data);
@@ -101,10 +64,11 @@ fn rwRoundTripRoot() !void {
     defer std.testing.allocator.free(read_back);
 
     try std.testing.expectEqualStrings(data, read_back);
-    // Best-effort cleanup; ignore failures.
-    _ = std.posix.system.unlink(tmp_path.ptr);
+    var z_buf: [128]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&z_buf, "{s}", .{tmp_path}) catch return;
+    _ = std.posix.system.unlink(path_z.ptr);
 }
 
-test "fs: writeFile + readFile round-trip" {
+test "fs: writeFile + readFile round-trip via File facade" {
     try volt.run(.{ .allocator = std.testing.allocator }, rwRoundTripRoot, .{});
 }

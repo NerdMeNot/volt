@@ -9,6 +9,63 @@ The repositioning of Volt from "stackful coroutine runtime" to
 Phase 0 was risk mitigation; Phase 1 the I/O trait surface and
 adapters; Phase 2 the networking depth.
 
+### Phase 3 — filesystem depth + streaming (`volt.fs.*`)
+
+- **`File`** — async file handle implementing all six `volt.io`
+  traits (`Reader`, `Writer`, `Seeker`, `Closer`, `ReaderAt`,
+  `WriterAt`). All blocking I/O routes through the blocking pool;
+  the calling coroutine parks while the pool thread does the
+  syscall. `as_fd` populated, so `volt.io.copy(socket.writer(),
+  file.reader())` is positioned for kernel zero-copy in v1.2.
+- **`OpenOptions`** — `{ read, write, append, create, exclusive,
+  truncate, mode }` builder. POSIX `O_*` flag mapping in `toPosix`.
+- **`Metadata`** — typed `fstat` result: size, mode, kind (file /
+  directory / symlink / device / fifo / socket / unknown),
+  atime, mtime, ctime, optional btime.
+- **`Dir`** — dirfd-rooted directory handle. `cwd()` for `AT_FDCWD`
+  without keeping a dirfd. `openDir` / `openFile` use `*at`-rooted
+  syscalls (TOCTOU-safe). Iterator yields `DirEntry { name, kind,
+  inode }`.
+- **`Walker`** — recursive iterator (real implementation, replaces
+  the P0 stub). Allocator-backed stack of frames so deep trees
+  don't blow the OS stack. `WalkOptions { max_depth = 4096,
+  follow_symlinks, skip_hidden }`. `skipSubtree()` cancels descent
+  into the previously yielded directory. Symlink-loop detection
+  is a v1.2 follow-up; default-false ships now.
+- **`tree`** — `makeDir`, `makeDirAll`, `removeFile`, `removeDir`,
+  `removeTree`, `rename`, `symlink`, `readlinkAlloc`, `copy`.
+  `removeTree` walks pre-order then iterates in reverse for
+  post-order removal. Path-relative ops route through the
+  blocking pool. `copy` is read+write today; kernel accelerators
+  (`copy_file_range`, `clonefile`/`fcopyfile`) are tracked for
+  v1.2 alongside the underlying syscall wrappers.
+- **`path`** — re-exports of `std.fs.path` (join, dirname,
+  basename, extension, isAbsolute) under `volt.fs.path` so users
+  don't cross namespaces.
+- **`temp`** — `createTemp` / `mkdtemp` with random alphanumeric
+  suffix (~5e18 unique paths, time XOR pid seeded — collision-
+  resistant for temp files, not cryptographic). `TempDir.deinit()`
+  removes the tree.
+- **`fs.zig` facade** — `readFile` / `writeFile` rewritten on top
+  of `File` (no longer bypassing via raw syscalls). Pre-allocates
+  by size, loops on partial reads.
+- Integration tests for File round-trip + positional I/O + trait
+  composition; Dir.iterate + Walker (incl. skipSubtree); tree ops
+  round-trip; rename + copy + symlink + readlinkAlloc.
+
+#### Deferred from P3 → v1.2 / later
+
+- **Kernel zero-copy fills** in `volt.io.copy` (`sendfile` Darwin /
+  Linux, `splice` Linux, `copy_file_range` Linux,
+  `clonefile`/`fcopyfile` Darwin). The dispatch shape is in
+  place (P1.C); the platform-specific syscall wrappers and
+  fallback handling are a focused workstream of their own.
+- **`statx` integration** for `Metadata.btime` on Linux — today
+  btime is null on systems where it's not free.
+- **Symlink-loop detection** in `Walker` when
+  `follow_symlinks = true`. The contract is locked; the inode
+  tracking is the v1.2 fill.
+
 ### Phase 2 — networking depth (`volt.net.*`)
 
 - `src/io/net.zig` promoted to its own folder `src/net/`. Tokio shape:
