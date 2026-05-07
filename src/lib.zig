@@ -427,6 +427,7 @@ test {
     _ = @import("test/watcher_test.zig");
     _ = @import("test/mmap_test.zig");
     _ = @import("test/cancel_io_test.zig");
+    _ = @import("test/cancellation_audit_test.zig");
     _ = @import("channel/Channel.zig");
     _ = @import("channel/Oneshot.zig");
     _ = @import("channel/Watch.zig");

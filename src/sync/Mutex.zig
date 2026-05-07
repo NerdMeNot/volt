@@ -82,52 +82,54 @@ pub const Mutex = struct {
     }
 
     /// Acquire the lock, suspending the coroutine if it's held.
-    pub fn lock(self: *Mutex) void {
+    /// Returns `error.Cancelled` if the coroutine is cancelled while
+    /// parked on the waiter list (waiter list invariants stay
+    /// intact — best-effort removal under the slow-path mutex).
+    ///
+    /// API note: this used to return `void`, but the void variant
+    /// silently busy-looped on cancel since `parkCurrent` would
+    /// return `error.Cancelled` indefinitely. The error union is
+    /// the honest signature. Callers that don't care about
+    /// cancellation can `mu.lock() catch {}` — the lock is never
+    /// half-acquired on error.
+    pub fn lock(self: *Mutex) error{Cancelled}!void {
         // Fast path: uncontended.
         if (self.tryLock()) return;
 
         // Slow path: enqueue and park.
-        while (true) {
-            var waiter: Waiter = .{};
-            self.waiter_mutex.lock();
-            // Re-check under the slow-path mutex. If the lock is now free
-            // (and no waiters ahead of us), grab it.
-            if (self.waiters.isEmpty() and self.tryLock()) {
-                self.waiter_mutex.unlock();
-                return;
-            }
-            self.waiters.pushBack(&waiter);
+        var waiter: Waiter = .{};
+        self.waiter_mutex.lock();
+        // Re-check under the slow-path mutex. If the lock is now free
+        // (and no waiters ahead of us), grab it.
+        if (self.waiters.isEmpty() and self.tryLock()) {
             self.waiter_mutex.unlock();
-
-            // Park until the unlocker hands the lock to us. lock() has
-            // no error union so a cancel here unwinds via best-effort
-            // waiter removal; the queue invariants stay intact.
-            waiter.park.parkCurrent() catch |err| switch (err) {
-                error.Cancelled => {
-                    // Best-effort remove from waiter list. If we'd
-                    // already been popped, the unlocker handed us the
-                    // lock — keep it.
-                    self.waiter_mutex.lock();
-                    const removed = self.removeWaiter(&waiter);
-                    self.waiter_mutex.unlock();
-                    if (!removed) {
-                        // We were already handed the lock. Hold it
-                        // (caller will see the cancellation later when
-                        // they next yield); they MUST call unlock.
-                        return;
-                    }
-                    // Genuine cancel — but we have no way to surface it
-                    // without an error union. Fall through and re-loop;
-                    // the next `parkCurrent` in this thread will return
-                    // `error.Cancelled` and the calling coroutine will
-                    // unwind cleanly. (This is the best we can do for
-                    // an async-but-not-error-returning mutex API.)
-                    continue;
-                },
-            };
-            // Lock was handed off to us by the unlocker; we own it.
             return;
         }
+        self.waiters.pushBack(&waiter);
+        self.waiter_mutex.unlock();
+
+        // Park until the unlocker hands the lock to us.
+        waiter.park.parkCurrent() catch |err| switch (err) {
+            error.Cancelled => {
+                // Best-effort remove from waiter list. If we'd
+                // already been popped, the unlocker handed us the
+                // lock — surface it (caller becomes the holder).
+                self.waiter_mutex.lock();
+                const removed = self.removeWaiter(&waiter);
+                self.waiter_mutex.unlock();
+                if (!removed) {
+                    // We were already handed the lock. The unlocker
+                    // moved `state` to LOCKED; we own it now. Caller
+                    // gets the lock despite the cancel; their next
+                    // yield surfaces error.Cancelled and they
+                    // unwind via defer mu.unlock().
+                    return;
+                }
+                // Genuine cancel — surface it. Lock is NOT held.
+                return error.Cancelled;
+            },
+        };
+        // Lock was handed off to us by the unlocker; we own it.
     }
 
     /// Release the lock. Must only be called by the holder.
@@ -186,10 +188,10 @@ const CounterCtx = struct {
     counter: u64 = 0,
 };
 
-fn incrementer(ctx: *CounterCtx, iters: u32) void {
+fn incrementer(ctx: *CounterCtx, iters: u32) !void {
     var i: u32 = 0;
     while (i < iters) : (i += 1) {
-        ctx.mu.lock();
+        try ctx.mu.lock();
         ctx.counter += 1;
         ctx.mu.unlock();
     }
@@ -231,8 +233,8 @@ const FifoCtx = struct {
     },
 };
 
-fn fifoLocker(ctx: *FifoCtx, slot: usize) void {
-    ctx.mu.lock();
+fn fifoLocker(ctx: *FifoCtx, slot: usize) !void {
+    try ctx.mu.lock();
     const order = ctx.order.fetchAdd(1, .monotonic);
     ctx.finishes[slot].store(order + 1, .release);
     // Spin a bit while holding the lock so subsequent lockers enqueue.
@@ -246,7 +248,7 @@ fn fifoRoot() !FifoCtx {
     var ctx = FifoCtx{ .mu = &mu };
 
     // Hold the mutex from the root, spawn 4 lockers in order, release.
-    mu.lock();
+    try mu.lock();
 
     var lockers: [4]*volt.Job = undefined;
     for (&lockers, 0..) |*j, i| {

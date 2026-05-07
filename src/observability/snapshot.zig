@@ -147,16 +147,16 @@ const Mutex = @import("../sync/Mutex.zig").Mutex;
 
 const LiveCtx = struct { gate: *Mutex };
 
-fn liveCountChild(ctx: *LiveCtx) void {
+fn liveCountChild(ctx: *LiveCtx) !void {
     // Park on the mutex held by root — deterministic enqueue (no
     // notify-race). Root unlocks after snapshotting, we acquire+exit.
-    ctx.gate.lock();
+    try ctx.gate.lock();
     ctx.gate.unlock();
 }
 
 fn liveCountRoot() !usize {
     var gate = Mutex{};
-    gate.lock(); // root holds it
+    try gate.lock(); // root holds it
     var ctx = LiveCtx{ .gate = &gate };
 
     var children: [3]*volt.Job = undefined;
