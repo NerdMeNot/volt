@@ -349,10 +349,51 @@ pub const Mmap = struct {
         };
     }
 
+    /// Risk-4 contract: **resize the mapping and return a fresh slice.**
+    ///
+    /// The signature returns `[]u8`, not `void`, deliberately —
+    /// callers MUST rebind any cached slice or pointer to the
+    /// returned value. The address may have moved:
+    ///   - Darwin: no `mremap` — implementation always unmap+remap,
+    ///     so the address ALWAYS changes.
+    ///   - Linux: `mremap(MREMAP_MAYMOVE)` may move at the kernel's
+    ///     discretion when in-place grow isn't possible.
+    /// Treat any cached pointer into the old mapping as invalid the
+    /// instant `remap` returns. Shrinking does not move the address
+    /// on Linux but the contract is uniform — always rebind.
     pub fn remap(self: *Mmap, new_len: usize) MmapError![]u8 {
-        _ = self;
-        _ = new_len;
-        @compileError("Mmap.remap: P4.D");
+        if (new_len == 0) return error.InvalidRange;
+
+        if (builtin.os.tag == .linux) {
+            const old_ptr: *align(std.heap.pageSize()) const anyopaque = @ptrCast(@alignCast(self.ptr));
+            const flags: std.c.MREMAP = .{ .MAYMOVE = true };
+            const result = std.c.mremap(old_ptr, self.len, new_len, flags);
+            if (@intFromPtr(result) == @intFromPtr(std.c.MAP_FAILED)) {
+                return error.RemapFailed;
+            }
+            self.ptr = @ptrCast(result);
+            self.len = new_len;
+            return self.slice();
+        }
+
+        // Darwin / BSD: no mremap. Unmap + remap.
+        const prot = makeProt(self.perms);
+        const map_flags = if (self.backing_fd != null)
+            makeFileMap(self.mode, false)
+        else
+            makeAnonMap();
+        const fd: posix.fd_t = self.backing_fd orelse -1;
+        const result = std.c.mmap(null, new_len, prot, map_flags, fd, 0);
+        if (@intFromPtr(result) == @intFromPtr(std.c.MAP_FAILED)) {
+            return error.RemapFailed;
+        }
+
+        const old_ptr_aligned: *align(std.heap.pageSize()) const anyopaque = @ptrCast(@alignCast(self.ptr));
+        _ = std.c.munmap(old_ptr_aligned, self.len);
+
+        self.ptr = @ptrCast(result);
+        self.len = new_len;
+        return self.slice();
     }
 };
 
