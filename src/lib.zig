@@ -91,6 +91,12 @@ pub const fs = struct {
     /// Path manipulation — pure string ops, no syscalls.
     pub const path = @import("fs/path.zig");
 
+    /// Temporary files + directories with random alphanumeric
+    /// suffixes. `TempDir.deinit()` removes the tree.
+    pub const temp = @import("fs/temp.zig");
+    pub const TempDir = @import("fs/temp.zig").TempDir;
+    pub const TempFile = @import("fs/temp.zig").TempFile;
+
     /// P0 contract artifact (P4 implementation) — Mmap with locked
     /// page-fault contract. Bodies @compileError until P4.
     pub const Mmap = @import("fs/Mmap.zig").Mmap;
@@ -429,6 +435,7 @@ test {
     _ = @import("fs/Walker.zig");
     _ = @import("fs/tree.zig");
     _ = @import("fs/path.zig");
+    _ = @import("fs/temp.zig");
     _ = @import("process/Command.zig");
     _ = @import("observability/snapshot.zig");
     _ = @import("observability/metrics.zig");
