@@ -210,3 +210,53 @@ test "P3.B: Walker.skipSubtree skips descent into a directory" {
     // `sub/inner.txt` not yielded).
     try std.testing.expectEqual(@as(u32, 2), count);
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// P3.x.6 — Walker.max_depth surfaces error.MaxDepthExceeded
+// ─────────────────────────────────────────────────────────────────────
+
+fn maxDepthRoot(root: []const u8) !bool {
+    rmRf(root);
+    var path_z_buf: [256]u8 = undefined;
+    const root_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{root});
+    _ = std.posix.system.mkdir(root_z.ptr, 0o755);
+
+    var sub_buf: [256]u8 = undefined;
+    const sub = try std.fmt.bufPrint(&sub_buf, "{s}/sub", .{root});
+    var sub_z_buf: [256]u8 = undefined;
+    const sub_z = try std.fmt.bufPrintZ(&sub_z_buf, "{s}", .{sub});
+    _ = std.posix.system.mkdir(sub_z.ptr, 0o755);
+
+    var inner_buf: [256]u8 = undefined;
+    const inner = try std.fmt.bufPrint(&inner_buf, "{s}/inner.txt", .{sub});
+    var fi = try volt.fs.File.create(inner);
+    fi.close();
+
+    // max_depth = 1 means we yield root contents but NEVER descend.
+    // The walker should error.MaxDepthExceeded when it tries to
+    // descend into "sub".
+    var saw_error = false;
+    {
+        var w = try volt.fs.Walker.open(std.testing.allocator, root, .{ .max_depth = 1 });
+        defer w.deinit();
+        while (true) {
+            const r = w.next() catch |err| {
+                if (err == error.MaxDepthExceeded) saw_error = true;
+                break;
+            };
+            if (r == null) break;
+        }
+    }
+
+    rmRf(inner);
+    _ = std.posix.system.rmdir(sub_z.ptr);
+    _ = std.posix.system.rmdir(root_z.ptr);
+    return saw_error;
+}
+
+test "P3.x.6: Walker max_depth = 1 → error.MaxDepthExceeded on descent" {
+    var path_buf: [128]u8 = undefined;
+    const root = try unique_dir(&path_buf, "/tmp/volt-fs-md");
+    const saw = try volt.run(.{ .allocator = std.testing.allocator }, maxDepthRoot, .{root});
+    try std.testing.expect(saw);
+}

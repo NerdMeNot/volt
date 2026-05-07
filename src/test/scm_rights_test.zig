@@ -76,6 +76,47 @@ fn scmRoot(ctx: *ScmCtx) !void {
     try receiver.join();
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// P3.x.6 — SCM_RIGHTS edge cases (input validation)
+// ─────────────────────────────────────────────────────────────────────
+
+fn edgeRoot() !void {
+    var fds: [2]std.posix.fd_t = undefined;
+    const rc = std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    if (rc != 0) return error.SocketPairFailed;
+    try volt.io.lowlevel.setNonblock(fds[0]);
+    try volt.io.lowlevel.setNonblock(fds[1]);
+    var a: volt.net.UnixStream = .{ .fd = fds[0] };
+    var b: volt.net.UnixStream = .{ .fd = fds[1] };
+    defer a.close();
+    defer b.close();
+
+    // Empty fds slice → InvalidArgument.
+    try std.testing.expectError(
+        error.InvalidArgument,
+        a.sendFds(&[_]std.posix.fd_t{}, "x"),
+    );
+
+    // Empty payload → InvalidArgument (SCM_RIGHTS is ancillary; needs ≥ 1 byte data).
+    const dummy_fd: std.posix.fd_t = -1;
+    try std.testing.expectError(
+        error.InvalidArgument,
+        a.sendFds(&[_]std.posix.fd_t{dummy_fd}, ""),
+    );
+
+    // Too many fds → TooManyFds.
+    var many: [32]std.posix.fd_t = undefined;
+    @memset(&many, -1);
+    try std.testing.expectError(
+        error.TooManyFds,
+        a.sendFds(&many, "x"),
+    );
+}
+
+test "P3.x.6: SCM_RIGHTS edge cases" {
+    try volt.run(.{ .allocator = std.testing.allocator }, edgeRoot, .{});
+}
+
 test "P3.x.4: SCM_RIGHTS — send file fd over UnixStream, peer reads it" {
     var path_buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "/tmp/volt-scm-{d}.txt", .{std.posix.system.getpid()});

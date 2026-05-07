@@ -43,3 +43,18 @@ test "P2.E: dns.lookupHostFirst returns the first match" {
     try std.testing.expect(addr != null);
     try std.testing.expectEqual(@as(u16, 443), addr.?.getPort());
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// P3.x.6 — DNS error path: invalid hostname → HostNotFound
+// ─────────────────────────────────────────────────────────────────────
+
+fn invalidHostRoot() !void {
+    // RFC 6761 reserves `.invalid` for domains that must NEVER
+    // resolve; getaddrinfo returns EAI_NONAME → HostNotFound.
+    const result = volt.net.dns.lookupHost(std.testing.allocator, "this-host-must-not-exist.invalid", 80);
+    try std.testing.expectError(error.HostNotFound, result);
+}
+
+test "P3.x.6: dns.lookupHost on .invalid TLD → HostNotFound" {
+    try volt.run(.{ .allocator = std.testing.allocator }, invalidHostRoot, .{});
+}

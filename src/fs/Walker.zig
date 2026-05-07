@@ -167,7 +167,12 @@ pub const Walker = struct {
             @memcpy(self.name_storage[0..ent.name.len], ent.name);
             self.name_len = ent.name.len;
 
-            if (ent.kind == .directory and top.depth + 1 < self.opts.max_depth) {
+            if (ent.kind == .directory) {
+                // Always queue descent on a directory; the depth
+                // check fires at descent time so MaxDepthExceeded
+                // surfaces when the tree is genuinely too deep.
+                // (Without this, the yield-time check would silently
+                // suppress the error — bug fix from P3.x.6.)
                 self.pending_dir_name_len = ent.name.len;
             }
 

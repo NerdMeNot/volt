@@ -124,6 +124,67 @@ fn dgramRoot(server_path: []const u8) !DgramCtx {
     return ctx;
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// P3.x.6 — UnixStream shutdown / readv / writev via socketpair
+// ─────────────────────────────────────────────────────────────────────
+
+const UnixDepthCtx = struct {
+    a: volt.net.UnixStream,
+    b: volt.net.UnixStream,
+    eof_seen: bool = false,
+    written_via_v: usize = 0,
+    read_via_v: usize = 0,
+    combined: [24]u8 = undefined,
+};
+
+fn unixDepthRoot(ctx: *UnixDepthCtx) !void {
+    var fds: [2]std.posix.fd_t = undefined;
+    const rc = std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    if (rc != 0) return error.SocketPairFailed;
+    try volt.io.lowlevel.setNonblock(fds[0]);
+    try volt.io.lowlevel.setNonblock(fds[1]);
+    ctx.a = .{ .fd = fds[0] };
+    ctx.b = .{ .fd = fds[1] };
+    defer ctx.a.close();
+    defer ctx.b.close();
+
+    // 1. writev / readv vectored I/O.
+    const x = "uno-";
+    const y = "dos-";
+    const z = "tres";
+    const iovs = [_]std.posix.iovec_const{
+        .{ .base = x.ptr, .len = x.len },
+        .{ .base = y.ptr, .len = y.len },
+        .{ .base = z.ptr, .len = z.len },
+    };
+    ctx.written_via_v = try ctx.a.writev(&iovs);
+
+    var buf1: [8]u8 = undefined;
+    var buf2: [8]u8 = undefined;
+    var iovs_in = [_]std.posix.iovec{
+        .{ .base = &buf1, .len = buf1.len },
+        .{ .base = &buf2, .len = buf2.len },
+    };
+    ctx.read_via_v = try ctx.b.readv(&iovs_in);
+    @memcpy(ctx.combined[0..buf1.len], &buf1);
+    @memcpy(ctx.combined[buf1.len..][0..buf2.len], &buf2);
+
+    // 2. shutdown(.write) — peer's next read sees EOF.
+    try ctx.a.shutdown(.write);
+    var eof_buf: [8]u8 = undefined;
+    const n = try ctx.b.read(&eof_buf);
+    ctx.eof_seen = (n == 0);
+}
+
+test "P3.x.6: UnixStream writev / readv / shutdown" {
+    var ctx = UnixDepthCtx{ .a = undefined, .b = undefined };
+    try volt.run(.{ .allocator = std.testing.allocator }, unixDepthRoot, .{&ctx});
+    try std.testing.expectEqual(@as(usize, 12), ctx.written_via_v);
+    try std.testing.expectEqual(@as(usize, 12), ctx.read_via_v);
+    try std.testing.expectEqualStrings("uno-dos-tres", ctx.combined[0..12]);
+    try std.testing.expect(ctx.eof_seen);
+}
+
 test "P2.D: UnixDatagram sendTo / recvFrom round-trip" {
     var path_buf: [128]u8 = undefined;
     const server_path = try unique_path(&path_buf, "/tmp/volt-dgram-s");

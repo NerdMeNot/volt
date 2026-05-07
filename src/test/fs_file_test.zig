@@ -147,3 +147,49 @@ test "P3.A: File.seek / getEndPos" {
     const end = try volt.run(.{ .allocator = std.testing.allocator }, seekRoot, .{path});
     try std.testing.expectEqual(@as(u64, 10), end);
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// P3.x.6 — fs error paths
+// ─────────────────────────────────────────────────────────────────────
+
+fn missingFileRoot() !void {
+    // Open a path that definitely doesn't exist → FileNotFound.
+    const result = volt.fs.File.openRead("/nonexistent/path/to/nothing-volt-test.txt");
+    try std.testing.expectError(error.FileNotFound, result);
+}
+
+test "P3.x.6: File.openRead on nonexistent path → FileNotFound" {
+    try volt.run(.{ .allocator = std.testing.allocator }, missingFileRoot, .{});
+}
+
+fn missingChmodRoot() !void {
+    const result = volt.fs.tree.chmod("/nonexistent/path/volt-chmod-test.txt", 0o644);
+    try std.testing.expectError(error.FileNotFound, result);
+}
+
+test "P3.x.6: tree.chmod on nonexistent path → FileNotFound" {
+    try volt.run(.{ .allocator = std.testing.allocator }, missingChmodRoot, .{});
+}
+
+fn exclusiveExistingRoot(path: []const u8) !void {
+    cleanup(path);
+    {
+        var f = try volt.fs.File.create(path);
+        f.close();
+    }
+    defer cleanup(path);
+
+    // OpenOptions.exclusive on a path that already exists → PathAlreadyExists.
+    const result = (volt.fs.OpenOptions{
+        .write = true,
+        .create = true,
+        .exclusive = true,
+    }).open(path);
+    try std.testing.expectError(error.PathAlreadyExists, result);
+}
+
+test "P3.x.6: OpenOptions.exclusive on existing → PathAlreadyExists" {
+    var path_buf: [128]u8 = undefined;
+    const path = try unique_path(&path_buf, "/tmp/volt-fs-excl");
+    try volt.run(.{ .allocator = std.testing.allocator }, exclusiveExistingRoot, .{path});
+}

@@ -291,3 +291,45 @@ test "P4.E: Mmap.readerAt() positional read independent of cursor" {
     const path = try std.fmt.bufPrint(&path_buf, "/tmp/volt-mat-{d}.txt", .{std.posix.system.getpid()});
     try volt.run(.{ .allocator = std.testing.allocator }, mmapReaderAtRoot, .{path});
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// P3.x.6 — Mmap.lock + unlock smoke; InvalidRange validation
+// ─────────────────────────────────────────────────────────────────────
+
+fn lockRoot() !void {
+    var m = try volt.fs.Mmap.anonymous(8192, .{
+        .perms = .{ .read = true, .write = true, .exec = false },
+    });
+    defer m.deinit();
+
+    const range = volt.fs.MmapRange{ .offset = 0, .length = m.len };
+    try m.lock(range);
+    try m.unlock(range);
+}
+
+test "P3.x.6: Mmap.lock / unlock smoke" {
+    try volt.run(.{ .allocator = std.testing.allocator }, lockRoot, .{});
+}
+
+fn invalidRangeRoot() !void {
+    var m = try volt.fs.Mmap.anonymous(4096, .{
+        .perms = .{ .read = true, .write = true, .exec = false },
+    });
+    defer m.deinit();
+
+    // Offset past end → InvalidRange.
+    try std.testing.expectError(
+        error.InvalidRange,
+        m.advise(.{ .offset = 8192, .length = 100 }, .will_need),
+    );
+
+    // Length past end → InvalidRange.
+    try std.testing.expectError(
+        error.InvalidRange,
+        m.flush(.{ .offset = 0, .length = 8192 }, .async_),
+    );
+}
+
+test "P3.x.6: Mmap operations reject out-of-bounds Range" {
+    try volt.run(.{ .allocator = std.testing.allocator }, invalidRangeRoot, .{});
+}

@@ -72,6 +72,65 @@ fn watcherRoot(ctx: *WatchCtx) !void {
     try watcher.join();
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// P3.x.6 — Watcher fires on delete and rename events
+// ─────────────────────────────────────────────────────────────────────
+
+const DeleteCtx = struct {
+    dir: []const u8,
+    file: []const u8,
+    got_event: bool = false,
+};
+
+fn deleteWatcherCoro(ctx: *DeleteCtx) !void {
+    var w = try volt.fs.Watcher.open(ctx.dir);
+    defer w.deinit();
+    try volt.yield();
+    if (try w.next()) |ev| {
+        _ = ev;
+        ctx.got_event = true;
+    }
+}
+
+fn deleteTriggerCoro(ctx: *DeleteCtx) !void {
+    try volt.yield();
+    try volt.yield();
+    try volt.yield();
+    // First make sure the file exists, then delete it.
+    var f = try volt.fs.File.create(ctx.file);
+    f.close();
+    try volt.yield();
+    try volt.fs.tree.removeFile(ctx.file);
+}
+
+fn deleteRoot(ctx: *DeleteCtx) !void {
+    rmRf(ctx.file);
+    rmRf(ctx.dir);
+    try volt.fs.tree.makeDir(ctx.dir, 0o755);
+    defer rmRf(ctx.dir);
+    defer rmRf(ctx.file);
+
+    var watcher = try volt.spawn(deleteWatcherCoro, .{ctx});
+    defer volt.destroyTask(watcher);
+    var trigger = try volt.spawn(deleteTriggerCoro, .{ctx});
+    defer volt.destroyTask(trigger);
+
+    try trigger.join();
+    try watcher.join();
+}
+
+test "P3.x.6: Watcher fires events for delete operations" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    var dir_buf: [128]u8 = undefined;
+    var file_buf: [256]u8 = undefined;
+    const pid = std.posix.system.getpid();
+    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/volt-w-d-{d}", .{pid});
+    const file = try std.fmt.bufPrint(&file_buf, "{s}/will-delete.txt", .{dir});
+    var ctx = DeleteCtx{ .dir = dir, .file = file };
+    try volt.run(.{ .allocator = std.testing.allocator }, deleteRoot, .{&ctx});
+    try std.testing.expect(ctx.got_event);
+}
+
 test "P3.x.5: Watcher fires an event on file creation in watched dir" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos and builtin.os.tag != .ios and
         builtin.os.tag != .tvos and builtin.os.tag != .watchos)

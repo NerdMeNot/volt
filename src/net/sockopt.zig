@@ -81,15 +81,17 @@ pub fn setKeepAliveParams(
     interval: Duration,
     count: u32,
 ) SetOptionError!void {
-    const idle_secs: c_int = @intCast(@max(@as(u64, 1), idle.toSeconds()));
-    const interval_secs: c_int = @intCast(@max(@as(u64, 1), interval.toSeconds()));
+    const idle_secs: c_int = @intCast(@max(@as(u64, 1), idle.nanos / std.time.ns_per_s));
+    const interval_secs: c_int = @intCast(@max(@as(u64, 1), interval.nanos / std.time.ns_per_s));
     const count_int: c_int = @intCast(count);
 
-    // KEEPIDLE / KEEPINTVL / KEEPCNT — same names on Darwin and Linux,
-    // both at IPPROTO_TCP. Darwin spells KEEPIDLE as TCP_KEEPALIVE
-    // historically; in Zig's posix it's exposed as TCP.KEEPIDLE on
-    // both, so the same path works.
-    try setInt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPIDLE, idle_secs);
+    // Darwin spells the idle-time option TCP_KEEPALIVE; Linux spells
+    // it TCP_KEEPIDLE. KEEPINTVL / KEEPCNT match on both.
+    const idle_opt: u32 = comptime switch (@import("builtin").os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos, .driverkit => posix.TCP.KEEPALIVE,
+        else => posix.TCP.KEEPIDLE,
+    };
+    try setInt(fd, posix.IPPROTO.TCP, idle_opt, idle_secs);
     try setInt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPINTVL, interval_secs);
     try setInt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPCNT, count_int);
 }
@@ -101,7 +103,7 @@ pub fn setKeepAliveParams(
 pub fn setLinger(fd: posix.socket_t, value: ?Duration) SetOptionError!void {
     const Linger = extern struct { onoff: c_int, linger: c_int };
     var l: Linger = if (value) |d|
-        .{ .onoff = 1, .linger = @intCast(d.toSeconds()) }
+        .{ .onoff = 1, .linger = @intCast(d.nanos / std.time.ns_per_s) }
     else
         .{ .onoff = 0, .linger = 0 };
     try syscall.setsockopt(fd, posix.SOL.SOCKET, posix.SO.LINGER, std.mem.asBytes(&l));

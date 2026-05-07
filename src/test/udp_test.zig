@@ -52,6 +52,54 @@ test "P2.C: UDP loopback sendTo/recvFrom round-trip" {
     try std.testing.expectEqualStrings("hello-udp", ctx.received[0..ctx.received_len]);
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// P3.x.6 — UDP connect / send / recv (post-connect API)
+// ─────────────────────────────────────────────────────────────────────
+
+const ConnectedDgramCtx = struct {
+    receiver_addr: volt.net.Address,
+    received: [32]u8 = undefined,
+    received_len: usize = 0,
+};
+
+fn connectedReceiver(sock: *volt.net.UdpSocket, ctx: *ConnectedDgramCtx) !void {
+    var buf: [64]u8 = undefined;
+    const dgram = try sock.recvFrom(&buf);
+    @memcpy(ctx.received[0..dgram.len], buf[0..dgram.len]);
+    ctx.received_len = dgram.len;
+}
+
+fn connectedSender(target: volt.net.Address) !void {
+    var sender = try volt.net.UdpSocket.bind(volt.net.Address.loopback4(0));
+    defer sender.close();
+    try sender.connect(target);
+    try volt.yield();
+    // After connect: send / recv replace sendTo / recvFrom.
+    _ = try sender.send("hello-connected");
+}
+
+fn connectedRoot() !ConnectedDgramCtx {
+    var receiver = try volt.net.UdpSocket.bind(volt.net.Address.loopback4(0));
+    defer receiver.close();
+    const local = try receiver.localAddress();
+
+    var ctx = ConnectedDgramCtx{ .receiver_addr = local };
+
+    var recv_task = try volt.spawn(connectedReceiver, .{ &receiver, &ctx });
+    defer volt.destroyTask(recv_task);
+    var send_task = try volt.spawn(connectedSender, .{local});
+    defer volt.destroyTask(send_task);
+
+    try recv_task.join();
+    try send_task.join();
+    return ctx;
+}
+
+test "P3.x.6: UDP connect + send / recv (post-connect API)" {
+    const ctx = try volt.run(.{ .allocator = std.testing.allocator }, connectedRoot, .{});
+    try std.testing.expectEqualStrings("hello-connected", ctx.received[0..ctx.received_len]);
+}
+
 test "P2.C: UDP setBroadcast / setMulticastTtl don't error on a fresh socket" {
     // Smoke test: setsockopt paths reach the kernel without surprising errors.
     // Doesn't actually exercise multicast traffic — that needs a routable
