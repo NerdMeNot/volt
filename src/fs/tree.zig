@@ -19,6 +19,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const c = std.c;
 
 const syscall = @import("../internal/syscall.zig");
 const spawnBlocking = @import("../api/spawn_blocking.zig").spawnBlocking;
@@ -26,6 +27,14 @@ const File = @import("File.zig").File;
 const OpenOptionsT = @import("OpenOptions.zig").OpenOptions;
 const Walker = @import("Walker.zig").Walker;
 const Kind = @import("Metadata.zig").Kind;
+const Metadata = @import("Metadata.zig").Metadata;
+const Instant = @import("../time.zig").Instant;
+
+// AT_SYMLINK_NOFOLLOW differs per platform: Linux 0x100, Darwin 0x0020.
+const AT_SYMLINK_NOFOLLOW: u32 = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos, .visionos, .driverkit, .freebsd, .netbsd, .openbsd, .dragonfly => 0x0020,
+    else => 0x100,
+};
 
 // ─────────────────────────────────────────────────────────────────────
 // mkdir / mkdirAll / remove
@@ -206,6 +215,229 @@ pub fn readlinkAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
             var scratch: [4096]u8 = undefined;
             const target = try syscall.readlinkatZ(posix.AT.FDCWD, a.path_z.ptr, &scratch);
             return a.allocator.dupe(u8, target);
+        }
+    }.run, .{&args});
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// stat / lstat / exists / access
+// ─────────────────────────────────────────────────────────────────────
+
+/// Get metadata for `path`. Follows symlinks.
+pub fn stat(path: []const u8) !Metadata {
+    var path_buf: [4096]u8 = undefined;
+    if (path.len >= path_buf.len) return error.NameTooLong;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return error.NameTooLong;
+
+    const Args = struct { path_z: [:0]const u8 };
+    var args = Args{ .path_z = path_z };
+    const s = try spawnBlocking(struct {
+        fn run(a: *Args) !posix.Stat {
+            return syscall.fstatatZ(posix.AT.FDCWD, a.path_z.ptr, 0);
+        }
+    }.run, .{&args});
+    return Metadata.fromPosixStat(s);
+}
+
+/// Like `stat` but doesn't follow symlinks — returns metadata about
+/// the link itself if `path` is a symlink.
+pub fn lstat(path: []const u8) !Metadata {
+    var path_buf: [4096]u8 = undefined;
+    if (path.len >= path_buf.len) return error.NameTooLong;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return error.NameTooLong;
+
+    const Args = struct { path_z: [:0]const u8 };
+    var args = Args{ .path_z = path_z };
+    const s = try spawnBlocking(struct {
+        fn run(a: *Args) !posix.Stat {
+            return syscall.fstatatZ(posix.AT.FDCWD, a.path_z.ptr, AT_SYMLINK_NOFOLLOW);
+        }
+    }.run, .{&args});
+    return Metadata.fromPosixStat(s);
+}
+
+/// Cheap probe for "is there something at this path?". Returns
+/// `false` on ENOENT, propagates other errors.
+pub fn exists(path: []const u8) !bool {
+    access(path, .{ .exists = true }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+/// Bitfield for `access` checks. Pass `.exists = true` for an
+/// existence-only probe; combine `read`/`write`/`execute` for
+/// permission checks against the calling user.
+pub const AccessMode = packed struct {
+    exists: bool = false,
+    read: bool = false,
+    write: bool = false,
+    execute: bool = false,
+};
+
+/// Check that `path` exists and is accessible per `mode`. Returns
+/// without error on success; surfaces `error.FileNotFound`,
+/// `error.AccessDenied`, etc. on failure.
+pub fn access(path: []const u8, mode: AccessMode) !void {
+    var path_buf: [4096]u8 = undefined;
+    if (path.len >= path_buf.len) return error.NameTooLong;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return error.NameTooLong;
+
+    var mode_bits: c_uint = 0;
+    if (mode.exists or @as(u4, @bitCast(mode)) == 0) mode_bits |= std.c.F_OK;
+    if (mode.read) mode_bits |= std.c.R_OK;
+    if (mode.write) mode_bits |= std.c.W_OK;
+    if (mode.execute) mode_bits |= std.c.X_OK;
+
+    const Args = struct { path_z: [:0]const u8, bits: c_uint };
+    var args = Args{ .path_z = path_z, .bits = mode_bits };
+    return spawnBlocking(struct {
+        fn run(a: *Args) !void {
+            const rc = std.c.access(a.path_z.ptr, a.bits);
+            if (rc == 0) return;
+            return switch (posix.errno(rc)) {
+                .ACCES, .PERM => error.AccessDenied,
+                .NOENT => error.FileNotFound,
+                .NOTDIR => error.NotDir,
+                .NAMETOOLONG => error.NameTooLong,
+                .LOOP => error.SymLinkLoop,
+                .ROFS => error.ReadOnlyFileSystem,
+                .IO => error.InputOutput,
+                else => error.Unexpected,
+            };
+        }
+    }.run, .{&args});
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// chmod / chown / utimes
+// ─────────────────────────────────────────────────────────────────────
+
+/// Change file mode bits.
+pub fn chmod(path: []const u8, mode: posix.mode_t) !void {
+    var path_buf: [4096]u8 = undefined;
+    if (path.len >= path_buf.len) return error.NameTooLong;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return error.NameTooLong;
+
+    const Args = struct { path_z: [:0]const u8, mode: posix.mode_t };
+    var args = Args{ .path_z = path_z, .mode = mode };
+    return spawnBlocking(struct {
+        fn run(a: *Args) !void {
+            const rc = std.c.chmod(a.path_z.ptr, a.mode);
+            if (rc == 0) return;
+            return switch (posix.errno(rc)) {
+                .ACCES, .PERM => error.AccessDenied,
+                .NOENT => error.FileNotFound,
+                .NOTDIR => error.NotDir,
+                .NAMETOOLONG => error.NameTooLong,
+                .LOOP => error.SymLinkLoop,
+                .ROFS => error.ReadOnlyFileSystem,
+                .IO => error.InputOutput,
+                else => error.Unexpected,
+            };
+        }
+    }.run, .{&args});
+}
+
+/// Change file ownership. `uid` / `gid` of `~0` (max u32) skips
+/// that field per POSIX convention.
+pub fn chown(path: []const u8, uid: u32, gid: u32) !void {
+    var path_buf: [4096]u8 = undefined;
+    if (path.len >= path_buf.len) return error.NameTooLong;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return error.NameTooLong;
+
+    const Args = struct { path_z: [:0]const u8, uid: u32, gid: u32 };
+    var args = Args{ .path_z = path_z, .uid = uid, .gid = gid };
+    return spawnBlocking(struct {
+        fn run(a: *Args) !void {
+            const rc = std.c.fchownat(posix.AT.FDCWD, a.path_z.ptr, a.uid, a.gid, 0);
+            if (rc == 0) return;
+            return switch (posix.errno(rc)) {
+                .ACCES, .PERM => error.AccessDenied,
+                .NOENT => error.FileNotFound,
+                .NOTDIR => error.NotDir,
+                .NAMETOOLONG => error.NameTooLong,
+                .LOOP => error.SymLinkLoop,
+                .ROFS => error.ReadOnlyFileSystem,
+                .IO => error.InputOutput,
+                else => error.Unexpected,
+            };
+        }
+    }.run, .{&args});
+}
+
+/// Set the access and modification times.
+pub fn utimes(path: []const u8, atime: Instant, mtime: Instant) !void {
+    var path_buf: [4096]u8 = undefined;
+    if (path.len >= path_buf.len) return error.NameTooLong;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return error.NameTooLong;
+
+    // utimes(2) takes [atime, mtime] as struct timeval (sec, usec).
+    const a_secs: i64 = @intCast(@divFloor(atime.timestamp, std.time.ns_per_s));
+    const a_us: i32 = @intCast(@divFloor(@mod(atime.timestamp, std.time.ns_per_s), std.time.ns_per_us));
+    const m_secs: i64 = @intCast(@divFloor(mtime.timestamp, std.time.ns_per_s));
+    const m_us: i32 = @intCast(@divFloor(@mod(mtime.timestamp, std.time.ns_per_s), std.time.ns_per_us));
+
+    const Args = struct {
+        path_z: [:0]const u8,
+        times: [2]std.posix.timeval,
+    };
+    var args = Args{
+        .path_z = path_z,
+        .times = .{
+            .{ .sec = a_secs, .usec = a_us },
+            .{ .sec = m_secs, .usec = m_us },
+        },
+    };
+    return spawnBlocking(struct {
+        fn run(a: *Args) !void {
+            const rc = std.c.utimes(a.path_z.ptr, &a.times);
+            if (rc == 0) return;
+            return switch (posix.errno(rc)) {
+                .ACCES, .PERM => error.AccessDenied,
+                .NOENT => error.FileNotFound,
+                .NOTDIR => error.NotDir,
+                .NAMETOOLONG => error.NameTooLong,
+                .LOOP => error.SymLinkLoop,
+                .ROFS => error.ReadOnlyFileSystem,
+                else => error.Unexpected,
+            };
+        }
+    }.run, .{&args});
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// canonicalize (realpath)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Resolve `path` into an absolute, symlink-resolved canonical
+/// form. Caller frees the returned slice.
+pub fn canonicalize(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var path_buf: [4096]u8 = undefined;
+    if (path.len >= path_buf.len) return error.NameTooLong;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return error.NameTooLong;
+
+    const Args = struct { allocator: std.mem.Allocator, path_z: [:0]const u8 };
+    var args = Args{ .allocator = allocator, .path_z = path_z };
+    return spawnBlocking(struct {
+        fn run(a: *Args) ![]u8 {
+            // PATH_MAX (Linux 4096, Darwin 1024) — take the larger.
+            var resolved: [4096]u8 = undefined;
+            const got = std.c.realpath(a.path_z.ptr, &resolved);
+            if (got == null) {
+                return switch (posix.errno(@as(c_int, -1))) {
+                    .ACCES => error.AccessDenied,
+                    .NOENT => error.FileNotFound,
+                    .NOTDIR => error.NotDir,
+                    .NAMETOOLONG => error.NameTooLong,
+                    .LOOP => error.SymLinkLoop,
+                    .IO => error.InputOutput,
+                    else => error.Unexpected,
+                };
+            }
+            const canonical = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(got.?)), 0);
+            return a.allocator.dupe(u8, canonical);
         }
     }.run, .{&args});
 }

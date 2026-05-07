@@ -151,3 +151,96 @@ test "P3.C: path.join concatenates with /" {
     defer std.testing.allocator.free(joined);
     try std.testing.expectEqualStrings("a/b/c", joined);
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// P3.x.1 — stat / exists / access / chmod / canonicalize
+// ─────────────────────────────────────────────────────────────────────
+
+const StatFillsArgs = struct {
+    path: []const u8,
+};
+
+fn statFillsRoot(args: StatFillsArgs) !void {
+    volt.fs.tree.removeFile(args.path) catch {};
+
+    // exists() is false when nothing is there.
+    try std.testing.expectEqual(false, try volt.fs.tree.exists(args.path));
+
+    // Create a file with some content; stat reports its size.
+    {
+        var f = try volt.fs.File.create(args.path);
+        try f.writeAll("hello stat");
+        f.close();
+    }
+    defer volt.fs.tree.removeFile(args.path) catch {};
+
+    try std.testing.expectEqual(true, try volt.fs.tree.exists(args.path));
+
+    const meta = try volt.fs.tree.stat(args.path);
+    try std.testing.expectEqual(@as(u64, 10), meta.size);
+    try std.testing.expectEqual(volt.fs.Kind.file, meta.kind);
+
+    // access — readable should pass.
+    try volt.fs.tree.access(args.path, .{ .read = true });
+
+    // chmod 0o600 then verify mode.
+    try volt.fs.tree.chmod(args.path, 0o600);
+    const meta2 = try volt.fs.tree.stat(args.path);
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(meta2.mode)) & 0o777);
+
+    // canonicalize: returns absolute path with symlinks resolved.
+    // On macOS, `/tmp` is a symlink to `/private/tmp`, so the result
+    // ends with our basename but the prefix may differ. Just verify
+    // it's absolute and ends with the file name.
+    const canon = try volt.fs.tree.canonicalize(std.testing.allocator, args.path);
+    defer std.testing.allocator.free(canon);
+    try std.testing.expect(canon.len > 0 and canon[0] == '/');
+    try std.testing.expect(std.mem.endsWith(u8, canon, volt.fs.path.basename(args.path)));
+}
+
+test "P3.x.1: tree.stat / exists / access / chmod / canonicalize" {
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/volt-fills-{d}.txt", .{std.posix.system.getpid()});
+    try volt.run(.{ .allocator = std.testing.allocator }, statFillsRoot, .{StatFillsArgs{ .path = path }});
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// lstat sees the link, stat follows it
+// ─────────────────────────────────────────────────────────────────────
+
+const LStatArgs = struct {
+    target: []const u8,
+    link: []const u8,
+};
+
+fn lstatRoot(args: LStatArgs) !void {
+    volt.fs.tree.removeFile(args.target) catch {};
+    volt.fs.tree.removeFile(args.link) catch {};
+
+    {
+        var f = try volt.fs.File.create(args.target);
+        try f.writeAll("target");
+        f.close();
+    }
+    defer volt.fs.tree.removeFile(args.target) catch {};
+    try volt.fs.tree.symlink(args.target, args.link);
+    defer volt.fs.tree.removeFile(args.link) catch {};
+
+    // lstat sees a symlink.
+    const lmeta = try volt.fs.tree.lstat(args.link);
+    try std.testing.expectEqual(volt.fs.Kind.symlink, lmeta.kind);
+
+    // stat follows it — sees the target file.
+    const meta = try volt.fs.tree.stat(args.link);
+    try std.testing.expectEqual(volt.fs.Kind.file, meta.kind);
+    try std.testing.expectEqual(@as(u64, 6), meta.size);
+}
+
+test "P3.x.1: lstat vs stat on a symlink" {
+    var t_buf: [128]u8 = undefined;
+    var l_buf: [128]u8 = undefined;
+    const pid = std.posix.system.getpid();
+    const target = try std.fmt.bufPrint(&t_buf, "/tmp/volt-ls-{d}-target.txt", .{pid});
+    const link = try std.fmt.bufPrint(&l_buf, "/tmp/volt-ls-{d}-link", .{pid});
+    try volt.run(.{ .allocator = std.testing.allocator }, lstatRoot, .{LStatArgs{ .target = target, .link = link }});
+}
