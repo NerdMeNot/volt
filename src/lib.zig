@@ -78,6 +78,12 @@ pub const fs = struct {
     pub const Metadata = @import("fs/Metadata.zig").Metadata;
     pub const Kind = @import("fs/Metadata.zig").Kind;
 
+    /// Directory handle — dirfd-rooted operations (TOCTOU-safe vs
+    /// path-relative). `Dir.cwd()` for the process's CWD without
+    /// keeping a long-lived dirfd.
+    pub const Dir = @import("fs/Dir.zig").Dir;
+    pub const DirEntry = @import("fs/DirEntry.zig").DirEntry;
+
     /// P0 contract artifact (P4 implementation) — Mmap with locked
     /// page-fault contract. Bodies @compileError until P4.
     pub const Mmap = @import("fs/Mmap.zig").Mmap;
@@ -385,6 +391,7 @@ test {
     _ = @import("test/unix_socket_test.zig");
     _ = @import("test/dns_test.zig");
     _ = @import("test/fs_file_test.zig");
+    _ = @import("test/fs_dir_test.zig");
     _ = @import("channel/Channel.zig");
     _ = @import("channel/Oneshot.zig");
     _ = @import("channel/Watch.zig");
@@ -409,6 +416,9 @@ test {
     _ = @import("fs/File.zig");
     _ = @import("fs/OpenOptions.zig");
     _ = @import("fs/Metadata.zig");
+    _ = @import("fs/Dir.zig");
+    _ = @import("fs/DirEntry.zig");
+    _ = @import("fs/Walker.zig");
     _ = @import("process/Command.zig");
     _ = @import("observability/snapshot.zig");
     _ = @import("observability/metrics.zig");
