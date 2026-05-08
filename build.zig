@@ -10,6 +10,24 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Reactor backend selection. Default: kqueue on Darwin/BSD, epoll
+    // on Linux. `-Dreactor=iouring` switches Linux to io_uring.
+    // Cross-platform aware: passing -Dreactor=iouring on a non-Linux
+    // target is rejected at compile time inside src/io/reactor.zig.
+    const ReactorChoice = enum { default, epoll, iouring };
+    const reactor_choice = b.option(
+        ReactorChoice,
+        "reactor",
+        "Reactor backend (default: kqueue on Darwin, epoll on Linux). " ++
+            "Set to 'iouring' for the io_uring backend on Linux.",
+    ) orelse .default;
+
+    // Surface the reactor choice as a comptime-readable module so
+    // src/io/reactor.zig can switch on it. Threaded through to both
+    // the public `volt` module and the test module.
+    const build_options = b.addOptions();
+    build_options.addOption(ReactorChoice, "reactor_choice", reactor_choice);
+
     // x86_64 context-switch asm lives in a separate .S so the linker
     // sees the symbols on every host. Module-level comptime asm in
     // Zig 0.16 doesn't always emit on x86_64-linux ELF.
@@ -22,6 +40,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     volt_mod.link_libc = true;
+    volt_mod.addOptions("build_options", build_options);
     if (target_is_x86_64) {
         volt_mod.addAssemblyFile(b.path("src/coroutine/context_x86_64.S"));
     }
@@ -32,6 +51,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    unit_test_mod.addOptions("build_options", build_options);
     // libc on every platform — Volt uses sigsetjmp/siglongjmp,
     // mprotect (signal-handler path), raise, std.c.* in places that
     // either don't have a raw-syscall replacement or where we'd

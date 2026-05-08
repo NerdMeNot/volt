@@ -37,21 +37,32 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 
-pub const impl = switch (builtin.os.tag) {
-    .macos, .ios, .freebsd, .netbsd, .dragonfly, .openbsd => @import("reactor_kqueue.zig"),
-    .linux => @import("reactor_epoll.zig"),
-    .windows => @compileError(
-        "Volt: Windows runtime support pending. The IOCP reactor itself " ++
-            "(reactor_iocp.zig) cross-compiles cleanly and Windows arms exist for " ++
-            "stack reservation (VirtualAlloc), Futex (WaitOnAddress), sleep, and " ++
-            "monotonic time (QPC). Remaining work to flip Windows on by default: " ++
-            "Windows arms for io/net.zig (ioctlsocket FIONBIO), io/io.zig " ++
-            "(WriteFile vs posix.write), process/Command.zig (CreateProcess), " ++
-            "observability/tracing.zig stderr writer, and a Windows CI runner. " ++
-            "See `reactor_iocp.zig` header for the IOCP-side status note.",
-    ),
-    else => @compileError("Volt reactor: unsupported OS '" ++ @tagName(builtin.os.tag) ++ "'"),
+pub const impl = blk: {
+    // Linux gets a build-flag choice between epoll (default) and
+    // io_uring. Other platforms have a single canonical backend.
+    if (builtin.os.tag == .linux) switch (build_options.reactor_choice) {
+        .iouring => break :blk @import("reactor_iouring.zig"),
+        .epoll, .default => break :blk @import("reactor_epoll.zig"),
+    };
+    if (build_options.reactor_choice == .iouring) {
+        @compileError("Volt: -Dreactor=iouring is Linux-only; current target is " ++ @tagName(builtin.os.tag));
+    }
+    break :blk switch (builtin.os.tag) {
+        .macos, .ios, .freebsd, .netbsd, .dragonfly, .openbsd => @import("reactor_kqueue.zig"),
+        .windows => @compileError(
+            "Volt: Windows runtime support pending. The IOCP reactor itself " ++
+                "(reactor_iocp.zig) cross-compiles cleanly and Windows arms exist for " ++
+                "stack reservation (VirtualAlloc), Futex (WaitOnAddress), sleep, and " ++
+                "monotonic time (QPC). Remaining work to flip Windows on by default: " ++
+                "Windows arms for io/net.zig (ioctlsocket FIONBIO), io/io.zig " ++
+                "(WriteFile vs posix.write), process/Command.zig (CreateProcess), " ++
+                "observability/tracing.zig stderr writer, and a Windows CI runner. " ++
+                "See `reactor_iocp.zig` header for the IOCP-side status note.",
+        ),
+        else => @compileError("Volt reactor: unsupported OS '" ++ @tagName(builtin.os.tag) ++ "'"),
+    };
 };
 
 pub const Reactor = impl.Reactor;
