@@ -168,6 +168,218 @@ test "reactor conformance: unregisterTimer before fire returns pendingCount to 0
     try std.testing.expectEqual(@as(usize, 0), r.pendingCount());
 }
 
+test "reactor conformance: multiple fds register + fire independently" {
+    // Two pipes registered concurrently, only the first writer fires;
+    // verifies the reactor delivers exactly one wake and identifies
+    // the right target. Ensures backends correctly key wakes per
+    // (fd, kind) and don't conflate registrations.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var r = try Reactor.init(std.testing.allocator);
+    defer r.deinit();
+
+    const a = try syscall.pipe();
+    defer syscall.close(a[0]);
+    defer syscall.close(a[1]);
+    const b = try syscall.pipe();
+    defer syscall.close(b[0]);
+    defer syscall.close(b[1]);
+
+    var ta: usize = 0xa;
+    var tb: usize = 0xb;
+    try r.registerWait(a[0], .readable, @ptrCast(&ta));
+    try r.registerWait(b[0], .readable, @ptrCast(&tb));
+    try std.testing.expectEqual(@as(usize, 2), r.pendingCount());
+
+    // Fire only `a`.
+    _ = try syscall.write(a[1], "x");
+
+    var rec: WakeRecorder = .{};
+    defer rec.deinit(std.testing.allocator);
+    const n = try r.poll(50 * std.time.ns_per_ms, @ptrCast(&rec), &WakeRecorder.wakeStatic);
+
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&ta)), rec.woken.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), r.pendingCount());
+
+    // Drain `a` so we leave a clean slate for the deferred unregister.
+    var sink: [1]u8 = undefined;
+    _ = syscall.read(a[0], &sink) catch {};
+    r.unregisterWait(b[0], .readable);
+    try std.testing.expectEqual(@as(usize, 0), r.pendingCount());
+}
+
+test "reactor conformance: register-cancel-register cycle on same fd" {
+    // Common pattern: a coroutine waits on an fd, gets cancelled,
+    // unwinds, and another coroutine (or the same one re-launching)
+    // waits on the same fd again. The backend must accept the
+    // re-registration without leaking the prior one.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var r = try Reactor.init(std.testing.allocator);
+    defer r.deinit();
+
+    const fds = try syscall.pipe();
+    defer syscall.close(fds[0]);
+    defer syscall.close(fds[1]);
+
+    var t1: usize = 0x1;
+    try r.registerWait(fds[0], .readable, @ptrCast(&t1));
+    try std.testing.expectEqual(@as(usize, 1), r.pendingCount());
+
+    r.unregisterWait(fds[0], .readable);
+    try std.testing.expectEqual(@as(usize, 0), r.pendingCount());
+
+    // Re-register with a different target. Must succeed.
+    var t2: usize = 0x2;
+    try r.registerWait(fds[0], .readable, @ptrCast(&t2));
+    try std.testing.expectEqual(@as(usize, 1), r.pendingCount());
+
+    // Fire it; the wake must arrive on `t2`, not `t1`.
+    _ = try syscall.write(fds[1], "y");
+    var rec: WakeRecorder = .{};
+    defer rec.deinit(std.testing.allocator);
+    const n = try r.poll(50 * std.time.ns_per_ms, @ptrCast(&rec), &WakeRecorder.wakeStatic);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&t2)), rec.woken.items[0]);
+}
+
+test "reactor conformance: timer + wait interleaved fire independently" {
+    // Mixed registration: a wait + a timer share the reactor.
+    // Verifies the backend dispatches each completion to the right
+    // target (no cross-contamination between timer and fd queues).
+    if (!timersSupported()) return error.SkipZigTest;
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var r = try Reactor.init(std.testing.allocator);
+    defer r.deinit();
+
+    const fds = try syscall.pipe();
+    defer syscall.close(fds[0]);
+    defer syscall.close(fds[1]);
+
+    var fd_target: usize = 0xffd;
+    var timer_target: usize = 0x71;
+
+    // 50ms timer — long enough that the fd wake fires first.
+    _ = try r.registerTimer(50 * std.time.ns_per_ms, @ptrCast(&timer_target));
+    try r.registerWait(fds[0], .readable, @ptrCast(&fd_target));
+    try std.testing.expectEqual(@as(usize, 2), r.pendingCount());
+
+    _ = try syscall.write(fds[1], "z");
+
+    // Drive the reactor until both fire. We may need multiple poll
+    // calls because some backends batch; at most 2 polls (one for
+    // the wait, one for the timer).
+    var rec: WakeRecorder = .{};
+    defer rec.deinit(std.testing.allocator);
+    var attempts: u32 = 0;
+    while (rec.woken.items.len < 2 and attempts < 5) : (attempts += 1) {
+        _ = try r.poll(200 * std.time.ns_per_ms, @ptrCast(&rec), &WakeRecorder.wakeStatic);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), rec.woken.items.len);
+    // Order is backend-dependent; just verify both targets fired.
+    var saw_fd = false;
+    var saw_timer = false;
+    for (rec.woken.items) |target| {
+        if (target == @as(*anyopaque, @ptrCast(&fd_target))) saw_fd = true;
+        if (target == @as(*anyopaque, @ptrCast(&timer_target))) saw_timer = true;
+    }
+    try std.testing.expect(saw_fd);
+    try std.testing.expect(saw_timer);
+    try std.testing.expectEqual(@as(usize, 0), r.pendingCount());
+}
+
+test "reactor conformance: pendingCount property — random register/unregister mix" {
+    // Property test: after a random sequence of register / cancel /
+    // fire operations, the reactor's pending counter must reflect
+    // exactly the in-flight registrations. Stresses the bookkeeping
+    // path that bug-class #4 (cancel-leak) lived in.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var r = try Reactor.init(std.testing.allocator);
+    defer r.deinit();
+
+    // Build a pool of pipes; each iteration picks a random pipe to
+    // operate on. 16 pipes × 1000 iterations is fast (<1s) and
+    // exercises slot-reuse paths in iouring/iocp backends.
+    const N: usize = 16;
+    var pipes: [N][2]std.posix.fd_t = undefined;
+    for (&pipes) |*p| {
+        p.* = try syscall.pipe();
+    }
+    defer for (pipes) |p| {
+        syscall.close(p[0]);
+        syscall.close(p[1]);
+    };
+
+    // Per-pipe registration state — null = not registered, non-null = target.
+    var registered: [N]?*anyopaque = .{null} ** N;
+    // Stable per-pipe sentinel addresses so identity round-trips through wake.
+    var sentinels: [N]usize = blk: {
+        var arr: [N]usize = undefined;
+        for (&arr, 0..) |*s, i| s.* = 0x1000 + i;
+        break :blk arr;
+    };
+
+    var prng = std.Random.DefaultPrng.init(0xdeadbeef);
+    const rng = prng.random();
+
+    const ITERATIONS: usize = 1000;
+    var i: usize = 0;
+    while (i < ITERATIONS) : (i += 1) {
+        const pipe_idx = rng.uintLessThan(usize, N);
+        const action = rng.uintLessThan(u8, 3);
+
+        switch (action) {
+            // Register if not already registered.
+            0 => {
+                if (registered[pipe_idx] == null) {
+                    const target: *anyopaque = @ptrCast(&sentinels[pipe_idx]);
+                    try r.registerWait(pipes[pipe_idx][0], .readable, target);
+                    registered[pipe_idx] = target;
+                }
+            },
+            // Unregister if registered.
+            1 => {
+                if (registered[pipe_idx] != null) {
+                    r.unregisterWait(pipes[pipe_idx][0], .readable);
+                    registered[pipe_idx] = null;
+                }
+            },
+            // Fire (write) if registered. Drain via poll afterward.
+            2 => {
+                if (registered[pipe_idx] != null) {
+                    _ = syscall.write(pipes[pipe_idx][1], "p") catch {};
+                    var rec: WakeRecorder = .{};
+                    defer rec.deinit(std.testing.allocator);
+                    _ = try r.poll(20 * std.time.ns_per_ms, @ptrCast(&rec), &WakeRecorder.wakeStatic);
+                    // Drain the byte so the next register on this pipe
+                    // doesn't fire immediately on the still-readable fd.
+                    var sink: [1]u8 = undefined;
+                    _ = syscall.read(pipes[pipe_idx][0], &sink) catch {};
+                    if (rec.woken.items.len > 0) registered[pipe_idx] = null;
+                }
+            },
+            else => unreachable,
+        }
+    }
+
+    // Final invariant: count of `registered != null` slots == pendingCount.
+    var expected: usize = 0;
+    for (registered) |reg| {
+        if (reg != null) expected += 1;
+    }
+    try std.testing.expectEqual(expected, r.pendingCount());
+
+    // Clean up: unregister whatever's left.
+    for (registered, 0..) |reg, idx| {
+        if (reg != null) r.unregisterWait(pipes[idx][0], .readable);
+    }
+    try std.testing.expectEqual(@as(usize, 0), r.pendingCount());
+}
+
 test "reactor conformance: tickle returns the polling thread immediately" {
     // Cross-thread wake. A polling thread blocks in poll; a tickle()
     // from another thread (or the same thread before poll) makes the
