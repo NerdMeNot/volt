@@ -59,16 +59,20 @@ That's the whole shape. No `async`, no `await`, no `Future`, no `.poll()`, no ma
 
 ## Status
 
-Volt is at v1.0.0 against Zig 0.16.0. Version tags follow `vX.Y.Z-zigA.B.C` so the Zig version is always explicit.
+Volt is the substrate for everything that needs async, networking, or file I/O in Zig — for NerdMeNot's libraries (S3, HTTP, PG, DataFrame I/O) and for any third-party that adopts it. Version tags follow `vX.Y.Z-zigA.B.C` so the Zig version is always explicit.
 
-| Target | Backend | Status |
-|---|---|---|
-| macOS arm64 / x86_64 | kqueue | runtime + CI |
-| Linux x86_64 / arm64 | epoll | runtime + CI |
-| Linux x86_64 | io_uring | parallel backend; cross-compile clean |
-| Windows x86_64 / arm64 | IOCP | cross-compile clean; runtime port pending |
+| Target | Backend | Tier | Notes |
+|---|---|---|---|
+| macOS arm64 / x86_64 | kqueue | **Production** | Primary dev platform. CI green. |
+| Linux x86_64 / arm64 | epoll | **Production** | Default Linux backend. CI green. |
+| Linux x86_64 / arm64 | io_uring | Production-candidate | Opt-in via `-Dreactor=iouring`. Tracked-registration cancel safety (ported from tokio-uring). |
+| Windows x86_64 / arm64 | IOCP+AFD | Beta | AFD readiness reactor (mio/wepoll approach) + SEH stack-overflow handler land in v1.1; runtime-default flip pending Phase 2c-2g (syscall arms, fs Windows arms, CreateProcess, ConsoleCtrlHandler). |
 
-The Windows IOCP backend itself, the VirtualAlloc-backed stack, the `WaitOnAddress` futex, and `QueryPerformanceCounter` time all compile and link cleanly for Windows. What's still missing for runtime-default: ioctlsocket / WriteFile / CreateProcess arms in `io/net.zig`, `io/io.zig`, `process/Command.zig`, and a Windows CI runner. See `src/io/reactor.zig` for the punch list.
+A consumer can adopt Volt today on Darwin + Linux without caveats. io_uring is opt-in and stable in structure; flip the default once it's been green in CI for ≥4 weeks. Windows is structurally landed but not yet runtime-default — see `docs/internals/backend-parity.md` for the full punch list and `src/io/reactor.zig` for the in-source breadcrumb.
+
+### Backend conformance
+
+Every reactor backend exposes the same public surface — `init`, `deinit`, `pendingCount`, `tickle`, `registerWait`, `unregisterWait`, `registerTimer`, `unregisterTimer`, `poll`. The `comptime` block in `src/io/reactor.zig` enforces this at compile time: drop or rename a method on any backend and the build fails with a localized error pointing at the conformance assertion. mio uses trait bounds; libuv uses a vtable; Boost.Asio uses templates; Volt uses comptime.
 
 ## Install
 
