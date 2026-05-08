@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const runtime_mod = @import("../runtime.zig");
-const tls = @import("../scheduler/tls.zig");
+const current = @import("../scheduler/current.zig");
 const spawn_mod = @import("../coroutine/spawn.zig");
 
 /// All errors `volt.run` can surface besides the root function's own.
@@ -40,19 +40,18 @@ pub const RunError = error{
     ReservedTooSmall,
     InitialCommitTooSmall,
     InitialCommitTooLarge,
-    // From kqueue init / EV_USER registration:
+    // From reactor init across all backends (kqueue, epoll, io_uring,
+    // IOCP). Backend-specific names (EpollCtlFailed, EventNotFound,
+    // CreateIoCompletionPortFailed, etc.) are translated at the
+    // backend boundary into ReactorError, which we re-narrow here.
+    InitFailed,
+    RegistrationFailed,
+    PollFailed,
+    NotImplemented,
+    // From mmap-backed stack allocation + ad-hoc syscall paths in
+    // bootstrap (fcntl/pipe/eventfd quota).
     AccessDenied,
-    EventNotFound,
     SystemResources,
-    // From epoll init / eventfd registration (Linux):
-    EpollCreateFailed,
-    EpollCtlFailed,
-    EventfdCreateFailed,
-    // From IOCP CreateIoCompletionPort (Windows):
-    CreateIoCompletionPortFailed,
-    AssociateFailed,
-    WindowsTimerNotImplemented,
-    // From mmap stack allocation with guard pages:
     PermissionDenied,
     MemoryMappingNotSupported,
     MappingAlreadyExists,

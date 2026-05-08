@@ -14,11 +14,11 @@ const Park = @import("../scheduler/park.zig").Park;
 const reactor_mod = @import("reactor.zig");
 const io_errors = @import("errors.zig");
 
-/// Errors `Reactor.registerWait` can produce on any backend (kqueue or
-/// epoll), plus `Cancelled` from `parkCurrent`. Backend-specific names
-/// (`EventNotFound` from kqueue's ENOENT, `EpollCtlFailed` from epoll)
-/// translate to the platform-neutral `WaitRegistrationFailed` here so
-/// public types don't leak the active backend.
+/// Errors `Reactor.registerWait` can produce on any backend, plus
+/// `Cancelled` from `parkCurrent`. Backends translate kernel-side
+/// errors to `ReactorError` at their boundary; we re-narrow into
+/// `WaitError` (an `IoError` sub-set) here so public types stay
+/// platform-neutral.
 pub const WaitError = io_errors.WaitError;
 
 fn waitOn(fd: posix.fd_t, kind: reactor_mod.EventKind) WaitError!void {
@@ -35,14 +35,11 @@ fn waitOn(fd: posix.fd_t, kind: reactor_mod.EventKind) WaitError!void {
 
     rt.reactor.registerWait(fd, kind, @ptrCast(&park)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.AccessDenied => return error.AccessDenied,
-        error.SystemResources => return error.SystemResources,
-        error.Unexpected => return error.Unexpected,
-        // Kqueue's `EventNotFound`, epoll's `EpollCtlFailed` /
-        // `TimerfdSettimeFailed`, and io_uring's analogues all collapse
-        // to a platform-neutral name here. Public types don't leak
-        // which reactor backend is active.
-        else => return error.WaitRegistrationFailed,
+        error.InitFailed,
+        error.RegistrationFailed,
+        error.PollFailed,
+        error.NotImplemented,
+        => return error.WaitRegistrationFailed,
     };
     // From here on, the reactor will call park.unpark() when the fd is
     // ready. parkCurrent suspends us; the wake brings us back here.

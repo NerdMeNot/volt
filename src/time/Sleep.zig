@@ -18,21 +18,17 @@ const runtime_mod = @import("../runtime.zig");
 const current = @import("../scheduler/current.zig");
 const Park = @import("../scheduler/park.zig").Park;
 
-/// Union of errors `Reactor.registerTimer` can return on any backend
-/// (kqueue: KeventError; epoll: EpollCtlFailed/TimerfdCreateFailed/
-/// TimerfdSettimeFailed). Plus `Cancelled` from `parkCurrent`.
+/// Public sleep error set. Backend-specific kernel errors are
+/// translated to `ReactorError` at the reactor boundary; we re-narrow
+/// them here into a stable, platform-neutral set so callers don't see
+/// `EpollCtlFailed` on Linux but `EventNotFound` on Darwin.
 pub const SleepError = error{
     Cancelled,
     OutOfMemory,
-    // kqueue paths
-    AccessDenied,
-    EventNotFound,
-    SystemResources,
-    Unexpected,
-    // epoll paths
-    EpollCtlFailed,
-    TimerfdCreateFailed,
-    TimerfdSettimeFailed,
+    /// Reactor couldn't arm the timer (kernel-side allocation pressure,
+    /// quota exceeded, or unsupported on the active backend). Maps from
+    /// `ReactorError.{InitFailed, RegistrationFailed, PollFailed, NotImplemented}`.
+    TimerRegistrationFailed,
 };
 
 /// Suspend the calling coroutine for `duration`. Returns
@@ -51,20 +47,29 @@ pub fn sleep(duration: Duration) SleepError!void {
     // Park on the calling coroutine's stack. Stable for the duration
     // of the sleep — the coroutine can't return while parked.
     var park: Park = .{};
-    const timer_id = try rt.reactor.registerTimer(ns, @ptrCast(&park));
+    const timer_id = rt.reactor.registerTimer(ns, @ptrCast(&park)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InitFailed,
+        error.RegistrationFailed,
+        error.PollFailed,
+        error.NotImplemented,
+        => return error.TimerRegistrationFailed,
+    };
     park.parkCurrent() catch |err| switch (err) {
         error.Cancelled => {
-            // Cancellation: the timer is still registered with kqueue
-            // and the pending counter is still inflated. Without the
-            // unregister, idle workers would block on `poll` waiting
-            // for the timer to fire — which for an hour-long sleep
-            // means the runtime wedges. Unregister cleans both up.
+            // Cancellation: the timer is still registered with the
+            // reactor and the pending counter is still inflated.
+            // Without the unregister, idle workers would block on
+            // `poll` waiting for the timer to fire — which for an
+            // hour-long sleep means the runtime wedges. Unregister
+            // cleans both up.
             rt.reactor.unregisterTimer(timer_id);
             return error.Cancelled;
         },
     };
-    // Successful wake: timer fired (EV_ONESHOT auto-removed it from
-    // kqueue, poll decremented pending). Nothing to clean up.
+    // Successful wake: timer fired (EV_ONESHOT or its backend
+    // analogue auto-removed it; poll decremented pending). Nothing
+    // to clean up.
 }
 
 // ─────────────────────────────────────────────────────────────────────

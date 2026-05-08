@@ -32,6 +32,7 @@ const linux = std.os.linux;
 
 const syscall = @import("../internal/syscall.zig");
 const Mutex = @import("../internal/thread.zig").Mutex;
+const reactor_types = @import("reactor_types.zig");
 
 comptime {
     if (builtin.os.tag != .linux) {
@@ -39,10 +40,12 @@ comptime {
     }
 }
 
-pub const EventKind = enum(u8) {
-    readable,
-    writable,
-};
+/// Re-exported so `reactor.zig`'s conformance check can read it from
+/// `impl.EventKind`. The canonical declaration lives in
+/// `reactor_types.zig`.
+pub const EventKind = reactor_types.EventKind;
+
+const ReactorError = reactor_types.ReactorError;
 
 fn epollEventsFor(kind: EventKind) u32 {
     return switch (kind) {
@@ -84,11 +87,11 @@ pub const Reactor = struct {
         _pad: u24 = 0,
     };
 
-    pub fn init(allocator: std.mem.Allocator) !Reactor {
-        const epfd = try linuxCreateEpoll();
+    pub fn init(allocator: std.mem.Allocator) ReactorError!Reactor {
+        const epfd = linuxCreateEpoll() catch return error.InitFailed;
         errdefer syscall.close(epfd);
 
-        const tfd = try linuxCreateEventfd();
+        const tfd = linuxCreateEventfd() catch return error.InitFailed;
         errdefer syscall.close(tfd);
 
         // Register the tickle eventfd with the epoll set so any
@@ -98,7 +101,7 @@ pub const Reactor = struct {
             .data = .{ .ptr = TICKLE_TAG },
         };
         if (linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, tfd, &ev) != 0) {
-            return error.EpollCtlFailed;
+            return error.InitFailed;
         }
 
         return .{
@@ -134,7 +137,7 @@ pub const Reactor = struct {
         fd: posix.fd_t,
         kind: EventKind,
         target: *anyopaque,
-    ) !void {
+    ) ReactorError!void {
         const key = WaitKey{ .fd = @intCast(fd), .kind_tag = @intFromEnum(kind) };
 
         var ev = linux.epoll_event{
@@ -150,16 +153,16 @@ pub const Reactor = struct {
             const errno = posix.errno(rc1);
             if (errno == .EXIST) {
                 const rc2 = linux.epoll_ctl(self.epfd, linux.EPOLL.CTL_MOD, fd, &ev);
-                if (rc2 != 0) return error.EpollCtlFailed;
+                if (rc2 != 0) return error.RegistrationFailed;
             } else {
-                return error.EpollCtlFailed;
+                return error.RegistrationFailed;
             }
         }
 
         self.mutex.lock();
         defer self.mutex.unlock();
         // Allow re-registration: ignore key already present.
-        try self.waiters.put(key, {});
+        self.waiters.put(key, {}) catch return error.OutOfMemory;
         _ = self.pending.fetchAdd(1, .release);
     }
 
@@ -178,13 +181,13 @@ pub const Reactor = struct {
         self: *Reactor,
         duration_ns: u64,
         target: *anyopaque,
-    ) !u64 {
-        const entry = try self.allocator.create(TimerEntry);
+    ) ReactorError!u64 {
+        const entry = self.allocator.create(TimerEntry) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(entry);
 
         const tfd = linux.timerfd_create(linux.TIMERFD_CLOCK.MONOTONIC, .{ .NONBLOCK = true });
         const tfd_i: i32 = @intCast(tfd);
-        if (tfd_i < 0) return error.TimerfdCreateFailed;
+        if (tfd_i < 0) return error.RegistrationFailed;
         errdefer syscall.close(tfd_i);
 
         const spec = linux.itimerspec{
@@ -195,7 +198,7 @@ pub const Reactor = struct {
             },
         };
         if (linux.timerfd_settime(tfd_i, .{}, &spec, null) != 0) {
-            return error.TimerfdSettimeFailed;
+            return error.RegistrationFailed;
         }
 
         entry.* = .{ .target = target, .timerfd = tfd_i };
@@ -207,7 +210,7 @@ pub const Reactor = struct {
             .data = .{ .ptr = @intFromPtr(entry) | TIMER_TAG_BIT },
         };
         if (linux.epoll_ctl(self.epfd, linux.EPOLL.CTL_ADD, tfd_i, &ev) != 0) {
-            return error.EpollCtlFailed;
+            return error.RegistrationFailed;
         }
 
         _ = self.pending.fetchAdd(1, .release);
@@ -248,7 +251,7 @@ pub const Reactor = struct {
         timeout_ns: ?u64,
         wake_ctx: *anyopaque,
         wakeFn: *const fn (*anyopaque, *anyopaque) anyerror!void,
-    ) !usize {
+    ) anyerror!usize {
         var events: [64]linux.epoll_event = undefined;
         const timeout_ms: i32 = if (timeout_ns) |ns|
             @intCast(@min(@divTrunc(ns, std.time.ns_per_ms), std.math.maxInt(i32)))
@@ -305,14 +308,18 @@ pub const Reactor = struct {
 // Linux syscall wrappers (kept here so the kqueue backend stays clean)
 // ─────────────────────────────────────────────────────────────────────
 
-fn linuxCreateEpoll() !i32 {
+// Internal-only: errors here flow up through `init`, which translates
+// them all to ReactorError.InitFailed. Names are kept distinct for
+// debugging visibility (a stack trace through the failing call stays
+// informative) but they don't escape the file.
+fn linuxCreateEpoll() error{EpollCreateFailed}!i32 {
     const flags = linux.EPOLL.CLOEXEC;
     const rc: i32 = @intCast(linux.epoll_create1(flags));
     if (rc < 0) return error.EpollCreateFailed;
     return rc;
 }
 
-fn linuxCreateEventfd() !i32 {
+fn linuxCreateEventfd() error{EventfdCreateFailed}!i32 {
     const flags: u32 = linux.EFD.NONBLOCK | linux.EFD.CLOEXEC;
     const rc: i32 = @intCast(linux.eventfd(0, flags));
     if (rc < 0) return error.EventfdCreateFailed;

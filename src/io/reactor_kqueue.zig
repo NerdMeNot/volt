@@ -10,6 +10,7 @@ const system = posix.system;
 
 const syscall = @import("../internal/syscall.zig");
 const Mutex = @import("../internal/thread.zig").Mutex;
+const reactor_types = @import("reactor_types.zig");
 
 comptime {
     const ok = switch (builtin.os.tag) {
@@ -19,10 +20,12 @@ comptime {
     if (!ok) @compileError("reactor_kqueue.zig is for Darwin/BSD only");
 }
 
-pub const EventKind = enum(u8) {
-    readable,
-    writable,
-};
+/// Re-exported so `reactor.zig`'s conformance check can read it from
+/// `impl.EventKind`. The canonical declaration lives in
+/// `reactor_types.zig` — drift here fails to build.
+pub const EventKind = reactor_types.EventKind;
+
+const ReactorError = reactor_types.ReactorError;
 
 fn filterFor(kind: EventKind) i16 {
     return switch (kind) {
@@ -70,8 +73,8 @@ pub const Reactor = struct {
         _pad: u24 = 0,
     };
 
-    pub fn init(allocator: std.mem.Allocator) !Reactor {
-        const kq = try syscall.kqueue();
+    pub fn init(allocator: std.mem.Allocator) ReactorError!Reactor {
+        const kq = syscall.kqueue() catch return error.InitFailed;
         errdefer syscall.close(kq);
 
         // Register a persistent EV_USER event for instant wake-up. Other
@@ -88,7 +91,7 @@ pub const Reactor = struct {
         };
         const changes = [_]posix.Kevent{tickle_ev};
         var dummy: [0]posix.Kevent = undefined;
-        _ = try syscall.kevent(kq, &changes, &dummy, null);
+        _ = syscall.kevent(kq, &changes, &dummy, null) catch return error.InitFailed;
 
         return .{
             .kq = kq,
@@ -135,7 +138,7 @@ pub const Reactor = struct {
     /// this, a cancelled sleep leaks a kqueue registration AND a
     /// pending-count increment, wedging idle workers in `poll`
     /// (they wait the timer out, which can be hours).
-    pub fn registerTimer(self: *Reactor, duration_ns: u64, target: *anyopaque) !u64 {
+    pub fn registerTimer(self: *Reactor, duration_ns: u64, target: *anyopaque) ReactorError!u64 {
         const id = self.timer_id.fetchAdd(1, .monotonic);
         const ev = posix.Kevent{
             .ident = @intCast(id),
@@ -147,7 +150,7 @@ pub const Reactor = struct {
         };
         const changes = [_]posix.Kevent{ev};
         var dummy: [0]posix.Kevent = undefined;
-        _ = try syscall.kevent(self.kq, &changes, &dummy, null);
+        _ = syscall.kevent(self.kq, &changes, &dummy, null) catch return error.RegistrationFailed;
         _ = self.pending.fetchAdd(1, .release);
         return id;
     }
@@ -206,7 +209,7 @@ pub const Reactor = struct {
     /// to the reactor — it's stored in the kevent's `udata` field and
     /// passed back to the wake callback when the event fires. Typically
     /// a `*Park` (see `io/wait.zig`).
-    pub fn registerWait(self: *Reactor, fd: posix.fd_t, kind: EventKind, target: *anyopaque) !void {
+    pub fn registerWait(self: *Reactor, fd: posix.fd_t, kind: EventKind, target: *anyopaque) ReactorError!void {
         const key = WaitKey{ .fd = @intCast(fd), .kind_tag = @intFromEnum(kind) };
 
         const ev = posix.Kevent{
@@ -222,12 +225,12 @@ pub const Reactor = struct {
         // map insert fails (OOM), we must clean up the kevent registration.
         const changes = [_]posix.Kevent{ev};
         var dummy: [0]posix.Kevent = undefined;
-        _ = try syscall.kevent(self.kq, &changes, &dummy, null);
+        _ = syscall.kevent(self.kq, &changes, &dummy, null) catch return error.RegistrationFailed;
 
         self.mutex.lock();
         defer self.mutex.unlock();
         std.debug.assert(!self.waiters.contains(key));
-        self.waiters.put(key, {}) catch |err| {
+        self.waiters.put(key, {}) catch {
             // Best-effort: tear down the kevent we just armed.
             const remove_ev = posix.Kevent{
                 .ident = @intCast(fd),
@@ -239,7 +242,7 @@ pub const Reactor = struct {
             };
             const remove_changes = [_]posix.Kevent{remove_ev};
             _ = syscall.kevent(self.kq, &remove_changes, &dummy, null) catch {};
-            return err;
+            return error.OutOfMemory;
         };
         _ = self.pending.fetchAdd(1, .release);
     }
@@ -255,7 +258,7 @@ pub const Reactor = struct {
         timeout_ns: ?u64,
         wake_ctx: *anyopaque,
         wakeFn: *const fn (*anyopaque, *anyopaque) anyerror!void,
-    ) !usize {
+    ) anyerror!usize {
         var events: [64]posix.Kevent = undefined;
         const ts: ?posix.timespec = if (timeout_ns) |ns| .{
             .sec = @intCast(@divTrunc(ns, std.time.ns_per_s)),
@@ -263,12 +266,12 @@ pub const Reactor = struct {
         } else null;
 
         const changes: []const posix.Kevent = &.{};
-        const n = try syscall.kevent(
+        const n = syscall.kevent(
             self.kq,
             changes,
             &events,
             if (ts) |*t| t else null,
-        );
+        ) catch return error.PollFailed;
 
         var woken: usize = 0;
         for (events[0..n]) |ev| {
