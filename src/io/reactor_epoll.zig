@@ -132,6 +132,15 @@ pub const Reactor = struct {
 
     /// Register `target` to be `wakeFn`-invoked when `fd` is ready for
     /// `kind`. One-shot — the kernel auto-disables after one delivery.
+    ///
+    /// CRITICAL ORDERING (R2, mirroring `reactor_kqueue.zig`):
+    /// waiters.put + pending++ happen BEFORE epoll_ctl ADD. The kernel
+    /// can queue an event the moment the fd is added; if the put hasn't
+    /// happened, the (theoretical) waiters-map check would miss it.
+    /// epoll's current poll() doesn't query waiters at all (it trusts
+    /// `data.ptr`), so the race manifestation here is a pending-counter
+    /// undercount rather than a hang — but the ordering rule is
+    /// uniform across backends.
     pub fn registerWait(
         self: *Reactor,
         fd: posix.fd_t,
@@ -145,25 +154,34 @@ pub const Reactor = struct {
             .data = .{ .ptr = @intFromPtr(target) },
         };
 
+        self.mutex.lock();
+        self.waiters.put(key, {}) catch {
+            self.mutex.unlock();
+            return error.OutOfMemory;
+        };
+        _ = self.pending.fetchAdd(1, .release);
+
         // ADD if first registration; MOD on re-register (epoll
         // remembers the fd even after ONESHOT disabled it).
         const rc1 = linux.epoll_ctl(self.epfd, linux.EPOLL.CTL_ADD, fd, &ev);
         if (rc1 != 0) {
-            // EEXIST: was registered before; switch to MOD.
             const errno = posix.errno(rc1);
             if (errno == .EXIST) {
                 const rc2 = linux.epoll_ctl(self.epfd, linux.EPOLL.CTL_MOD, fd, &ev);
-                if (rc2 != 0) return error.RegistrationFailed;
+                if (rc2 != 0) {
+                    _ = self.waiters.remove(key);
+                    _ = self.pending.fetchSub(1, .release);
+                    self.mutex.unlock();
+                    return error.RegistrationFailed;
+                }
             } else {
+                _ = self.waiters.remove(key);
+                _ = self.pending.fetchSub(1, .release);
+                self.mutex.unlock();
                 return error.RegistrationFailed;
             }
         }
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        // Allow re-registration: ignore key already present.
-        self.waiters.put(key, {}) catch return error.OutOfMemory;
-        _ = self.pending.fetchAdd(1, .release);
+        self.mutex.unlock();
     }
 
     /// Arm a one-shot timer that fires after `duration_ns` nanoseconds.

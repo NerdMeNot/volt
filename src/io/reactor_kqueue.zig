@@ -151,8 +151,16 @@ pub const Reactor = struct {
         };
         const changes = [_]posix.Kevent{ev};
         var dummy: [0]posix.Kevent = undefined;
-        _ = syscall.kevent(self.kq, &changes, &dummy, null) catch return error.RegistrationFailed;
+        // pending++ before kevent ADD (R2 ordering rule). For timers
+        // there's no waiters map (timer ident is the lookup key in
+        // poll's path), so the only concurrency concern is the
+        // counter itself: poll consuming the timer's CQE before our
+        // increment would underflow pending.
         _ = self.pending.fetchAdd(1, .release);
+        _ = syscall.kevent(self.kq, &changes, &dummy, null) catch {
+            _ = self.pending.fetchSub(1, .release);
+            return error.RegistrationFailed;
+        };
         return id;
     }
 

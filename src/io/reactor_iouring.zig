@@ -302,6 +302,11 @@ pub const Reactor = struct {
         kind: EventKind,
         target: *anyopaque,
     ) ReactorError!void {
+        // CRITICAL ORDERING (R2, mirroring `reactor_kqueue.zig`):
+        // pending++ happens BEFORE `ring.submit`. If a CQE arrives
+        // very fast (e.g. fd already ready), poll() could decrement
+        // before the increment landed — the deinit invariant
+        // `pending == 0` would transiently see negative values.
         const ud = try self.allocSlot(target, .wait, null, fd, kind);
         errdefer self.freeSlot(ud.slot);
 
@@ -311,8 +316,11 @@ pub const Reactor = struct {
         const sqe = self.ring.get_sqe() catch return error.RegistrationFailed;
         sqe.prep_poll_add(fd, pollEventsFor(kind));
         sqe.user_data = ud.pack();
-        _ = self.ring.submit() catch return error.RegistrationFailed;
         _ = self.pending.fetchAdd(1, .release);
+        _ = self.ring.submit() catch {
+            _ = self.pending.fetchSub(1, .release);
+            return error.RegistrationFailed;
+        };
     }
 
     pub fn registerTimer(
@@ -341,8 +349,12 @@ pub const Reactor = struct {
         const sqe = self.ring.get_sqe() catch return error.RegistrationFailed;
         sqe.prep_timeout(ts, 0, 0);
         sqe.user_data = ud.pack();
-        _ = self.ring.submit() catch return error.RegistrationFailed;
+        // pending++ before submit (R2 ordering rule).
         _ = self.pending.fetchAdd(1, .release);
+        _ = self.ring.submit() catch {
+            _ = self.pending.fetchSub(1, .release);
+            return error.RegistrationFailed;
+        };
         return ud.pack();
     }
 
