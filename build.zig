@@ -22,11 +22,24 @@ pub fn build(b: *std.Build) void {
             "Set to 'iouring' for the io_uring backend on Linux.",
     ) orelse .default;
 
+    // Reactor-trace: compile-time-gated event ring buffer in the
+    // reactor (register/unregister/poll-consume events). OFF by default
+    // (zero overhead in production); turn ON with `-Dreactor-trace` for
+    // diagnostic builds when a leak/race is being investigated. The
+    // trace dumps to stderr if `Runtime.deinit` detects a non-zero
+    // pendingCount.
+    const reactor_trace = b.option(
+        bool,
+        "reactor-trace",
+        "Enable reactor event trace ring buffer for diagnostic builds (default: off).",
+    ) orelse false;
+
     // Surface the reactor choice as a comptime-readable module so
     // src/io/reactor.zig can switch on it. Threaded through to both
     // the public `volt` module and the test module.
     const build_options = b.addOptions();
     build_options.addOption(ReactorChoice, "reactor_choice", reactor_choice);
+    build_options.addOption(bool, "reactor_trace", reactor_trace);
 
     // x86_64 context-switch asm lives in a separate .S so the linker
     // sees the symbols on every host. Module-level comptime asm in

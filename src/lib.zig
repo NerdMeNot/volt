@@ -377,6 +377,7 @@ test {
     _ = @import("scheduler/injection.zig");
     _ = io.Reactor;
     _ = @import("io/reactor_test.zig");
+    _ = @import("io/reactor_trace.zig");
     _ = @import("test/helpers.zig");
     // Cross-compile-only: ensure the alternative io_uring backend
     // builds cleanly on Linux. Not loaded into the dispatcher.

@@ -126,6 +126,11 @@ pub const Runtime = struct {
     stack_pool: @import("coroutine/stack_pool.zig").StackPool,
 
     pub fn init(config: Config) !Runtime {
+        // Reset the diagnostic reactor trace so each runtime gets a
+        // clean ring (no events from prior test runs contaminating the
+        // dump if THIS runtime leaks). No-op when -Dreactor-trace=false.
+        @import("io/reactor_trace.zig").reset();
+
         const allocator = config.allocator;
         const num_workers = blk: {
             // Determinism mode: force single worker, ignore `workers`.
@@ -198,23 +203,29 @@ pub const Runtime = struct {
         // the cost is zero in production but the gate fires loud in
         // test/Debug builds, which is exactly when leaks should
         // surface.
+        // Cleanliness invariant: every register* must be paired with
+        // exactly one decrement (by unregisterWait or by poll consuming
+        // the kernel event) before the runtime tears down. Closed in R2
+        // by fixing the registerWait race: waiters.put now happens
+        // BEFORE kevent ADD, so kqueue-fired events never miss the
+        // waiters lookup. See docs/internals/cancellation-contract.md.
+        //
+        // Re-enabled as a hard assert — under -Dreactor-trace, the
+        // print + dump still fire first so a regression's evidence is
+        // preserved.
         const pc = self.reactor.pendingCount();
         if (pc != 0) {
-            // Diagnostic — surfaces leaks to stderr without panicking
-            // the test suite. The strict `std.debug.assert(pc == 0)` is
-            // gated behind a follow-up audit task: there's still an
-            // intermittent race in the cancel-during-poll path that
-            // leaks 0–80 of 100 reactor registrations on the
-            // 100-coroutine TCP-park torture test, even with the IRIW
-            // fix in `Coroutine.cancel` + `Park.parkCurrent`. The
-            // print exists so progress on closing the remaining race
-            // is observable; flip back to `assert` once it stays at 0
-            // across stress runs.
             std.debug.print(
-                "[runtime.deinit] reactor leak: pendingCount = {d} (see audit task)\n",
+                "[runtime.deinit] reactor leak: pendingCount = {d}\n",
                 .{pc},
             );
+            const trace = @import("io/reactor_trace.zig");
+            if (comptime trace.enabled) {
+                std.debug.print("[runtime.deinit] dumping reactor trace (all events)\n", .{});
+                trace.dumpAll();
+            }
         }
+        std.debug.assert(pc == 0);
 
         if (self.blocking_pool.load(.acquire)) |pool| pool.deinit();
         // Workers free any stack that wasn't pooled (i.e. coroutines

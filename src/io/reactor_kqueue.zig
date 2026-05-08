@@ -11,6 +11,7 @@ const system = posix.system;
 const syscall = @import("../internal/syscall.zig");
 const Mutex = @import("../internal/thread.zig").Mutex;
 const reactor_types = @import("reactor_types.zig");
+const trace = @import("reactor_trace.zig");
 
 comptime {
     const ok = switch (builtin.os.tag) {
@@ -212,13 +213,22 @@ pub const Reactor = struct {
         // Best-effort: EV_DELETE may return ENOENT (event already
         // delivered or never registered). We don't care about the
         // outcome — the map remove below is what reconciles state.
-        _ = syscall.kevent(self.kq, &changes, &dummy, null) catch {};
+        if (syscall.kevent(self.kq, &changes, &dummy, null)) |_| {
+            trace.record(.unregister_kevent_ok, @intCast(fd), @intFromEnum(kind), self.pending.load(.monotonic));
+        } else |_| {
+            trace.record(.unregister_kevent_fail, @intCast(fd), @intFromEnum(kind), self.pending.load(.monotonic));
+        }
 
         self.mutex.lock();
         const key = WaitKey{ .fd = @intCast(fd), .kind_tag = @intFromEnum(kind) };
         const had_it = self.waiters.remove(key);
         self.mutex.unlock();
-        if (had_it) _ = self.pending.fetchSub(1, .release);
+        if (had_it) {
+            _ = self.pending.fetchSub(1, .release);
+            trace.record(.unregister_remove_true, @intCast(fd), @intFromEnum(kind), self.pending.load(.monotonic));
+        } else {
+            trace.record(.unregister_remove_false, @intCast(fd), @intFromEnum(kind), self.pending.load(.monotonic));
+        }
     }
 
     /// Arm a one-shot wait for (fd, kind). The `target` pointer is opaque
@@ -237,30 +247,57 @@ pub const Reactor = struct {
             .udata = @intFromPtr(target),
         };
 
-        // We arm the kevent BEFORE inserting into the waiters map: if the
-        // map insert fails (OOM), we must clean up the kevent registration.
-        const changes = [_]posix.Kevent{ev};
-        var dummy: [0]posix.Kevent = undefined;
-        _ = syscall.kevent(self.kq, &changes, &dummy, null) catch return error.RegistrationFailed;
-
+        // CRITICAL ORDERING — close the register/poll race that was the
+        // root cause of the cancel-torture-test leak (R2):
+        //
+        //   1. Insert into waiters map FIRST (key visible to poll).
+        //   2. Increment pending counter.
+        //   3. Arm the kevent (kqueue starts watching).
+        //
+        // Why this order: kqueue may queue an event the moment the
+        // kevent is armed (e.g. connect-to-loopback completes
+        // synchronously and the writable filter is immediately
+        // satisfied). Earlier code did `kevent ADD → waiters.put`,
+        // which left a window: kqueue could fire, poll() retrieved
+        // the event, called `waiters.remove(key)` which returned
+        // FALSE because the put hadn't happened — poll dropped the
+        // wake. The coroutine then parked with no wake source. Hang.
+        //
+        // With waiters.put first, when poll() retrieves the event
+        // it finds the key, removes it, decrements pending, fires
+        // wakeFn. Correct in every interleaving.
+        //
+        // Holding the mutex across the kevent syscall is intentional:
+        // the syscall is fast (sub-microsecond on modern kernels) and
+        // serialization prevents a different worker's poll() from
+        // racing with our `pending++`. (poll's `pending--` is fine
+        // even before our `pending++` lands — it'd underflow once
+        // and re-increment back; but the visibility ordering matters
+        // for diagnostic invariants like waiters.count == pending.)
         self.mutex.lock();
-        defer self.mutex.unlock();
         std.debug.assert(!self.waiters.contains(key));
         self.waiters.put(key, {}) catch {
-            // Best-effort: tear down the kevent we just armed.
-            const remove_ev = posix.Kevent{
-                .ident = @intCast(fd),
-                .filter = filterFor(kind),
-                .flags = system.EV.DELETE,
-                .fflags = 0,
-                .data = 0,
-                .udata = 0,
-            };
-            const remove_changes = [_]posix.Kevent{remove_ev};
-            _ = syscall.kevent(self.kq, &remove_changes, &dummy, null) catch {};
+            self.mutex.unlock();
+            trace.record(.register_fail_oom, @intCast(fd), @intFromEnum(kind), self.pending.load(.monotonic));
             return error.OutOfMemory;
         };
         _ = self.pending.fetchAdd(1, .release);
+        const changes = [_]posix.Kevent{ev};
+        var dummy: [0]posix.Kevent = undefined;
+        if (syscall.kevent(self.kq, &changes, &dummy, null)) |_| {
+            self.mutex.unlock();
+            trace.record(.register_ok, @intCast(fd), @intFromEnum(kind), self.pending.load(.monotonic));
+        } else |_| {
+            // Rollback. We need to remove from waiters AND decrement
+            // pending. Mutex is still held so the rollback is atomic
+            // with respect to a concurrent poll() seeing inconsistent
+            // state.
+            _ = self.waiters.remove(key);
+            _ = self.pending.fetchSub(1, .release);
+            self.mutex.unlock();
+            trace.record(.register_fail_kevent, @intCast(fd), @intFromEnum(kind), self.pending.load(.monotonic));
+            return error.RegistrationFailed;
+        }
     }
 
     /// Block on kevent for up to `timeout_ns` (or forever if null), call
@@ -297,6 +334,7 @@ pub const Reactor = struct {
                 // Timer events aren't in the waiters map (no fd key).
                 // EV_ONESHOT ensures kernel auto-removes the kevent.
                 _ = self.pending.fetchSub(1, .release);
+                trace.record(.timer_unregister_ok, -1, 0xFF, self.pending.load(.monotonic));
                 try wakeFn(wake_ctx, target);
                 woken += 1;
                 continue;
@@ -305,13 +343,20 @@ pub const Reactor = struct {
                 .fd = @intCast(ev.ident),
                 .kind_tag = @intFromEnum(kindFor(ev.filter)),
             };
+            const fd_signed: i32 = @intCast(ev.ident);
+            const kind_byte: u8 = @intFromEnum(kindFor(ev.filter));
+            trace.record(.poll_event_received, fd_signed, kind_byte, self.pending.load(.monotonic));
             self.mutex.lock();
             const removed = self.waiters.remove(key);
             self.mutex.unlock();
             if (removed) {
                 _ = self.pending.fetchSub(1, .release);
+                trace.record(.poll_remove_true, fd_signed, kind_byte, self.pending.load(.monotonic));
+                trace.record(.poll_wakefn_invoked, fd_signed, kind_byte, self.pending.load(.monotonic));
                 try wakeFn(wake_ctx, target);
                 woken += 1;
+            } else {
+                trace.record(.poll_remove_false, fd_signed, kind_byte, self.pending.load(.monotonic));
             }
             // If `removed` is false, this CQE belongs to a registration
             // that was cancelled via `unregisterWait` between EV_ONESHOT
