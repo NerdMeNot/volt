@@ -895,14 +895,102 @@ pub fn pwrite(fd: posix.fd_t, bytes: []const u8, offset: u64) WriteError!usize {
     }
 }
 
-pub fn fstat(fd: posix.fd_t) !posix.Stat {
-    var stat: posix.Stat = undefined;
-    switch (posix.errno(system.fstat(fd, &stat))) {
-        .SUCCESS => return stat,
-        .BADF => unreachable,
-        .NOMEM => return error.SystemResources,
-        else => |err| return posix.unexpectedErrno(err),
+/// Volt-internal `Stat` — a flat, OS-portable view of `fstat`/`fstatat`
+/// results. Zig 0.16's `std.posix.Stat` is `void` on Linux (the
+/// platform now provides `Statx` only); we wrap the per-OS source so
+/// the rest of Volt sees one uniform type.
+pub const Stat = struct {
+    /// Mode bits (file kind in upper bits, perm bits in lower 12).
+    /// Use the `posix.S.{IFREG,IFDIR,...}` constants to match the kind.
+    mode: u32,
+    /// File size in bytes.
+    size: u64,
+    /// Last access time, ns since epoch.
+    atime_ns: i128,
+    /// Last modification time, ns since epoch.
+    mtime_ns: i128,
+    /// Last status change time (chmod/chown), ns since epoch.
+    ctime_ns: i128,
+    /// Birth (creation) time. `null` on systems that don't expose it
+    /// (older Linux kernels, some filesystems).
+    btime_ns: ?i128,
+};
+
+pub fn fstat(fd: posix.fd_t) !Stat {
+    if (builtin.os.tag == .linux) {
+        // Linux: use statx (kernel 4.11+; AT_EMPTY_PATH lets us pass an
+        // empty path and statx the fd directly). Returns Statx; we
+        // convert to Volt's portable Stat.
+        const linux = std.os.linux;
+        var sx: linux.Statx = undefined;
+        const empty: [*:0]const u8 = "";
+        const rc = linux.statx(
+            fd,
+            empty,
+            linux.AT.EMPTY_PATH,
+            linux.STATX.BASIC_STATS,
+            &sx,
+        );
+        switch (posix.errno(rc)) {
+            .SUCCESS => return statFromStatx(sx),
+            .BADF => unreachable,
+            .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    } else {
+        // Darwin/BSD: libc fstat fills system.Stat directly.
+        var stat: system.Stat = undefined;
+        switch (posix.errno(system.fstat(fd, &stat))) {
+            .SUCCESS => return statFromPosix(stat),
+            .BADF => unreachable,
+            .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
     }
+}
+
+fn statFromPosix(s: system.Stat) Stat {
+    const atime = s.atime();
+    const mtime = s.mtime();
+    const ctime = s.ctime();
+    const btime: ?i128 = if (@hasDecl(@TypeOf(s), "birthtime"))
+        nsFromTimespec(s.birthtime())
+    else
+        null;
+    return .{
+        .mode = @intCast(s.mode),
+        .size = @intCast(s.size),
+        .atime_ns = nsFromTimespec(atime),
+        .mtime_ns = nsFromTimespec(mtime),
+        .ctime_ns = nsFromTimespec(ctime),
+        .btime_ns = btime,
+    };
+}
+
+fn statFromStatx(sx: std.os.linux.Statx) Stat {
+    return .{
+        .mode = sx.mode,
+        .size = sx.size,
+        .atime_ns = nsFromStatxTime(sx.atime),
+        .mtime_ns = nsFromStatxTime(sx.mtime),
+        .ctime_ns = nsFromStatxTime(sx.ctime),
+        // STATX.BASIC_STATS doesn't include BTIME, but most Linux
+        // kernels fill it anyway when the FS supports it. Inspect
+        // the mask to know whether btime is valid.
+        .btime_ns = if (sx.mask.BTIME) nsFromStatxTime(sx.btime) else null,
+    };
+}
+
+fn nsFromTimespec(ts: posix.timespec) i128 {
+    const secs: i128 = @intCast(ts.sec);
+    const nsec: i128 = @intCast(ts.nsec);
+    return secs * std.time.ns_per_s + nsec;
+}
+
+fn nsFromStatxTime(ts: std.os.linux.statx_timestamp) i128 {
+    const secs: i128 = @intCast(ts.sec);
+    const nsec: i128 = @intCast(ts.nsec);
+    return secs * std.time.ns_per_s + nsec;
 }
 
 pub fn ftruncate(fd: posix.fd_t, length: u64) !void {
@@ -1275,21 +1363,36 @@ pub const FStatAtError = error{
     InvalidUtf8,
 } || std.posix.UnexpectedError;
 
-pub fn fstatatZ(dirfd: posix.fd_t, sub_path: [*:0]const u8, flags: u32) FStatAtError!posix.Stat {
-    var stat: posix.Stat = undefined;
-    switch (posix.errno(system.fstatat(dirfd, sub_path, &stat, flags))) {
-        .SUCCESS => return stat,
-        .ACCES => return error.AccessDenied,
-        .PERM => return error.AccessDenied,
-        .BADF => unreachable,
-        .FAULT => unreachable,
-        .INVAL => unreachable,
-        .LOOP => return error.SymLinkLoop,
-        .NAMETOOLONG => return error.NameTooLong,
-        .NOENT => return error.FileNotFound,
-        .NOMEM => return error.SystemResources,
-        .NOTDIR => return error.FileNotFound,
-        else => |err| return posix.unexpectedErrno(err),
+pub fn fstatatZ(dirfd: posix.fd_t, sub_path: [*:0]const u8, flags: u32) FStatAtError!Stat {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var sx: linux.Statx = undefined;
+        // The `flags` argument here uses the same AT.* bits as
+        // posix.fstatat (AT.SYMLINK_NOFOLLOW etc.) — statx accepts
+        // the same set, so we pass through.
+        const rc = linux.statx(dirfd, sub_path, flags, linux.STATX.BASIC_STATS, &sx);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return statFromStatx(sx),
+            .ACCES, .PERM => return error.AccessDenied,
+            .BADF, .FAULT, .INVAL => unreachable,
+            .LOOP => return error.SymLinkLoop,
+            .NAMETOOLONG => return error.NameTooLong,
+            .NOENT, .NOTDIR => return error.FileNotFound,
+            .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    } else {
+        var stat: system.Stat = undefined;
+        switch (posix.errno(system.fstatat(dirfd, sub_path, &stat, flags))) {
+            .SUCCESS => return statFromPosix(stat),
+            .ACCES, .PERM => return error.AccessDenied,
+            .BADF, .FAULT, .INVAL => unreachable,
+            .LOOP => return error.SymLinkLoop,
+            .NAMETOOLONG => return error.NameTooLong,
+            .NOENT, .NOTDIR => return error.FileNotFound,
+            .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
     }
 }
 

@@ -8,6 +8,7 @@ const posix = std.posix;
 const builtin = @import("builtin");
 
 const Instant = @import("../time.zig").Instant;
+const syscall = @import("../internal/syscall.zig");
 
 pub const Kind = enum {
     file,
@@ -41,32 +42,24 @@ pub const Metadata = struct {
     /// integration is a v1.2 follow-up.
     btime: ?Instant = null,
 
-    /// Build a Metadata from a Posix Stat struct. Platform-specific
-    /// timespec field names are abstracted here.
-    pub fn fromPosixStat(stat: posix.Stat) Metadata {
+    /// Build a Metadata from Volt's portable Stat. The Stat type
+    /// abstracts over Darwin/BSD's `system.Stat` and Linux's `Statx`
+    /// (since Zig 0.16 dropped `posix.Stat` on Linux).
+    pub fn fromStat(stat: syscall.Stat) Metadata {
         const kind = kindFromMode(stat.mode);
         return .{
-            .size = @intCast(stat.size),
-            .mode = stat.mode,
+            .size = stat.size,
+            .mode = @intCast(stat.mode),
             .kind = kind,
-            .atime = nsFromTimespec(stat.atime()),
-            .mtime = nsFromTimespec(stat.mtime()),
-            .ctime = nsFromTimespec(stat.ctime()),
-            .btime = if (@hasDecl(@TypeOf(stat), "birthtime"))
-                nsFromTimespec(stat.birthtime())
-            else
-                null,
+            .atime = .{ .timestamp = stat.atime_ns },
+            .mtime = .{ .timestamp = stat.mtime_ns },
+            .ctime = .{ .timestamp = stat.ctime_ns },
+            .btime = if (stat.btime_ns) |ns| Instant{ .timestamp = ns } else null,
         };
     }
 };
 
-fn nsFromTimespec(ts: posix.timespec) Instant {
-    const secs: i128 = @intCast(ts.sec);
-    const nsec: i128 = @intCast(ts.nsec);
-    return .{ .timestamp = secs * std.time.ns_per_s + nsec };
-}
-
-fn kindFromMode(mode: posix.mode_t) Kind {
+fn kindFromMode(mode: u32) Kind {
     const fmt = mode & posix.S.IFMT;
     return switch (fmt) {
         posix.S.IFREG => .file,

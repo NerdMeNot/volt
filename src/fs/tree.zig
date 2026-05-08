@@ -232,11 +232,11 @@ pub fn stat(path: []const u8) !Metadata {
     const Args = struct { path_z: [:0]const u8 };
     var args = Args{ .path_z = path_z };
     const s = try spawnBlocking(struct {
-        fn run(a: *Args) !posix.Stat {
+        fn run(a: *Args) !syscall.Stat {
             return syscall.fstatatZ(posix.AT.FDCWD, a.path_z.ptr, 0);
         }
     }.run, .{&args});
-    return Metadata.fromPosixStat(s);
+    return Metadata.fromStat(s);
 }
 
 /// Like `stat` but doesn't follow symlinks — returns metadata about
@@ -249,11 +249,11 @@ pub fn lstat(path: []const u8) !Metadata {
     const Args = struct { path_z: [:0]const u8 };
     var args = Args{ .path_z = path_z };
     const s = try spawnBlocking(struct {
-        fn run(a: *Args) !posix.Stat {
+        fn run(a: *Args) !syscall.Stat {
             return syscall.fstatatZ(posix.AT.FDCWD, a.path_z.ptr, AT_SYMLINK_NOFOLLOW);
         }
     }.run, .{&args});
-    return Metadata.fromPosixStat(s);
+    return Metadata.fromStat(s);
 }
 
 /// Cheap probe for "is there something at this path?". Returns

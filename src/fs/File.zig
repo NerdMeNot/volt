@@ -165,11 +165,11 @@ pub const File = struct {
         const Args = struct { fd: posix.fd_t };
         var args = Args{ .fd = self.fd };
         const stat = try spawnBlocking(struct {
-            fn run(a: *Args) !posix.Stat {
+            fn run(a: *Args) !syscall.Stat {
                 return syscall.fstat(a.fd);
             }
         }.run, .{&args});
-        return Metadata.fromPosixStat(stat);
+        return Metadata.fromStat(stat);
     }
 
     // ── Trait surface ──────────────────────────────────────────────────
