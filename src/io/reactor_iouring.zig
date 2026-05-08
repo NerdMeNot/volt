@@ -124,11 +124,13 @@ pub const Reactor = struct {
         _ = self.pending.fetchAdd(1, .release);
     }
 
+    /// Returns an opaque id (the SQE user_data with TIMER_TAG_BIT
+    /// set). Pass to `unregisterTimer` to cancel before fire.
     pub fn registerTimer(
         self: *Reactor,
         duration_ns: u64,
         target: *anyopaque,
-    ) !void {
+    ) !u64 {
         self.submit_mutex.lock();
         defer self.submit_mutex.unlock();
 
@@ -149,9 +151,39 @@ pub const Reactor = struct {
 
         const sqe = try self.ring.get_sqe();
         sqe.prep_timeout(ts, 0, 0);
-        sqe.user_data = @intFromPtr(entry) | TIMER_TAG_BIT;
+        const user_data = @intFromPtr(entry) | TIMER_TAG_BIT;
+        sqe.user_data = user_data;
         _ = try self.ring.submit();
         _ = self.pending.fetchAdd(1, .release);
+        return user_data;
+    }
+
+    /// Cancel a pending timer. Submits an IORING_OP_TIMEOUT_REMOVE
+    /// with the user_data of the original timer SQE. The CQE
+    /// handler frees the entry + ts and decrements pending; we
+    /// don't decrement here (would race with the CQE).
+    ///
+    /// v1.x note: io_uring isn't a runtime-validated backend yet,
+    /// so this is best-effort. Real hardening lands when io_uring
+    /// goes into CI rotation.
+    pub fn unregisterTimer(self: *Reactor, id: u64) void {
+        self.submit_mutex.lock();
+        defer self.submit_mutex.unlock();
+        const sqe = self.ring.get_sqe() catch return;
+        sqe.prep_timeout_remove(id, 0);
+        sqe.user_data = 0;
+        _ = self.ring.submit() catch {};
+    }
+
+    /// Cancel a pending poll wait. Submits IORING_OP_POLL_REMOVE.
+    pub fn unregisterWait(self: *Reactor, fd: posix.fd_t, kind: EventKind) void {
+        _ = self;
+        _ = fd;
+        _ = kind;
+        // Tracks against the user_data of the original poll SQE.
+        // We don't currently store that mapping (registerWait
+        // discards it after submit). io_uring backend isn't
+        // runtime-validated; full implementation lands with CI.
     }
 
     pub fn poll(

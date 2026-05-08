@@ -166,13 +166,19 @@ pub const Reactor = struct {
     /// Arm a one-shot timer that fires after `duration_ns` nanoseconds.
     /// Allocates a fresh timerfd + heap-allocated TimerEntry; on
     /// expiry, `poll` closes the fd, frees the entry, and delivers
-    /// the wake to `target`. No fd or heap leak across the timer
-    /// lifecycle.
+    /// the wake to `target`.
+    ///
+    /// Returns an opaque id (the TimerEntry pointer cast to u64).
+    /// Callers that need to cancel before fire must pass it to
+    /// `unregisterTimer` — without that, a cancelled sleep leaks
+    /// the timerfd, the heap entry, and the pending counter,
+    /// wedging idle workers in `poll` (same kqueue-side bug just
+    /// fixed in `reactor_kqueue`).
     pub fn registerTimer(
         self: *Reactor,
         duration_ns: u64,
         target: *anyopaque,
-    ) !void {
+    ) !u64 {
         const entry = try self.allocator.create(TimerEntry);
         errdefer self.allocator.destroy(entry);
 
@@ -205,6 +211,33 @@ pub const Reactor = struct {
         }
 
         _ = self.pending.fetchAdd(1, .release);
+        return @intFromPtr(entry);
+    }
+
+    /// Cancel a pending timer. If the timer hasn't fired, EPOLL_CTL_DEL
+    /// removes the registration, we close the timerfd + free the
+    /// entry, and decrement pending. Best-effort on failure paths;
+    /// double-cancel is safe-ish (the entry pointer is unique per
+    /// timer, but freeing a freed entry is UB — callers must call
+    /// at most once).
+    pub fn unregisterTimer(self: *Reactor, id: u64) void {
+        const entry: *TimerEntry = @ptrFromInt(id);
+        const tfd = entry.timerfd;
+        // EPOLL_CTL_DEL with null event ptr is fine post-2.6.9.
+        _ = linux.epoll_ctl(self.epfd, linux.EPOLL.CTL_DEL, tfd, null);
+        syscall.close(tfd);
+        self.allocator.destroy(entry);
+        _ = self.pending.fetchSub(1, .release);
+    }
+
+    /// Cancel a pending fd wait. Same shape as `unregisterTimer`.
+    pub fn unregisterWait(self: *Reactor, fd: posix.fd_t, kind: EventKind) void {
+        _ = linux.epoll_ctl(self.epfd, linux.EPOLL.CTL_DEL, fd, null);
+        self.mutex.lock();
+        const key = WaitKey{ .fd = @intCast(fd), .kind_tag = @intFromEnum(kind) };
+        _ = self.waiters.remove(key);
+        self.mutex.unlock();
+        _ = self.pending.fetchSub(1, .release);
     }
 
     /// Block on epoll_wait for up to `timeout_ns`. For each ready

@@ -166,7 +166,7 @@ pub const Reactor = struct {
         self: *Reactor,
         duration_ns: u64,
         target: *anyopaque,
-    ) !void {
+    ) !u64 {
         // Stub: real implementation needs CreateTimerQueueTimer + a
         // callback that PostQueuedCompletionStatus's. The skeleton is
         // here for interface uniformity; the runtime panics if a
@@ -175,6 +175,21 @@ pub const Reactor = struct {
         _ = duration_ns;
         _ = target;
         return error.WindowsTimerNotImplemented;
+    }
+
+    pub fn unregisterTimer(self: *Reactor, id: u64) void {
+        _ = self;
+        _ = id;
+        // No-op stub — registerTimer never succeeds today.
+    }
+
+    pub fn unregisterWait(self: *Reactor, fd: std.posix.fd_t, kind: EventKind) void {
+        _ = self;
+        _ = fd;
+        _ = kind;
+        // IOCP doesn't directly support disassociating a handle from
+        // the port — the canonical cancel is CancelIoEx on the
+        // outstanding overlapped op. Lands with the Windows runtime.
     }
 
     pub fn poll(
