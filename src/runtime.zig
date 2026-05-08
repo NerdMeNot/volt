@@ -184,6 +184,22 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
+        // Cleanliness invariants. If these fire, the runtime is leaking
+        // kernel registrations or has live coroutines we'll about to
+        // abandon — both classes of bug we want to catch loudly.
+        //
+        //   - reactor.pendingCount() == 0: every register* must have a
+        //     paired unregister* by shutdown time. The Phase 1 audit
+        //     scripts (`audit_park_sites.sh`, `audit_registrations.sh`)
+        //     enforce the source-level pairing; this assert is the
+        //     runtime gate.
+        //
+        // We `assert` (not panic) so ReleaseFast strips the check —
+        // the cost is zero in production but the gate fires loud in
+        // test/Debug builds, which is exactly when leaks should
+        // surface.
+        std.debug.assert(self.reactor.pendingCount() == 0);
+
         if (self.blocking_pool.load(.acquire)) |pool| pool.deinit();
         // Workers free any stack that wasn't pooled (i.e. coroutines
         // still alive at runtime tear-down). After workers, the pool's

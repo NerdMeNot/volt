@@ -57,6 +57,19 @@ fn pinToCore(core_idx: usize) !void {
 /// or shutdown — this timeout is effectively a watchdog for stuck conditions.
 const REACTOR_POLL_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
 
+/// Maximum idle-park block time when no reactor work is pending. Same
+/// watchdog rationale as `REACTOR_POLL_TIMEOUT_NS`: in the steady state
+/// `Runtime.notify*` will unpark workers as soon as work arrives or
+/// shutdown is signaled, making this timeout invisible. But if a wake
+/// is ever lost (race between unpark and the parker's WAITING transition,
+/// or a backend bug), the worker re-enters its run loop within this
+/// budget, observes `shutdownRequested()`, and exits cleanly instead of
+/// wedging the process forever in `__ulock_wait2`.
+///
+/// Cost when there's no lost wake: zero — the parker returns on the
+/// real signal, never sees the timeout.
+const IDLE_PARK_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
+
 /// Per-worker idle parker. Single-atomic state machine — one modification
 /// order means no cross-atomic IRIW race.
 ///
@@ -105,7 +118,19 @@ const Parker = struct {
         }
 
         while (self.state.load(.acquire) == WAITING) {
-            self.condition.wait(&self.mutex);
+            // Watchdog timeout (matches REACTOR_POLL_TIMEOUT_NS rationale).
+            // In the steady state Runtime.notify* unparks before this fires;
+            // the timeout exists purely so a lost wake (e.g. a backend bug
+            // or an unforeseen race between the unparker's swap-to-NOTIFIED
+            // and our cond.wait entry) can't wedge the process forever.
+            // The worker re-enters its run loop, observes shouldStop, and
+            // exits cleanly.
+            self.condition.timedWait(&self.mutex, IDLE_PARK_TIMEOUT_NS) catch {
+                // Timeout. State is still WAITING — no real wake arrived.
+                // Drop out of WAITING so the worker can re-evaluate.
+                self.state.store(EMPTY, .release);
+                return;
+            };
         }
         self.state.store(EMPTY, .release);
     }
