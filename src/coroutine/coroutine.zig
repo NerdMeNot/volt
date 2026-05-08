@@ -126,14 +126,28 @@ pub const Coroutine = struct {
     }
 
     pub fn cancel(self: *Coroutine) void {
-        self.cancel_flag.store(true, .release);
-        // If the coroutine is currently parked on a Park (channel
-        // waiter, mutex queue, sleep timer, etc.), wake it now so
-        // it observes the cancellation immediately at its
-        // post-resume check. Without this nudge it'd wait until
-        // some unrelated wake source fires (or never, if the wake
-        // source is gone).
-        const park_addr = self.current_park.load(.acquire);
+        // Race-correctness rationale: cancel() and Park.parkCurrent()
+        // are two halves of an IRIW-style ordering problem.
+        //
+        //   cancel():        store cancel_flag → load current_park
+        //   parkCurrent():   store current_park → load cancel_flag (post-store recheck)
+        //
+        // For the cancel signal to be observed correctly in every
+        // interleaving, the two stores must form a global total order
+        // — otherwise the canceller can read current_park=0 (because
+        // parkCurrent hasn't stored yet) AND parkCurrent can read
+        // cancel_flag=false (because it ran before the canceller
+        // stored it). Both observations are individually consistent
+        // with release/acquire semantics, but the coro then commits
+        // to ctx_swap with cancel_flag set and no unpark scheduled —
+        // a permanent leak (parked coroutine never wakes).
+        //
+        // Solution: seq_cst on the cancel_flag store + current_park
+        // load here, paired with seq_cst on the matching ops in
+        // parkCurrent. Costs a memory fence per cancel; cancellation
+        // is rare so the cost is invisible.
+        self.cancel_flag.store(true, .seq_cst);
+        const park_addr = self.current_park.load(.seq_cst);
         if (park_addr != 0) {
             const park: *Park = @ptrFromInt(park_addr);
             park.unpark();

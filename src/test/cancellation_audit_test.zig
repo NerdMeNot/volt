@@ -347,12 +347,20 @@ test "cancel-audit:nanoTimestamp monotonic per-coroutine across yields" {
 // ─────────────────────────────────────────────────────────────────────
 
 const SpawnBlockingCancelCtx = struct {
-    wg: *helpers.WaitGroup,
+    pool_started: *helpers.Latch,
     saw_cancelled: bool = false,
     pool_thread_finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
 fn slowBlockingWork(ctx: *SpawnBlockingCancelCtx) u32 {
+    // Signal "the pool thread is now running" — this is the
+    // synchronization point the test depends on. Cancel must land
+    // AFTER this so the UAF guard (Futex.wait on closure.tag in
+    // spawn_blocking.zig) actually has work to do. Done from
+    // inside the pool thread, not from the dispatching coroutine,
+    // because the cancel-vs-dispatch race is what we're testing.
+    ctx.pool_started.signal();
+
     // ~10 ms of work — long enough that we're parked when cancel lands.
     @import("../internal/thread.zig").sleep(10 * std.time.ns_per_ms);
     ctx.pool_thread_finished.store(true, .release);
@@ -360,7 +368,6 @@ fn slowBlockingWork(ctx: *SpawnBlockingCancelCtx) u32 {
 }
 
 fn spawnBlockingCancelCoro(ctx: *SpawnBlockingCancelCtx) void {
-    ctx.wg.done();
     if (volt.spawnBlocking(slowBlockingWork, .{ctx})) |_| {
         // unexpected — we cancelled
     } else |err| {
@@ -369,12 +376,16 @@ fn spawnBlockingCancelCoro(ctx: *SpawnBlockingCancelCtx) void {
 }
 
 fn spawnBlockingCancelRoot() !SpawnBlockingCancelCtx {
-    var wg = helpers.WaitGroup.init(1);
-    var ctx = SpawnBlockingCancelCtx{ .wg = &wg };
+    var pool_started = helpers.Latch{};
+    var ctx = SpawnBlockingCancelCtx{ .pool_started = &pool_started };
     const job = try volt.launch(spawnBlockingCancelCoro, .{&ctx});
     defer volt.destroyJob(job);
 
-    try wg.wait(PARK_TIMEOUT_NS);
+    // Deterministic wait: only cancel once the pool thread is
+    // actually running its work. Without this, cancel-before-
+    // dispatch returns Cancelled immediately and the pool thread
+    // never runs (pool_thread_finished stays false → test fails).
+    try pool_started.wait(1 * std.time.ns_per_s);
 
     job.cancel();
     job.join() catch {};

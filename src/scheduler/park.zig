@@ -87,7 +87,27 @@ pub const Park = struct {
 
         // Register `self` as the coro's current park so a concurrent
         // `cancel()` can wake us. Cleared on resume below.
-        coro.current_park.store(@intFromPtr(self), .release);
+        //
+        // Seq_cst here pairs with `Coroutine.cancel()`'s seq_cst
+        // ordering on `cancel_flag.store` + `current_park.load`. The
+        // post-store re-check below catches cancellations that
+        // happened in the window between the entry isCancelled check
+        // and our store of current_park: with the seq_cst total
+        // order, either cancel observes our current_park (and
+        // unparks us) OR we observe cancel_flag (and bail out).
+        coro.current_park.store(@intFromPtr(self), .seq_cst);
+
+        // Re-check cancel_flag AFTER current_park is visible. Without
+        // this, a cancel that fires between line 80's check and the
+        // current_park.store above can leave cancel_flag set with no
+        // unpark scheduled — the coroutine then commits to ctx_swap
+        // and never wakes (kernel registration leaks, the runtime's
+        // pendingCount never drops to 0, and Runtime.deinit's
+        // invariant assert fires).
+        if (coro.cancel_flag.load(.seq_cst)) {
+            coro.current_park.store(0, .release);
+            return error.Cancelled;
+        }
 
         // Yield to the scheduler. The worker will call `self.es.subscribe`
         // which atomically registers us or fast-wakes.

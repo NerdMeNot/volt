@@ -179,9 +179,25 @@ pub const Reactor = struct {
         }
     }
 
-    /// Cancel a pending fd wait registration. Same EV_DELETE
-    /// semantics as `unregisterTimer`. Used by `volt.io.wait*` on
-    /// cancellation to keep kqueue / pending counter in sync.
+    /// Cancel a pending fd wait registration. Used by `volt.io.wait*`
+    /// on cancellation to keep kqueue + pending counter in sync.
+    ///
+    /// Race-correctness rationale: the EV_DELETE syscall and the
+    /// `waiters` map removal are *separately* the source of truth
+    /// for the registration. EV_DELETE may return ENOENT (because
+    /// EV_ONESHOT auto-removed the kevent post-fire, or kqueue
+    /// already delivered the event to a polling worker), in which
+    /// case poll() will pick the event up. We unconditionally do
+    /// the waiters-map remove + pending decrement here; poll()'s
+    /// own waiters-map remove serves as the dedup — whichever side
+    /// wins atomically decrements pending and fires (or drops) the
+    /// wake.
+    ///
+    /// Bug fixed: previously, a cancel that lost the race against
+    /// kqueue's auto-removal would swallow EventNotFound without
+    /// removing from waiters or decrementing pending, leaving
+    /// pendingCount off-by-one AND letting a later poll() fire
+    /// wakeFn on a Park whose stack frame had already unwound (UAF).
     pub fn unregisterWait(self: *Reactor, fd: posix.fd_t, kind: EventKind) void {
         const ev = posix.Kevent{
             .ident = @intCast(fd),
@@ -193,16 +209,16 @@ pub const Reactor = struct {
         };
         const changes = [_]posix.Kevent{ev};
         var dummy: [0]posix.Kevent = undefined;
-        if (syscall.kevent(self.kq, &changes, &dummy, null)) |_| {
-            self.mutex.lock();
-            const key = WaitKey{ .fd = @intCast(fd), .kind_tag = @intFromEnum(kind) };
-            _ = self.waiters.remove(key);
-            self.mutex.unlock();
-            _ = self.pending.fetchSub(1, .release);
-        } else |err| switch (err) {
-            error.EventNotFound => {},
-            else => {},
-        }
+        // Best-effort: EV_DELETE may return ENOENT (event already
+        // delivered or never registered). We don't care about the
+        // outcome — the map remove below is what reconciles state.
+        _ = syscall.kevent(self.kq, &changes, &dummy, null) catch {};
+
+        self.mutex.lock();
+        const key = WaitKey{ .fd = @intCast(fd), .kind_tag = @intFromEnum(kind) };
+        const had_it = self.waiters.remove(key);
+        self.mutex.unlock();
+        if (had_it) _ = self.pending.fetchSub(1, .release);
     }
 
     /// Arm a one-shot wait for (fd, kind). The `target` pointer is opaque
@@ -292,9 +308,17 @@ pub const Reactor = struct {
             self.mutex.lock();
             const removed = self.waiters.remove(key);
             self.mutex.unlock();
-            if (removed) _ = self.pending.fetchSub(1, .release);
-            try wakeFn(wake_ctx, target);
-            woken += 1;
+            if (removed) {
+                _ = self.pending.fetchSub(1, .release);
+                try wakeFn(wake_ctx, target);
+                woken += 1;
+            }
+            // If `removed` is false, this CQE belongs to a registration
+            // that was cancelled via `unregisterWait` between EV_ONESHOT
+            // delivery and our retrieval. The cancel path already
+            // decremented pending and the target Park may have been
+            // freed (the cancelled coroutine unwound its stack). DROP
+            // the wake — invoking wakeFn on a stale target is UAF.
         }
         return woken;
     }
