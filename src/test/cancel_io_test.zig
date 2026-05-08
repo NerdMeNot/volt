@@ -7,13 +7,16 @@
 
 const std = @import("std");
 const volt = @import("../lib.zig");
+const helpers = @import("helpers.zig");
 
 const PipeCancelCtx = struct {
     rfd: std.posix.fd_t,
+    wg: *helpers.WaitGroup,
     saw_cancelled: bool = false,
 };
 
 fn pipeReaderForCancel(ctx: *PipeCancelCtx) void {
+    ctx.wg.done();
     var buf: [16]u8 = undefined;
     // Will park indefinitely — no writer ever sends data. Cancel
     // wakes the park; wait.zig surfaces error.Cancelled which
@@ -32,14 +35,12 @@ fn pipeCancelRoot() !PipeCancelCtx {
     try volt.io.lowlevel.setNonblock(fds[0]);
     try volt.io.lowlevel.setNonblock(fds[1]);
 
-    var ctx = PipeCancelCtx{ .rfd = fds[0] };
+    var wg = helpers.WaitGroup.init(1);
+    var ctx = PipeCancelCtx{ .rfd = fds[0], .wg = &wg };
     const reader = try volt.launch(pipeReaderForCancel, .{&ctx});
     defer volt.destroyJob(reader);
 
-    // Yield enough times that the reader has registered on the
-    // reactor and is parked.
-    var i: u32 = 0;
-    while (i < 5) : (i += 1) try volt.yield();
+    try wg.wait(1 * std.time.ns_per_s);
 
     reader.cancel();
     // Job.join returns error.Cancelled when the child was cancelled —

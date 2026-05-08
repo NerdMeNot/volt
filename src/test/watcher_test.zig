@@ -11,10 +11,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const volt = @import("../lib.zig");
+const helpers = @import("helpers.zig");
 
 const WatchCtx = struct {
     dir: []const u8,
     file: []const u8,
+    watcher_ready: *helpers.Latch,
     got_event: bool = false,
 };
 
@@ -29,11 +31,10 @@ fn watcherCoro(ctx: *WatchCtx) !void {
     var w = try volt.fs.Watcher.open(ctx.dir);
     defer w.deinit();
 
-    // Yield once so the trigger coro has a chance to register the
-    // file change. With the reactor edge-triggered mode, our next()
-    // call still wakes on subsequent changes, but ordering matters
-    // for the test.
-    try volt.yield();
+    // Signal the trigger coro that the watcher is now armed. This
+    // replaces a yield() that hoped (but didn't guarantee) the
+    // trigger ran later.
+    ctx.watcher_ready.signal();
 
     if (try w.next()) |ev| {
         // Any event counts as a pass — Darwin's coarse-grained
@@ -45,10 +46,9 @@ fn watcherCoro(ctx: *WatchCtx) !void {
 }
 
 fn triggerCoro(ctx: *WatchCtx) !void {
-    // Wait briefly so the watcher registers first.
-    try volt.yield();
-    try volt.yield();
-    try volt.yield();
+    // Deterministic wait: only fire the file change after the
+    // watcher has signaled it's armed.
+    try ctx.watcher_ready.wait(1 * std.time.ns_per_s);
 
     var f = try volt.fs.File.create(ctx.file);
     try f.writeAll("touch");
@@ -144,7 +144,8 @@ test "P3.x.5: Watcher fires an event on file creation in watched dir" {
     const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/volt-w-{d}", .{pid});
     const file = try std.fmt.bufPrint(&file_buf, "{s}/touch.txt", .{dir});
 
-    var ctx = WatchCtx{ .dir = dir, .file = file };
+    var watcher_ready = helpers.Latch{};
+    var ctx = WatchCtx{ .dir = dir, .file = file, .watcher_ready = &watcher_ready };
     try volt.run(.{ .allocator = std.testing.allocator }, watcherRoot, .{&ctx});
     try std.testing.expect(ctx.got_event);
 }

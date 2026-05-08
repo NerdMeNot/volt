@@ -17,6 +17,9 @@
 
 const std = @import("std");
 const volt = @import("../lib.zig");
+const helpers = @import("helpers.zig");
+
+const PARK_TIMEOUT_NS: u64 = 1 * std.time.ns_per_s;
 
 // ─────────────────────────────────────────────────────────────────────
 // 1. Cancel a parked channel SENDER
@@ -24,15 +27,19 @@ const volt = @import("../lib.zig");
 
 const SendCancelCtx = struct {
     ch: *volt.channel.Channel(u32),
+    wg: *helpers.WaitGroup,
     saw_cancelled: bool = false,
     saw_ok: bool = false,
     saw_other_error: ?anyerror = null,
 };
 
 fn senderCoro(ctx: *SendCancelCtx) void {
-    // Channel is full (capacity 1, one item already inside) — this
-    // send parks until either (a) someone recv's, freeing a slot, or
-    // (b) cancellation wakes us. Expect (b).
+    // Signal "I'm about to park" before the channel send. Tiny race
+    // between done() and ch.send() reaching its park; cancel-from-
+    // anywhere handles both states (running and parked) correctly.
+    ctx.wg.done();
+    // Channel is full — this send parks until either (a) someone
+    // recv's, freeing a slot, or (b) cancellation wakes us. Expect (b).
     if (ctx.ch.send(99)) |_| {
         ctx.saw_ok = true;
     } else |err| {
@@ -52,13 +59,14 @@ fn sendCancelRoot() !SendCancelCtx {
     try ch.send(1);
     try ch.send(2);
 
-    var ctx = SendCancelCtx{ .ch = &ch };
+    var wg = helpers.WaitGroup.init(1);
+    var ctx = SendCancelCtx{ .ch = &ch, .wg = &wg };
     const sender = try volt.launch(senderCoro, .{&ctx});
     defer volt.destroyJob(sender);
 
-    // Yield so sender registers and parks.
-    var i: u32 = 0;
-    while (i < 5) : (i += 1) try volt.yield();
+    // Deterministic wait: returns once the sender has called done()
+    // — i.e., it's about to park (or already parked).
+    try wg.wait(PARK_TIMEOUT_NS);
 
     sender.cancel();
     sender.join() catch {};
@@ -82,10 +90,12 @@ test "cancel-audit:cancel parked channel sender → error.Cancelled, channel int
 
 const RecvCancelCtx = struct {
     ch: *volt.channel.Channel(u32),
+    wg: *helpers.WaitGroup,
     saw_cancelled: bool = false,
 };
 
 fn receiverCoro(ctx: *RecvCancelCtx) void {
+    ctx.wg.done();
     if (ctx.ch.recv()) |_| {
         // unexpected
     } else |err| {
@@ -98,12 +108,12 @@ fn recvCancelRoot() !RecvCancelCtx {
     var ch = try Channel.init(std.testing.allocator, 4);
     defer ch.deinit();
 
-    var ctx = RecvCancelCtx{ .ch = &ch };
+    var wg = helpers.WaitGroup.init(1);
+    var ctx = RecvCancelCtx{ .ch = &ch, .wg = &wg };
     const receiver = try volt.launch(receiverCoro, .{&ctx});
     defer volt.destroyJob(receiver);
 
-    var i: u32 = 0;
-    while (i < 5) : (i += 1) try volt.yield();
+    try wg.wait(PARK_TIMEOUT_NS);
 
     receiver.cancel();
     receiver.join() catch {};
@@ -125,10 +135,12 @@ test "cancel-audit:cancel parked channel receiver → error.Cancelled, channel i
 // ─────────────────────────────────────────────────────────────────────
 
 const SleepCancelCtx = struct {
+    wg: *helpers.WaitGroup,
     saw_cancelled: bool = false,
 };
 
 fn sleeperCoro(ctx: *SleepCancelCtx) void {
+    ctx.wg.done();
     // 1 hour — would never fire in a test; cancel must surface.
     if (volt.sleep(volt.Duration.fromSecs(3600))) |_| {
         // unexpected
@@ -138,12 +150,12 @@ fn sleeperCoro(ctx: *SleepCancelCtx) void {
 }
 
 fn sleepCancelRoot() !SleepCancelCtx {
-    var ctx = SleepCancelCtx{};
+    var wg = helpers.WaitGroup.init(1);
+    var ctx = SleepCancelCtx{ .wg = &wg };
     const sleeper = try volt.launch(sleeperCoro, .{&ctx});
     defer volt.destroyJob(sleeper);
 
-    var i: u32 = 0;
-    while (i < 5) : (i += 1) try volt.yield();
+    try wg.wait(PARK_TIMEOUT_NS);
 
     sleeper.cancel();
     sleeper.join() catch {};
@@ -161,10 +173,12 @@ test "cancel-audit:cancel sleeping coroutine → error.Cancelled (no firing)" {
 
 const MutexCancelCtx = struct {
     mu: *volt.sync.Mutex,
+    wg: *helpers.WaitGroup,
     saw_cancelled: bool = false,
 };
 
 fn mutexWaiterCoro(ctx: *MutexCancelCtx) void {
+    ctx.wg.done();
     if (ctx.mu.lock()) |_| {
         // Either the unlocker handed it to us before cancel landed, or
         // we beat the cancel — release immediately.
@@ -178,13 +192,12 @@ fn mutexCancelRoot() !MutexCancelCtx {
     var mu = volt.sync.Mutex{};
     try mu.lock(); // root holds it
 
-    var ctx = MutexCancelCtx{ .mu = &mu };
+    var wg = helpers.WaitGroup.init(1);
+    var ctx = MutexCancelCtx{ .mu = &mu, .wg = &wg };
     const waiter = try volt.launch(mutexWaiterCoro, .{&ctx});
     defer volt.destroyJob(waiter);
 
-    // Yield so the waiter parks on the mutex.
-    var i: u32 = 0;
-    while (i < 5) : (i += 1) try volt.yield();
+    try wg.wait(PARK_TIMEOUT_NS);
 
     waiter.cancel();
     waiter.join() catch {};
@@ -209,12 +222,23 @@ test "cancel-audit:cancel parked Mutex.lock → error.Cancelled, waiter list int
 const TortureCtx = struct {
     listener: *volt.net.TcpListener,
     addr: volt.net.Address,
+    wg: *helpers.WaitGroup,
     cancelled_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 };
 
 fn tortureWorker(ctx: *TortureCtx) void {
-    var stream = volt.net.TcpStream.connect(ctx.addr) catch return;
+    var stream = volt.net.TcpStream.connect(ctx.addr) catch {
+        ctx.wg.done(); // signal even on connect failure so parent doesn't wedge
+        return;
+    };
     defer stream.close();
+
+    // Signal "I'm about to park on read" so the parent's wg.wait()
+    // returns once all 100 children have reached this point. The
+    // race between done() and the read entering its park is fine:
+    // cancel-from-anywhere works whether the coroutine is running
+    // or parked.
+    ctx.wg.done();
 
     // Park forever on a read — the server side never writes.
     var buf: [16]u8 = undefined;
@@ -232,10 +256,11 @@ fn tortureRoot() !u32 {
     defer listener.close();
     const addr = try listener.localAddress();
 
-    var ctx = TortureCtx{ .listener = &listener, .addr = addr };
+    const N: u32 = 100;
+    var wg = helpers.WaitGroup.init(N);
+    var ctx = TortureCtx{ .listener = &listener, .addr = addr, .wg = &wg };
 
     // Spawn 100 client connections, each parked on read.
-    const N: u32 = 100;
     var workers: [N]*volt.Job = undefined;
     for (&workers) |*j| j.* = try volt.launch(tortureWorker, .{&ctx});
     defer for (workers) |j| volt.destroyJob(j);
@@ -247,9 +272,10 @@ fn tortureRoot() !u32 {
     for (&server_streams) |*s| s.* = try listener.accept();
     defer for (&server_streams) |*s| s.close();
 
-    // Yield enough that all 100 are parked on read.
-    var y: u32 = 0;
-    while (y < 50) : (y += 1) try volt.yield();
+    // Deterministic wait: returns once all 100 workers have reached
+    // their pre-read signal. 5s budget is generous; a healthy
+    // runtime hits this in <100ms.
+    try wg.wait(5 * std.time.ns_per_s);
 
     // Cancel all 100.
     for (workers) |j| j.cancel();
@@ -321,6 +347,7 @@ test "cancel-audit:nanoTimestamp monotonic per-coroutine across yields" {
 // ─────────────────────────────────────────────────────────────────────
 
 const SpawnBlockingCancelCtx = struct {
+    wg: *helpers.WaitGroup,
     saw_cancelled: bool = false,
     pool_thread_finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
@@ -333,6 +360,7 @@ fn slowBlockingWork(ctx: *SpawnBlockingCancelCtx) u32 {
 }
 
 fn spawnBlockingCancelCoro(ctx: *SpawnBlockingCancelCtx) void {
+    ctx.wg.done();
     if (volt.spawnBlocking(slowBlockingWork, .{ctx})) |_| {
         // unexpected — we cancelled
     } else |err| {
@@ -341,14 +369,12 @@ fn spawnBlockingCancelCoro(ctx: *SpawnBlockingCancelCtx) void {
 }
 
 fn spawnBlockingCancelRoot() !SpawnBlockingCancelCtx {
-    var ctx = SpawnBlockingCancelCtx{};
+    var wg = helpers.WaitGroup.init(1);
+    var ctx = SpawnBlockingCancelCtx{ .wg = &wg };
     const job = try volt.launch(spawnBlockingCancelCoro, .{&ctx});
     defer volt.destroyJob(job);
 
-    // Yield enough that the child has dispatched to the blocking pool
-    // and parked.
-    var i: u32 = 0;
-    while (i < 5) : (i += 1) try volt.yield();
+    try wg.wait(PARK_TIMEOUT_NS);
 
     job.cancel();
     job.join() catch {};

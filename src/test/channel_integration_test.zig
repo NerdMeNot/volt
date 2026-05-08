@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const volt = @import("../lib.zig");
+const helpers = @import("helpers.zig");
 const Channel = volt.channel.Channel;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -186,10 +187,12 @@ test "v0.3.x channel: capacity-2 backpressure, sender blocks on full" {
 
 const CloseWakeCtx = struct {
     ch: *Channel(u32),
+    wg: *helpers.WaitGroup,
     woke_with_closed: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 };
 
 fn waitingConsumer(ctx: *CloseWakeCtx) void {
+    ctx.wg.done();
     _ = ctx.ch.recv() catch |err| switch (err) {
         error.Closed => {
             _ = ctx.woke_with_closed.fetchAdd(1, .monotonic);
@@ -203,16 +206,17 @@ fn waitingConsumer(ctx: *CloseWakeCtx) void {
 fn closeWakeRoot() !u32 {
     var ch = try Channel(u32).init(std.testing.allocator, 4);
     defer ch.deinit();
-    var ctx = CloseWakeCtx{ .ch = &ch };
+    var wg = helpers.WaitGroup.init(8);
+    var ctx = CloseWakeCtx{ .ch = &ch, .wg = &wg };
 
     // Spawn 8 consumers that block on an empty channel.
     var consumers: [8]*volt.Job = undefined;
     for (&consumers) |*j| j.* = try volt.launch(waitingConsumer, .{&ctx});
     defer for (consumers) |j| volt.destroyJob(j);
 
-    // Yield a few times so consumers all park.
-    var k: u32 = 0;
-    while (k < 8) : (k += 1) try volt.yield();
+    // Deterministic wait: all 8 consumers have signaled, each is
+    // entering or already parked on ch.recv().
+    try wg.wait(1 * std.time.ns_per_s);
 
     // Close — every consumer must unwind with .closed.
     ch.close();
