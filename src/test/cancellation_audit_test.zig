@@ -313,3 +313,54 @@ test "cancel-audit:nanoTimestamp monotonic per-coroutine across yields" {
     defer samples.deinit();
     try std.testing.expectEqual(@as(usize, 4), samples.items.len);
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// 7. Cancel a coroutine parked in spawnBlocking — must wait for the
+//    pool thread to finish writing the closure before returning, or
+//    the closure (on the calling stack) is freed mid-write → UAF.
+// ─────────────────────────────────────────────────────────────────────
+
+const SpawnBlockingCancelCtx = struct {
+    saw_cancelled: bool = false,
+    pool_thread_finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn slowBlockingWork(ctx: *SpawnBlockingCancelCtx) u32 {
+    // ~10 ms of work — long enough that we're parked when cancel lands.
+    @import("../internal/thread.zig").sleep(10 * std.time.ns_per_ms);
+    ctx.pool_thread_finished.store(true, .release);
+    return 42;
+}
+
+fn spawnBlockingCancelCoro(ctx: *SpawnBlockingCancelCtx) void {
+    if (volt.spawnBlocking(slowBlockingWork, .{ctx})) |_| {
+        // unexpected — we cancelled
+    } else |err| {
+        if (err == error.Cancelled) ctx.saw_cancelled = true;
+    }
+}
+
+fn spawnBlockingCancelRoot() !SpawnBlockingCancelCtx {
+    var ctx = SpawnBlockingCancelCtx{};
+    const job = try volt.launch(spawnBlockingCancelCoro, .{&ctx});
+    defer volt.destroyJob(job);
+
+    // Yield enough that the child has dispatched to the blocking pool
+    // and parked.
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) try volt.yield();
+
+    job.cancel();
+    job.join() catch {};
+    return ctx;
+}
+
+test "cancel-audit:cancel parked spawnBlocking → waits for pool thread (no UAF)" {
+    const ctx = try volt.run(.{ .allocator = std.testing.allocator }, spawnBlockingCancelRoot, .{});
+    try std.testing.expect(ctx.saw_cancelled);
+    // The pool thread MUST have finished its work before our coroutine
+    // returned — if it hadn't, the closure on the stack would have
+    // been freed mid-write. We verify by checking the flag the pool
+    // thread sets on completion.
+    try std.testing.expect(ctx.pool_thread_finished.load(.acquire));
+}

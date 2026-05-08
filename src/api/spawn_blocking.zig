@@ -25,7 +25,8 @@ const Park = @import("../scheduler/park.zig").Park;
 const Pool = @import("../blocking/Pool.zig").Pool;
 const PoolJob = @import("../blocking/Pool.zig").Job;
 const runtime_mod = @import("../runtime.zig");
-const tls = @import("../scheduler/tls.zig");
+const current = @import("../scheduler/current.zig");
+const Futex = @import("../internal/thread.zig").Futex;
 
 const PayloadOf = @import("../coroutine/spawn.zig").PayloadOf;
 const CanError = @import("../coroutine/spawn.zig").CanError;
@@ -40,7 +41,7 @@ pub fn spawnBlocking(
 
     const rt = runtime_mod.currentRuntime() orelse
         @panic("volt.spawnBlocking called outside a runtime");
-    const coro = tls.currentCoroutine() orelse
+    const coro = current.currentCoroutine() orelse
         @panic("volt.spawnBlocking called outside a coroutine");
 
     if (coro.isCancelled()) return error.Cancelled;
@@ -48,14 +49,30 @@ pub fn spawnBlocking(
     const pool = try rt.blockingPool();
 
     // Closure on the calling coroutine's stack — pool thread reads
-    // these while we're parked. Stable until we wake.
+    // these while we're parked. Stable until we wake AND the pool
+    // thread is done writing.
+    //
+    // ## Cancellation safety
+    //
+    // If our coroutine is cancelled mid-park, the pool thread is
+    // still running and WILL write to this closure (`result_value`
+    // / `result_err` / `tag`). If we returned immediately on cancel,
+    // the closure would be freed (stack unwind) and the pool thread
+    // would write to freed memory — UAF, possibly silent corruption.
+    //
+    // Fix: on Cancelled, drop down to OS-level futex wait on `tag`
+    // until the pool thread sets it to non-zero. The pool thread
+    // also `Futex.wake`s `tag` after writing, so this returns
+    // promptly. We then surface the original Cancelled.
+    //
+    // (Tag is `u32` instead of `u8` so it's futex-compatible.)
     const Closure = struct {
         args_storage: @TypeOf(args),
         park: Park = .{},
         result_value: Payload = undefined,
         result_err: anyerror = undefined,
-        // Tag: 0 = pending, 1 = ok, 2 = err.
-        tag: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+        /// 0 = pending, 1 = ok, 2 = err. u32 for Futex compatibility.
+        tag: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
         job: PoolJob = undefined,
 
         fn run(opaque_ctx: *anyopaque) void {
@@ -72,6 +89,11 @@ pub fn spawnBlocking(
                 self.result_value = @call(.auto, user_fn, self.args_storage);
                 self.tag.store(1, .release);
             }
+            // Wake both kinds of waiter: the parked coroutine (normal
+            // case) AND any thread-level futex waiter (cancellation
+            // case). park.unpark is a no-op if not parked; Futex.wake
+            // is a no-op if no thread is waiting.
+            Futex.wake(&self.tag, 1);
             self.park.unpark();
         }
     };
@@ -84,7 +106,18 @@ pub fn spawnBlocking(
 
     pool.submit(&closure.job);
 
-    try closure.park.parkCurrent();
+    closure.park.parkCurrent() catch |err| switch (err) {
+        error.Cancelled => {
+            // Pool thread may still be writing to `closure`. Block at
+            // OS level (futex) until tag becomes non-zero — coroutine
+            // park would re-fire Cancelled and not actually wait.
+            while (closure.tag.load(.acquire) == 0) {
+                Futex.wait(&closure.tag, 0);
+            }
+            // Pool thread is done; closure is safe to free.
+            return error.Cancelled;
+        },
+    };
 
     const tag = closure.tag.load(.acquire);
     return switch (tag) {

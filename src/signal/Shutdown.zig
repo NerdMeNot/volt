@@ -23,7 +23,7 @@ const builtin = @import("builtin");
 const sig_util = @import("../internal/util/signal.zig");
 const Park = @import("../scheduler/park.zig").Park;
 const runtime_mod = @import("../runtime.zig");
-const tls = @import("../scheduler/tls.zig");
+const current = @import("../scheduler/current.zig");
 
 pub const Signal = sig_util.Signal;
 pub const SignalSet = sig_util.SignalSet;
@@ -49,14 +49,23 @@ pub const SignalListener = struct {
         }
         const rt = runtime_mod.currentRuntime() orelse
             @panic("volt.signal.wait called outside a runtime");
-        const coro = tls.currentCoroutine() orelse
+        const coro = current.currentCoroutine() orelse
             @panic("volt.signal.wait called outside a coroutine");
 
         if (coro.isCancelled()) return error.Cancelled;
 
         var park: Park = .{};
-        try rt.reactor.registerWait(self.handler.getFd(), .readable, @ptrCast(&park));
-        try park.parkCurrent();
+        const fd = self.handler.getFd();
+        try rt.reactor.registerWait(fd, .readable, @ptrCast(&park));
+        park.parkCurrent() catch |err| switch (err) {
+            error.Cancelled => {
+                // Same kqueue-leak story as `volt.io.wait*`: cancelled
+                // before signal arrives → kevent stays armed and
+                // pending counter inflated, wedging idle workers.
+                rt.reactor.unregisterWait(fd, .readable);
+                return error.Cancelled;
+            },
+        };
 
         return try self.handler.read();
     }
