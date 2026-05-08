@@ -21,7 +21,7 @@
 
 const std = @import("std");
 const thread = @import("../internal/thread.zig");
-const tls = @import("../scheduler/tls.zig");
+const current = @import("../scheduler/current.zig");
 
 pub const Job = struct {
     run_fn: *const fn (*anyopaque) void,
@@ -102,8 +102,8 @@ pub const Pool = struct {
     fn threadEntry(self: *Pool) void {
         // Set runtime TLS so Park.unpark from this thread routes via
         // currentRuntime() → injectGlobal → notifyOneWorker.
-        tls.setRuntime(self.runtime);
-        defer tls.clearRuntime();
+        current.setRuntime(self.runtime);
+        defer current.clearRuntime();
 
         while (true) {
             self.queue_mutex.lock();

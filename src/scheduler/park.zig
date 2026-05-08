@@ -53,7 +53,9 @@ const Coroutine = @import("../coroutine/coroutine.zig").Coroutine;
 const event_source = @import("../coroutine/event_source.zig");
 const EventSource = event_source.EventSource;
 const ctx_mod = @import("../coroutine/context.zig");
-const tls = @import("tls.zig");
+// Import the function directly (not the module as `current`) because
+// this file uses `current` as a local variable name in CAS loops.
+const currentCoroutine = @import("current.zig").currentCoroutine;
 const runtime_mod = @import("../runtime.zig");
 
 /// Low bit of the state, indicating "unpark fired."
@@ -72,7 +74,7 @@ pub const Park = struct {
     /// `error.Cancelled` if the coroutine has been cancelled (either
     /// before entering, or via cancel-from-anywhere while parked).
     pub fn parkCurrent(self: *Park) error{Cancelled}!void {
-        const coro = tls.currentCoroutine() orelse
+        const coro = currentCoroutine() orelse
             @panic("Park.parkCurrent called outside a coroutine");
 
         if (coro.isCancelled()) return error.Cancelled;
@@ -187,7 +189,7 @@ fn scheduleCoro(coro: *Coroutine) void {
 test "park: parkCurrent without coroutine panics (smoke)" {
     // parkCurrent requires a current coroutine. Verify the precondition
     // holds (TLS empty when not inside a coroutine).
-    try std.testing.expect(tls.currentCoroutine() == null);
+    try std.testing.expect(currentCoroutine() == null);
 }
 
 test "park: encoding constants" {

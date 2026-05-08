@@ -21,7 +21,18 @@ const ctx = @import("coroutine/context.zig");
 const Coroutine = @import("coroutine/coroutine.zig").Coroutine;
 const spawn_mod = @import("coroutine/spawn.zig");
 const stack_mod = @import("coroutine/stack.zig");
-const tls = @import("scheduler/tls.zig");
+// Import the functions directly (not the module as `current`) because
+// this file uses `current` as a local variable name in CAS loops.
+const sched_current = @import("scheduler/current.zig");
+const currentCoroutine = sched_current.currentCoroutine;
+const currentRuntimeRaw = sched_current.currentRuntimeRaw;
+const currentWorkerRaw = sched_current.currentWorkerRaw;
+const setCurrent = sched_current.setCurrent;
+const clearCurrent = sched_current.clearCurrent;
+const setCurrentWorker = sched_current.setCurrentWorker;
+const clearCurrentWorker = sched_current.clearCurrentWorker;
+const setRuntime = sched_current.setRuntime;
+const clearRuntime = sched_current.clearRuntime;
 const reactor_mod = @import("io/reactor.zig");
 const Worker = @import("scheduler/worker.zig").Worker;
 const Injection = @import("scheduler/injection.zig").Injection;
@@ -462,7 +473,7 @@ pub const Runtime = struct {
             args,
         );
         // Capture the parent for async-backtrace ancestry.
-        if (tls.currentCoroutine()) |parent| {
+        if (currentCoroutine()) |parent| {
             created.coro.parent_id = @intFromPtr(parent);
         }
         const w = currentWorker() orelse @panic(
@@ -544,12 +555,12 @@ fn workerThreadEntry(w: *Worker) void {
 
 /// Recover a *Runtime from the type-erased TLS slot.
 pub fn currentRuntime() ?*Runtime {
-    const raw = tls.currentRuntimeRaw() orelse return null;
+    const raw = currentRuntimeRaw() orelse return null;
     return @ptrCast(@alignCast(raw));
 }
 
 pub fn currentWorker() ?*Worker {
-    const raw = tls.currentWorkerRaw() orelse return null;
+    const raw = currentWorkerRaw() orelse return null;
     return @ptrCast(@alignCast(raw));
 }
 

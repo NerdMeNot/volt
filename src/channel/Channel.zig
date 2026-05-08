@@ -38,7 +38,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Coroutine = @import("../coroutine/coroutine.zig").Coroutine;
 const Park = @import("../scheduler/park.zig").Park;
-const tls = @import("../scheduler/tls.zig");
+const current = @import("../scheduler/current.zig");
 const thread = @import("../internal/thread.zig");
 
 const CACHE_LINE: usize = std.atomic.cache_line;

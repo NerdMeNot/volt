@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const Coroutine = @import("coroutine.zig").Coroutine;
-const tls = @import("../scheduler/tls.zig");
+const current = @import("../scheduler/current.zig");
 const runtime_mod = @import("../runtime.zig");
 
 /// `subscribe_fn(self_opaque, coro)` takes ownership of `coro`. The opaque
@@ -33,7 +33,7 @@ fn yieldSubscribe(opaque_self: *anyopaque, coro: *Coroutine) void {
     // Forward-declared Worker to avoid a hard import cycle. The opaque
     // *Worker is recovered from TLS and we call its `pushLocal` method.
     const Worker = @import("../scheduler/worker.zig").Worker;
-    const raw = tls.currentWorkerRaw() orelse
+    const raw = current.currentWorkerRaw() orelse
         @panic("Yield.subscribe: no current worker (yield outside a worker thread?)");
     const w: *Worker = @ptrCast(@alignCast(raw));
     w.pushLocal(coro);

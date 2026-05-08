@@ -1,20 +1,29 @@
-//! Thread-local state for the active coroutine, runtime, and worker.
+//! Per-thread accessors for the currently-active coroutine, runtime,
+//! and worker.
 //!
 //! When a coroutine is executing, three slots are populated on the worker's
 //! thread:
-//!   - `current_coroutine` — the coroutine currently on-CPU
-//!   - `current_worker`    — the worker thread executing it
-//!   - `current_runtime`   — the runtime that owns both
+//!   - `current_coro`    — the coroutine currently on-CPU
+//!   - `current_worker`  — the worker thread executing it
+//!   - `current_rt`      — the runtime that owns both
 //!
-//! `current_worker` and `current_runtime` are set once when the worker
-//! starts and cleared at shutdown. `current_coroutine` is set/cleared on
-//! every dispatch.
+//! `current_worker` and `current_rt` are set once when the worker starts
+//! and cleared at shutdown. `current_coro` is set/cleared on every dispatch.
 //!
 //! Operations like `volt.yield()`, `volt.spawn()`, `mutex.lock()` query
 //! these slots to find their context without taking the runtime / worker
 //! as parameters — that's what gives the public API its Go/Kotlin feel.
 //!
-//! Cost on Apple Silicon ARM64: a TLS read is one instruction (~1ns).
+//! Storage is `threadlocal var`; lookup cost on Apple Silicon ARM64 is
+//! one instruction (~1ns).
+//!
+//! ## Naming note
+//!
+//! The module used to be called `tls` (thread-local storage). It was
+//! renamed to `current` to free up the `tls` namespace for Volt's
+//! Transport-Layer-Security library (`volt-tls`). This file is about
+//! "what is currently running on this thread"; the storage mechanism
+//! (TLS the OS feature) is an implementation detail.
 
 const std = @import("std");
 const Coroutine = @import("../coroutine/coroutine.zig").Coroutine;
@@ -70,13 +79,13 @@ pub fn clearRuntime() void {
     current_rt = null;
 }
 
-test "tls: starts empty" {
+test "current: starts empty" {
     try std.testing.expect(currentCoroutine() == null);
     try std.testing.expect(currentRuntimeRaw() == null);
     try std.testing.expect(currentWorkerRaw() == null);
 }
 
-test "tls: setCurrent / clearCurrent round trip" {
+test "current: setCurrent / clearCurrent round trip" {
     var dummy_rt: u32 = 42;
     var ctx_buf: @import("../coroutine/context.zig").Context = .{};
     var coro: Coroutine = .{

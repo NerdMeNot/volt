@@ -30,7 +30,7 @@ const stack_mod = @import("../coroutine/stack.zig");
 const stack_overflow = @import("../coroutine/stack_overflow.zig");
 const event_source = @import("../coroutine/event_source.zig");
 const Deque = @import("deque.zig").Deque;
-const tls = @import("tls.zig");
+const current = @import("current.zig");
 const thread = @import("../internal/thread.zig");
 
 const runtime_mod = @import("../runtime.zig");
@@ -235,10 +235,10 @@ pub const Worker = struct {
     /// reaches `.done` (the bootstrap path on worker 0). Otherwise loops
     /// until the runtime's shutdown flag is set.
     pub fn run(self: *Worker, until_done: ?*Coroutine) void {
-        tls.setRuntime(@ptrCast(self.runtime));
-        tls.setCurrentWorker(@ptrCast(self));
-        defer tls.clearCurrentWorker();
-        defer tls.clearRuntime();
+        current.setRuntime(@ptrCast(self.runtime));
+        current.setCurrentWorker(@ptrCast(self));
+        defer current.clearCurrentWorker();
+        defer current.clearRuntime();
 
         // Install the SIGSEGV handler + per-thread sigaltstack so guard-
         // page hits inside coroutines turn into either a stack-grow or
@@ -338,7 +338,7 @@ pub const Worker = struct {
 
     fn dispatch(self: *Worker, coro: *Coroutine) void {
         _ = self.dispatch_count.fetchAdd(1, .monotonic);
-        tls.setCurrent(coro, @ptrCast(self.runtime));
+        current.setCurrent(coro, @ptrCast(self.runtime));
         coro.scheduler_ctx = &self.main_ctx;
 
         // Stack-overflow recovery checkpoint. If the coroutine writes
@@ -353,7 +353,7 @@ pub const Worker = struct {
 
         if (stack_overflow.setjmpDispatch(&dispatch_cp)) {
             // Coroutine's stack is unsafe to re-enter. Route through Done.
-            tls.clearCurrent();
+            current.clearCurrent();
             const done_es = &event_source.done_singleton;
             done_es.subscribe_fn(@ptrCast(@constCast(done_es)), coro);
             return;
@@ -365,7 +365,7 @@ pub const Worker = struct {
         // via the trampoline on completion). Hand off ownership.
         const es = coro.pending_event;
 
-        tls.clearCurrent();
+        current.clearCurrent();
 
         es.subscribe_fn(@ptrCast(@constCast(es)), coro);
     }

@@ -5,11 +5,11 @@
 //! pushes the coroutine back onto the local deque.
 
 const ctx_mod = @import("../coroutine/context.zig");
-const tls = @import("../scheduler/tls.zig");
+const current = @import("../scheduler/current.zig");
 const event_source = @import("../coroutine/event_source.zig");
 
 pub fn yield() error{Cancelled}!void {
-    const coro = tls.currentCoroutine() orelse
+    const coro = current.currentCoroutine() orelse
         @panic("volt.yield called outside a coroutine");
 
     if (coro.isCancelled()) return error.Cancelled;

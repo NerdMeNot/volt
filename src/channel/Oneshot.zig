@@ -40,7 +40,9 @@ const assert = std.debug.assert;
 const Coroutine = @import("../coroutine/coroutine.zig").Coroutine;
 const ctx_mod = @import("../coroutine/context.zig");
 const event_source = @import("../coroutine/event_source.zig");
-const tls = @import("../scheduler/tls.zig");
+// Import the function directly (not the module as `current`) because
+// this file uses `current` as a local variable name in CAS loops.
+const currentCoroutine = @import("../scheduler/current.zig").currentCoroutine;
 const runtime_mod = @import("../runtime.zig");
 
 const READY: usize = 1;
@@ -129,7 +131,7 @@ pub fn Oneshot(comptime T: type) type {
         /// `error.Closed`). Returns `error.Cancelled` if the calling
         /// coroutine has been cancelled.
         pub fn recv(self: *Self) RecvError!T {
-            const coro = tls.currentCoroutine() orelse
+            const coro = currentCoroutine() orelse
                 @panic("Oneshot.recv called outside a coroutine");
 
             if (coro.isCancelled()) return error.Cancelled;

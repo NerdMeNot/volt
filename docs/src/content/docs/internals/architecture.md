@@ -236,7 +236,7 @@ parked worker.
 | Worker, dispatch loop | `src/scheduler/worker.zig` |
 | Chase-Lev deque | `src/scheduler/deque.zig` |
 | Injection queue | `src/scheduler/injection.zig` |
-| TLS (current coro/worker/runtime) | `src/scheduler/tls.zig` |
+| TLS (current coro/worker/runtime) | `src/scheduler/current.zig` |
 | Park primitive | `src/scheduler/park.zig` |
 | Coroutine | `src/coroutine/coroutine.zig` |
 | Context switch (asm) | `src/coroutine/context_{arm64.zig, x86_64.S}` |
