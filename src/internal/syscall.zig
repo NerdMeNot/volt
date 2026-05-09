@@ -192,6 +192,15 @@ pub const FcntlError = error{
 } || std.posix.UnexpectedError;
 
 pub fn fcntl(fd: posix.fd_t, cmd: i32, arg: usize) FcntlError!usize {
+    if (builtin.os.tag == .windows) {
+        // Windows has no fcntl. Specific flag toggles map to disjoint
+        // APIs (ioctlsocket FIONBIO for socket nonblock,
+        // SetNamedPipeHandleState for pipes, SetHandleInformation for
+        // CLOEXEC). Volt's higher layers must call those directly on
+        // Windows; reaching this path is a porting bug.
+        _ = .{ fd, cmd, arg };
+        return error.Unexpected;
+    }
     while (true) {
         // With libc linked, `system.fcntl` returns `c_int` on both
         // Linux and Darwin (libc-typed return). Promote to isize for
@@ -1208,6 +1217,15 @@ pub fn openatZ(dirfd: posix.fd_t, path: [*:0]const u8, flags: posix.O, mode: pos
 pub const WaitPidResult = struct { pid: posix.pid_t, status: u32 };
 
 pub fn waitpid(pid: posix.pid_t, flags: u32) WaitPidResult {
+    if (builtin.os.tag == .windows) {
+        // Windows has no waitpid. Process management lives behind
+        // CreateProcessW + WaitForSingleObject + GetExitCodeProcess
+        // (see W5 in the Windows port plan). For now: error sentinel
+        // so cross-compile passes; reaching this on Windows runtime
+        // is a porting bug.
+        _ = .{ pid, flags };
+        return .{ .pid = -1, .status = 0 };
+    }
     var status: c_int = undefined;
     while (true) {
         const rc = system.waitpid(pid, &status, @intCast(flags));
