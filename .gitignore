@@ -73,3 +73,9 @@ benchmarks/
 
 # Build temp files
 build.zig.tmp
+
+# Windows cross-compile artifacts
+*.lib
+*.dll
+*.def
+*.pdb
