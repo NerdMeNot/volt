@@ -1,10 +1,13 @@
 name: Nightly
 
 # Deep stress + memory checks. Runs once a day on a fresh checkout of
-# `main`, plus on manual dispatch with a tunable iteration count. The
-# PR-tier `stress-pr` job (in ci.yml) catches obvious flakes at N=50;
-# this workflow runs the same script at N=500 to surface low-rate races
-# that need many seeds to reproduce.
+# `main`, plus on manual dispatch with a tunable iteration count.
+#
+# Iteration count rationale: N=200 catches a 1% flake with ~87%
+# probability per nightly. Over a week of nightlies, that's >99.9%
+# catch rate. Higher counts hit diminishing returns for the same wall
+# time on GH-hosted runners (~30–45s/iter on 2-core Linux). For
+# sub-0.1% flakes, manual dispatch with `n_iters=2000` is the path.
 
 on:
   schedule:
@@ -15,7 +18,7 @@ on:
       n_iters:
         description: 'Stress iterations per (os, backend) entry'
         required: false
-        default: '500'
+        default: '200'
         type: string
       timeout_per_iter_secs:
         description: 'Per-iteration timeout (seconds)'
@@ -28,14 +31,14 @@ env:
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────
-  # Deep stress: N=500 on every (os, backend) we ship. Each iteration
+  # Deep stress: N=200 on every (os, backend) we ship. Each iteration
   # is a full `zig build test` run with a fresh seed and a per-iteration
   # timeout. If any iteration hangs past the timeout, that entry fails
   # with a stack-trace sample logged.
   # ─────────────────────────────────────────────────────────────────────
   stress-deep:
-    name: Stress N=${{ github.event.inputs.n_iters || '500' }} (${{ matrix.name }})
-    timeout-minutes: 350
+    name: Stress N=${{ github.event.inputs.n_iters || '200' }} (${{ matrix.name }})
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
