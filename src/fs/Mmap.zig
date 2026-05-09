@@ -318,7 +318,7 @@ pub const Mmap = struct {
             .dont_need => std.c.MADV.DONTNEED,
             .free => std.c.MADV.FREE,
         };
-        const ptr: *align(std.heap.pageSize()) anyopaque = @ptrCast(@alignCast(self.ptr + range.offset));
+        const ptr: *align(std.heap.page_size_min) anyopaque = @ptrCast(@alignCast(self.ptr + range.offset));
         const rc = std.c.madvise(ptr, range.length, advice);
         if (rc != 0) return mmapErrno();
     }
@@ -328,14 +328,14 @@ pub const Mmap = struct {
     /// path internally.
     pub fn lock(self: *Mmap, range: Range) MmapError!void {
         try self.checkRange(range);
-        const ptr: *align(std.heap.pageSize()) const anyopaque = @ptrCast(@alignCast(self.ptr + range.offset));
+        const ptr: *align(std.heap.page_size_min) const anyopaque = @ptrCast(@alignCast(self.ptr + range.offset));
         const rc = std.c.mlock(ptr, range.length);
         if (rc != 0) return mmapErrno();
     }
 
     pub fn unlock(self: *Mmap, range: Range) MmapError!void {
         try self.checkRange(range);
-        const ptr: *align(std.heap.pageSize()) const anyopaque = @ptrCast(@alignCast(self.ptr + range.offset));
+        const ptr: *align(std.heap.page_size_min) const anyopaque = @ptrCast(@alignCast(self.ptr + range.offset));
         const rc = std.c.munlock(ptr, range.length);
         if (rc != 0) return mmapErrno();
     }
@@ -350,7 +350,7 @@ pub const Mmap = struct {
             .async_ => MS_ASYNC,
             .sync_ => MS_SYNC,
         };
-        const ptr: *align(std.heap.pageSize()) const anyopaque = @ptrCast(@alignCast(self.ptr + range.offset));
+        const ptr: *align(std.heap.page_size_min) const anyopaque = @ptrCast(@alignCast(self.ptr + range.offset));
         const rc = std.c.msync(ptr, range.length, flags);
         if (rc != 0) return mmapErrno();
     }
@@ -360,7 +360,7 @@ pub const Mmap = struct {
     pub fn protect(self: *Mmap, range: Range, perms: Perms) MmapError!void {
         try self.checkRange(range);
         const prot = makeProt(perms);
-        const ptr: *align(std.heap.pageSize()) anyopaque = @ptrCast(@alignCast(self.ptr + range.offset));
+        const ptr: *align(std.heap.page_size_min) anyopaque = @ptrCast(@alignCast(self.ptr + range.offset));
         const rc = std.c.mprotect(ptr, range.length, prot);
         if (rc != 0) return mmapErrno();
     }
@@ -392,7 +392,7 @@ pub const Mmap = struct {
         var args = Args{ .ptr = self.ptr, .offset = range.offset, .length = range.length };
         spawnBlocking(struct {
             fn run(a: *Args) !void {
-                const ptr_aligned: *align(std.heap.pageSize()) anyopaque =
+                const ptr_aligned: *align(std.heap.page_size_min) anyopaque =
                     @ptrCast(@alignCast(a.ptr + a.offset));
                 _ = std.c.madvise(ptr_aligned, a.length, std.c.MADV.WILLNEED);
                 forceTouchPages(@ptrCast(a.ptr + a.offset), a.length);
@@ -419,7 +419,7 @@ pub const Mmap = struct {
         if (new_len == 0) return error.InvalidRange;
 
         if (builtin.os.tag == .linux) {
-            const old_ptr: *align(std.heap.pageSize()) const anyopaque = @ptrCast(@alignCast(self.ptr));
+            const old_ptr: *align(std.heap.page_size_min) const anyopaque = @ptrCast(@alignCast(self.ptr));
             const flags: std.c.MREMAP = .{ .MAYMOVE = true };
             const result = std.c.mremap(old_ptr, self.len, new_len, flags);
             if (@intFromPtr(result) == @intFromPtr(std.c.MAP_FAILED)) {
@@ -442,7 +442,7 @@ pub const Mmap = struct {
             return error.RemapFailed;
         }
 
-        const old_ptr_aligned: *align(std.heap.pageSize()) const anyopaque = @ptrCast(@alignCast(self.ptr));
+        const old_ptr_aligned: *align(std.heap.page_size_min) const anyopaque = @ptrCast(@alignCast(self.ptr));
         _ = std.c.munmap(old_ptr_aligned, self.len);
 
         self.ptr = @ptrCast(result);
@@ -506,7 +506,7 @@ fn mmapErrno() MmapError {
 }
 
 fn forceTouchPages(ptr: [*]u8, len: usize) void {
-    const page_size: usize = std.heap.pageSize();
+    const page_size: usize = std.heap.page_size_min;
     var i: usize = 0;
     var sink: u8 = 0;
     while (i < len) : (i += page_size) {
