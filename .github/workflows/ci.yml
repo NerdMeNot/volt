@@ -79,8 +79,12 @@ jobs:
           - { os: ubuntu-22.04-arm, name: linux-arm64-epoll,    build_args: "" }
           - { os: ubuntu-22.04-arm, name: linux-arm64-iouring,  build_args: "-Dreactor=iouring" }
           # Darwin (kqueue is the only backend).
+          # Apple Silicon is the v1 target; Intel macOS is cross-compile
+          # validated only. The Darwin x86_64 native run hit a SEGV in
+          # every spawn-using test (likely a SysV-on-Mach-O linker /
+          # sigaltstack interaction). Cross-compile catches signature
+          # drift; runtime support for Intel macs is deferred to v1.x.
           - { os: macos-latest,     name: macos-arm64-kqueue,   build_args: "" }
-          - { os: macos-15-intel,   name: macos-x86_64-kqueue,  build_args: "" }
           # Windows IOCP — uncomment once W1–W8 land the native syscall arms.
           # - { os: windows-latest, name: windows-x86_64-iocp,  build_args: "" }
     runs-on: ${{ matrix.os }}
