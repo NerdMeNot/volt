@@ -163,9 +163,16 @@ pub const Reactor = struct {
 
         // ADD if first registration; MOD on re-register (epoll
         // remembers the fd even after ONESHOT disabled it).
+        //
+        // `linux.epoll_ctl` is a raw syscall — return is `-errno` packed
+        // into a `usize`. `posix.errno` (= `std.c.errno` under libc) is
+        // the wrong extractor here: it's libc-shaped (`if (rc == -1)`)
+        // and silently returns `.SUCCESS` for any other value, so we'd
+        // never see EEXIST and would always take the error path.
+        // `linux.errno` is the raw-syscall variant.
         const rc1 = linux.epoll_ctl(self.epfd, linux.EPOLL.CTL_ADD, fd, &ev);
         if (rc1 != 0) {
-            const errno = posix.errno(rc1);
+            const errno = linux.errno(rc1);
             if (errno == .EXIST) {
                 const rc2 = linux.epoll_ctl(self.epfd, linux.EPOLL.CTL_MOD, fd, &ev);
                 if (rc2 != 0) {
