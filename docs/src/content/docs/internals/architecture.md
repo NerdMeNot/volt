@@ -228,6 +228,103 @@ cross-thread spawns and reactor wakes touch the injection queue
 unconditionally — local-deque pushes alone wouldn't notify a
 parked worker.
 
+## Parker protocol (lost-wake-free)
+
+Each worker has a `Parker` — a single-atomic state machine over
+`u8`: `EMPTY` | `NOTIFIED` | `WAITING`, plus an
+`std.Thread.Condition` for the slow-path block.
+
+### Park
+
+```text
+1. fast: cmpxchg(NOTIFIED → EMPTY, .acquire, .monotonic)
+   → if state was NOTIFIED, drain and return.
+
+2. mutex.lock()                                (slow path)
+
+3. (bitmap registration: fetchOr release)
+
+4. cmpxchg(EMPTY → WAITING, .seq_cst, .acquire)
+   → if cmpxchg fails, observed must be NOTIFIED;
+     reset state=EMPTY and return.
+
+5. while state.load(.acquire) == WAITING:
+       cond.timedWait(PARK_WATCHDOG_NS)
+       on timeout: panic with diagnostics
+
+6. state.store(EMPTY, .release)
+```
+
+### Unpark
+
+```text
+1. old = state.swap(NOTIFIED, .seq_cst)
+2. if old == WAITING:
+       mutex.lock()
+       cond.signal()
+       mutex.unlock()
+```
+
+### Why no lost wakes are possible
+
+Park's step 4 cmpxchg and unpark's step 1 swap are both seq_cst
+RMW operations on the same atomic — they linearize through a
+single modification order. There are exactly two relative orders,
+both safe:
+
+**Case A — park's cmpxchg first, then unpark's swap.** State
+goes EMPTY → WAITING. Park enters the wait loop. Unpark's swap
+sees WAITING, transitions to NOTIFIED. Unpark blocks on
+`mutex.lock()` (park holds it through step 4). Park's
+`cond.timedWait` atomically releases the mutex and sleeps. Unpark
+acquires the mutex, signals. Park wakes, sees state=NOTIFIED,
+exits the loop. ✅
+
+**Case B — unpark's swap first, then park's cmpxchg.** State
+goes EMPTY → NOTIFIED. Park's cmpxchg(EMPTY → WAITING) fails
+(observed=NOTIFIED). Park resets state=EMPTY and returns
+immediately — no `cond.wait` ever entered, no signal needed. ✅
+
+The fast path (step 1) handles the case where the notification
+landed before park even started. The bitmap toggling (step 3)
+exists for the *waker-side optimization* of finding a parked
+worker via `@ctz`; it doesn't participate in the lost-wake proof.
+
+### Watchdog
+
+`PARK_WATCHDOG_NS` (30s) is a defense-in-depth deadline. The
+proof above says it can never fire. If it does, that's a real bug
+— either a violated assumption (e.g. memory ordering bug) or a
+missed `notifyAllWorkers` somewhere in the runtime. We **panic
+with diagnostics** instead of silently rescuing the worker; a
+silent rescue would degrade the system invisibly. Earlier
+versions did rescue (set state=EMPTY, exit park); the rescue
+masked bugs.
+
+## Shutdown protocol (quiescence ack)
+
+`Runtime.runUntilDone` is the single shutdown path. After the
+root coroutine completes:
+
+```text
+1. Worker 0's run() returns (root reached `.done`).
+2. requestShutdown():
+     - shutdown_flag.store(true, .release)
+     - notifyAllWorkers() — tickle reactor + unpark every worker
+3. for w in workers[1..]: w.thread.join()
+4. waitForQuiescence(SHUTDOWN_DEADLINE_NS = 10s)
+     - poll quiesced_count.load(.acquire) == workers.len
+     - on timeout: panic with diagnostics (workers stuck)
+```
+
+Every `Worker.run()` increments `quiesced_count` exactly once on
+exit (via `defer`, so it covers panic paths too). Step 4 is
+normally a no-op — by the time the joins return, the counter
+already matches — but it's the explicit, observable gate. If a
+join ever hangs (lost wake, missed notify), the timeout panic
+fires within 10s with the actual `quiesced_count` value, naming
+which workers didn't ack.
+
 ## File map
 
 | Concept | Source |

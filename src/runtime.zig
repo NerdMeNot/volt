@@ -37,6 +37,7 @@ const reactor_mod = @import("io/reactor.zig");
 const Worker = @import("scheduler/worker.zig").Worker;
 const Injection = @import("scheduler/injection.zig").Injection;
 const time_mod = @import("time.zig");
+const thread = @import("internal/thread.zig");
 
 /// Maximum supported worker count. Sharded across `BITMAP_WORDS` 64-bit
 /// atomics in `parked_workers`. Raise both constants together.
@@ -96,6 +97,14 @@ pub const Runtime = struct {
     /// Set once when the bootstrap thread is ready to tear down. Workers
     /// observe this in their main loop and exit.
     shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// Quiescence counter — workers `fetchAdd(1)` exactly once when their
+    /// `run()` loop returns. `runUntilDone` waits on this counter after
+    /// `thread.join` to formally observe shutdown completion (rather than
+    /// relying purely on join's implicit serialization). Provides explicit
+    /// telemetry: a hung worker shows up as `quiesced_count < workers.len`,
+    /// not as a silent join hang. See `docs/internals/architecture.md`.
+    quiesced_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     /// Round-robin counter for spreading wake-ups across workers (used by
     /// notifyOneWorker to absorb the about-to-park race).
@@ -227,6 +236,12 @@ pub const Runtime = struct {
         }
         std.debug.assert(pc == 0);
 
+        // Sanity bound on the quiescence counter. The actual correctness
+        // gate is `waitForQuiescence` inside `runUntilDone`; this assert
+        // just catches a counter that has somehow exceeded the worker
+        // count (would indicate a double-fetchAdd bug).
+        std.debug.assert(self.quiesced_count.load(.acquire) <= self.workers.len);
+
         if (self.blocking_pool.load(.acquire)) |pool| pool.deinit();
         // Workers free any stack that wasn't pooled (i.e. coroutines
         // still alive at runtime tear-down). After workers, the pool's
@@ -263,6 +278,32 @@ pub const Runtime = struct {
     pub fn requestShutdown(self: *Runtime) void {
         self.shutdown_flag.store(true, .release);
         self.notifyAllWorkers();
+    }
+
+    /// Maximum time `waitForQuiescence` polls before panicking with a
+    /// diagnostic dump. 10s is generous: a healthy shutdown completes in
+    /// microseconds (workers observe `shutdown_flag` on their next
+    /// `findWork`/wake cycle). If this fires, a worker is genuinely stuck
+    /// — almost always a lost wake or a coroutine that won't yield to a
+    /// cancellation. We want a loud failure, not a silent hang.
+    pub const SHUTDOWN_DEADLINE_NS: u64 = 10 * std.time.ns_per_s;
+
+    /// Block until every worker's `run()` has returned (observable via
+    /// `quiesced_count == workers.len`). Returns `error.Timeout` if the
+    /// deadline elapses — `runUntilDone` translates that into a panic
+    /// with diagnostics.
+    pub fn waitForQuiescence(self: *Runtime, timeout_ns: u64) error{Timeout}!void {
+        const start_ns = time_mod.nanoTimestamp();
+        const target = self.workers.len;
+        while (self.quiesced_count.load(.acquire) < target) {
+            const elapsed_ns: u64 = @intCast(time_mod.nanoTimestamp() - start_ns);
+            if (elapsed_ns > timeout_ns) return error.Timeout;
+            // Yield CPU briefly. The poll resolution doesn't matter — this
+            // path runs at most once per shutdown, on the bootstrap thread,
+            // and the workers all unblock together once `shutdown_flag` is
+            // visible.
+            thread.sleep(1 * std.time.ns_per_ms);
+        }
     }
 
     pub fn tryClaimReactorPoll(self: *Runtime) bool {
@@ -589,6 +630,27 @@ pub const Runtime = struct {
                 w.thread = null;
             }
         }
+
+        // Formal quiescence gate. After thread.join, every worker's
+        // `run()` has returned and incremented `quiesced_count`. This
+        // wait is normally a no-op (counter already at target by the
+        // time we get here), but exists as a hard observability point:
+        // if we ever introduce a code path that bypasses the per-worker
+        // `defer fetchAdd` (e.g. a panic that escapes), the counter
+        // catches it. The deadline panic surfaces the bug loudly.
+        self.waitForQuiescence(SHUTDOWN_DEADLINE_NS) catch {
+            std.debug.panic(
+                "Runtime.runUntilDone: workers did not quiesce within {d}ms — " ++
+                    "quiesced={d}/{d}. A worker's run() did not return; either " ++
+                    "thread.join hung (lost wake?) or a panic bypassed the " ++
+                    "fetchAdd. Stack traces should follow.",
+                .{
+                    SHUTDOWN_DEADLINE_NS / std.time.ns_per_ms,
+                    self.quiesced_count.load(.acquire),
+                    self.workers.len,
+                },
+            );
+        };
     }
 };
 
