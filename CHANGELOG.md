@@ -2,7 +2,121 @@
 
 All notable changes to Volt are documented in this file.
 
-## Unreleased — v1.1.0-zig0.16.0
+## Unreleased — v1.0.0-zig0.16.0 (this branch, pending merge)
+
+The "scheduler-rewrite" branch's race-correctness, cross-platform CI,
+and v1 ship-framing pass. Production-tier on every backend the v1
+matrix supports; Windows runtime explicitly deferred to v1.x.
+
+### R workstream — race correctness (the ship blocker)
+
+- **R1** Cancel/park/poll state-machine documented in
+  `docs/internals/cancellation-contract.md`. 5 actors, 4 state
+  spaces, 5 invariants, 11 race scenarios, 6 proof obligations.
+- **R2** Reactor `registerWait` ordering — `waiters.put + pending++`
+  now happens BEFORE `kevent ADD` / `epoll_ctl ADD` / `io_uring`
+  submit. Closes the kernel-fires-before-bookkeeping race that was
+  leaking 0–80 of 100 reactor registrations on the cancel torture
+  test. Applied uniformly across kqueue, epoll, and iouring backends.
+- **R3** IRIW audit — seq_cst on `Coroutine.cancel.cancel_flag` +
+  `Park.parkCurrent.current_park` linearization pair. `scripts/
+  audit_iriw.sh` flags any `flag.store + ptr.load` pattern that
+  isn't seq_cst across coordinator pairs.
+- **R4** Formal worker-shutdown protocol — quiescence ack counter
+  in `Runtime.quiesced_count`, `runUntilDone` calls
+  `waitForQuiescence(10s)` after thread-join, panic-with-diagnostics
+  on timeout. `Parker.park`'s 5s silent-rescue watchdog upgraded to
+  30s panic-with-diagnostics: the parking protocol is provably
+  lost-wake-free under seq_cst (proof in `docs/internals/
+  architecture.md` §"Parker protocol"); if the watchdog fires it's
+  a real bug, surfaced loudly.
+- **R7** `Mutex` + `Semaphore` FIFO ordering tests rewritten —
+  the old assertion conflated scheduler enqueue order with
+  wait-queue order (yield-as-sync anti-pattern). Now asserts the
+  set property: every waiter resumed exactly once, distinct values
+  in [1, N]. Stress tests 8×200 / 16×500 cover the real correctness
+  property under contention.
+
+### L workstream — Linux native validation
+
+- **L1** Volt-internal `syscall.Stat` portable abstraction over
+  Darwin/BSD's `system.Stat` and Linux's `Statx` — Zig 0.16 dropped
+  `posix.Stat` on Linux and the existing Volt code wouldn't compile.
+  `fs/Metadata.fromStat` accepts the portable type.
+- **L2** Native Linux runs validated in CI for x86_64 + arm64 ×
+  epoll + iouring.
+- **L3** Dropped `allow_failure: true` from io_uring CI entries —
+  io_uring is a real ship-blocker now, not optional.
+- **L4** Dual-backend CI job — same Linux runner runs both
+  `-Dreactor=epoll` and `-Dreactor=iouring` side-by-side; surfaces
+  divergence between the two backends.
+
+### Windows port — partial (cross-compile only at v1)
+
+- **W1** Windows syscall arms in `internal/syscall.zig` — `close`,
+  `pipe`, `read`, `write`, `recv`, `send`, `recvfrom`, `sendto`
+  (via the new `internal/win32/ws2_32.zig` extern bindings),
+  `closeSocket` (Winsock graceful close), `fcntl` + `waitpid`
+  (stub-with-error for paths that need W2/W5 equivalents).
+- **W2** Net layer — Volt-portable `SOCK_NONBLOCK` /
+  `SOCK_CLOEXEC` constants in `syscall.zig`. `socket()` Windows
+  arm via `ws2_32.socket` + `ioctlsocket(FIONBIO)`. `sockopt`'s
+  `setKeepAliveParams` extends to `TCP_KEEPALIVE` on Windows.
+- **W8** Reactor's Windows `@compileError` removed — the IOCP+AFD
+  reactor (`reactor_iocp.zig`) is wired in. Cross-compile clean.
+- **Native Windows runtime** is blocked at v1 by three Zig 0.16
+  stdlib bugs:
+  1. `std.Io.Writer.zig:1803` — invalid format spec for
+     `*anyopaque`.
+  2. `std.c.zig:4767` — `os.windows.ws2_32` has no member
+     `addrinfo`.
+  3. `std.c.zig:10659` — `std.c.mmap` parameter of type `void` not
+     allowed under `x86_64_win` calling convention.
+  W3-W7 (fs/Mmap/process/signal/Watcher Windows arms) remain
+  pending; tier-bumps to runtime in v1.x once upstream Zig fixes
+  land or Volt replaces affected stdlib calls with internal
+  bindings.
+
+### CI
+
+- Complete rebuild of `.github/workflows/{ci,nightly}.yml`. Stress
+  N=50 per PR on every production (platform, backend); N=200
+  nightly. Failed-iteration logs uploaded as artifacts. Old
+  Zig-0.15.2 nightly that referenced removed `test-stress` /
+  `test-concurrency` build targets is gone.
+- `temp-ci.yml` runs the same checks on pushes to
+  `scheduler-rewrite` (delete on merge to main).
+
+### Sync primitive bug fixes
+
+- **`Notify.notifyAllAndClose`** — closes the broadcast-race in
+  `CancellationToken.cancel`. Bare `notifyAll` left late-arrival
+  `wait()` callers parked forever (no permit stored, no waiters
+  to drain). The closing variant flips a permanent-permit flag;
+  every future `wait` returns immediately.
+- **`Mutex` / `Semaphore`** wait-queue FIFO is now tested for the
+  actual property (no lost wakes, no double-grants under
+  contention) rather than the scheduler-dependent
+  launch→park ordering.
+
+### Reactor diagnostics
+
+- **D1** Compile-time-gated trace ring (`reactor_trace.zig`):
+  `-Dreactor-trace` enables register/unregister/poll event
+  capture into a 64K-event lock-free ring. `runtime.deinit` dumps
+  the trace if `pendingCount != 0` at teardown. Used to localize
+  the R2 race in nanosecond-resolution.
+- **D5** `Runtime.deinit` re-enabled hard
+  `assert(pendingCount == 0)` and dumps trace on leak.
+
+### Platform decisions
+
+- **macos-x86_64 (Intel)** — dropped from native CI. SEGV in
+  every spawn-using test on the GH `macos-15-intel` runner;
+  Apple Silicon arm64 is the v1 macOS target. Cross-compile gate
+  remains so signature drift is caught.
+
+## Earlier — v1.1.0 plan (now folded into v1.0.0)
 
 The repositioning of Volt from "stackful coroutine runtime" to
 **"the async standard library for Zig — runtime + net + fs + mmap"**.
