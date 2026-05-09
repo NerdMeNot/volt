@@ -19,15 +19,27 @@ const posix = std.posix;
 /// Re-export the raw syscall layer so callers can reach down when needed.
 pub const system = std.posix.system;
 
-/// `posix.errno(rc)` shim that accepts a signed `rc` (negative-on-error
-/// convention) on both Darwin and Linux. On Linux `posix.errno` takes
-/// `usize`; we bit-cast. On Darwin/BSD it accepts the signed value
-/// directly (libc-typed return).
+/// `posix.errno(rc)` shim that accepts a signed `rc`.
+///
+/// Volt links libc on every supported target (`build.zig`:
+/// `link_libc = true`). With libc linked, `std.posix.errno` resolves
+/// to `std.c.errno`, which is:
+///
+///     fn errno(rc: anytype) E {
+///         return if (rc == -1) @enumFromInt(_errno().*) else .SUCCESS;
+///     }
+///
+/// The `rc == -1` check requires `rc` to be a signed integer — passing
+/// a `usize` makes the comparison evaluate to *false* for any value
+/// (including the bit-pattern `MAX_USIZE` of an `@bitCast(@as(isize,
+/// -1))`), and the function silently returns `.SUCCESS` for genuine
+/// errors. We hit exactly that on Linux+libc CI: every syscall failure
+/// reported `errno=0` and crashed in `posix.unexpectedErrno`.
+///
+/// Fix: always pass the signed value. Works on Darwin, Linux+libc, and
+/// any other target std.c.errno is the active backend.
 inline fn errnoOf(signed: isize) std.posix.E {
-    return switch (builtin.os.tag) {
-        .linux => posix.errno(@as(usize, @bitCast(signed))),
-        else => posix.errno(signed),
-    };
+    return posix.errno(signed);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
