@@ -100,14 +100,44 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) SocketError!posix.sock
 // close
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Close a file descriptor. Logs (in debug) if close fails unexpectedly.
-/// close() is not retried on EINTR — per POSIX, retrying may close someone else's fd.
+/// Close a file descriptor / handle. Logs (in debug) if close fails
+/// unexpectedly. close() is not retried on EINTR — per POSIX,
+/// retrying may close someone else's fd.
+///
+/// Windows: dispatches to CloseHandle for kernel HANDLEs. Sockets
+/// must use `closeSocket` (Winsock distinguishes them, even though
+/// SOCKET is HANDLE-sized).
 pub fn close(fd: posix.fd_t) void {
+    if (builtin.os.tag == .windows) {
+        // CloseHandle returns BOOL; non-zero on success. We don't care
+        // about the return — close is best-effort and logging happens
+        // only in debug.
+        const ok = std.os.windows.kernel32.CloseHandle(fd);
+        if (ok == 0 and std.debug.runtime_safety) {
+            // Don't panic — close on a stale handle is a class of bug
+            // we want to surface but not abort production runtimes.
+            const err = std.os.windows.GetLastError();
+            std.debug.print("[syscall.close] CloseHandle failed: {}\n", .{err});
+        }
+        return;
+    }
     switch (posix.errno(system.close(fd))) {
         .SUCCESS, .INTR, .IO => return,
         .BADF => if (std.debug.runtime_safety) @panic("close on invalid fd"),
         else => return,
     }
+}
+
+/// Close a socket. POSIX: same as `close`. Windows: dispatches to
+/// `closesocket` from ws2_32 (Winsock's graceful close protocol —
+/// flushes pending sends before tearing down the socket).
+pub fn closeSocket(fd: posix.socket_t) void {
+    if (builtin.os.tag == .windows) {
+        const ws2 = std.os.windows.ws2_32;
+        _ = ws2.closesocket(fd);
+        return;
+    }
+    close(fd);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -120,6 +150,25 @@ pub const PipeError = error{
 } || std.posix.UnexpectedError;
 
 pub fn pipe() PipeError![2]posix.fd_t {
+    if (builtin.os.tag == .windows) {
+        var read_h: std.os.windows.HANDLE = undefined;
+        var write_h: std.os.windows.HANDLE = undefined;
+        // 0 = default 4 KiB buffer. nullable security attrs = default
+        // (handle not inheritable, default DACL).
+        const ok = std.os.windows.kernel32.CreatePipe(
+            &read_h,
+            &write_h,
+            null,
+            0,
+        );
+        if (ok == 0) {
+            return switch (std.os.windows.GetLastError()) {
+                .TOO_MANY_OPEN_FILES => error.ProcessFdQuotaExceeded,
+                else => error.Unexpected,
+            };
+        }
+        return .{ read_h, write_h };
+    }
     var fds: [2]posix.fd_t = undefined;
     switch (posix.errno(system.pipe(&fds))) {
         .SUCCESS => return fds,
@@ -190,6 +239,26 @@ pub const WriteError = error{
 } || std.posix.UnexpectedError;
 
 pub fn write(fd: posix.fd_t, bytes: []const u8) WriteError!usize {
+    if (builtin.os.tag == .windows) {
+        // WriteFile is sync — for non-overlapped HANDLEs it blocks until
+        // bytes are written or the pipe/file accepts a partial write.
+        // Volt's blocking-pool dispatches I/O so the worker isn't blocked.
+        var written: std.os.windows.DWORD = 0;
+        const want: std.os.windows.DWORD = @intCast(@min(bytes.len, std.math.maxInt(std.os.windows.DWORD)));
+        const ok = std.os.windows.kernel32.WriteFile(fd, bytes.ptr, want, &written, null);
+        if (ok == 0) {
+            return switch (std.os.windows.GetLastError()) {
+                .BROKEN_PIPE, .NO_DATA => error.BrokenPipe,
+                .NETNAME_DELETED => error.ConnectionResetByPeer,
+                .DISK_FULL => error.NoSpaceLeft,
+                .ACCESS_DENIED => error.AccessDenied,
+                .INVALID_PARAMETER => error.InvalidArgument,
+                .OPERATION_ABORTED => error.OperationAborted,
+                else => error.Unexpected,
+            };
+        }
+        return written;
+    }
     const max = if (builtin.os.tag == .linux) 0x7ffff000 else std.math.maxInt(isize);
     const count = @min(bytes.len, max);
     while (true) {
@@ -247,6 +316,23 @@ pub fn writev(fd: posix.fd_t, iov: []const posix.iovec_const) WriteError!usize {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn read(fd: posix.fd_t, bytes: []u8) ReadError!usize {
+    if (builtin.os.tag == .windows) {
+        var got: std.os.windows.DWORD = 0;
+        const want: std.os.windows.DWORD = @intCast(@min(bytes.len, std.math.maxInt(std.os.windows.DWORD)));
+        const ok = std.os.windows.kernel32.ReadFile(fd, bytes.ptr, want, &got, null);
+        if (ok == 0) {
+            return switch (std.os.windows.GetLastError()) {
+                // ReadFile signals EOF on a closed pipe via BROKEN_PIPE.
+                // POSIX read returns 0 on EOF. Match that.
+                .BROKEN_PIPE, .HANDLE_EOF => 0,
+                .NETNAME_DELETED => error.ConnectionResetByPeer,
+                .ACCESS_DENIED => return error.NotOpenForReading,
+                .OPERATION_ABORTED => return error.NotOpenForReading,
+                else => error.Unexpected,
+            };
+        }
+        return got;
+    }
     const max = if (builtin.os.tag == .linux) 0x7ffff000 else std.math.maxInt(isize);
     const count = @min(bytes.len, max);
     while (true) {
