@@ -118,9 +118,9 @@ jobs:
           |----------|---------|--------|
           | macOS arm64 | kqueue | runtime + native CI + N=200 nightly stress |
           | macOS x86_64 (Intel) | kqueue | cross-compile gate only — Apple Silicon is the v1 target |
-          | Linux x86_64/arm64 | epoll  | runtime + native CI + N=500 nightly stress |
-          | Linux x86_64/arm64 | io_uring | runtime + native CI + N=500 nightly stress |
-          | Windows x86_64/arm64 | IOCP+AFD | cross-compile gate + native CI (after W1–W9) |
+          | Linux x86_64/arm64 | epoll  | runtime + native CI + N=200 nightly stress |
+          | Linux x86_64/arm64 | io_uring | runtime + native CI + N=200 nightly stress |
+          | Windows x86_64/arm64 | IOCP+AFD | cross-compile gate only — runtime in v1.x (blocked on Zig 0.16 stdlib fixes) |
 
           ### Requirements
           - **Zig**: ${{ env.ZIG_VERSION }} or compatible

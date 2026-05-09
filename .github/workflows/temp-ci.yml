@@ -58,10 +58,13 @@ jobs:
           - { os: ubuntu-22.04-arm, name: linux-arm64-iouring,  build_args: "-Dreactor=iouring" }
           - { os: macos-latest,     name: macos-arm64-kqueue,   build_args: "" }
           # macos-x86_64 dropped — see ci.yml for rationale.
-          # Windows native test entry — surfaces the runtime side of W2–W7.
-          # While those land, this entry is allowed to fail (continue-on-error)
-          # so the rest of the matrix gates the build.
-          - { os: windows-latest,   name: windows-x86_64-iocp,  build_args: "", allow_failure: true }
+          # Windows native test entry: blocked on three Zig 0.16 stdlib
+          # bugs (std.Io.Writer fmt-spec, std.c ws2_32.addrinfo missing,
+          # std.c mmap signature uses void). Cross-compile (build-lib) is
+          # green for both x86_64 and aarch64 Windows; runtime support
+          # lands in v1.x once upstream fixes land. Re-enable here when
+          # they do.
+          # - { os: windows-latest, name: windows-x86_64-iocp,  build_args: "", allow_failure: true }
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.allow_failure || false }}
     steps:

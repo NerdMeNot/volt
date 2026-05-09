@@ -22,22 +22,37 @@ adopting when you depend on Volt.
 | **Production-candidate** | Cross-compile validated; structurally complete; all conformance tests pass on the platforms where they can be run. Native CI either gated on missing pieces or recently-added (<4 weeks of green). Tier-bump to *Production* requires ≥4 weeks of CI greenness. |
 | **Beta** | Code is in the tree and compiles, but lacks runtime validation. Typically a structural skeleton missing one or more dependent layers (e.g. AFD reactor with no syscall layer below it). |
 
-## Current matrix (v1.1)
+## Current matrix (v1.0)
 
 | Platform / Backend | Tier | Default? | Notes |
 |---|---|---|---|
-| **Darwin / kqueue** (`reactor_kqueue.zig`) | Production | ✅ | Volt's primary dev platform. All v1.0 cancel-leak audits + recent reactor-conformance suite green here. |
-| **Linux / epoll** (`reactor_epoll.zig`) | Production | ✅ | Default Linux backend. Cross-compile + native CI green. |
-| **Linux / io_uring** (`reactor_iouring.zig`) | Production-candidate | Opt-in (`-Dreactor=iouring`) | Phase 1 of the v1.1 plan: tracked-registration model with `IORING_OP_ASYNC_CANCEL` + generation-counter UAF prevention (ported from tokio-uring). Currently `allow_failure: true` in CI pending the unrelated `linux.fstat` fix that blocks `zig build test -Dtarget=linux-gnu` for *any* backend. |
-| **Windows / IOCP+AFD** (`reactor_iocp.zig`) | Beta | — (dispatcher gated) | Phase 2a-2b of v1.1: AFD-based readiness reactor (mio/wepoll approach via `IOCTL_AFD_POLL`) + SEH stack-overflow handler. Cross-compiles cleanly. Tier-bump requires Phase 2c-2g (syscall layer arms, fs/Dir, fs/Metadata, process/Command, signal, file watcher, CI runner). |
+| **Darwin arm64 / kqueue** (`reactor_kqueue.zig`) | Production | ✅ | Volt's primary dev platform. Native CI green + N=200 nightly stress. |
+| **Darwin x86_64 (Intel) / kqueue** | Cross-compile only | — | Apple Silicon is the v1 macOS target. Native runtime returns in v1.x. |
+| **Linux x86_64 + arm64 / epoll** (`reactor_epoll.zig`) | Production | ✅ | Default Linux backend. Native CI green + N=200 nightly stress. |
+| **Linux x86_64 + arm64 / io_uring** (`reactor_iouring.zig`) | Production | Opt-in (`-Dreactor=iouring`) | Tracked-registration model with `IORING_OP_ASYNC_CANCEL` + generation-counter UAF prevention (ported from tokio-uring). Native CI green + N=200 nightly stress. Pending tier-bump to default after ≥4 weeks of consecutive nightly green. |
+| **Windows x86_64 + arm64 / IOCP+AFD** (`reactor_iocp.zig`) | Cross-compile only | — | Reactor (AFD-based readiness via `IOCTL_AFD_POLL`) + SEH stack-overflow handler are landed and cross-compile-clean. Native runtime is blocked on three Zig 0.16 stdlib bugs (see *Windows runtime status* below). Targets v1.x once upstream Zig fixes land. |
 
 ## What can a consumer adopt today?
 
 If you're shipping a Zig library on Volt:
 
-- **Darwin + Linux x86_64 + Linux arm64**: production-ready substrate. Adopt freely.
-- **Linux io_uring**: works structurally; opt-in via `-Dreactor=iouring`. Treat as evaluation-grade until the upstream `fstat` blocker clears and CI runs ≥4 weeks green.
-- **Windows**: not yet runtime-default. The reactor + stack handler are ready; the I/O syscall layer + fs surface still need Windows arms. Track Phase 2c-2g in the v1.1 plan.
+- **Darwin arm64 + Linux x86_64 + Linux arm64**: production-ready substrate. Adopt freely.
+- **Linux io_uring**: opt-in via `-Dreactor=iouring`. Native CI green + N=200 nightly stress; safe to ship on. Default-flip lands once it's been green for ≥4 weeks of consecutive nightlies.
+- **Darwin x86_64 (Intel)**: cross-compile-validated only at v1; runtime returns in v1.x. Apple Silicon is the v1 macOS target.
+- **Windows**: not runtime-supported at v1. The reactor + stack handler are ready and cross-compile cleanly; runtime is blocked on Zig 0.16 stdlib bugs in code Volt's tests exercise.
+
+## Windows runtime status
+
+Three Zig 0.16 stdlib bugs surface when running `zig build test -Dtarget=x86_64-windows-gnu`:
+
+1. **`std.Io.Writer.zig:1803`** — invalid format string `'d'` for type `*anyopaque`. Hits any `std.fmt`-using path that prints opaque pointers; Volt's diagnostic logging triggers it.
+2. **`std.c.zig:4767`** — `os.windows.ws2_32` has no member `addrinfo`. Volt's DNS path references it.
+3. **`std.c.zig:10659`** — `mmap` parameter of type `void` not allowed under `x86_64_win` calling convention. Volt's `fs/Mmap.zig` Windows arm hits it.
+
+These are upstream blockers — fixing them requires patching Zig stdlib. Volt v1 ships with Windows as cross-compile-only; native runtime tier-bumps in v1.x once one of:
+
+- Upstream Zig releases a 0.16.x fix.
+- Volt replaces the affected stdlib calls with internal bindings (substantial scope; tracked in W2-W7 of the original Windows port plan).
 
 ## Architectural choices, in case you're wondering
 

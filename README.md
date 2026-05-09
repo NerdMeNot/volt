@@ -63,12 +63,13 @@ Volt is the substrate for everything that needs async, networking, or file I/O i
 
 | Target | Backend | Tier | Notes |
 |---|---|---|---|
-| macOS arm64 / x86_64 | kqueue | **Production** | Primary dev platform. CI green. |
-| Linux x86_64 / arm64 | epoll | **Production** | Default Linux backend. CI green. |
-| Linux x86_64 / arm64 | io_uring | Production-candidate | Opt-in via `-Dreactor=iouring`. Tracked-registration cancel safety (ported from tokio-uring). |
-| Windows x86_64 / arm64 | IOCP+AFD | Beta | AFD readiness reactor (mio/wepoll approach) + SEH stack-overflow handler land in v1.1; runtime-default flip pending Phase 2c-2g (syscall arms, fs Windows arms, CreateProcess, ConsoleCtrlHandler). |
+| macOS arm64 | kqueue | **Production** | Primary dev platform. Native CI green + N=200 nightly stress. |
+| macOS x86_64 (Intel) | kqueue | Cross-compile only | Apple Silicon is the v1 target. Native runtime returns in v1.x. |
+| Linux x86_64 / arm64 | epoll | **Production** | Default Linux backend. Native CI green + N=200 nightly stress. |
+| Linux x86_64 / arm64 | io_uring | **Production** | Opt-in via `-Dreactor=iouring`. Native CI green + N=200 nightly stress. Tracked-registration cancel safety (ported from tokio-uring). |
+| Windows x86_64 / arm64 | IOCP+AFD | Cross-compile only | Reactor + SEH handler landed and cross-compile-clean. Native runtime blocked on three Zig 0.16 stdlib bugs (`std.Io.Writer` fmt-spec for `*anyopaque`, `std.c` ws2_32.addrinfo missing, `std.c` mmap signature uses void). Windows runtime targets v1.x once upstream Zig fixes land. |
 
-A consumer can adopt Volt today on Darwin + Linux without caveats. io_uring is opt-in and stable in structure; flip the default once it's been green in CI for ≥4 weeks. Windows is structurally landed but not yet runtime-default — see `docs/internals/backend-parity.md` for the full punch list and `src/io/reactor.zig` for the in-source breadcrumb.
+A consumer can adopt Volt today on Darwin arm64 + Linux x86_64/arm64 (epoll or io_uring) without caveats — every (platform, backend) combination runs the full test suite + N=50 stress per PR + N=200 stress nightly. Windows is structurally landed but blocked on Zig 0.16 stdlib bugs in code paths Volt's tests exercise; see `docs/internals/backend-parity.md` for the punch list.
 
 ### Backend conformance
 
