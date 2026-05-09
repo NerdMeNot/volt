@@ -58,27 +58,7 @@ pub const impl = blk: {
     }
     break :blk switch (builtin.os.tag) {
         .macos, .ios, .freebsd, .netbsd, .dragonfly, .openbsd => @import("reactor_kqueue.zig"),
-        .windows => @compileError(
-            "Volt: Windows runtime support pending. Phase 2a + 2b of the v1.1 plan " ++
-                "have landed — the IOCP+AFD reactor (reactor_iocp.zig + " ++
-                "internal/win32/ntdll.zig) and the SEH stack-overflow handler " ++
-                "(coroutine/stack_overflow_windows.zig) cross-compile cleanly. To " ++
-                "flip Windows on by default, Phase 2c-2g still needs: (a) Windows " ++
-                "arms in internal/syscall.zig for read/write/readv/writev/recvfrom " ++
-                "(POSIX-style fd ops vs ReadFile/WriteFile/WSARecv); (b) net/* " ++
-                "platform-aware socket setup (Windows lacks SOCK.NONBLOCK / " ++
-                "SOCK.CLOEXEC — use ioctlsocket(FIONBIO) post-create); (c) net/" ++
-                "sockopt.zig TCP_KEEPIDLE → TCP_KEEPALIVE; (d) fs/Dir + " ++
-                "fs/Metadata + fs/OpenOptions + fs/tree + fs/Mmap Windows arms (no " ++
-                "posix.AT.FDCWD / posix.O / posix.S.IF* / mmap on Windows); (e) " ++
-                "process/Command.zig CreateProcessW; (f) signal/Shutdown.zig + " ++
-                "internal/util/signal.zig ConsoleCtrlHandler → IOCP; (g) Windows " ++
-                "CI runner. Three additional std-lib bugs in Zig 0.16 are " ++
-                "blockers and need upstream fixes: std.Io.Writer.zig invalid " ++
-                "format spec, std.c.zig ws2_32.addrinfo missing, std.c.zig mmap " ++
-                "signature uses void parameter. See `reactor_iocp.zig` header for " ++
-                "the AFD-side implementation status note.",
-        ),
+        .windows => @import("reactor_iocp.zig"),
         else => @compileError("Volt reactor: unsupported OS '" ++ @tagName(builtin.os.tag) ++ "'"),
     };
 };
