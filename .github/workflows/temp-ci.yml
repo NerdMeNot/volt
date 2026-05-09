@@ -58,7 +58,12 @@ jobs:
           - { os: ubuntu-22.04-arm, name: linux-arm64-iouring,  build_args: "-Dreactor=iouring" }
           - { os: macos-latest,     name: macos-arm64-kqueue,   build_args: "" }
           # macos-x86_64 dropped — see ci.yml for rationale.
+          # Windows native test entry — surfaces the runtime side of W2–W7.
+          # While those land, this entry is allowed to fail (continue-on-error)
+          # so the rest of the matrix gates the build.
+          - { os: windows-latest,   name: windows-x86_64-iocp,  build_args: "", allow_failure: true }
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.allow_failure || false }}
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -66,9 +71,11 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       - shell: bash
         run: |
-          uname -a
-          if [[ "${{ runner.os }}" == "Linux" ]]; then
-            echo "Kernel: $(uname -r)"
+          if [[ "${{ runner.os }}" != "Windows" ]]; then
+            uname -a
+            if [[ "${{ runner.os }}" == "Linux" ]]; then
+              echo "Kernel: $(uname -r)"
+            fi
           fi
       - run: zig build test ${{ matrix.build_args }}
 
