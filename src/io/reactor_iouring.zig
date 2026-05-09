@@ -291,8 +291,16 @@ pub const Reactor = struct {
         defer self.regs_mutex.unlock();
 
         if (self.regs.get(slot)) |entry| {
-            entry.generation +%= 1; // wrap-around safe — we only check equality
-            entry.in_flight = false;
+            if (entry.in_flight) {
+                entry.generation +%= 1; // wrap-around safe — equality check only
+                entry.in_flight = false;
+                // Pending bookkeeping (R2 invariant, matching kqueue/epoll):
+                // unregister* decrements pending synchronously. The
+                // eventual stale CQE (with old user_data / -ECANCELED)
+                // hits poll's stale-CQE arm which intentionally does NOT
+                // decrement again — the cancel path owns the bookkeeping.
+                _ = self.pending.fetchSub(1, .release);
+            }
         }
     }
 
@@ -484,11 +492,12 @@ pub const Reactor = struct {
                 },
                 .wait, .timer => {
                     const target = self.consumeSlot(ud) orelse {
-                        // Stale CQE (cancelled before fire, or generation
-                        // mismatch). Decrement pending: the slot was
-                        // accounted for at register time and the kernel
-                        // is done with it.
-                        _ = self.pending.fetchSub(1, .release);
+                        // Stale CQE — slot was cancelled by user (via
+                        // unregisterWait/Timer's `markCancelled`).
+                        // `markCancelled` already decremented pending,
+                        // so we MUST NOT decrement here or we'd
+                        // double-subtract and underflow on the next
+                        // register.
                         continue;
                     };
                     _ = self.pending.fetchSub(1, .release);
