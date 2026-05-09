@@ -133,8 +133,8 @@ pub fn close(fd: posix.fd_t) void {
 /// flushes pending sends before tearing down the socket).
 pub fn closeSocket(fd: posix.socket_t) void {
     if (builtin.os.tag == .windows) {
-        const ws2 = std.os.windows.ws2_32;
-        _ = ws2.closesocket(fd);
+        const ws2 = @import("win32/ws2_32.zig");
+        _ = ws2.closesocket(@ptrCast(fd));
         return;
     }
     close(fd);
