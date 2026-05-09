@@ -622,6 +622,25 @@ pub fn sendto(
     dest_addr: ?*const posix.sockaddr,
     addrlen: posix.socklen_t,
 ) SendError!usize {
+    if (builtin.os.tag == .windows) {
+        const ws2 = @import("win32/ws2_32.zig");
+        const sock: ws2.SOCKET = @ptrCast(fd);
+        const len: c_int = @intCast(@min(buf.len, std.math.maxInt(c_int)));
+        const flags_int: c_int = @intCast(flags);
+        const rc = if (dest_addr) |a|
+            ws2.sendto(sock, buf.ptr, len, flags_int, @ptrCast(a), @intCast(addrlen))
+        else
+            ws2.send(sock, buf.ptr, len, flags_int);
+        if (rc != ws2.SOCKET_ERROR) return @intCast(rc);
+        return switch (ws2.WSAGetLastError()) {
+            ws2.WSAEWOULDBLOCK, ws2.WSAEINPROGRESS => error.WouldBlock,
+            ws2.WSAECONNRESET, ws2.WSAECONNABORTED => error.ConnectionResetByPeer,
+            ws2.WSAESHUTDOWN => error.BrokenPipe,
+            ws2.WSAENOBUFS => error.SystemResources,
+            ws2.WSAEMSGSIZE => error.MessageTooBig,
+            else => error.Unexpected,
+        };
+    }
     while (true) {
         const rc = system.sendto(fd, buf.ptr, buf.len, flags, dest_addr, addrlen);
         const signed: isize = @bitCast(rc);
@@ -676,6 +695,28 @@ pub fn recvfrom(
     src_addr: ?*posix.sockaddr,
     addrlen: ?*posix.socklen_t,
 ) RecvFromError!usize {
+    if (builtin.os.tag == .windows) {
+        const ws2 = @import("win32/ws2_32.zig");
+        const sock: ws2.SOCKET = @ptrCast(fd);
+        const len: c_int = @intCast(@min(buf.len, std.math.maxInt(c_int)));
+        const flags_int: c_int = @intCast(flags);
+        const rc = if (src_addr) |a| blk: {
+            // recvfrom requires a c_int* fromlen — coerce socklen_t.
+            var alen: c_int = if (addrlen) |al| @intCast(al.*) else 0;
+            const r = ws2.recvfrom(sock, buf.ptr, len, flags_int, @ptrCast(a), &alen);
+            if (addrlen) |al| al.* = @intCast(alen);
+            break :blk r;
+        } else ws2.recv(sock, buf.ptr, len, flags_int);
+        if (rc != ws2.SOCKET_ERROR) return @intCast(rc);
+        return switch (ws2.WSAGetLastError()) {
+            ws2.WSAEWOULDBLOCK => error.WouldBlock,
+            ws2.WSAECONNRESET, ws2.WSAECONNABORTED => error.ConnectionResetByPeer,
+            ws2.WSAETIMEDOUT => error.ConnectionTimedOut,
+            ws2.WSAEMSGSIZE => error.MessageTooBig,
+            ws2.WSAENOBUFS => error.SystemResources,
+            else => error.Unexpected,
+        };
+    }
     while (true) {
         const rc = system.recvfrom(fd, buf.ptr, buf.len, flags, src_addr, addrlen);
         const signed: isize = @bitCast(rc);
