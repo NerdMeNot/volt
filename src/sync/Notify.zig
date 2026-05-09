@@ -73,12 +73,21 @@ pub const Notify = struct {
     /// Saturating-at-1 permit. `notifyOne` sets it; `wait`'s fast path
     /// CAS-clears it.
     permit: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    /// Closed flag. Once true, every `wait` returns immediately
+    /// (permanent permit). Set by `notifyAllAndClose` for one-shot
+    /// broadcasts (e.g. CancellationToken.cancel) — closes the
+    /// late-arrival race where a waiter parks AFTER the broadcast and
+    /// then misses every future signal. Once closed, the Notify is
+    /// permanently "open" — wait() always returns immediately.
+    closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     waiter_mutex: thread.Mutex = .{},
     waiters: WaiterList = .{},
 
     /// Suspend the calling coroutine until notified. Returns immediately
-    /// if a permit is stored.
+    /// if a permit is stored or the Notify has been closed.
     pub fn wait(self: *Notify) WaitError!void {
+        // Fast path: closed Notify — every wait returns instantly.
+        if (self.closed.load(.acquire)) return;
         // Fast path: consume an already-stored permit.
         if (self.permit.cmpxchgStrong(1, 0, .acquire, .monotonic) == null) {
             return;
@@ -86,6 +95,12 @@ pub const Notify = struct {
 
         var waiter: Waiter = .{};
         self.waiter_mutex.lock();
+        // Re-check closed under the lock — a `notifyAllAndClose` could
+        // have raced us between the fast-path check and the lock.
+        if (self.closed.load(.acquire)) {
+            self.waiter_mutex.unlock();
+            return;
+        }
         // Re-check the permit under the lock — a `notifyOne` could
         // have raced us between the fast-path check and the lock.
         if (self.permit.cmpxchgStrong(1, 0, .acquire, .monotonic) == null) {
@@ -127,6 +142,37 @@ pub const Notify = struct {
     /// late `wait()` callers won't see anything.
     pub fn notifyAll(self: *Notify) void {
         self.waiter_mutex.lock();
+        const drained = self.waiters.drain();
+        self.waiter_mutex.unlock();
+
+        var cur = drained;
+        while (cur) |w| {
+            const next = w.next;
+            w.next = null;
+            w.park.unpark();
+            cur = next;
+        }
+    }
+
+    /// Wake every current waiter AND mark the Notify as closed so all
+    /// future `wait()` calls return immediately. Use this for one-shot
+    /// broadcasts where late-arrivals must observe the event.
+    ///
+    /// Closes the broadcast-race window: with bare `notifyAll`, a
+    /// waiter that called `wait()` AFTER the broadcast would park
+    /// forever (no permit was stored, no waiters left to wake).
+    /// `notifyAllAndClose` sets a permanent permit — every future
+    /// `wait` returns instantly.
+    ///
+    /// After this, the Notify is one-shot done. Calling notifyOne /
+    /// notifyAll on a closed Notify is a no-op (waits are already
+    /// short-circuited).
+    pub fn notifyAllAndClose(self: *Notify) void {
+        self.waiter_mutex.lock();
+        // Set closed under the lock so any `wait` racing with us
+        // observes either (a) closed=true on its lock-held re-check,
+        // or (b) it's already pushed onto `waiters` and gets drained.
+        self.closed.store(true, .release);
         const drained = self.waiters.drain();
         self.waiter_mutex.unlock();
 

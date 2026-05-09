@@ -65,13 +65,19 @@ pub const CancellationToken = struct {
     }
 
     /// Cancel the token. Idempotent — additional `cancel` calls are
-    /// no-ops. Wakes everyone parked on `cancelled.wait()` and
-    /// cascades to every child that called `linkParent(self)`.
+    /// no-ops. Wakes everyone parked on `cancelled.wait()` AND closes
+    /// the Notify so any late-arrival `cancelled.wait()` returns
+    /// immediately. Cascades to every child that called
+    /// `linkParent(self)`.
     pub fn cancel(self: *CancellationToken) void {
         if (self.flag.cmpxchgStrong(false, true, .acq_rel, .monotonic) != null) {
             return; // already cancelled
         }
-        self.cancelled.notifyAll();
+        // notifyAllAndClose, not bare notifyAll: cancellation is
+        // one-shot and any future `cancelled.wait()` must observe it
+        // even if called AFTER cancel fires (the broadcast-race that
+        // bare notifyAll leaves open).
+        self.cancelled.notifyAllAndClose();
 
         // Drain the linked-children list and cascade. Recursive but
         // bounded by the depth of the link chain (typically 1–2).
