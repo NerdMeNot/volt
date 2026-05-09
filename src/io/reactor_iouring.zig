@@ -438,6 +438,12 @@ pub const Reactor = struct {
             const orig_gen = reg.generation;
             entry.value.generation +%= 1;
             entry.value.in_flight = false;
+            // R2 invariant: pending decrement is owned by the cancel
+            // path, mirroring `markCancelled` for timers and the
+            // synchronous decrement that kqueue/epoll do on
+            // unregister*. Poll's stale-CQE arm must NOT decrement
+            // again or we'd underflow.
+            _ = self.pending.fetchSub(1, .release);
             return .{
                 .slot = @intCast(entry.key),
                 .original_generation = orig_gen,
