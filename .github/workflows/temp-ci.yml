@@ -1,0 +1,100 @@
+# TEMPORARY — fires the same checks as ci.yml on pushes to the
+# scheduler-rewrite branch, so we get CI signal before merging to main.
+# Delete this file once scheduler-rewrite is merged.
+
+name: Temp CI (scheduler-rewrite)
+
+on:
+  push:
+    branches: [scheduler-rewrite]
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  format:
+    name: zig fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig fmt --check src/ bench/ examples/
+
+  cross-compile:
+    name: Cross-compile (${{ matrix.target }})
+    needs: format
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-gnu
+          - aarch64-linux-gnu
+          - x86_64-windows-gnu
+          - aarch64-windows-gnu
+          - x86_64-macos
+          - aarch64-macos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build-lib src/lib.zig -target ${{ matrix.target }} -lc -fno-emit-bin
+
+  test:
+    name: Test (${{ matrix.name }})
+    needs: format
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    name: linux-x86_64-epoll,   build_args: "" }
+          - { os: ubuntu-latest,    name: linux-x86_64-iouring, build_args: "-Dreactor=iouring" }
+          - { os: ubuntu-22.04-arm, name: linux-arm64-epoll,    build_args: "" }
+          - { os: ubuntu-22.04-arm, name: linux-arm64-iouring,  build_args: "-Dreactor=iouring" }
+          - { os: macos-latest,     name: macos-arm64-kqueue,   build_args: "" }
+          - { os: macos-15-intel,   name: macos-x86_64-kqueue,  build_args: "" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - shell: bash
+        run: |
+          uname -a
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            echo "Kernel: $(uname -r)"
+          fi
+      - run: zig build test ${{ matrix.build_args }}
+
+  stress:
+    name: Stress N=50 (${{ matrix.name }})
+    needs: format
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux-x86_64-epoll,   build_args: "" }
+          - { os: ubuntu-latest, name: linux-x86_64-iouring, build_args: "-Dreactor=iouring" }
+          - { os: macos-latest,  name: macos-arm64-kqueue,   build_args: "" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - shell: bash
+        run: N=50 TIMEOUT_SECS=120 scripts/stress_test.sh ${{ matrix.build_args }}
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-logs-${{ matrix.name }}
+          path: tmp/stress/
+          if-no-files-found: ignore
+          retention-days: 14
