@@ -103,7 +103,7 @@ pub const UdpSocket = struct {
 
     /// Bind a UDP socket to `address`. Non-blocking.
     pub fn bind(address: Address) BindError!UdpSocket {
-        const sock_type = posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+        const sock_type = posix.SOCK.DGRAM | syscall.SOCK_NONBLOCK | syscall.SOCK_CLOEXEC;
         const fd = try syscall.socket(address.family(), sock_type, 0);
         errdefer syscall.close(fd);
         try syscall.bind(fd, &address.any, address.osSockLen());

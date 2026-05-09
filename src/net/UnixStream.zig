@@ -35,7 +35,7 @@ pub const UnixStream = struct {
     fd: posix.socket_t,
 
     pub fn connect(address: UnixAddress) ConnectError!UnixStream {
-        const sock_type = posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+        const sock_type = posix.SOCK.STREAM | syscall.SOCK_NONBLOCK | syscall.SOCK_CLOEXEC;
         const fd = try syscall.socket(posix.AF.UNIX, sock_type, 0);
         errdefer syscall.close(fd);
 

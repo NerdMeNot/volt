@@ -26,7 +26,7 @@ pub const UnixListener = struct {
     fd: posix.socket_t,
 
     pub fn bind(address: UnixAddress) ListenError!UnixListener {
-        const sock_type = posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+        const sock_type = posix.SOCK.STREAM | syscall.SOCK_NONBLOCK | syscall.SOCK_CLOEXEC;
         const fd = try syscall.socket(posix.AF.UNIX, sock_type, 0);
         errdefer syscall.close(fd);
 
@@ -40,7 +40,7 @@ pub const UnixListener = struct {
     }
 
     pub fn accept(self: *UnixListener) AcceptError!UnixStream {
-        const flags: u32 = posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+        const flags: u32 = syscall.SOCK_NONBLOCK | syscall.SOCK_CLOEXEC;
         while (true) {
             const accepted = syscall.accept(self.fd, null, null, flags) catch |err| switch (err) {
                 error.WouldBlock => {

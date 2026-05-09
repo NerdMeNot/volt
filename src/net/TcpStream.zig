@@ -34,7 +34,7 @@ pub const TcpStream = struct {
     /// Async connect. On WouldBlock/InProgress, parks until writable
     /// then checks `SO_ERROR` to determine final status.
     pub fn connect(address: Address) ConnectError!TcpStream {
-        const sock_type = posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+        const sock_type = posix.SOCK.STREAM | syscall.SOCK_NONBLOCK | syscall.SOCK_CLOEXEC;
         const fd = try syscall.socket(address.family(), sock_type, 0);
         errdefer syscall.close(fd);
 

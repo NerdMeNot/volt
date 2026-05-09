@@ -26,7 +26,7 @@ pub const TcpListener = struct {
 
     /// Bind a TCP listener to `address`. The socket is non-blocking.
     pub fn bind(address: Address) ListenError!TcpListener {
-        const sock_type = posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+        const sock_type = posix.SOCK.STREAM | syscall.SOCK_NONBLOCK | syscall.SOCK_CLOEXEC;
         const fd = try syscall.socket(address.family(), sock_type, 0);
         errdefer syscall.close(fd);
 
@@ -42,7 +42,7 @@ pub const TcpListener = struct {
 
     /// Async accept. Returns a new `TcpStream` for the accepted connection.
     pub fn accept(self: *TcpListener) AcceptError!TcpStream {
-        const flags: u32 = posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+        const flags: u32 = syscall.SOCK_NONBLOCK | syscall.SOCK_CLOEXEC;
         while (true) {
             const accepted = syscall.accept(self.fd, null, null, flags) catch |err| switch (err) {
                 error.WouldBlock => {

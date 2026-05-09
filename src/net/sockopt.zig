@@ -85,10 +85,14 @@ pub fn setKeepAliveParams(
     const interval_secs: c_int = @intCast(@max(@as(u64, 1), interval.nanos / std.time.ns_per_s));
     const count_int: c_int = @intCast(count);
 
-    // Darwin spells the idle-time option TCP_KEEPALIVE; Linux spells
-    // it TCP_KEEPIDLE. KEEPINTVL / KEEPCNT match on both.
+    // Darwin and Windows spell the idle-time option TCP_KEEPALIVE;
+    // Linux spells it TCP_KEEPIDLE. KEEPINTVL / KEEPCNT match on
+    // POSIX. (Windows technically uses WSAIoctl SIO_KEEPALIVE_VALS for
+    // tuning all three together, but the simple TCP_KEEPALIVE socket
+    // option works for the idle-time leg.)
     const idle_opt: u32 = comptime switch (@import("builtin").os.tag) {
         .macos, .ios, .tvos, .watchos, .visionos, .driverkit => posix.TCP.KEEPALIVE,
+        .windows => 3, // TCP_KEEPALIVE on Windows
         else => posix.TCP.KEEPIDLE,
     };
     try setInt(fd, posix.IPPROTO.TCP, idle_opt, idle_secs);

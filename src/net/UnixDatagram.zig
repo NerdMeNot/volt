@@ -30,7 +30,7 @@ pub const UnixDatagram = struct {
     fd: posix.socket_t,
 
     pub fn bind(address: UnixAddress) BindError!UnixDatagram {
-        const sock_type = posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+        const sock_type = posix.SOCK.DGRAM | syscall.SOCK_NONBLOCK | syscall.SOCK_CLOEXEC;
         const fd = try syscall.socket(posix.AF.UNIX, sock_type, 0);
         errdefer syscall.close(fd);
         try syscall.bind(fd, address.sockaddrPtr(), address.osSockLen());

@@ -57,15 +57,58 @@ pub const SocketError = error{
     SocketTypeNotSupported,
 } || std.posix.UnexpectedError;
 
+/// Volt-portable SOCK flag bits. Linux exposes CLOEXEC and NONBLOCK
+/// as native socket-type flags via accept4 / socket; Darwin and Windows
+/// do not. On platforms without native flag support we treat these as
+/// `0` and `socket()` applies the equivalent via post-create fcntl
+/// (POSIX) or ioctlsocket / SetHandleInformation (Windows). Net-layer
+/// callers always pass the same `SOCK.STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC`
+/// shape regardless of platform.
+pub const SOCK_NONBLOCK: u32 = if (builtin.os.tag == .linux) posix.SOCK.NONBLOCK else 1 << 16;
+pub const SOCK_CLOEXEC: u32 = if (builtin.os.tag == .linux) posix.SOCK.CLOEXEC else 1 << 15;
+
 pub fn socket(domain: u32, sock_type: u32, protocol: u32) SocketError!posix.socket_t {
-    // On Darwin (and several BSDs), CLOEXEC/NONBLOCK aren't real socket-type
-    // bits — they're Zig shims that need post-create fcntl. Linux's accept4-
-    // style flags ARE real, so we keep them passthrough on Linux.
-    const has_native_flags = builtin.os.tag == .linux;
-    const flag_mask: u32 = posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
-    const native_type = if (has_native_flags) sock_type else sock_type & ~flag_mask;
-    const want_cloexec = !has_native_flags and (sock_type & posix.SOCK.CLOEXEC) != 0;
-    const want_nonblock = !has_native_flags and (sock_type & posix.SOCK.NONBLOCK) != 0;
+    const want_cloexec = (sock_type & SOCK_CLOEXEC) != 0;
+    const want_nonblock = (sock_type & SOCK_NONBLOCK) != 0;
+    // Strip Volt-portable flags before passing to the kernel — Linux's
+    // native flags pass through (we already aliased SOCK_NONBLOCK to
+    // posix.SOCK.NONBLOCK on Linux); other platforms get a clean type.
+    const native_type = if (builtin.os.tag == .linux)
+        sock_type
+    else
+        sock_type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
+
+    if (builtin.os.tag == .windows) {
+        const ws2 = @import("win32/ws2_32.zig");
+        // WSASocketW with no flags returns a SOCKET HANDLE. Using the
+        // basic `socket` symbol from std.c works too — but Volt links
+        // ws2_32 explicitly via the WSARecv/etc. bindings, so go
+        // through that path uniformly. Volt's net/* always asks for
+        // nonblock; we satisfy via ioctlsocket post-create.
+        const sock = std.os.windows.ws2_32.socket(@intCast(domain), @intCast(native_type), @intCast(protocol));
+        if (@intFromPtr(sock) == @intFromPtr(ws2.INVALID_SOCKET)) {
+            return switch (ws2.WSAGetLastError()) {
+                10024 => error.ProcessFdQuotaExceeded, // WSAEMFILE
+                10043 => error.ProtocolNotSupported, // WSAEPROTONOSUPPORT
+                10047 => error.AddressFamilyNotSupported, // WSAEAFNOSUPPORT
+                10055 => error.SystemResources, // WSAENOBUFS
+                else => error.Unexpected,
+            };
+        }
+        const fd: posix.socket_t = @ptrCast(sock);
+        errdefer closeSocket(fd);
+        if (want_nonblock) {
+            var nb: c_ulong = 1;
+            _ = ws2.ioctlsocket(@ptrCast(fd), ws2.FIONBIO, &nb);
+        }
+        if (want_cloexec) {
+            // Win32 inheritance is opt-in (CreatePipe / SetHandle...).
+            // Sockets default to non-inheritable in modern Windows,
+            // so this is effectively a no-op. Documented for parity
+            // with POSIX SOCK_CLOEXEC semantics.
+        }
+        return fd;
+    }
 
     const rc = system.socket(domain, native_type, protocol);
     switch (posix.errno(rc)) {
@@ -83,15 +126,19 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) SocketError!posix.sock
     const fd: posix.socket_t = @intCast(rc);
     errdefer close(fd);
 
-    if (want_cloexec) {
-        const F = posix.F;
-        _ = fcntl(fd, F.SETFD, @intCast(@as(c_int, 1))) catch {}; // FD_CLOEXEC
-    }
-    if (want_nonblock) {
-        const F = posix.F;
-        const cur = fcntl(fd, F.GETFL, 0) catch 0;
-        const nb: u32 = @bitCast(posix.O{ .NONBLOCK = true });
-        _ = fcntl(fd, F.SETFL, cur | nb) catch {};
+    // Linux already applied native flags; Darwin/BSD need post-create
+    // fcntl since SOCK_CLOEXEC/SOCK_NONBLOCK aren't real bits.
+    if (builtin.os.tag != .linux) {
+        if (want_cloexec) {
+            const F = posix.F;
+            _ = fcntl(fd, F.SETFD, @intCast(@as(c_int, 1))) catch {}; // FD_CLOEXEC
+        }
+        if (want_nonblock) {
+            const F = posix.F;
+            const cur = fcntl(fd, F.GETFL, 0) catch 0;
+            const nb: u32 = @bitCast(posix.O{ .NONBLOCK = true });
+            _ = fcntl(fd, F.SETFL, cur | nb) catch {};
+        }
     }
     return fd;
 }
