@@ -1,275 +1,173 @@
 name: Nightly
 
+# Deep stress + memory checks. Runs once a day on a fresh checkout of
+# `main`, plus on manual dispatch with a tunable iteration count. The
+# PR-tier `stress-pr` job (in ci.yml) catches obvious flakes at N=50;
+# this workflow runs the same script at N=500 to surface low-rate races
+# that need many seeds to reproduce.
+
 on:
   schedule:
-    # Run at 3 AM UTC every day
+    # 03:00 UTC daily. Off-hours for both US and EU contributors.
     - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
-      soak_duration_minutes:
-        description: 'Soak test duration in minutes'
+      n_iters:
+        description: 'Stress iterations per (os, backend) entry'
         required: false
-        default: '30'
+        default: '500'
+        type: string
+      timeout_per_iter_secs:
+        description: 'Per-iteration timeout (seconds)'
+        required: false
+        default: '180'
         type: string
 
 env:
-  ZIG_VERSION: "0.15.2"
+  ZIG_VERSION: "0.16.0"
 
 jobs:
-  # ═══════════════════════════════════════════════════════════════════════════
-  # Exhaustive Concurrency Tests - All Platforms
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  exhaustive-concurrency:
-    name: Exhaustive Concurrency (${{ matrix.name }})
-    timeout-minutes: 30
+  # ─────────────────────────────────────────────────────────────────────
+  # Deep stress: N=500 on every (os, backend) we ship. Each iteration
+  # is a full `zig build test` run with a fresh seed and a per-iteration
+  # timeout. If any iteration hangs past the timeout, that entry fails
+  # with a stack-trace sample logged.
+  # ─────────────────────────────────────────────────────────────────────
+  stress-deep:
+    name: Stress N=${{ github.event.inputs.n_iters || '500' }} (${{ matrix.name }})
+    timeout-minutes: 350
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            name: linux-x86_64
-          - os: ubuntu-24.04-arm
-            name: linux-arm64
-          - os: macos-latest
-            name: macos-arm64
-          - os: macos-15-intel
-            name: macos-x86_64
-          - os: windows-latest
-            name: windows-x86_64
-
+          - { os: ubuntu-latest,    name: linux-x86_64-epoll,   build_args: "" }
+          - { os: ubuntu-latest,    name: linux-x86_64-iouring, build_args: "-Dreactor=iouring" }
+          - { os: ubuntu-22.04-arm, name: linux-arm64-epoll,    build_args: "" }
+          - { os: ubuntu-22.04-arm, name: linux-arm64-iouring,  build_args: "-Dreactor=iouring" }
+          - { os: macos-latest,     name: macos-arm64-kqueue,   build_args: "" }
+          - { os: macos-15-intel,   name: macos-x86_64-kqueue,  build_args: "" }
+          # Windows IOCP — uncomment once W1–W8 land.
+          # - { os: windows-latest, name: windows-x86_64-iocp,  build_args: "" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-
-      - name: Run exhaustive concurrency tests
-        run: zig build test-concurrency
-        env:
-          VOLT_TEST_INTENSITY: exhaustive
-
-  # ═══════════════════════════════════════════════════════════════════════════
-  # Integration Tests - Async Runtime Correctness
-  # Tests Future/Poll/Waker state machines through the real scheduler
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  integration:
-    name: Integration (${{ matrix.name }})
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: linux-x86_64
-          - os: ubuntu-24.04-arm
-            name: linux-arm64
-          - os: macos-latest
-            name: macos-arm64
-          - os: macos-15-intel
-            name: macos-x86_64
-          - os: windows-latest
-            name: windows-x86_64
-
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-
-      - name: Run integration tests
-        run: zig build test-integration
-
-  # ═══════════════════════════════════════════════════════════════════════════
-  # Exhaustive Stress Tests
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  exhaustive-stress:
-    name: Exhaustive Stress (${{ matrix.name }})
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: linux-x86_64
-          - os: ubuntu-24.04-arm
-            name: linux-arm64
-          - os: macos-latest
-            name: macos-arm64
-
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-
-      - name: Run exhaustive stress tests
-        run: zig build test-stress
-        env:
-          VOLT_TEST_INTENSITY: exhaustive
-
-  # ═══════════════════════════════════════════════════════════════════════════
-  # Soak Tests - Extended Duration
-  # Tests primitives under continuous operation to catch subtle leaks/races
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  soak-test:
-    name: Soak Test (${{ matrix.name }})
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: linux-x86_64
-          - os: macos-latest
-            name: macos-arm64
-
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-
-      - name: Run soak test (30 minutes default)
+      - name: System info
         shell: bash
         run: |
-          DURATION="${{ github.event.inputs.soak_duration_minutes || '30' }}"
-          DURATION_SECS=$((DURATION * 60))
-          echo "Running soak test for ${DURATION} minutes (${DURATION_SECS}s)..."
-          zig build test-soak -- --duration "$DURATION_SECS" --report 60
+          uname -a
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            echo "Kernel: $(uname -r)"
+          fi
+      - name: Stress run
+        shell: bash
+        run: |
+          N="${{ github.event.inputs.n_iters || '500' }}" \
+          TIMEOUT_SECS="${{ github.event.inputs.timeout_per_iter_secs || '180' }}" \
+          scripts/stress_test.sh ${{ matrix.build_args }}
+      - name: Upload failed-iteration logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-logs-${{ matrix.name }}
+          path: tmp/stress/
+          if-no-files-found: ignore
+          retention-days: 30
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # Memory Leak Detection (Linux only - uses valgrind)
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  memory-check:
-    name: Memory Check (Valgrind)
-    timeout-minutes: 20
+  # ─────────────────────────────────────────────────────────────────────
+  # Valgrind on Linux. Detects definite leaks the runtime's own
+  # `pendingCount == 0` assert can't catch (e.g. heap leaks below
+  # the reactor layer). Best-effort — Valgrind doesn't always play
+  # nicely with Zig's debug allocator, so this is allowed to skip
+  # when the test binary path can't be discovered.
+  # ─────────────────────────────────────────────────────────────────────
+  valgrind:
+    name: Valgrind (linux-x86_64)
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-
       - name: Install Valgrind
         run: sudo apt-get update && sudo apt-get install -y valgrind
-
-      - name: Build test binary
+      - name: Build test binary (Debug)
         run: zig build test -Doptimize=Debug
-
-      - name: Run memory check
+      - name: Run Valgrind
+        shell: bash
         run: |
-          # Find test binary — Zig 0.15.x puts it under .zig-cache/o/<hash>/test
+          set -e
+          # Zig 0.16 stashes the test binary in .zig-cache/o/<hash>/test
           TEST_BIN=$(find .zig-cache -type f -executable -name "test" 2>/dev/null | head -1)
           if [ -z "$TEST_BIN" ]; then
-            # Fallback: look for any executable test binary
-            TEST_BIN=$(find .zig-cache -type f -executable 2>/dev/null | grep -E '/test$' | head -1)
+            echo "::warning::Test binary not found — skipping Valgrind"
+            exit 0
           fi
-
-          if [ -n "$TEST_BIN" ]; then
-            echo "Running valgrind on $TEST_BIN"
-            valgrind --leak-check=full \
-                     --show-leak-kinds=definite,possible \
-                     --error-exitcode=1 \
-                     --track-origins=yes \
-                     "$TEST_BIN" 2>&1 | tee valgrind.log
-
-            # Check for leaks
-            if grep -q "definitely lost: [^0]" valgrind.log; then
-              echo "Memory leaks detected!"
-              exit 1
-            fi
-            echo "No memory leaks detected"
-          else
-            echo "::warning::Test binary not found in .zig-cache — skipping valgrind"
+          echo "Running Valgrind on $TEST_BIN"
+          valgrind --leak-check=full \
+                   --show-leak-kinds=definite \
+                   --error-exitcode=1 \
+                   --track-origins=yes \
+                   --gen-suppressions=all \
+                   "$TEST_BIN" 2>&1 | tee valgrind.log
+          if grep -qE "definitely lost: [^0]" valgrind.log; then
+            echo "::error::Definite memory leaks detected"
+            exit 1
           fi
-        continue-on-error: true  # Valgrind may have issues with Zig runtime
+          echo "No definite leaks"
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # Cross-Architecture Consistency
-  # Runs same tests on ARM and x86 to catch memory ordering bugs
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  cross-arch-consistency:
-    name: Cross-Arch Consistency
-    needs: [exhaustive-concurrency]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check ARM vs x86 results
-        run: |
-          echo "If both exhaustive-concurrency jobs passed on ARM and x86,"
-          echo "the memory ordering is likely correct across architectures."
-          echo ""
-          echo "ARM results: ${{ needs.exhaustive-concurrency.result }}"
-
-  # ═══════════════════════════════════════════════════════════════════════════
-  # Nightly Summary
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  nightly-summary:
-    name: Nightly Summary
-    needs:
-      - exhaustive-concurrency
-      - integration
-      - exhaustive-stress
-      - soak-test
-      - memory-check
-      - cross-arch-consistency
+  # ─────────────────────────────────────────────────────────────────────
+  # Cross-architecture consistency: same suite must pass on x86_64 AND
+  # arm64. If only one fails, that's strong evidence of a memory-ordering
+  # bug specific to the failing architecture's relaxed memory model.
+  # ─────────────────────────────────────────────────────────────────────
+  cross-arch:
+    name: Cross-arch consistency
+    needs: [stress-deep]
     runs-on: ubuntu-latest
     if: always()
     steps:
-      - name: Summary
+      - shell: bash
+        run: |
+          # GitHub doesn't expose individual matrix outcomes, but
+          # `stress-deep.result` is `success` only when ALL matrix
+          # entries succeed. So `success` here means x86 and arm
+          # both passed.
+          got="${{ needs.stress-deep.result }}"
+          if [[ "$got" == "success" ]]; then
+            echo "Cross-arch consistency: PASS (all matrix entries green)"
+            exit 0
+          fi
+          echo "::warning::Cross-arch divergence — at least one (os, arch) failed"
+          echo "Inspect the matrix breakdown to identify which architecture(s)"
+          exit 1
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Aggregated summary — single status line per nightly run.
+  # ─────────────────────────────────────────────────────────────────────
+  nightly-summary:
+    name: Nightly Summary
+    needs: [stress-deep, valgrind, cross-arch]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - shell: bash
         run: |
           echo "## Nightly Test Results"
           echo ""
-          echo "| Test Suite | Result |"
-          echo "|------------|--------|"
-          echo "| Exhaustive Concurrency | ${{ needs.exhaustive-concurrency.result }} |"
-          echo "| Integration | ${{ needs.integration.result }} |"
-          echo "| Exhaustive Stress | ${{ needs.exhaustive-stress.result }} |"
-          echo "| Soak Test | ${{ needs.soak-test.result }} |"
-          echo "| Memory Check | ${{ needs.memory-check.result }} |"
-          echo "| Cross-Arch Consistency | ${{ needs.cross-arch-consistency.result }} |"
-          echo ""
+          echo "| Suite | Result |"
+          echo "|---|---|"
+          echo "| Stress (N=500, 6 entries) | ${{ needs.stress-deep.result }} |"
+          echo "| Valgrind | ${{ needs.valgrind.result }} |"
+          echo "| Cross-arch | ${{ needs.cross-arch.result }} |"
 
-          FAILED=0
-          if [[ "${{ needs.exhaustive-concurrency.result }}" == "failure" ]]; then
-            echo "Exhaustive concurrency tests failed"
-            FAILED=1
-          fi
-          if [[ "${{ needs.integration.result }}" == "failure" ]]; then
-            echo "Integration tests failed"
-            FAILED=1
-          fi
-          if [[ "${{ needs.exhaustive-stress.result }}" == "failure" ]]; then
-            echo "Exhaustive stress tests failed"
-            FAILED=1
-          fi
-          if [[ "${{ needs.soak-test.result }}" == "failure" ]]; then
-            echo "Soak test failed"
-            FAILED=1
-          fi
-
-          if [[ $FAILED -eq 0 ]]; then
-            echo "All nightly tests passed!"
-          else
-            exit 1
-          fi
+          fail=0
+          if [[ "${{ needs.stress-deep.result }}" != "success" ]]; then fail=1; fi
+          if [[ "${{ needs.valgrind.result }}" != "success" ]]; then fail=1; fi
+          if [[ "${{ needs.cross-arch.result }}" != "success" ]]; then fail=1; fi
+          [[ $fail -eq 0 ]] || exit 1

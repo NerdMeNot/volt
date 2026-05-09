@@ -116,10 +116,10 @@ jobs:
 
           | Platform | Backend | Status |
           |----------|---------|--------|
-          | macOS arm64/x86_64 | kqueue | runtime + CI |
-          | Linux x86_64/arm64 | epoll  | runtime + CI |
-          | Linux x86_64       | io_uring | parallel backend; cross-compile + CI |
-          | Windows x86_64/arm64 | IOCP | cross-compile only — see reactor.zig |
+          | macOS arm64/x86_64 | kqueue | runtime + native CI + N=500 nightly stress |
+          | Linux x86_64/arm64 | epoll  | runtime + native CI + N=500 nightly stress |
+          | Linux x86_64/arm64 | io_uring | runtime + native CI + N=500 nightly stress |
+          | Windows x86_64/arm64 | IOCP+AFD | cross-compile gate + native CI (after W1–W9) |
 
           ### Requirements
           - **Zig**: ${{ env.ZIG_VERSION }} or compatible

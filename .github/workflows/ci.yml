@@ -9,11 +9,26 @@ on:
 env:
   ZIG_VERSION: "0.16.0"
 
-jobs:
-  # ───────────────────────────────────────────────────────────────────────
-  # Quick gate: formatting check.
-  # ───────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# CI structure
+# ─────────────────────────────────────────────────────────────────────────
+#
+# 1. format       — `zig fmt --check`. Trivial gate, runs first.
+# 2. cross-compile — every (target, backend) parses + type-checks.
+# 3. test         — full unit + integration suite, native, on every (os,
+#                   backend) we ship: Darwin/kqueue x86+arm, Linux/epoll
+#                   x86+arm, Linux/iouring x86+arm. (Windows/IOCP is
+#                   cross-compile-only until W1–W8 land the native arms.)
+# 4. stress-pr    — `scripts/stress_test.sh` at N=50 on each first-tier
+#                   (os, backend) — Linux/epoll, Linux/iouring,
+#                   Darwin/kqueue. Catches schedule-sensitive flakes that
+#                   pass under one seed but fail under another.
+# 5. ci-success   — single boolean gate; required check on PRs.
+#
+# `allow_failure: true` is GONE — iouring is now a real ship-blocker.
+# ─────────────────────────────────────────────────────────────────────────
 
+jobs:
   format:
     name: zig fmt
     runs-on: ubuntu-latest
@@ -25,74 +40,6 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       - name: Check formatting
         run: zig fmt --check src/ bench/ examples/
-
-  # ───────────────────────────────────────────────────────────────────────
-  # Native test matrix.
-  #
-  # v1.0 ships kqueue (Darwin/BSD) and epoll (Linux) as default reactor
-  # backends. Windows is cross-compile validated only — see the
-  # `cross-compile` job below and `src/io/reactor.zig` for the status note.
-  # ───────────────────────────────────────────────────────────────────────
-
-  test:
-    name: Test (${{ matrix.name }})
-    needs: format
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: linux-x86_64-epoll
-          - os: ubuntu-22.04-arm
-            name: linux-arm64-epoll
-          - os: ubuntu-latest
-            name: linux-x86_64-iouring
-            build_args: -Dreactor=iouring
-            # io_uring backend's cancel-CQE handling isn't fully sound
-            # yet (cancelled SQEs still produce CQEs that the poll loop
-            # delivers; see reactor_iouring.zig comment on
-            # unregisterWait). Tests that exercise cancel-during-I/O
-            # may flake on this matrix entry until that's hardened.
-            # Marked allowed-to-fail so it doesn't gate the build but
-            # keeps the backend exercised so signature drift is caught.
-            allow_failure: true
-          - os: ubuntu-22.04-arm
-            name: linux-arm64-iouring
-            build_args: -Dreactor=iouring
-            allow_failure: true
-          - os: macos-latest
-            name: macos-arm64-kqueue
-          - os: macos-15-intel
-            name: macos-x86_64-kqueue
-    runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.allow_failure || false }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-      - name: System info
-        shell: bash
-        run: |
-          uname -a
-          if [[ "${{ runner.os }}" == "Linux" ]]; then
-            echo "Kernel: $(uname -r)"
-            grep -E '(io_uring|epoll)' /proc/kallsyms 2>/dev/null | head -3 || true
-          fi
-      - name: Unit + integration tests
-        run: zig build test ${{ matrix.build_args }}
-      - name: Build benchmarks (ReleaseFast smoke)
-        run: zig build bench ${{ matrix.build_args }} --summary all -- --help || true
-
-  # ───────────────────────────────────────────────────────────────────────
-  # Cross-compile gate. The IOCP reactor (`src/io/reactor_iocp.zig`)
-  # cross-compiles cleanly for x86_64 / aarch64 Windows; the io_uring
-  # reactor (`src/io/reactor_iouring.zig`) cross-compiles cleanly for
-  # Linux. Both are exercised here so API drift is caught even though
-  # they aren't the default backends.
-  # ───────────────────────────────────────────────────────────────────────
 
   cross-compile:
     name: Cross-compile (${{ matrix.target }})
@@ -117,24 +64,100 @@ jobs:
       - name: Cross-compile build-lib
         run: zig build-lib src/lib.zig -target ${{ matrix.target }} -lc -fno-emit-bin
 
-  # ───────────────────────────────────────────────────────────────────────
-  # CI pass/fail summary.
-  # ───────────────────────────────────────────────────────────────────────
+  test:
+    name: Test (${{ matrix.name }})
+    needs: format
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 — epoll + io_uring side-by-side.
+          - { os: ubuntu-latest,    name: linux-x86_64-epoll,   build_args: "" }
+          - { os: ubuntu-latest,    name: linux-x86_64-iouring, build_args: "-Dreactor=iouring" }
+          # Linux ARM64.
+          - { os: ubuntu-22.04-arm, name: linux-arm64-epoll,    build_args: "" }
+          - { os: ubuntu-22.04-arm, name: linux-arm64-iouring,  build_args: "-Dreactor=iouring" }
+          # Darwin (kqueue is the only backend).
+          - { os: macos-latest,     name: macos-arm64-kqueue,   build_args: "" }
+          - { os: macos-15-intel,   name: macos-x86_64-kqueue,  build_args: "" }
+          # Windows IOCP — uncomment once W1–W8 land the native syscall arms.
+          # - { os: windows-latest, name: windows-x86_64-iocp,  build_args: "" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: System info
+        shell: bash
+        run: |
+          uname -a
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            echo "Kernel: $(uname -r)"
+            grep -E '(io_uring|epoll)' /proc/kallsyms 2>/dev/null | head -3 || true
+          fi
+      - name: Unit + integration tests
+        run: zig build test ${{ matrix.build_args }}
+
+  # Stress gate — runs the full suite under random seeds, with a per-
+  # iteration timeout. N=50 is the PR-tier budget; nightly runs N=500.
+  # Catches:
+  #   - schedule-sensitive flakes (different seed → different worker
+  #     dispatch order → exposes dormant races)
+  #   - lost-wake bugs (each iteration drives the runtime through full
+  #     init + teardown; the quiescence ack panics if shutdown wedges)
+  stress-pr:
+    name: Stress N=50 (${{ matrix.name }})
+    needs: format
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux-x86_64-epoll,   build_args: "" }
+          - { os: ubuntu-latest, name: linux-x86_64-iouring, build_args: "-Dreactor=iouring" }
+          - { os: macos-latest,  name: macos-arm64-kqueue,   build_args: "" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Stress run (N=50)
+        shell: bash
+        run: N=50 TIMEOUT_SECS=120 scripts/stress_test.sh ${{ matrix.build_args }}
+      - name: Upload failed-iteration logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-logs-${{ matrix.name }}
+          path: tmp/stress/
+          if-no-files-found: ignore
+          retention-days: 14
 
   ci-success:
     name: CI Success
-    needs: [test, cross-compile]
+    needs: [test, cross-compile, stress-pr]
     runs-on: ubuntu-latest
     if: always()
     steps:
       - run: |
-          # `test` aggregates the matrix incl. allow_failure entries —
-          # if any non-allowed entry failed, the matrix is .failure(),
-          # which we treat as overall fail. allow_failure entries
-          # (currently io_uring) flag their failure on the run page
-          # without breaking the gate.
-          if [[ "${{ needs.test.result }}" != "success" ]] || [[ "${{ needs.cross-compile.result }}" != "success" ]]; then
-            echo "CI failed: test=${{ needs.test.result }} cross-compile=${{ needs.cross-compile.result }}"
+          fail=0
+          for r in test cross-compile stress-pr; do
+            case "$r" in
+              test)          got="${{ needs.test.result }}" ;;
+              cross-compile) got="${{ needs.cross-compile.result }}" ;;
+              stress-pr)     got="${{ needs.stress-pr.result }}" ;;
+            esac
+            if [[ "$got" != "success" ]]; then
+              echo "::error::$r → $got"
+              fail=1
+            fi
+          done
+          if [[ $fail -ne 0 ]]; then
             exit 1
           fi
           echo "All CI checks passed."
