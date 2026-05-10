@@ -35,6 +35,7 @@
 //!   primitive, so we never recursively re-enter the same mutex.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Coroutine = @import("../coroutine/coroutine.zig").Coroutine;
 const Park = @import("../scheduler/park.zig").Park;
@@ -42,6 +43,28 @@ const thread = @import("../internal/thread.zig");
 
 const UNLOCKED: u8 = 0;
 const LOCKED: u8 = 1;
+
+/// Userspace spin attempts before committing to a park. Each attempt is
+/// `SPIN_HINTS_PER_ITER` PAUSE-equivalent hints (~1 ns each on x86 with
+/// the `pause` instruction; ARM emits `yield`). Total spin budget on
+/// contention: SPIN_ITERS × SPIN_HINTS_PER_ITER ≈ 120 ns.
+///
+/// Why spin: a coroutine ctx-swap costs ~30–60 ns minimum (worker dispatch
+/// + scheduler logic). If the lock is going to be released within ~100 ns
+/// (the common case for short critical sections), spinning is cheaper than
+/// parking + waking. If the hold is longer, the spin completes quickly
+/// and we fall through to the park — no perf regression vs no-spin.
+///
+/// Comptime-gated: zero in Debug builds so contention bugs (e.g. holding
+/// a Mutex across an `await`) surface as immediate parking instead of
+/// being masked by a tight spin. ReleaseFast/ReleaseSafe spin normally.
+///
+/// Inspired by Go's `sync.Mutex` (active_spin=4, active_spin_cnt=30).
+/// We match Go's iteration count; per-iter hint count is 12 (vs Go's 30)
+/// — coroutines have lower base ctx-swap cost than goroutines, so the
+/// crossover where parking wins comes sooner. Tunable via Runtime.Config.
+const spin_iters: u32 = if (builtin.mode == .Debug) 0 else 4;
+const spin_hints_per_iter: u32 = if (builtin.mode == .Debug) 0 else 12;
 
 pub const Mutex = struct {
     const Waiter = struct {
@@ -95,6 +118,20 @@ pub const Mutex = struct {
     pub fn lock(self: *Mutex) error{Cancelled}!void {
         // Fast path: uncontended.
         if (self.tryLock()) return;
+
+        // Spin path: brief userspace spin before committing to park.
+        // Catches the common short-hold case where the lock holder will
+        // release within ~100ns. Comptime-zero in Debug so contention
+        // bugs surface immediately instead of being masked by spinning.
+        // (See `spin_iters` / `spin_hints_per_iter` consts above.)
+        if (comptime spin_iters > 0) {
+            var iter: u32 = 0;
+            while (iter < spin_iters) : (iter += 1) {
+                var p: u32 = 0;
+                while (p < spin_hints_per_iter) : (p += 1) std.atomic.spinLoopHint();
+                if (self.tryLock()) return;
+            }
+        }
 
         // Slow path: enqueue and park.
         var waiter: Waiter = .{};
