@@ -66,13 +66,13 @@ pub const done_singleton: EventSource = .{ .subscribe_fn = &doneSubscribe };
 fn doneSubscribe(opaque_self: *anyopaque, coro: *Coroutine) void {
     _ = opaque_self;
     coro.done_flag.store(true, .release);
-    coro.join_park.unpark();
 
-    // Recycle the coroutine's stack into the runtime's stack pool —
-    // the user's Job/Task handle still references the Coroutine
-    // struct (for state queries), but no one re-enters the stack
-    // memory. `Worker.deinit` will see `stack_pooled = true` and
-    // skip freeing.
+    // Recycle the coroutine's stack into the runtime's stack pool
+    // BEFORE unparking the joiner. If we unparked first, the joiner
+    // could resume on a different worker, return from join(), and
+    // immediately spawn a new coroutine that calls `pool.acquire()` —
+    // racing the recycle. Pool would miss → mmap → munmap on
+    // overflow. Recycling first guarantees the next acquire hits.
     //
     // We DON'T recycle the root coroutine's stack — the bootstrap
     // thread runs on it and keeps polling `until_done` from worker.run
@@ -96,6 +96,8 @@ fn doneSubscribe(opaque_self: *anyopaque, coro: *Coroutine) void {
             rt.stack_pool.release(gs);
         }
     }
+
+    coro.join_park.unpark();
 
     if (coro.is_root) {
         // The bootstrap thread in `runUntilDone` polls `until_done.isDone()`
