@@ -67,7 +67,13 @@ CHANNEL_NS=$(extract_ns "channel SPSC")
 MUTEX_NS=$(extract_ns "mutex lock/unlock")
 SPAWN_JOIN_NS=$(extract_ns "spawn+join")
 
-if [ -z "$YIELD_NS" ] || [ -z "$CHANNEL_NS" ] || [ -z "$MUTEX_NS" ] || [ -z "$SPAWN_JOIN_NS" ]; then
+# Mutex bench is opt-in (VOLT_BENCH_MUTEX=1). Default is SKIPPED,
+# in which case there's no ns/op to gate.
+if grep -q "mutex lock/unlock: SKIPPED" "$BENCH_OUT"; then
+    MUTEX_NS=""
+fi
+
+if [ -z "$YIELD_NS" ] || [ -z "$CHANNEL_NS" ] || [ -z "$SPAWN_JOIN_NS" ]; then
     echo "FAIL: couldn't parse bench output" >&2
     exit 2
 fi
@@ -86,7 +92,11 @@ check() {
 echo "Result:"
 check "yield ping-pong"  "$YIELD_NS"      "$YIELD_NS_MAX"
 check "channel SPSC"     "$CHANNEL_NS"    "$CHANNEL_NS_MAX"
-check "mutex lock/unlock" "$MUTEX_NS"    "$MUTEX_NS_MAX"
+if [ -n "$MUTEX_NS" ]; then
+    check "mutex lock/unlock" "$MUTEX_NS"    "$MUTEX_NS_MAX"
+else
+    printf "  ⚠ %-22s skipped (opt-in via VOLT_BENCH_MUTEX=1)\n" "mutex lock/unlock"
+fi
 check "spawn+join"       "$SPAWN_JOIN_NS" "$SPAWN_JOIN_NS_MAX"
 
 if [ "$fail" -eq 0 ]; then

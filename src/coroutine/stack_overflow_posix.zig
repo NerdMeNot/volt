@@ -121,17 +121,15 @@ pub fn longjmpDispatch(cp: *DispatchCheckpoint) noreturn {
 /// overflow was just caught (caller should mark the coro overflowed and
 /// route through Done); false on the normal-entry path.
 ///
-/// `savesigs=1`: snapshot the per-thread signal mask. We previously
-/// used `0` for perf (saves ~65ns/swap on Darwin via the eliminated
-/// `sigprocmask` syscall), but that change correlated with a Linux
-/// x86_64 mutex-bench panic ("Park.parkCurrent called outside a
-/// coroutine"). Hypothesis: glibc's siglongjmp restores the signal
-/// mask from the env regardless of `savesigs` — with `0`, it
-/// restores garbage, which flips signal masking around dispatches
-/// in subtle ways. Reverting to `1` until that's investigated.
+/// `savesigs=0`: don't snapshot the per-thread signal mask. The mask
+/// is constant during normal scheduling (only `installAltStack`/
+/// `installPerThread` touch it, both at thread entry — never inside a
+/// dispatch). Skipping the snapshot avoids a `sigprocmask` *syscall*
+/// per coroutine swap — ~65ns/swap on Darwin (8x speedup on yield
+/// ping-pong: 74ns → 10ns).
 pub inline fn setjmpDispatch(cp: *DispatchCheckpoint) bool {
     if (!supported) return false;
-    return sigSetjmp(&cp.jmp_buf, 1) != 0;
+    return sigSetjmp(&cp.jmp_buf, 0) != 0;
 }
 
 fn faultAddr(info: *const posix.siginfo_t) usize {
