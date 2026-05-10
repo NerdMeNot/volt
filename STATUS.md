@@ -39,6 +39,19 @@
 | S2 | ✅ README + backend-parity + release notes updated to v1 framing; CHANGELOG.md updated |
 | S3 | ⏳ Manual: tag `v1.0.0-zig0.16.0` after merging `scheduler-rewrite` → `main` |
 
+## Performance (Apple Silicon arm64, ReleaseFast)
+
+`zig build bench` on this Mac:
+
+| Benchmark | Result | Notes |
+|---|---|---|
+| Yield ping-pong (one-way ctx switch) | **74 ns/op** | Beats Go (~150ns); rivals Tokio (50-100ns) |
+| Channel SPSC (cap=16) | **208 ns/op** | On par with Go channels (200-500ns) |
+| Mutex lock/unlock | **1468 ns/op** | Includes contention path |
+| spawn+join | **13995 ns/op (14µs)** | Includes the join cost; Go spawn-only is ~3µs. The post-v1 perf target. |
+
+Architectural-correctness work this session (seq_cst on cancel/park, mutex-held reactor register, quiescence ack) added microsecond-scale overhead on cancel paths but doesn't touch the hot yield/channel/dispatch loops.
+
 ## v1 platform support
 
 | Target | Backend | Tier |
