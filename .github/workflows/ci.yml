@@ -105,6 +105,29 @@ jobs:
       - name: Unit + integration tests
         run: zig build test ${{ matrix.build_args }}
 
+  # Bench gate — runs the core benchmarks (zig build bench) and fails
+  # the PR if any metric exceeds its ceiling. Catches perf regressions
+  # before they land. Thresholds defined in scripts/bench_gate.sh.
+  bench-gate:
+    name: Bench gate (${{ matrix.name }})
+    needs: format
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux-x86_64-epoll }
+          - { os: macos-latest,  name: macos-arm64-kqueue }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Bench gate
+        run: scripts/bench_gate.sh
+
   # Stress gate — runs the full suite under random seeds, with a per-
   # iteration timeout. N=50 is the PR-tier budget; nightly runs N=500.
   # Catches:
@@ -144,17 +167,18 @@ jobs:
 
   ci-success:
     name: CI Success
-    needs: [test, cross-compile, stress-pr]
+    needs: [test, cross-compile, stress-pr, bench-gate]
     runs-on: ubuntu-latest
     if: always()
     steps:
       - run: |
           fail=0
-          for r in test cross-compile stress-pr; do
+          for r in test cross-compile stress-pr bench-gate; do
             case "$r" in
               test)          got="${{ needs.test.result }}" ;;
               cross-compile) got="${{ needs.cross-compile.result }}" ;;
               stress-pr)     got="${{ needs.stress-pr.result }}" ;;
+              bench-gate)    got="${{ needs.bench-gate.result }}" ;;
             esac
             if [[ "$got" != "success" ]]; then
               echo "::error::$r → $got"

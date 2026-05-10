@@ -82,6 +82,24 @@ jobs:
           fi
       - run: zig build test ${{ matrix.build_args }}
 
+  bench-gate:
+    name: Bench gate (${{ matrix.name }})
+    needs: format
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux-x86_64-epoll }
+          - { os: macos-latest,  name: macos-arm64-kqueue }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: scripts/bench_gate.sh
+
   stress:
     name: Stress N=50 (${{ matrix.name }})
     needs: format
