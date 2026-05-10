@@ -253,9 +253,42 @@ pub const Runtime = struct {
         std.debug.assert(self.quiesced_count.load(.acquire) <= self.workers.len);
 
         if (self.blocking_pool.load(.acquire)) |pool| pool.deinit();
-        // Workers free any stack that wasn't pooled (i.e. coroutines
-        // still alive at runtime tear-down). After workers, the pool's
-        // own deinit munmaps everything that was pooled.
+
+        // Defense-in-depth leak gate. With P1's rendezvous, every
+        // coroutine should be reclaimed before deinit (Done.subscribe ↔
+        // destroyJob/destroyTask). Anything still in `live_coroutines`
+        // at deinit time is a user-visible leak — they forgot to call
+        // destroyJob/destroyTask on a Job/Task they spawned. Drain the
+        // list so we don't leak the structs / extras / stacks; print
+        // a warning so the leak is observable.
+        {
+            var leaked: usize = 0;
+            self.live_mutex.lock();
+            var cur = self.live_coroutines;
+            while (cur) |coro| {
+                const next = coro.next_alive;
+                coro.prev_alive = null;
+                coro.next_alive = null;
+                coro.destroy_extras_fn(self.allocator, coro);
+                if (!coro.stack_pooled.load(.acquire)) {
+                    stack_mod.free(self.allocator, coro.stack);
+                }
+                self.allocator.destroy(coro);
+                leaked += 1;
+                cur = next;
+            }
+            self.live_coroutines = null;
+            self.live_mutex.unlock();
+            if (leaked > 0) {
+                std.debug.print(
+                    "[runtime.deinit] {d} coroutine(s) still alive at " ++
+                        "shutdown — caller forgot destroyJob/destroyTask. " ++
+                        "Reclaimed defensively.\n",
+                    .{leaked},
+                );
+            }
+        }
+
         for (self.workers) |*w| w.deinit(self.allocator);
         self.allocator.free(self.workers);
         self.stack_pool.deinit();
@@ -558,24 +591,59 @@ pub const Runtime = struct {
         comptime user_fn: anytype,
         args: anytype,
     ) !spawn_mod.Created(@TypeOf(user_fn)) {
+        // Failure-cleanup state machine. We need different unwind
+        // actions depending on which step failed:
+        //   - stack pulled from pool but spawn_mod.create not yet called:
+        //     return stack to pool.
+        //   - spawn_mod.create succeeded, later step (pushOwned) failed:
+        //     free everything `created` owns (struct + extras + stack).
+        // Tracking the stage explicitly is clearer than chained
+        // errdefers and avoids the double-free that the layered
+        // errdefer-on-recycled + errdefer-on-created shape produced.
+        var stage: enum { initial, has_recycled, has_created } = .initial;
         const recycled = self.stack_pool.acquire(stack_mod.default_reserved);
-        const created = try spawn_mod.create(
+        if (recycled != null) stage = .has_recycled;
+
+        var created: spawn_mod.Created(@TypeOf(user_fn)) = undefined;
+        errdefer switch (stage) {
+            .initial => {},
+            .has_recycled => if (recycled) |gs| self.stack_pool.release(gs),
+            .has_created => {
+                created.coro.destroy_extras_fn(self.allocator, created.coro);
+                if (!created.coro.stack_pooled.load(.acquire)) {
+                    stack_mod.free(self.allocator, created.coro.stack);
+                }
+                self.allocator.destroy(created.coro);
+            },
+        };
+
+        created = try spawn_mod.create(
             self.allocator,
             .{ .reserved = stack_mod.default_reserved },
             recycled,
             user_fn,
             args,
         );
+        // Ownership of the recycled stack is now inside `created`.
+        // Bump stage so the errdefer no longer tries to return it to
+        // the pool (would double-account vs the `has_created` branch).
+        stage = .has_created;
+
         // Capture the parent for async-backtrace ancestry.
         if (currentCoroutine()) |parent| {
             created.coro.parent_id = @intFromPtr(parent);
         }
-        self.registerLive(created.coro);
+
         const w = currentWorker() orelse @panic(
             "Runtime.createCoroutine called outside a worker thread. " ++
                 "Use Runtime.spawnRoot from the bootstrap thread instead.",
         );
+        // Push to deque BEFORE registering live: if pushOwned fails
+        // (OOM growing the deque), the errdefer cleans `created` —
+        // unwinding a registerLive would also race with snapshot
+        // iterators that hold `live_mutex`.
         try w.pushOwned(created.coro);
+        self.registerLive(created.coro);
         // Wake a parked sibling so it has a chance to steal. Same reasoning
         // as `schedule`: without this, parallelism collapses on bursty
         // spawn patterns.

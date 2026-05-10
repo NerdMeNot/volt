@@ -16,10 +16,17 @@ pub fn spawn(
     const rt = runtime_mod.currentRuntime() orelse
         @panic("volt.spawn called outside a runtime — use volt.run(...) first");
 
-    const created = try rt.createCoroutine(user_fn, args);
-
+    // Allocate the Task wrapper FIRST. If that fails we haven't yet
+    // launched a coroutine, so there's nothing to clean up. The
+    // alternative (createCoroutine first, then Task) leaks the
+    // coroutine on Task-alloc failure — the coro is already running
+    // on a worker but no handle exists, so neither destroyTask nor
+    // join can fire the lifecycle rendezvous.
     const T = TaskMod.Task(@TypeOf(user_fn));
     const task = try rt.allocator.create(T);
+    errdefer rt.allocator.destroy(task);
+
+    const created = try rt.createCoroutine(user_fn, args);
     task.* = .{
         .job = .{ .coro = created.coro },
         .result = created.result_ptr,
