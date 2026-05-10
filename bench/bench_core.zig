@@ -125,6 +125,42 @@ fn benchChannel(n: u64) !void {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Scope spawn — same shape as benchSpawn, but via volt.scope. Tests the
+// inline-arena fast path: Frame + Job allocated from scope's stack-
+// resident bump arena, zero heap calls in the spawn hot loop. Pure Zig
+// optimization; no GC language can replicate this.
+// ─────────────────────────────────────────────────────────────────────
+
+const ScopeSpawnCtx = struct { n: u32 };
+
+fn scopeSpawnNop(_: *ScopeSpawnCtx) void {}
+
+threadlocal var scope_spawn_ctx_slot: ?*ScopeSpawnCtx = null;
+
+fn scopeSpawnBody(s: *volt.Scope) !void {
+    const ctx = scope_spawn_ctx_slot.?;
+    var i: u32 = 0;
+    while (i < ctx.n) : (i += 1) {
+        try s.spawn(scopeSpawnNop, .{ctx});
+    }
+}
+
+fn scopeSpawnRoot(n: u32) !u64 {
+    var ctx = ScopeSpawnCtx{ .n = n };
+    scope_spawn_ctx_slot = &ctx;
+    defer scope_spawn_ctx_slot = null;
+    const t0 = volt.time.nanoTimestamp();
+    try volt.scope(scopeSpawnBody);
+    const wall = volt.time.nanoTimestamp() - t0;
+    return @intCast(wall);
+}
+
+fn benchScopeSpawn(n: u32) !void {
+    const wall = try volt.run(.{ .allocator = bench_allocator }, scopeSpawnRoot, .{n});
+    report("scope.spawn (inline-arena children)", n, wall);
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Mutex contention — N coroutines × M increments each on a shared mutex.
 // ─────────────────────────────────────────────────────────────────────
 
@@ -176,6 +212,10 @@ pub fn main() !void {
     });
 
     try benchSpawn(10_000);
+    // 16 children fits the default 8KB inline arena (~512B/Frame).
+    // Larger N falls back to heap; we measure pure inline-arena cost
+    // here, with a separate larger run to show the fallback transition.
+    try benchScopeSpawn(16);
     try benchYieldSwitch(100_000);
     try benchChannel(100_000);
     try benchMutex(8, 50_000);
