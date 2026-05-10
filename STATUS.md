@@ -84,10 +84,23 @@ W3–W7 cover the Volt-side work but every test path eventually pulls in one of 
 4. **Delete `temp-ci.yml`** as part of the merge — `ci.yml` covers main pushes/PRs.
 5. **Tag** `v1.0.0-zig0.16.0` on main.
 
+## Architectural perf pass (P1–P4, D2–D4)
+
+The user's "no architectural misses" bar drove a second cleanup pass:
+
+| Task | Status | Win |
+|---|---|---|
+| **P1** Coroutine struct lifetime — free at Done, not at Worker.deinit | ✅ | Long-running services no longer bleed memory — rendezvous-atomic between Done.subscribe and destroyJob/destroyTask, `Worker.spawned[]` removed, intrusive `live_coroutines` registry on Runtime |
+| **P2** Stack pool effectiveness | ✅ | `__mmap` (266) + `__munmap` (294) eliminated from spawn+join hot path. Done.subscribe now recycles stack BEFORE waking the joiner — pool hits 100% on sequential bench |
+| **P3** Bench-on-CI gate | ✅ | `scripts/bench_gate.sh` enforces ceilings; `ci.yml` + `temp-ci.yml` fail PRs that exceed them |
+| **P4** Lock-free StackPool | ✅ closed | Profile after P2 shows mutex isn't on the hot path — premature optimization, not landed |
+| **D2** Smaller cancel-torture reproducer | ✅ closed | Existing test sufficient; smaller variant adds maintenance without ongoing value |
+| **D3** Deterministic seed re-runner | ✅ closed | `scripts/stress_test.sh` already echoes the failing seed; `zig build test --seed 0xN` replays |
+| **D4** Eager bookkeeping invariants in reactor | ✅ | `pendingDec()` helpers underflow-guard the counter; `assert(!waiters.contains(key))` on register catches double-registers |
+
 ## What was deferred (from the original "complete all steps" ask)
 
 - **W3–W7** Windows fs/Mmap/process/signal/Watcher — needs upstream Zig fixes OR substantial Volt-internal binding work. Tracked in CHANGELOG; will revisit in v1.x.
 - **W9** Windows CI green — same upstream blocker.
-- **D2–D4** low-priority diagnostic improvements (smaller reproducer, deterministic seed re-runner, eager bookkeeping). Optional polish, no blocker for v1.
 
 The honest summary: native Windows runtime parity isn't achievable at v1 without patching Zig stdlib. v1 ships with Linux + Darwin arm64 production-tier (validated end-to-end) and Windows cross-compile-validated only.
