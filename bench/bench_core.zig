@@ -124,6 +124,14 @@ const MuCtx = struct {
 };
 
 fn muIncrementer(ctx: *MuCtx) !void {
+    // Diagnostic for the Linux x86 panic: print currentCoroutine at
+    // entry. If it's null here, dispatch isn't setting TLS for this
+    // call site under ReleaseFast on Linux x86. Single print per coro
+    // (not in the loop) so it doesn't dominate the bench.
+    const entry_coro = volt.scheduler.current.currentCoroutine();
+    if (entry_coro == null) {
+        std.debug.print("[diag] muIncrementer entry: currentCoroutine() == null!\n", .{});
+    }
     var i: u32 = 0;
     while (i < ctx.iters) : (i += 1) {
         try ctx.mu.lock();
