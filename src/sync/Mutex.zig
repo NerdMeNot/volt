@@ -1,38 +1,64 @@
 //! Mutex — async mutex for coroutines.
 //!
-//! Fair (FIFO waiter list), zero-allocation, RAII via `defer mu.unlock()`.
-//! Built on `Park` (the same single-atomic substrate the channel waiter
-//! list uses), with a fast-path lock-free CAS for the uncontended case.
+//! Fair (strict FIFO), zero-allocation, RAII via `defer mu.unlock()`.
+//! Built on a lock-free MCS-style queue with `*Coroutine` nodes
+//! intrusive in the Coroutine struct. Pure Zig idiom: no allocator
+//! anywhere in lock/unlock; no internal `std.Thread.Mutex` for the
+//! waiter list.
 //!
 //! ## Usage
 //!
 //! ```zig
 //! var mu = Mutex{};
-//! mu.lock();
+//! try mu.lock();
 //! defer mu.unlock();
 //! // critical section
 //! ```
 //!
-//! Or non-blocking:
-//!
-//! ```zig
-//! if (mu.tryLock()) {
-//!     defer mu.unlock();
-//!     // critical section
-//! }
-//! ```
-//!
 //! ## Design
 //!
-//! - `state` (atomic u8) — 0 = unlocked, 1 = locked. Fast path is a
-//!   single CAS for both lock and unlock.
-//! - On contention, the waiter takes a slow-path lock on `waiter_mutex`
-//!   (an internal sync mutex), enqueues itself, and parks. The unlocker
-//!   does a fast `state` CAS first; if successful, checks the waiter
-//!   list under `waiter_mutex` and wakes the head waiter.
-//! - The wake protocol mirrors `Channel.zig`'s post-M1 design: the
-//!   recheck inside the slow-path lock uses a no-wake variant of the
-//!   primitive, so we never recursively re-enter the same mutex.
+//! - **`tail: ?*Coroutine`** atomic. `null` = unlocked. Non-null =
+//!   most recent waiter in chain. Earlier waiters are reachable via
+//!   `mwait_next` pointers; the lock holder is implicit (the head of
+//!   the chain).
+//! - **Acquire** (`lock`): brief spin → `tail.swap(me)`. If the
+//!   previous tail was null, we're the head and we hold the lock.
+//!   Otherwise we link our predecessor's `mwait_next = me` and park.
+//! - **Release** (`unlock`): walk `mwait_next` to find the live
+//!   successor; skip any tombstoned (cancelled) waiters; hand the
+//!   lock to the live successor by setting their `mwait_granted` and
+//!   `unpark()`. If no successor exists, CAS `tail` from `me` to
+//!   `null`.
+//!
+//! ## Why MCS
+//!
+//! The earlier design used a `std.Thread.Mutex` to protect a flat
+//! waiter list. Under 8-way contention, that internal mutex was hot —
+//! ~200 ns/cycle of overhead. MCS replaces it with two atomic ops
+//! per cycle (the swap and the next-pointer store), eliminating the
+//! internal mutex entirely. FIFO fairness is preserved by construction
+//! (`tail.swap` is a total order).
+//!
+//! ## Cancellation
+//!
+//! A waiter cancelled before its grant arrives sets a tombstone
+//! (`mwait_cancelled = true`) and exits with `error.Cancelled` without
+//! touching the chain. The predecessor's eventual handoff sees the
+//! tombstone and skips past — searching forward for a live successor.
+//! If the cancelled waiter has no successor, the predecessor releases
+//! the lock cleanly via the standard tail CAS.
+//!
+//! Lock is NOT held on `error.Cancelled` return.
+//!
+//! ## Future work (v1.x)
+//!
+//! - **Same-worker continuation handoff**: when the live successor is
+//!   parked on the same worker as the unlocker, ctx-swap directly to
+//!   them (bypassing the scheduler dispatch). Saves ~300 ns per cycle
+//!   on the same-worker case. Requires worker-id tracking on the
+//!   parked waiter and changes to `Worker.dispatch` to handle the
+//!   "swap returned from a different coro than dispatched" path —
+//!   non-trivial, deferred to v1.x.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -40,10 +66,6 @@ const assert = std.debug.assert;
 const Coroutine = @import("../coroutine/coroutine.zig").Coroutine;
 const current = @import("../scheduler/current.zig");
 const Park = @import("../scheduler/park.zig").Park;
-const thread = @import("../internal/thread.zig");
-
-const UNLOCKED: u8 = 0;
-const LOCKED: u8 = 1;
 
 /// Deadlock detection — only compiled into Debug builds. Each Mutex
 /// remembers its current holder; each Coroutine remembers the Mutex
@@ -85,37 +107,18 @@ const spin_iters: u32 = if (builtin.mode == .Debug) 0 else 4;
 const spin_hints_per_iter: u32 = if (builtin.mode == .Debug) 0 else 12;
 
 pub const Mutex = struct {
-    const Waiter = struct {
-        park: Park = .{},
-        next: ?*Waiter = null,
-    };
-
-    const WaiterList = struct {
-        head: ?*Waiter = null,
-        tail: ?*Waiter = null,
-
-        fn pushBack(self: *@This(), w: *Waiter) void {
-            w.next = null;
-            if (self.tail) |t| t.next = w else self.head = w;
-            self.tail = w;
-        }
-
-        fn popFront(self: *@This()) ?*Waiter {
-            const w = self.head orelse return null;
-            self.head = w.next;
-            if (self.head == null) self.tail = null;
-            w.next = null;
-            return w;
-        }
-
-        fn isEmpty(self: *const @This()) bool {
-            return self.head == null;
-        }
-    };
-
-    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(UNLOCKED),
-    waiter_mutex: thread.Mutex = .{},
-    waiters: WaiterList = .{},
+    /// Tail of the MCS-style lock-free queue.
+    ///
+    /// - `null` → unlocked, no waiters.
+    /// - non-null → the lock is held; this pointer is the LATEST waiter
+    ///   in the FIFO chain. Earlier waiters can be walked via
+    ///   `mwait_next` pointers. The HEAD of the chain (current holder)
+    ///   is implicit — it's the coroutine that did the original swap
+    ///   with `pred=null`.
+    ///
+    /// FIFO fairness preserved: `tail.swap(me)` is a total order, so
+    /// the chain is in arrival order. No `waiter_mutex` needed.
+    tail: std.atomic.Value(?*Coroutine) = std.atomic.Value(?*Coroutine).init(null),
 
     /// Debug-only: current lock holder (or null). Comptime-elided in
     /// release builds — `?*Coroutine` becomes `void`, no struct bytes,
@@ -125,38 +128,42 @@ pub const Mutex = struct {
     else {},
 
     /// Try to acquire the lock without blocking. Returns true on success.
+    /// Requires a coroutine context — Volt's Mutex is coroutine-only;
+    /// use `std.Thread.Mutex` for OS-thread synchronization.
     pub fn tryLock(self: *Mutex) bool {
-        const got = self.state.cmpxchgStrong(UNLOCKED, LOCKED, .acquire, .monotonic) == null;
-        if (comptime debug_deadlock) {
-            if (got) {
-                if (current.currentCoroutine()) |me| {
-                    self.holder.store(@intFromPtr(me), .release);
-                }
+        const me = current.currentCoroutine() orelse
+            @panic("volt.sync.Mutex.tryLock requires a coroutine context");
+        const got = self.tail.cmpxchgStrong(null, me, .acquire, .monotonic) == null;
+        if (got) {
+            // Initialize my chain slot. No predecessor to set my.next, so
+            // I do it myself.
+            me.mwait_next.store(null, .monotonic);
+            if (comptime debug_deadlock) {
+                self.holder.store(@intFromPtr(me), .release);
             }
         }
         return got;
     }
 
-    /// Acquire the lock, suspending the coroutine if it's held.
+    /// Acquire the lock, parking the coroutine if it's held.
     /// Returns `error.Cancelled` if the coroutine is cancelled while
-    /// parked on the waiter list (waiter list invariants stay
-    /// intact — best-effort removal under the slow-path mutex).
+    /// queued.
     ///
-    /// API note: this used to return `void`, but the void variant
-    /// silently busy-looped on cancel since `parkCurrent` would
-    /// return `error.Cancelled` indefinitely. The error union is
-    /// the honest signature. Callers that don't care about
-    /// cancellation can `mu.lock() catch {}` — the lock is never
-    /// half-acquired on error.
+    /// Cancellation model:
+    /// - If we're cancelled BEFORE the grant arrives, we set our
+    ///   `mwait_cancelled` tombstone and exit with `error.Cancelled`.
+    ///   The lock is NOT held. We don't touch tail or our successor's
+    ///   chain link — the predecessor's eventual handoff sees the
+    ///   tombstone and skips past us to our successor (or releases
+    ///   the lock if we had none).
+    /// - If we get the grant and THEN observe cancellation, we hand
+    ///   off to our successor and exit with `error.Cancelled`. Symmetric
+    ///   to the cancellation-while-holding-the-lock case.
     pub fn lock(self: *Mutex) error{Cancelled}!void {
         // Fast path: uncontended.
         if (self.tryLock()) return;
 
         // Spin path: brief userspace spin before committing to park.
-        // Catches the common short-hold case where the lock holder will
-        // release within ~100ns. Comptime-zero in Debug so contention
-        // bugs surface immediately instead of being masked by spinning.
-        // (See `spin_iters` / `spin_hints_per_iter` consts above.)
         if (comptime spin_iters > 0) {
             var iter: u32 = 0;
             while (iter < spin_iters) : (iter += 1) {
@@ -166,102 +173,112 @@ pub const Mutex = struct {
             }
         }
 
-        // Debug deadlock check — walk the holder→waiting chain looking
-        // for a cycle that includes us. Catches A-locks-X-then-Y vs
-        // B-locks-Y-then-X classics. Comptime-gated; release builds
-        // skip this entirely.
+        const me = current.currentCoroutine() orelse
+            @panic("volt.sync.Mutex.lock requires a coroutine context");
+
+        // Debug deadlock check.
         if (comptime debug_deadlock) {
-            if (current.currentCoroutine()) |me| {
-                checkCycle(me, self);
-            }
+            checkCycle(me, self);
         }
 
-        // Slow path: enqueue and park.
-        var waiter: Waiter = .{};
-        self.waiter_mutex.lock();
-        // Re-check under the slow-path mutex. If the lock is now free
-        // (and no waiters ahead of us), grab it.
-        if (self.waiters.isEmpty() and self.tryLock()) {
-            self.waiter_mutex.unlock();
-            return;
-        }
-        self.waiters.pushBack(&waiter);
-        // Record we're waiting on THIS mutex so other coros' deadlock
-        // walks can follow the chain through us.
-        if (comptime debug_deadlock) {
-            if (current.currentCoroutine()) |me| {
+        // MCS enqueue.
+        me.mwait_next.store(null, .monotonic);
+        me.mwait_granted.store(false, .monotonic);
+        me.mwait_cancelled.store(false, .monotonic);
+
+        const pred_opt = self.tail.swap(me, .acq_rel);
+        if (pred_opt) |pred| {
+            pred.mwait_next.store(me, .release);
+
+            if (comptime debug_deadlock) {
                 me.waiting_on_mutex.store(@intFromPtr(self), .release);
             }
-        }
-        self.waiter_mutex.unlock();
 
-        // Park until the unlocker hands the lock to us.
-        waiter.park.parkCurrent() catch |err| switch (err) {
-            error.Cancelled => {
-                // Best-effort remove from waiter list. If we'd
-                // already been popped, the unlocker handed us the
-                // lock — surface it (caller becomes the holder).
-                self.waiter_mutex.lock();
-                const removed = self.removeWaiter(&waiter);
-                self.waiter_mutex.unlock();
-                if (comptime debug_deadlock) {
-                    if (current.currentCoroutine()) |me| {
+            // Park until grant arrives OR cancel fires. parkUncancellable
+            // registers current_park so cancel can wake us (but doesn't
+            // return error.Cancelled — we decide). The loop re-parks if
+            // we wake spuriously without grant.
+            while (!me.mwait_granted.load(.acquire)) {
+                if (me.cancel_flag.load(.acquire)) {
+                    // Cancelled before grant. Tombstone & exit. Predecessor's
+                    // handoff will skip past us via mwait_cancelled check.
+                    me.mwait_cancelled.store(true, .release);
+                    if (comptime debug_deadlock) {
                         me.waiting_on_mutex.store(0, .release);
                     }
+                    return error.Cancelled;
                 }
-                if (!removed) {
-                    // We were already handed the lock. The unlocker
-                    // moved `state` to LOCKED; we own it now. Caller
-                    // gets the lock despite the cancel; their next
-                    // yield surfaces error.Cancelled and they
-                    // unwind via defer mu.unlock().
-                    if (comptime debug_deadlock) {
-                        if (current.currentCoroutine()) |me| {
-                            self.holder.store(@intFromPtr(me), .release);
-                        }
-                    }
-                    return;
-                }
-                // Genuine cancel — surface it. Lock is NOT held.
-                return error.Cancelled;
-            },
-        };
-        // Lock was handed off to us by the unlocker; we own it.
-        if (comptime debug_deadlock) {
-            if (current.currentCoroutine()) |me| {
-                me.waiting_on_mutex.store(0, .release);
-                self.holder.store(@intFromPtr(me), .release);
+                me.mwait_park.parkUncancellable();
             }
+        }
+        // else: no predecessor — I have the lock immediately.
+
+        // ── I hold the lock ──
+        if (comptime debug_deadlock) {
+            me.waiting_on_mutex.store(0, .release);
+            self.holder.store(@intFromPtr(me), .release);
+        }
+
+        // Cancellation that arrived AFTER grant: I have the lock but
+        // shouldn't keep it. Hand off and exit Cancelled.
+        if (me.cancel_flag.load(.acquire)) {
+            self.handoffNext(me);
+            return error.Cancelled;
         }
     }
 
     /// Release the lock. Must only be called by the holder.
     pub fn unlock(self: *Mutex) void {
-        // Clear holder BEFORE the handoff so a parallel deadlock walk
-        // doesn't see us as still holding while the new owner sets up.
+        const me = current.currentCoroutine() orelse
+            @panic("volt.sync.Mutex.unlock requires a coroutine context");
+
         if (comptime debug_deadlock) self.holder.store(0, .release);
 
-        // Decide handoff vs drop under the slow-path mutex. Critical:
-        // we MUST NOT drop state to UNLOCKED before checking the
-        // waiter list. An earlier version did
-        //     state.store(UNLOCKED); waiter_mutex.lock();
-        //     if (popFront) state.store(LOCKED) else …
-        // which opens a window where a concurrent tryLock steals the
-        // lock between the two stores AND the popped waiter is then
-        // unparked thinking it owns the lock too — both proceed into
-        // the critical section. Surfaced as a lost-increment in the
-        // 16×500 mutex-stress test on Linux x86 iouring (got 7899/8000).
-        //
-        // The fix: keep state=LOCKED across handoff. The waiter takes
-        // ownership directly. Only the no-waiters branch drops state.
-        self.waiter_mutex.lock();
-        const w = self.waiters.popFront();
-        if (w) |waiter| {
-            self.waiter_mutex.unlock();
-            waiter.park.unpark();
-        } else {
-            self.state.store(UNLOCKED, .release);
-            self.waiter_mutex.unlock();
+        self.handoffNext(me);
+    }
+
+    /// Common handoff path: find a live successor (skipping any
+    /// tombstoned/cancelled waiters) and hand them the lock; otherwise
+    /// CAS tail back to null. Used by both unlock() and the
+    /// cancellation-after-grant path in lock().
+    fn handoffNext(self: *Mutex, holder: *Coroutine) void {
+        // Walk the chain, skipping cancelled tombstones. `me` is the
+        // current node we're trying to hand off PAST. Initially the
+        // holder; if next is tombstoned, advance `me = next` and try
+        // again.
+        var me = holder;
+        while (true) {
+            var next_opt = me.mwait_next.load(.acquire);
+
+            if (next_opt == null) {
+                // No successor visible yet. Try to release the lock by
+                // CAS'ing tail from me to null.
+                if (self.tail.cmpxchgStrong(me, null, .acq_rel, .acquire) == null) {
+                    return; // released
+                }
+                // CAS failed: someone did `tail.swap(them)` after our
+                // load. They WILL store `me.mwait_next = them` shortly.
+                while (true) {
+                    next_opt = me.mwait_next.load(.acquire);
+                    if (next_opt != null) break;
+                    std.atomic.spinLoopHint();
+                }
+            }
+
+            const next = next_opt.?;
+
+            if (next.mwait_cancelled.load(.acquire)) {
+                // Tombstoned waiter — skip past. Continue searching from
+                // `next` (it's still in the chain logically; its own
+                // mwait_next is what we now consult).
+                me = next;
+                continue;
+            }
+
+            // Live successor — hand off the grant.
+            next.mwait_granted.store(true, .release);
+            next.mwait_park.unpark();
+            return;
         }
     }
 
@@ -306,21 +323,6 @@ pub const Mutex = struct {
             .{MAX_HOPS},
         );
     }
-
-    fn removeWaiter(self: *Mutex, target: *Waiter) bool {
-        var prev: ?*Waiter = null;
-        var cur = self.waiters.head;
-        while (cur) |w| : (cur = w.next) {
-            if (w == target) {
-                if (prev) |p| p.next = w.next else self.waiters.head = w.next;
-                if (self.waiters.tail == w) self.waiters.tail = prev;
-                w.next = null;
-                return true;
-            }
-            prev = w;
-        }
-        return false;
-    }
 };
 
 // ─────────────────────────────────────────────────────────────────────
@@ -329,13 +331,19 @@ pub const Mutex = struct {
 
 const volt = @import("../lib.zig");
 
-test "mutex: tryLock uncontended succeeds, second fails" {
+fn tryLockTestRoot() !void {
     var mu = Mutex{};
     try std.testing.expect(mu.tryLock());
     try std.testing.expect(!mu.tryLock());
     mu.unlock();
     try std.testing.expect(mu.tryLock());
     mu.unlock();
+}
+
+test "mutex: tryLock uncontended succeeds, second fails" {
+    // Mutex now requires a coroutine context (MCS chain uses *Coroutine
+    // nodes). The pure-thread tryLock test wraps in volt.run.
+    try volt.run(.{ .allocator = std.testing.allocator }, tryLockTestRoot, .{});
 }
 
 const CounterCtx = struct {

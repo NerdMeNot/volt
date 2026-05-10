@@ -126,6 +126,49 @@ pub const Park = struct {
         if (coro.isCancelled()) return error.Cancelled;
     }
 
+    /// Park-without-cancel-check. Used by lock-free queue primitives
+    /// (e.g. Mutex's MCS chain) where a cancelled waiter must stay
+    /// queued to consume the eventual handoff — otherwise the chain
+    /// breaks. The caller is responsible for checking
+    /// `coro.isCancelled()` AFTER resume and propagating the grant to
+    /// its successor before returning `error.Cancelled` to the user.
+    ///
+    /// `current_park` IS registered (so cancel-from-anywhere can wake
+    /// us via the standard cancel→unpark path), but we don't surface
+    /// `error.Cancelled`. The caller's outer loop re-parks if the wait
+    /// condition isn't satisfied yet.
+    ///
+    /// IRIW pattern (same as `parkCurrent`): seq_cst ordering on
+    /// `current_park.store` and the post-store re-check of
+    /// `cancel_flag` ensures either cancel observes our `current_park`
+    /// (and unparks us) OR we observe `cancel_flag` (and bail without
+    /// parking). Without this re-check, a cancel between our entry and
+    /// our store can leave us parked with no waker — the test
+    /// `cancel-audit:cancel parked Mutex.lock` hangs at the watchdog.
+    pub fn parkUncancellable(self: *Park) void {
+        const coro = currentCoroutine() orelse
+            @panic("Park.parkUncancellable called outside a coroutine");
+
+        // Fast path: a notification arrived before we got here. Consume it.
+        if (self.state.cmpxchgStrong(NOTIFIED, 0, .acquire, .monotonic) == null) {
+            return;
+        }
+
+        coro.current_park.store(@intFromPtr(self), .seq_cst);
+
+        // Post-store IRIW re-check: catches the cancel-before-store
+        // window where cancel saw current_park=0 and didn't wake us.
+        if (coro.cancel_flag.load(.seq_cst)) {
+            coro.current_park.store(0, .release);
+            return; // caller's loop sees the cancel and exits
+        }
+
+        coro.pending_event = &self.es;
+        ctx_mod.swap(&coro.ctx, coro.scheduler_ctx);
+        coro.current_park.store(0, .release);
+        // Resumed (by grant OR by cancel). Caller decides.
+    }
+
     /// Wake whoever is parked here. Idempotent — if no waiter is
     /// registered, stores NOTIFIED for the next park to consume. Safe to
     /// call from any thread.

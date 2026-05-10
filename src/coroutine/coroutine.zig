@@ -132,6 +132,47 @@ pub const Coroutine = struct {
     /// completely via a comptime-conditional struct shape.
     waiting_on_mutex: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
+    // ─── Lock-free Mutex MCS-queue intrusive node ─────────────────────
+    //
+    // Each Coroutine carries one slot for participating in a Mutex's
+    // lock-free FIFO queue. A coroutine can only wait on one Mutex at a
+    // time (lock() is synchronous from the coroutine's perspective), so
+    // one slot suffices. Embedded here (intrusive) so the queue needs
+    // zero allocation — pure Zig idiom: no allocator anywhere in the
+    // mutex lock/unlock hot path.
+    //
+    // Protocol (see src/sync/Mutex.zig for details):
+    //   - `mwait_next`: pointer to the next coroutine in the queue,
+    //     written by my predecessor in the chain after they enqueue me.
+    //   - `mwait_granted`: my predecessor sets this true when they
+    //     unlock and hand the lock to me.
+    //   - `mwait_park`: I park on this slot waiting for `mwait_granted`.
+    //     Uses parkUncancellable so the lock-handoff chain isn't broken
+    //     by a cancel mid-wait (cancelled coros pass the grant through
+    //     and exit on resume).
+
+    /// MCS queue next-pointer. Written by predecessor; read by me on
+    /// unlock to find my successor.
+    mwait_next: std.atomic.Value(?*Coroutine) = std.atomic.Value(?*Coroutine).init(null),
+
+    /// Set true by my predecessor's unlock to signal "the lock is yours".
+    /// I spin on `parkUncancellable + load` until this turns true.
+    mwait_granted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// Set true when I cancel out of a mutex.lock() before the grant
+    /// arrived. The predecessor's handoff sees this tombstone and skips
+    /// past me to my mwait_next (or releases the lock if I have no
+    /// successor). Lets a cancelled waiter exit promptly without
+    /// touching tail, so the chain stays consistent and the rest of the
+    /// queue keeps making progress.
+    mwait_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// Per-coro Park slot used for waiting on `mwait_granted`. Separate
+    /// from `join_park` (which is for Job.join) so neither blocks the
+    /// other. Pure Zig idiom: no separate allocation, embedded in the
+    /// Coroutine struct.
+    mwait_park: @import("../scheduler/park.zig").Park = .{},
+
     /// Owned stack reservation (whole virtual range, mmap'd PROT_NONE
     /// with a small initial committed region at the top). The runtime
     /// grows the committed portion on demand via the SIGSEGV handler.
