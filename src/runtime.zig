@@ -134,6 +134,16 @@ pub const Runtime = struct {
     /// state spawn-and-complete workloads.
     stack_pool: @import("coroutine/stack_pool.zig").StackPool,
 
+    /// Head of the per-runtime live-coroutine registry. Used by
+    /// `volt.observability.snapshot` to walk every live coroutine.
+    /// Manipulated under `live_mutex` — `Runtime.createCoroutine` /
+    /// `spawnRoot` insert here; `coroutine.lifecycleRelease` /
+    /// `lifecycleReleaseRoot` remove here. With the rendezvous-based
+    /// lifecycle (P1), the registry stays bounded at the live count
+    /// rather than growing forever like the prior `Worker.spawned[]`.
+    live_coroutines: ?*Coroutine = null,
+    live_mutex: thread.Mutex = .{},
+
     pub fn init(config: Config) !Runtime {
         // Reset the diagnostic reactor trace so each runtime gets a
         // clean ring (no events from prior test runs contaminating the
@@ -560,6 +570,7 @@ pub const Runtime = struct {
         if (currentCoroutine()) |parent| {
             created.coro.parent_id = @intFromPtr(parent);
         }
+        self.registerLive(created.coro);
         const w = currentWorker() orelse @panic(
             "Runtime.createCoroutine called outside a worker thread. " ++
                 "Use Runtime.spawnRoot from the bootstrap thread instead.",
@@ -591,8 +602,42 @@ pub const Runtime = struct {
         // wake worker 0 (the bootstrap watcher) on completion — without
         // having to broadcast a wake to every worker.
         created.coro.is_root = true;
+        self.registerLive(created.coro);
         try self.workers[0].pushOwned(created.coro);
         return created;
+    }
+
+    /// Insert `coro` at the head of the per-runtime live registry.
+    /// Called by `createCoroutine` / `spawnRoot`. Cleared by
+    /// `unregisterLive` on lifecycle release. The intrusive
+    /// prev/next pointers live on the Coroutine struct itself, so no
+    /// per-spawn allocation.
+    pub fn registerLive(self: *Runtime, coro: *Coroutine) void {
+        self.live_mutex.lock();
+        defer self.live_mutex.unlock();
+        coro.prev_alive = null;
+        coro.next_alive = self.live_coroutines;
+        if (self.live_coroutines) |old_head| old_head.prev_alive = coro;
+        self.live_coroutines = coro;
+    }
+
+    /// Remove `coro` from the live registry. Called from
+    /// `coroutine.lifecycleRelease` (and `lifecycleReleaseRoot`)
+    /// before freeing the struct. Idempotent: a coro that was never
+    /// registered (or already unregistered) is a no-op.
+    pub fn unregisterLive(self: *Runtime, coro: *Coroutine) void {
+        self.live_mutex.lock();
+        defer self.live_mutex.unlock();
+        if (coro.prev_alive) |p| {
+            p.next_alive = coro.next_alive;
+        } else if (self.live_coroutines == coro) {
+            self.live_coroutines = coro.next_alive;
+        }
+        if (coro.next_alive) |n| {
+            n.prev_alive = coro.prev_alive;
+        }
+        coro.prev_alive = null;
+        coro.next_alive = null;
     }
 
     /// Start workers 1..N-1 as dedicated threads. Worker 0 is the caller

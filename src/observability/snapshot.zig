@@ -51,45 +51,53 @@ pub const TaskSnapshot = struct {
 };
 
 /// Collect a snapshot of every coroutine the runtime currently owns.
-/// Caller owns the returned slice.
+/// Caller owns the returned slice. Walks the per-runtime live
+/// registry under `live_mutex`.
 pub fn snapshot(allocator: std.mem.Allocator, rt: *runtime_mod.Runtime) ![]TaskSnapshot {
     var list: std.array_list.Managed(TaskSnapshot) = .init(allocator);
     errdefer list.deinit();
 
-    for (rt.workers) |*w| {
-        for (w.spawned.items) |coro| {
-            try list.append(.{
-                .id = @intFromPtr(coro),
-                .state = classifyState(coro),
-                .is_cancelled = coro.isCancelled(),
-                .is_overflowed = coro.overflow_flag.load(.acquire),
-                .is_root = coro.is_root,
-                .name = coro.name,
-                .spawn_site = coro.spawn_site,
-                .parent_id = coro.parent_id,
-            });
-        }
+    rt.live_mutex.lock();
+    defer rt.live_mutex.unlock();
+
+    var cur = rt.live_coroutines;
+    while (cur) |coro| : (cur = coro.next_alive) {
+        try list.append(.{
+            .id = @intFromPtr(coro),
+            .state = classifyState(coro),
+            .is_cancelled = coro.isCancelled(),
+            .is_overflowed = coro.overflow_flag.load(.acquire),
+            .is_root = coro.is_root,
+            .name = coro.name,
+            .spawn_site = coro.spawn_site,
+            .parent_id = coro.parent_id,
+        });
     }
 
     return list.toOwnedSlice();
 }
 
 /// Total count of coroutines the runtime owns (alive or done but not
-/// yet reaped). Cheap — no allocation.
-pub fn count(rt: *const runtime_mod.Runtime) usize {
+/// yet reaped). Cheap — no allocation. Walks the live registry under
+/// `live_mutex`.
+pub fn count(rt: *runtime_mod.Runtime) usize {
+    rt.live_mutex.lock();
+    defer rt.live_mutex.unlock();
     var total: usize = 0;
-    for (rt.workers) |*w| total += w.spawned.items.len;
+    var cur = rt.live_coroutines;
+    while (cur) |coro| : (cur = coro.next_alive) total += 1;
     return total;
 }
 
 /// Count just the still-alive coroutines (excludes those whose
-/// `done_flag` has fired).
-pub fn liveCount(rt: *const runtime_mod.Runtime) usize {
+/// `done_flag` has fired). Walks the live registry under `live_mutex`.
+pub fn liveCount(rt: *runtime_mod.Runtime) usize {
+    rt.live_mutex.lock();
+    defer rt.live_mutex.unlock();
     var total: usize = 0;
-    for (rt.workers) |*w| {
-        for (w.spawned.items) |coro| {
-            if (!coro.isDone()) total += 1;
-        }
+    var cur = rt.live_coroutines;
+    while (cur) |coro| : (cur = coro.next_alive) {
+        if (!coro.isDone()) total += 1;
     }
     return total;
 }

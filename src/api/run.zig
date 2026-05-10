@@ -106,17 +106,27 @@ pub fn run(
     // Bootstrap thread runs as worker 0 until the root is done.
     rt.runUntilDone(created.coro);
 
-    // Translate the root's result.
-    const result = created.result_ptr;
+    // Translate the root's result. We MUST snapshot the result struct
+    // by value before releasing the coroutine — `lifecycleReleaseRoot`
+    // frees `result_ptr` along with the rest of the root's extras.
     const RT = @typeInfo(@TypeOf(root_fn)).@"fn".return_type.?;
+    const result_snapshot = created.result_ptr.*;
+    const overflowed = created.coro.overflow_flag.load(.acquire);
 
-    return switch (result.tag) {
+    // Free the root coroutine. Done.subscribe deliberately does not
+    // fire the lifecycle rendezvous on root (it returns early); this
+    // call is the unconditional release for the root's struct + stack
+    // + result + closure + args.
+    const coro_mod = @import("../coroutine/coroutine.zig");
+    coro_mod.lifecycleReleaseRoot(rt.allocator, created.coro);
+
+    return switch (result_snapshot.tag) {
         .pending => blk: {
             // .pending here can mean either an unmatched park (root
             // parked on something nothing will wake) OR a stack-overflow
             // path where Done fired without the trampoline reaching its
             // final tag write. Disambiguate via overflow_flag.
-            if (created.coro.overflow_flag.load(.acquire)) {
+            if (overflowed) {
                 if (@typeInfo(RT) == .error_union) {
                     break :blk error.StackOverflow;
                 }
@@ -131,12 +141,12 @@ pub fn run(
                 .{},
             );
         },
-        .ok => result.value,
+        .ok => result_snapshot.value,
         .err => blk: {
             if (@typeInfo(RT) == .error_union) {
-                break :blk @errorCast(result.err);
+                break :blk @errorCast(result_snapshot.err);
             }
-            std.debug.panic("volt.run: root coroutine errored but root fn signature has no error union: {}", .{result.err});
+            std.debug.panic("volt.run: root coroutine errored but root fn signature has no error union: {}", .{result_snapshot.err});
         },
         .cancelled => blk: {
             if (@typeInfo(RT) == .error_union) {

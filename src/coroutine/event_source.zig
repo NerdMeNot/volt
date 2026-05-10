@@ -102,5 +102,18 @@ fn doneSubscribe(opaque_self: *anyopaque, coro: *Coroutine) void {
         // and may currently be parked. Wake worker 0 specifically — this
         // is the ONE thread we know has to observe the root's completion.
         if (runtime_mod.currentRuntime()) |rt| rt.workers[0].unpark();
+        // Root is special: `volt.run` reads `result_ptr` AFTER
+        // `runUntilDone` returns and releases the coroutine itself.
+        // Don't fire the rendezvous here — `volt.run` does it.
+        return;
+    }
+
+    // Non-root coroutine: rendezvous with the Job/Task-handle release.
+    // If `destroyJob`/`destroyTask` already fired, we're the second
+    // arrival and free here. If not, the eventual handle-release is
+    // the second arrival.
+    if (runtime_mod.currentRuntime()) |rt| {
+        const coro_mod = @import("coroutine.zig");
+        coro_mod.lifecycleRelease(rt.allocator, coro);
     }
 }

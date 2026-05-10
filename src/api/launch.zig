@@ -20,9 +20,17 @@ pub fn launch(comptime user_fn: anytype, args: anytype) !*Job {
     return job;
 }
 
-/// Free a Job's heap allocation (does not affect the coroutine itself).
+/// Free a Job's heap allocation AND signal the coroutine's lifecycle
+/// rendezvous. If Done.subscribe has already fired, the coroutine is
+/// freed here; otherwise the eventual Done.subscribe is the second
+/// arrival and frees there. Either way, the coroutine struct + extras
+/// are reclaimed deterministically — no accumulation in
+/// `Worker.spawned[]` until runtime shutdown.
 pub fn destroyJob(job: *Job) void {
     const rt = runtime_mod.currentRuntime() orelse
         @panic("volt.destroyJob called outside a runtime");
+    const coro = job.coro;
     rt.allocator.destroy(job);
+    const coro_mod = @import("../coroutine/coroutine.zig");
+    coro_mod.lifecycleRelease(rt.allocator, coro);
 }

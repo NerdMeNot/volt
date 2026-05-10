@@ -169,10 +169,6 @@ pub const Worker = struct {
     /// continuations (request/response chains). Owner-only; thieves see
     /// only the deque. Tokio-style.
     lifo_slot: ?*Coroutine = null,
-    /// Coroutines this worker created. Worker frees them at deinit. Workers
-    /// don't deinit until ALL workers have exited their loops, so by deinit
-    /// time nothing is executing on any thread.
-    spawned: std.array_list.Managed(*Coroutine),
     /// Local PRNG for steal-victim selection. Per-worker so we don't share
     /// state with siblings on every steal attempt.
     rng: std.Random.DefaultPrng,
@@ -194,34 +190,28 @@ pub const Worker = struct {
             .id = id,
             .runtime = runtime,
             .run_queue = try Deque(*Coroutine).init(allocator, INITIAL_DEQUE_CAPACITY),
-            .spawned = std.array_list.Managed(*Coroutine).init(allocator),
             .rng = std.Random.DefaultPrng.init(rng_seed),
         };
     }
 
     pub fn deinit(self: *Worker, allocator: std.mem.Allocator) void {
-        for (self.spawned.items) |coro| {
-            coro.destroy_extras_fn(allocator, coro);
-            // If `Done.subscribe` already released this coroutine's
-            // stack to the runtime's stack pool, skip freeing it
-            // again — the pool's `deinit` will munmap.
-            if (!coro.stack_pooled.load(.acquire)) {
-                stack_mod.free(allocator, coro.stack);
-            }
-            allocator.destroy(coro);
-        }
-        self.spawned.deinit();
+        _ = allocator;
+        // Coroutine struct + stack are freed via the lifecycle
+        // rendezvous in `coroutine.lifecycleRelease` (Done.subscribe ↔
+        // destroyJob/destroyTask), or `lifecycleReleaseRoot` for the
+        // root from `volt.run`. Worker no longer tracks per-spawn
+        // ownership — that pattern accumulated forever for long-
+        // running services. See P1.
         self.run_queue.deinit();
     }
 
-    /// Track ownership of a freshly-created coroutine and place it on the
-    /// deque (NOT the LIFO slot). Owner-only.
+    /// Place a freshly-created coroutine on the deque (NOT the LIFO
+    /// slot). Owner-only.
     ///
     /// Fresh spawns go to the deque so siblings can steal them. Routing
     /// fresh spawns through the LIFO slot would hide them from thieves
     /// and bottleneck burst spawns on a single worker.
     pub fn pushOwned(self: *Worker, coro: *Coroutine) !void {
-        try self.spawned.append(coro);
         self.run_queue.push(coro);
     }
 

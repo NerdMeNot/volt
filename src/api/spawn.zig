@@ -30,5 +30,8 @@ pub fn spawn(
 pub fn destroyTask(task: anytype) void {
     const rt = runtime_mod.currentRuntime() orelse
         @panic("volt.destroyTask called outside a runtime");
+    const coro = task.job.coro;
     rt.allocator.destroy(task);
+    const coro_mod = @import("../coroutine/coroutine.zig");
+    coro_mod.lifecycleRelease(rt.allocator, coro);
 }

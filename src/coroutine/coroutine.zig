@@ -15,6 +15,7 @@
 const std = @import("std");
 const ctx = @import("context.zig");
 const event_source = @import("event_source.zig");
+const stack_mod = @import("stack.zig");
 const Park = @import("../scheduler/park.zig").Park;
 
 pub const EventSource = event_source.EventSource;
@@ -98,6 +99,30 @@ pub const Coroutine = struct {
     /// freeing the stack again — the pool now owns it.
     stack_pooled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// Lifecycle rendezvous counter. Both `Done.subscribe` (terminal
+    /// event) and `destroyJob` / `destroyTask` (handle release) call
+    /// `lifecycle_count.fetchAdd(1, .acq_rel)`. Whichever side observes
+    /// the value `1` (i.e. they are the second arrival) is responsible
+    /// for freeing the Coroutine struct + its extras.
+    ///
+    /// This replaces the prior "free everything at Worker.deinit"
+    /// model — `Worker.spawned[]` accumulated forever for long-running
+    /// services, leaking ~100-200 bytes per spawn until shutdown.
+    /// With the rendezvous, struct + extras are reclaimed as soon as
+    /// both sides have signaled.
+    ///
+    /// Root coroutine is excluded — `volt.run` reads its result after
+    /// `runUntilDone` returns, so the result-side increment fires
+    /// from `volt.run` (not Done.subscribe). See `is_root` checks.
+    lifecycle_count: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+    /// Intrusive doubly-linked list pointers for the per-runtime
+    /// `live_coroutines` registry. Manipulated only under
+    /// `Runtime.live_mutex` — observers (snapshot) hold the same
+    /// mutex while walking. Cleared on lifecycle release.
+    prev_alive: ?*Coroutine = null,
+    next_alive: ?*Coroutine = null,
+
     /// Owned stack reservation (whole virtual range, mmap'd PROT_NONE
     /// with a small initial committed region at the top). The runtime
     /// grows the committed portion on demand via the SIGSEGV handler.
@@ -171,6 +196,48 @@ test "coroutine: initial flags are clear" {
     try std.testing.expect(!coro.isCancelled());
     try std.testing.expect(!coro.isDone());
     try std.testing.expectEqual(&event_source.yield_singleton, coro.pending_event);
+}
+
+/// Increment the lifecycle rendezvous counter; if we are the second
+/// arrival (we observed the count was 1), free the Coroutine and its
+/// extras (closure, args, result_ptr, stack).
+///
+/// Safe to call from both terminal sides:
+///   - `Done.subscribe` (after a coroutine reaches its terminal swap).
+///   - `destroyJob` / `destroyTask` (when the user releases the
+///     handle).
+///
+/// The first arrival just bumps the count to 1 and returns. The
+/// second arrival sees `old == 1` and is responsible for the free.
+/// `acq_rel` ordering: the freer needs to observe everything the
+/// other side wrote before its fetchAdd (e.g. Done.subscribe's
+/// `done_flag.store`). Without acq_rel, the free could publish stale
+/// state.
+pub fn lifecycleRelease(allocator: std.mem.Allocator, coro: *Coroutine) void {
+    const old = coro.lifecycle_count.fetchAdd(1, .acq_rel);
+    if (old != 1) return; // first arrival
+    // Second arrival — own the free.
+    if (@import("../runtime.zig").currentRuntime()) |rt| rt.unregisterLive(coro);
+    coro.destroy_extras_fn(allocator, coro);
+    if (!coro.stack_pooled.load(.acquire)) {
+        stack_mod.free(allocator, coro.stack);
+    }
+    allocator.destroy(coro);
+}
+
+/// Unconditional release for the root coroutine. `volt.run` calls
+/// this exactly once after `runUntilDone` returns and after it has
+/// snapshotted `result_ptr`. The root's `Done.subscribe` deliberately
+/// skips the rendezvous (it sees `is_root == true`), so this is the
+/// only release path for the root's struct + extras.
+pub fn lifecycleReleaseRoot(allocator: std.mem.Allocator, coro: *Coroutine) void {
+    std.debug.assert(coro.is_root);
+    if (@import("../runtime.zig").currentRuntime()) |rt| rt.unregisterLive(coro);
+    coro.destroy_extras_fn(allocator, coro);
+    if (!coro.stack_pooled.load(.acquire)) {
+        stack_mod.free(allocator, coro.stack);
+    }
+    allocator.destroy(coro);
 }
 
 test "coroutine: cancel flag round-trip" {
