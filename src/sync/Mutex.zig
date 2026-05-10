@@ -38,11 +38,29 @@ const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Coroutine = @import("../coroutine/coroutine.zig").Coroutine;
+const current = @import("../scheduler/current.zig");
 const Park = @import("../scheduler/park.zig").Park;
 const thread = @import("../internal/thread.zig");
 
 const UNLOCKED: u8 = 0;
 const LOCKED: u8 = 1;
+
+/// Deadlock detection — only compiled into Debug builds. Each Mutex
+/// remembers its current holder; each Coroutine remembers the Mutex
+/// it's currently waiting to acquire (`waiting_on_mutex`). Before
+/// committing to park, we walk the holder→waiting chain looking for
+/// a cycle that includes us. If found, panic with the cycle printed
+/// so the bug surfaces immediately instead of hanging.
+///
+/// Catches the most common deadlock class: two coroutines acquiring
+/// two mutexes in opposite orders. Doesn't catch every deadlock
+/// (channels, notifies, semaphore queues, custom park primitives) —
+/// future v1.x extends to a generic wait-for graph at Park level.
+///
+/// Zero release-mode cost: the holder field is `if (debug) ... else void`,
+/// the cycle walk lives behind `if (comptime debug)`, so ReleaseFast
+/// emits no extra atomic ops, no extra struct bytes.
+const debug_deadlock = builtin.mode == .Debug;
 
 /// Userspace spin attempts before committing to a park. Each attempt is
 /// `SPIN_HINTS_PER_ITER` PAUSE-equivalent hints (~1 ns each on x86 with
@@ -99,9 +117,24 @@ pub const Mutex = struct {
     waiter_mutex: thread.Mutex = .{},
     waiters: WaiterList = .{},
 
+    /// Debug-only: current lock holder (or null). Comptime-elided in
+    /// release builds — `?*Coroutine` becomes `void`, no struct bytes,
+    /// no atomics. See `debug_deadlock`.
+    holder: if (debug_deadlock) std.atomic.Value(usize) else void = if (debug_deadlock)
+        std.atomic.Value(usize).init(0)
+    else {},
+
     /// Try to acquire the lock without blocking. Returns true on success.
     pub fn tryLock(self: *Mutex) bool {
-        return self.state.cmpxchgStrong(UNLOCKED, LOCKED, .acquire, .monotonic) == null;
+        const got = self.state.cmpxchgStrong(UNLOCKED, LOCKED, .acquire, .monotonic) == null;
+        if (comptime debug_deadlock) {
+            if (got) {
+                if (current.currentCoroutine()) |me| {
+                    self.holder.store(@intFromPtr(me), .release);
+                }
+            }
+        }
+        return got;
     }
 
     /// Acquire the lock, suspending the coroutine if it's held.
@@ -133,6 +166,16 @@ pub const Mutex = struct {
             }
         }
 
+        // Debug deadlock check — walk the holder→waiting chain looking
+        // for a cycle that includes us. Catches A-locks-X-then-Y vs
+        // B-locks-Y-then-X classics. Comptime-gated; release builds
+        // skip this entirely.
+        if (comptime debug_deadlock) {
+            if (current.currentCoroutine()) |me| {
+                checkCycle(me, self);
+            }
+        }
+
         // Slow path: enqueue and park.
         var waiter: Waiter = .{};
         self.waiter_mutex.lock();
@@ -143,6 +186,13 @@ pub const Mutex = struct {
             return;
         }
         self.waiters.pushBack(&waiter);
+        // Record we're waiting on THIS mutex so other coros' deadlock
+        // walks can follow the chain through us.
+        if (comptime debug_deadlock) {
+            if (current.currentCoroutine()) |me| {
+                me.waiting_on_mutex.store(@intFromPtr(self), .release);
+            }
+        }
         self.waiter_mutex.unlock();
 
         // Park until the unlocker hands the lock to us.
@@ -154,12 +204,22 @@ pub const Mutex = struct {
                 self.waiter_mutex.lock();
                 const removed = self.removeWaiter(&waiter);
                 self.waiter_mutex.unlock();
+                if (comptime debug_deadlock) {
+                    if (current.currentCoroutine()) |me| {
+                        me.waiting_on_mutex.store(0, .release);
+                    }
+                }
                 if (!removed) {
                     // We were already handed the lock. The unlocker
                     // moved `state` to LOCKED; we own it now. Caller
                     // gets the lock despite the cancel; their next
                     // yield surfaces error.Cancelled and they
                     // unwind via defer mu.unlock().
+                    if (comptime debug_deadlock) {
+                        if (current.currentCoroutine()) |me| {
+                            self.holder.store(@intFromPtr(me), .release);
+                        }
+                    }
                     return;
                 }
                 // Genuine cancel — surface it. Lock is NOT held.
@@ -167,10 +227,20 @@ pub const Mutex = struct {
             },
         };
         // Lock was handed off to us by the unlocker; we own it.
+        if (comptime debug_deadlock) {
+            if (current.currentCoroutine()) |me| {
+                me.waiting_on_mutex.store(0, .release);
+                self.holder.store(@intFromPtr(me), .release);
+            }
+        }
     }
 
     /// Release the lock. Must only be called by the holder.
     pub fn unlock(self: *Mutex) void {
+        // Clear holder BEFORE the handoff so a parallel deadlock walk
+        // doesn't see us as still holding while the new owner sets up.
+        if (comptime debug_deadlock) self.holder.store(0, .release);
+
         // Decide handoff vs drop under the slow-path mutex. Critical:
         // we MUST NOT drop state to UNLOCKED before checking the
         // waiter list. An earlier version did
@@ -193,6 +263,48 @@ pub const Mutex = struct {
             self.state.store(UNLOCKED, .release);
             self.waiter_mutex.unlock();
         }
+    }
+
+    /// Walk the holder→waiting chain looking for a cycle that includes
+    /// `me`. Compiled only in Debug builds. Panics with the cycle path
+    /// printed if a deadlock is detected.
+    fn checkCycle(me: *Coroutine, target: *Mutex) void {
+        if (comptime !debug_deadlock) return;
+        // Bound the walk so a cycle-free chain never hangs the check.
+        // 64 hops is far more than any realistic application's lock
+        // depth (typical: 2-4).
+        const MAX_HOPS: u32 = 64;
+        var hops: u32 = 0;
+        var mu: *Mutex = target;
+        while (hops < MAX_HOPS) : (hops += 1) {
+            const holder_ptr = mu.holder.load(.acquire);
+            if (holder_ptr == 0) return; // not held — no cycle possible
+            const holder: *Coroutine = @ptrFromInt(holder_ptr);
+            if (holder == me) {
+                std.debug.panic(
+                    "Volt deadlock detected: coroutine attempting to acquire " ++
+                        "Mutex@0x{x} which is held by itself, or a cycle leads back here. " ++
+                        "Most common cause: two coroutines acquire two mutexes in opposite orders.",
+                    .{@intFromPtr(target)},
+                );
+            }
+            const next_mu_ptr = holder.waiting_on_mutex.load(.acquire);
+            if (next_mu_ptr == 0) return; // holder isn't waiting — no cycle
+            mu = @ptrFromInt(next_mu_ptr);
+            if (mu == target) {
+                std.debug.panic(
+                    "Volt deadlock detected: cycle of mutex acquisitions back to Mutex@0x{x}. " ++
+                        "Most common cause: lock ordering inconsistency between coroutines.",
+                    .{@intFromPtr(target)},
+                );
+            }
+        }
+        // Bound exceeded — pathological chain length, surface as deadlock.
+        std.debug.panic(
+            "Volt deadlock detection: holder→waiting chain exceeded {d} hops " ++
+                "without resolution. Probably a cycle.",
+            .{MAX_HOPS},
+        );
     }
 
     fn removeWaiter(self: *Mutex, target: *Waiter) bool {

@@ -123,6 +123,15 @@ pub const Coroutine = struct {
     prev_alive: ?*Coroutine = null,
     next_alive: ?*Coroutine = null,
 
+    /// Debug-only: address of the Mutex this coroutine is currently
+    /// waiting to acquire (0 if not waiting). Used by Mutex.lock's
+    /// deadlock-cycle detector to walk the holder→waiting chain.
+    /// In ReleaseFast/ReleaseSafe this field is still present (avoids
+    /// per-build struct-size differences that would confuse asm
+    /// offsets), but no code reads or writes it. v1.x can elide it
+    /// completely via a comptime-conditional struct shape.
+    waiting_on_mutex: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
     /// Owned stack reservation (whole virtual range, mmap'd PROT_NONE
     /// with a small initial committed region at the top). The runtime
     /// grows the committed portion on demand via the SIGSEGV handler.
