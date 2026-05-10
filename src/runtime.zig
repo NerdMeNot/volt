@@ -584,10 +584,32 @@ pub const Runtime = struct {
         }
     }
 
+    /// Variant of `createCoroutine` that allocates the spawn Frame from
+    /// the given allocator instead of `self.allocator`. Used by
+    /// `volt.scope` to allocate children's Frames from a scope-local
+    /// arena. See `api/launch.zig:launchWith`.
+    pub fn createCoroutineWith(
+        self: *Runtime,
+        allocator: std.mem.Allocator,
+        comptime user_fn: anytype,
+        args: anytype,
+    ) !spawn_mod.Created(@TypeOf(user_fn)) {
+        return self.createCoroutineImpl(allocator, user_fn, args);
+    }
+
     /// Spawn a coroutine for `user_fn(args)` on the calling worker's deque.
     /// MUST be called from a worker thread.
     pub fn createCoroutine(
         self: *Runtime,
+        comptime user_fn: anytype,
+        args: anytype,
+    ) !spawn_mod.Created(@TypeOf(user_fn)) {
+        return self.createCoroutineImpl(self.allocator, user_fn, args);
+    }
+
+    fn createCoroutineImpl(
+        self: *Runtime,
+        frame_allocator: std.mem.Allocator,
         comptime user_fn: anytype,
         args: anytype,
     ) !spawn_mod.Created(@TypeOf(user_fn)) {
@@ -628,12 +650,14 @@ pub const Runtime = struct {
                 }
                 // destroy_extras_fn frees the whole frame (Coroutine
                 // included) — no separate allocator.destroy needed.
-                created.coro.destroy_extras_fn(self.allocator, created.coro);
+                // Frame uses frame_allocator (may differ from self.allocator
+                // when called via createCoroutineWith for scope-inline).
+                created.coro.destroy_extras_fn(frame_allocator, created.coro);
             },
         };
 
         created = try spawn_mod.create(
-            self.allocator,
+            frame_allocator,
             .{ .reserved = stack_mod.default_reserved },
             recycled,
             user_fn,
