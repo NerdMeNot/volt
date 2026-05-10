@@ -46,13 +46,22 @@ SYM(voltCtxSwap):
 //   1. ctx_swap restores rbx (= closure), rsp (= top - 8).
 //   2. `ret` pops the pushed voltCoroEntry into rip — we land here
 //      with %rsp pointing at the first usable byte of the coro's stack.
+//
+// CFI: mark this as a stack-bottom frame. Without this, libunwind /
+// gdb / zig's panic stack-printer fails to walk past `voltCoroEntry`
+// and we lose the actual call site of any panic inside the coroutine
+// (saw this on Linux x86 mutex-bench: only 2 frames printed instead
+// of the real 5+).
 .globl SYM(voltCoroEntry)
 .p2align 4
 SYM(voltCoroEntry):
+    .cfi_startproc
+    .cfi_undefined %rip            // tells unwinder: this is the bottom
     movq %rbx, %rdi                // 1st arg = closure ptr
     movq (%rbx), %rax              // closure->run_fn (first field)
     callq *%rax                    // run_fn(closure)
     ud2                            // unreachable; trap if reached
+    .cfi_endproc
 
 #if defined(__linux__) || defined(__ELF__)
 .section .note.GNU-stack,"",@progbits

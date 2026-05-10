@@ -121,10 +121,15 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - name: Run mutex bench with diagnostics
+      - name: Run bench with mutex diagnostics + verbose
         env:
           VOLT_BENCH_MUTEX: "1"
-        run: zig build bench --summary none
+        run: |
+          # Capture the bench output even on panic.
+          set -o pipefail
+          zig build bench --summary none 2>&1 | tee bench-output.txt || true
+          echo "--- bench output captured ---"
+          tail -40 bench-output.txt
 
   stress:
     name: Stress N=50 (${{ matrix.name }})
