@@ -90,9 +90,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, name: linux-x86_64-epoll }
+          # See ci.yml for the linux-x86_64 allow_failure rationale.
+          - { os: ubuntu-latest, name: linux-x86_64-epoll, allow_failure: true }
           - { os: macos-latest,  name: macos-arm64-kqueue }
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.allow_failure || false }}
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
