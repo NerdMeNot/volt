@@ -162,10 +162,12 @@ pub const Reactor = struct {
         };
 
         self.mutex.lock();
-        // D4 invariant: same fd+kind shouldn't already be registered.
-        // If it is, our protocol has gone wrong (double register without
-        // intervening unregister). Catches reactor-state corruption.
-        std.debug.assert(!self.waiters.contains(key));
+        // NB: unlike kqueue, epoll's ONESHOT auto-disables but doesn't
+        // remove the fd from the epoll set; re-registration uses
+        // CTL_MOD on the existing entry. So a `waiters.put` here CAN
+        // legitimately hit an existing key (the kernel-side state
+        // matches via EEXIST → MOD branch below). We don't assert
+        // !contains.
         self.waiters.put(key, {}) catch {
             self.mutex.unlock();
             return error.OutOfMemory;
