@@ -120,9 +120,16 @@ pub fn longjmpDispatch(cp: *DispatchCheckpoint) noreturn {
 /// Wrap dispatch in a setjmp checkpoint. Returns true if a terminal
 /// overflow was just caught (caller should mark the coro overflowed and
 /// route through Done); false on the normal-entry path.
+///
+/// `savesigs=0`: don't snapshot the per-thread signal mask. The mask
+/// is constant during normal scheduling (only `installAltStack`/
+/// `installPerThread` touch it, both at thread entry — never inside a
+/// dispatch). Skipping the snapshot avoids a `sigprocmask` *syscall*
+/// per coroutine swap, which the Mac sample-profiler showed as a top
+/// hit on the spawn+join hot path.
 pub inline fn setjmpDispatch(cp: *DispatchCheckpoint) bool {
     if (!supported) return false;
-    return sigSetjmp(&cp.jmp_buf, 1) != 0;
+    return sigSetjmp(&cp.jmp_buf, 0) != 0;
 }
 
 fn faultAddr(info: *const posix.siginfo_t) usize {
