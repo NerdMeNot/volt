@@ -26,14 +26,46 @@
 //! (TLS the OS feature) is an implementation detail.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Coroutine = @import("../coroutine/coroutine.zig").Coroutine;
 
 threadlocal var current_coro: ?*Coroutine = null;
 threadlocal var current_worker: ?*anyopaque = null;
 threadlocal var current_rt: ?*anyopaque = null;
 
+/// On Linux x86_64, LLVM caches `%fs:0` (the TCB pointer) into a callee-save
+/// register (typically r12) and reuses it across function calls — including
+/// `voltCtxSwap`. When a coroutine migrates from thread T1 to thread T2 via
+/// the swap, the cached TCB still points to T1's TCB, so subsequent TLS
+/// reads return T1's slot value (which was cleared on swap-out). Manifested
+/// as `Park.parkCurrent called outside a coroutine` panics in high-
+/// contention bench paths.
+///
+/// Apple Silicon ARM64 isn't affected: TPIDR_EL0 is cheap to read and the
+/// compiler doesn't bother caching it. Linux arm64 is the same.
+///
+/// The fix: route the read through a `@call(.never_inline)` so the caller's
+/// frame has no TLS access to cache a TCB pointer for. Each call to the
+/// inner reader re-derives `%fs:0` fresh, picking up the current thread's
+/// TCB. Off the hot path on arm64 this adds nothing; on x86_64 Linux it
+/// trades one extra `mov %fs:0, %reg` (~1ns) per access for correctness.
+const tls_caches_tcb = builtin.target.cpu.arch == .x86_64 and builtin.target.os.tag == .linux;
+
+fn readCurrentCoroOutOfLine() ?*Coroutine {
+    return current_coro;
+}
+fn readCurrentRtOutOfLine() ?*anyopaque {
+    return current_rt;
+}
+fn readCurrentWorkerOutOfLine() ?*anyopaque {
+    return current_worker;
+}
+
 /// The coroutine currently executing on this thread, or null if not in one.
 pub fn currentCoroutine() ?*Coroutine {
+    if (comptime tls_caches_tcb) {
+        return @call(.never_inline, readCurrentCoroOutOfLine, .{});
+    }
     return current_coro;
 }
 
@@ -41,12 +73,18 @@ pub fn currentCoroutine() ?*Coroutine {
 /// because Runtime is defined in a sibling module that imports this one;
 /// callers cast back to *Runtime.
 pub fn currentRuntimeRaw() ?*anyopaque {
+    if (comptime tls_caches_tcb) {
+        return @call(.never_inline, readCurrentRtOutOfLine, .{});
+    }
     return current_rt;
 }
 
 /// The worker executing this thread, or null. Type-erased for the same
 /// reason as `currentRuntimeRaw`.
 pub fn currentWorkerRaw() ?*anyopaque {
+    if (comptime tls_caches_tcb) {
+        return @call(.never_inline, readCurrentWorkerOutOfLine, .{});
+    }
     return current_worker;
 }
 
