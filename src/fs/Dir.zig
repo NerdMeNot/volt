@@ -31,6 +31,12 @@ pub const Dir = struct {
 
     /// Open `path` as a directory. Routes through the blocking pool.
     pub fn open(path: []const u8) !Dir {
+        if (comptime builtin.os.tag == .windows) {
+            // Windows arm pending — see docs/internals/v1x-backlog.md §2 (W3).
+            // Will use CreateFileW with FILE_FLAG_BACKUP_SEMANTICS.
+            std.mem.doNotOptimizeAway(path.ptr);
+            return error.OperationNotSupported;
+        }
         var path_buf: [4096]u8 = undefined;
         if (path.len >= path_buf.len) return error.NameTooLong;
         const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return error.NameTooLong;
