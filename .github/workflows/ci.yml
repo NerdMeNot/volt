@@ -116,15 +116,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86 bench gate: known to panic in the mutex bench
-          # ("Park.parkCurrent called outside a coroutine") under
-          # ReleaseFast on GH Linux runners. Issue predates P1; runs
-          # cleanly on Apple Silicon. Marked allow_failure until the
-          # Linux x86_64-specific scheduler-TLS interaction is fixed.
-          - { os: ubuntu-latest, name: linux-x86_64-epoll, allow_failure: true }
+          - { os: ubuntu-latest, name: linux-x86_64-epoll }
           - { os: macos-latest,  name: macos-arm64-kqueue }
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.allow_failure || false }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup Zig
