@@ -116,9 +116,11 @@ pub fn run(
     // Free the root coroutine. Done.subscribe deliberately does not
     // fire the lifecycle rendezvous on root (it returns early); this
     // call is the unconditional release for the root's struct + stack
-    // + result + closure + args.
+    // + result + closure + args. We pass `&rt` explicitly because
+    // `runUntilDone` has already cleared the bootstrap thread's TLS
+    // `currentRuntime()` slot via Worker.run's defer.
     const coro_mod = @import("../coroutine/coroutine.zig");
-    coro_mod.lifecycleReleaseRoot(rt.allocator, created.coro);
+    coro_mod.lifecycleReleaseRoot(&rt, rt.allocator, created.coro);
 
     return switch (result_snapshot.tag) {
         .pending => blk: {

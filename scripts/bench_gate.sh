@@ -28,7 +28,11 @@ set -eu
 YIELD_NS_MAX="${YIELD_NS_MAX:-200}"
 CHANNEL_NS_MAX="${CHANNEL_NS_MAX:-1000}"
 MUTEX_NS_MAX="${MUTEX_NS_MAX:-5000}"
-SPAWN_JOIN_NS_MAX="${SPAWN_JOIN_NS_MAX:-50000}"
+# spawn+join is the highest-variance metric — local runs 6-22µs,
+# GH-hosted runners can spike to 60µs+ on cold cache. 100µs ceiling
+# gives 5x headroom over local steady-state without hiding real
+# regressions.
+SPAWN_JOIN_NS_MAX="${SPAWN_JOIN_NS_MAX:-100000}"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"

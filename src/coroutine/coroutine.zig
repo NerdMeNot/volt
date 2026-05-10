@@ -230,9 +230,14 @@ pub fn lifecycleRelease(allocator: std.mem.Allocator, coro: *Coroutine) void {
 /// snapshotted `result_ptr`. The root's `Done.subscribe` deliberately
 /// skips the rendezvous (it sees `is_root == true`), so this is the
 /// only release path for the root's struct + extras.
-pub fn lifecycleReleaseRoot(allocator: std.mem.Allocator, coro: *Coroutine) void {
+///
+/// `runUntilDone` has already returned, which means the bootstrap
+/// thread's TLS-based `currentRuntime()` has been cleared by
+/// `Worker.run`'s defer. We accept the `runtime` explicitly so we
+/// can still unregister.
+pub fn lifecycleReleaseRoot(rt: anytype, allocator: std.mem.Allocator, coro: *Coroutine) void {
     std.debug.assert(coro.is_root);
-    if (@import("../runtime.zig").currentRuntime()) |rt| rt.unregisterLive(coro);
+    rt.unregisterLive(coro);
     coro.destroy_extras_fn(allocator, coro);
     if (!coro.stack_pooled.load(.acquire)) {
         stack_mod.free(allocator, coro.stack);
