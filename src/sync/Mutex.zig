@@ -134,20 +134,26 @@ pub const Mutex = struct {
 
     /// Release the lock. Must only be called by the holder.
     pub fn unlock(self: *Mutex) void {
-        // Drop the lock first.
-        self.state.store(UNLOCKED, .release);
-
-        // Check for waiters and hand off.
+        // Decide handoff vs drop under the slow-path mutex. Critical:
+        // we MUST NOT drop state to UNLOCKED before checking the
+        // waiter list. An earlier version did
+        //     state.store(UNLOCKED); waiter_mutex.lock();
+        //     if (popFront) state.store(LOCKED) else …
+        // which opens a window where a concurrent tryLock steals the
+        // lock between the two stores AND the popped waiter is then
+        // unparked thinking it owns the lock too — both proceed into
+        // the critical section. Surfaced as a lost-increment in the
+        // 16×500 mutex-stress test on Linux x86 iouring (got 7899/8000).
+        //
+        // The fix: keep state=LOCKED across handoff. The waiter takes
+        // ownership directly. Only the no-waiters branch drops state.
         self.waiter_mutex.lock();
         const w = self.waiters.popFront();
         if (w) |waiter| {
-            // Hand the lock directly to this waiter — bring `state`
-            // back to LOCKED so a concurrent `tryLock` doesn't steal
-            // from under them.
-            self.state.store(LOCKED, .release);
             self.waiter_mutex.unlock();
             waiter.park.unpark();
         } else {
+            self.state.store(UNLOCKED, .release);
             self.waiter_mutex.unlock();
         }
     }
