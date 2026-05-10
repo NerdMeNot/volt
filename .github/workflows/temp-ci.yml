@@ -100,37 +100,6 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       - run: scripts/bench_gate.sh
 
-  # Diagnostic-only: runs the mutex bench (VOLT_BENCH_MUTEX=1) on
-  # Linux x86 to surface the 'Park.parkCurrent called outside a
-  # coroutine' panic with the diagnostic prints we added to
-  # muIncrementer. allow_failure: true so it doesn't gate the build,
-  # just collects evidence on every push.
-  diag-mutex-bench:
-    name: Mutex bench diagnostic (${{ matrix.name }})
-    needs: format
-    timeout-minutes: 10
-    continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-latest, name: linux-x86_64-epoll }
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-      - name: Run bench with mutex diagnostics + verbose
-        env:
-          VOLT_BENCH_MUTEX: "1"
-        run: |
-          # Capture the bench output even on panic.
-          set -o pipefail
-          zig build bench --summary none 2>&1 | tee bench-output.txt || true
-          echo "--- bench output captured ---"
-          tail -40 bench-output.txt
-
   stress:
     name: Stress N=50 (${{ matrix.name }})
     needs: format
