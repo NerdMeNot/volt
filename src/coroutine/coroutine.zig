@@ -218,11 +218,14 @@ pub fn lifecycleRelease(allocator: std.mem.Allocator, coro: *Coroutine) void {
     if (old != 1) return; // first arrival
     // Second arrival — own the free.
     if (@import("../runtime.zig").currentRuntime()) |rt| rt.unregisterLive(coro);
-    coro.destroy_extras_fn(allocator, coro);
     if (!coro.stack_pooled.load(.acquire)) {
         stack_mod.free(allocator, coro.stack);
     }
-    allocator.destroy(coro);
+    // destroy_extras_fn frees the whole frame (Coroutine + Closure + args
+    // + result slot, all in one allocation since the spawn-frame rework).
+    // Stack memory is independent and freed above. After this call `coro`
+    // is invalid memory — nothing else may touch it.
+    coro.destroy_extras_fn(allocator, coro);
 }
 
 /// Unconditional release for the root coroutine. `volt.run` calls
@@ -238,11 +241,11 @@ pub fn lifecycleRelease(allocator: std.mem.Allocator, coro: *Coroutine) void {
 pub fn lifecycleReleaseRoot(rt: anytype, allocator: std.mem.Allocator, coro: *Coroutine) void {
     std.debug.assert(coro.is_root);
     rt.unregisterLive(coro);
-    coro.destroy_extras_fn(allocator, coro);
     if (!coro.stack_pooled.load(.acquire)) {
         stack_mod.free(allocator, coro.stack);
     }
-    allocator.destroy(coro);
+    // Single destroy: the frame allocation includes the Coroutine.
+    coro.destroy_extras_fn(allocator, coro);
 }
 
 test "coroutine: cancel flag round-trip" {

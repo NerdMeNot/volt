@@ -623,11 +623,12 @@ pub const Runtime = struct {
             .has_local_recycled => if (recycled) |gs| w.local_stack_pool.release(gs),
             .has_global_recycled => if (recycled) |gs| self.stack_pool.release(gs),
             .has_created => {
-                created.coro.destroy_extras_fn(self.allocator, created.coro);
                 if (!created.coro.stack_pooled.load(.acquire)) {
                     stack_mod.free(self.allocator, created.coro.stack);
                 }
-                self.allocator.destroy(created.coro);
+                // destroy_extras_fn frees the whole frame (Coroutine
+                // included) — no separate allocator.destroy needed.
+                created.coro.destroy_extras_fn(self.allocator, created.coro);
             },
         };
 

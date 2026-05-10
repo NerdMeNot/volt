@@ -107,13 +107,39 @@ pub fn Closure(comptime user_fn: anytype, comptime Args: type) type {
             // past here is dead code.
             unreachable;
         }
+    };
+}
 
-        pub fn destroyExtras(allocator: std.mem.Allocator, coro: *Coroutine) void {
-            const closure: *Self = @ptrCast(@alignCast(coro.closure_ptr));
-            const args: *Args = @ptrCast(@alignCast(coro.args_ptr));
-            allocator.destroy(closure.result_ptr);
-            allocator.destroy(args);
-            allocator.destroy(closure);
+/// Single-allocation frame holding everything a coroutine needs:
+/// the Coroutine struct, the Closure, the args, and the result slot.
+/// One `allocator.create(Frame)` per spawn instead of four separate
+/// allocations — reduces allocator traffic 4×.
+///
+/// Layout note: `coro` is FIRST so `&frame.coro` is the same address as
+/// the Frame itself. That lets `lifecycleRelease(coro)` recover the
+/// Frame address with `@fieldParentPtr` — it's the same as the
+/// Coroutine pointer the user holds onto.
+pub fn Frame(comptime user_fn: anytype, comptime Args: type) type {
+    const UserFn = @TypeOf(user_fn);
+    const Payload = PayloadOf(UserFn);
+    return struct {
+        const Self = @This();
+        coro: Coroutine,
+        closure: Closure(user_fn, Args),
+        args: Args,
+        result: ResultSlot(Payload),
+
+        /// Free the entire frame. Called by lifecycleRelease via the
+        /// `destroy_extras_fn` slot in Coroutine — except we now repurpose
+        /// it to free THE WHOLE FRAME (Coroutine field included). The
+        /// caller's subsequent `allocator.destroy(coro)` becomes a no-op
+        /// (we set destroy_extras_fn to a function that frees the frame
+        /// AND coroutine.lifecycleRelease no longer separately destroys
+        /// the coro pointer). See Coroutine.lifecycleRelease for the
+        /// updated single-destroy lifecycle.
+        pub fn destroyFrame(allocator: std.mem.Allocator, coro: *Coroutine) void {
+            const frame: *Self = @fieldParentPtr("coro", coro);
+            allocator.destroy(frame);
         }
     };
 }
@@ -154,24 +180,18 @@ pub fn create(
     comptime user_fn: anytype,
     args: anytype,
 ) !Created(@TypeOf(user_fn)) {
-    const UserFn = @TypeOf(user_fn);
     const Args = @TypeOf(args);
-    const Payload = PayloadOf(UserFn);
     const Cl = Closure(user_fn, Args);
+    const F = Frame(user_fn, Args);
 
-    const coro = try allocator.create(Coroutine);
-    errdefer allocator.destroy(coro);
+    // Single allocation for the entire frame: Coroutine + Closure + args
+    // + result slot. Replaces the prior four separate allocator.create()
+    // calls — 4× fewer allocator-traffic ops on the spawn hot path.
+    const frame = try allocator.create(F);
+    errdefer allocator.destroy(frame);
 
-    const closure = try allocator.create(Cl);
-    errdefer allocator.destroy(closure);
-
-    const args_storage = try allocator.create(Args);
-    errdefer allocator.destroy(args_storage);
-    args_storage.* = args;
-
-    const result = try allocator.create(ResultSlot(Payload));
-    errdefer allocator.destroy(result);
-    result.* = .{};
+    frame.args = args;
+    frame.result = .{};
 
     const gs = if (recycled_stack) |rs| rs else blk: {
         const initial_commit = stack_opts.initial_commit orelse stack_mod.defaultInitialCommit();
@@ -182,30 +202,30 @@ pub fn create(
     const stack_ptr: [*]align(16) u8 = @ptrFromInt(gs.base);
     const stack: []align(16) u8 = stack_ptr[0..gs.reserved_size];
 
-    closure.* = .{
+    frame.closure = .{
         .run_fn = &Cl.run,
-        .coro = coro,
-        .args_ptr = args_storage,
-        .result_ptr = result,
+        .coro = &frame.coro,
+        .args_ptr = &frame.args,
+        .result_ptr = &frame.result,
     };
 
-    coro.* = .{
+    frame.coro = .{
         // scheduler_ctx is set on every dispatch. Until then, leave it
         // pointing at our own ctx (safe sentinel — we never use it before
         // dispatch).
-        .scheduler_ctx = &coro.ctx,
+        .scheduler_ctx = &frame.coro.ctx,
         // pending_event, done_flag, join_park, cancel_flag all default to
         // their zero/initial values via the struct's field defaults.
         .stack = stack,
         .stack_committed_bottom = std.atomic.Value(usize).init(gs.committed_bottom),
-        .destroy_extras_fn = &Cl.destroyExtras,
-        .closure_ptr = @ptrCast(closure),
-        .args_ptr = @ptrCast(args_storage),
+        .destroy_extras_fn = &F.destroyFrame,
+        .closure_ptr = @ptrCast(&frame.closure),
+        .args_ptr = @ptrCast(&frame.args),
     };
 
-    ctx.initContext(&coro.ctx, stack_mod.topOf(stack), closure);
+    ctx.initContext(&frame.coro.ctx, stack_mod.topOf(stack), &frame.closure);
 
-    return .{ .coro = coro, .result_ptr = result };
+    return .{ .coro = &frame.coro, .result_ptr = &frame.result };
 }
 
 test "spawn: PayloadOf strips error union" {
