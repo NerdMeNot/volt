@@ -57,7 +57,13 @@ jobs:
           - { os: ubuntu-22.04-arm, name: linux-arm64-epoll,    build_args: "" }
           - { os: ubuntu-22.04-arm, name: linux-arm64-iouring,  build_args: "-Dreactor=iouring" }
           - { os: macos-latest,     name: macos-arm64-kqueue,   build_args: "" }
-          # macos-x86_64 dropped — see ci.yml for rationale.
+          # macos x86_64 (Intel): continue-on-error to gather SEGV stack
+          # trace without gating ship. The SEGV is reproducible on every
+          # spawn-using test; we want to use the CI logs to diagnose,
+          # following the same pattern that just fixed the Linux x86 TLS
+          # caching bug (CI logs + cross-compile disasm, no interactive
+          # access needed).
+          - { os: macos-13,          name: macos-x86_64-kqueue,  build_args: "", allow_failure: true }
           # Windows native test entry: blocked on three Zig 0.16 stdlib
           # bugs (std.Io.Writer fmt-spec, std.c ws2_32.addrinfo missing,
           # std.c mmap signature uses void). Cross-compile (build-lib) is
