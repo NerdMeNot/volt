@@ -123,10 +123,10 @@ const MuCtx = struct {
     iters: u32,
 };
 
-fn muIncrementer(ctx: *MuCtx) void {
+fn muIncrementer(ctx: *MuCtx) !void {
     var i: u32 = 0;
     while (i < ctx.iters) : (i += 1) {
-        ctx.mu.lock();
+        try ctx.mu.lock();
         ctx.counter += 1;
         ctx.mu.unlock();
     }
