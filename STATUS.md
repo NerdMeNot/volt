@@ -41,14 +41,18 @@
 
 ## Performance (Apple Silicon arm64, ReleaseFast)
 
-`zig build bench` on this Mac:
+`zig build bench` on this Mac (after the `sigprocmask` removal in `setjmp` — see commit `4359872`):
 
 | Benchmark | Result | Notes |
 |---|---|---|
-| Yield ping-pong (one-way ctx switch) | **74 ns/op** | Beats Go (~150ns); rivals Tokio (50-100ns) |
-| Channel SPSC (cap=16) | **208 ns/op** | On par with Go channels (200-500ns) |
-| Mutex lock/unlock | **1468 ns/op** | Includes contention path |
-| spawn+join | **13995 ns/op (14µs)** | Includes the join cost; Go spawn-only is ~3µs. The post-v1 perf target. |
+| **Yield ping-pong (one-way ctx switch)** | **~10 ns/op** | Matches the spike claim. Competitive with the best stackful runtimes (Go: ~150ns, Tokio: ~50-100ns, may: ~10-20ns). |
+| Channel SPSC (cap=16) | **~179 ns/op** | On par with Go channels (200-500ns) |
+| Mutex lock/unlock | **~1340 ns/op** | Includes contention path |
+| spawn+join | **~9-14 µs (noisy)** | Includes join cost. Mostly stack-pool warmup + park/unpark. The post-v1 perf target. |
+
+### Profiling result that landed this win
+
+Mac `sample` showed `sigprocmask` (called via `sigsetjmp(env, 1)` in the per-dispatch overflow checkpoint) was a top stack-top hit. Volt doesn't manipulate signal masks during normal scheduling — only `installPerThread` does, at thread entry. Dropping the mask snapshot (`sigsetjmp(env, 0)`) removed one syscall per coroutine swap and gave 7–8x on the inner loop.
 
 Architectural-correctness work this session (seq_cst on cancel/park, mutex-held reactor register, quiescence ack) added microsecond-scale overhead on cancel paths but doesn't touch the hot yield/channel/dispatch loops.
 
