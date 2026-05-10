@@ -10,16 +10,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Reactor backend selection. Default: kqueue on Darwin/BSD, epoll
-    // on Linux. `-Dreactor=iouring` switches Linux to io_uring.
+    // Reactor backend selection. Default: kqueue on Darwin/BSD, io_uring
+    // on Linux (≥ 5.1). `-Dreactor=epoll` opts into the legacy epoll
+    // backend on Linux for older kernels or comparison.
     // Cross-platform aware: passing -Dreactor=iouring on a non-Linux
     // target is rejected at compile time inside src/io/reactor.zig.
     const ReactorChoice = enum { default, epoll, iouring };
     const reactor_choice = b.option(
         ReactorChoice,
         "reactor",
-        "Reactor backend (default: kqueue on Darwin, epoll on Linux). " ++
-            "Set to 'iouring' for the io_uring backend on Linux.",
+        "Reactor backend (default: kqueue on Darwin, io_uring on Linux ≥ 5.1). " ++
+            "Set to 'epoll' for the legacy Linux backend.",
     ) orelse .default;
 
     // Reactor-trace: compile-time-gated event ring buffer in the

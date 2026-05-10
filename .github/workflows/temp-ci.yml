@@ -52,10 +52,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,    name: linux-x86_64-epoll,   build_args: "" }
-          - { os: ubuntu-latest,    name: linux-x86_64-iouring, build_args: "-Dreactor=iouring" }
-          - { os: ubuntu-22.04-arm, name: linux-arm64-epoll,    build_args: "" }
-          - { os: ubuntu-22.04-arm, name: linux-arm64-iouring,  build_args: "-Dreactor=iouring" }
+          - { os: ubuntu-latest,    name: linux-x86_64-iouring, build_args: "" }
+          - { os: ubuntu-latest,    name: linux-x86_64-epoll,   build_args: "-Dreactor=epoll" }
+          - { os: ubuntu-22.04-arm, name: linux-arm64-iouring,  build_args: "" }
+          - { os: ubuntu-22.04-arm, name: linux-arm64-epoll,    build_args: "-Dreactor=epoll" }
           - { os: macos-latest,     name: macos-arm64-kqueue,   build_args: "" }
           # macos x86_64 (Intel): continue-on-error to gather SEGV stack
           # trace without gating ship. The SEGV is reproducible on every
@@ -114,8 +114,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, name: linux-x86_64-epoll,   build_args: "" }
-          - { os: ubuntu-latest, name: linux-x86_64-iouring, build_args: "-Dreactor=iouring" }
+          - { os: ubuntu-latest, name: linux-x86_64-iouring, build_args: "" }
+          - { os: ubuntu-latest, name: linux-x86_64-epoll,   build_args: "-Dreactor=epoll" }
           - { os: macos-latest,  name: macos-arm64-kqueue,   build_args: "" }
     runs-on: ${{ matrix.os }}
     steps:
