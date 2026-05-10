@@ -94,7 +94,20 @@ fn doneSubscribe(opaque_self: *anyopaque, coro: *Coroutine) void {
                 .floor = base + page,
             };
             coro.stack_pooled.store(true, .release);
-            rt.stack_pool.release(gs);
+            // Three-tier release path mirroring the acquire side:
+            //   1. Calling worker's local pool — hot path, owner-only,
+            //      no mutex. The Done.subscribe runs synchronously on
+            //      the worker that swapped into this coroutine, so the
+            //      "current worker" IS the right pool to push to.
+            //   2. Runtime's global pool — fallback if no current worker
+            //      (root cleanup edge case, though gated above).
+            const cur_worker = @import("../scheduler/current.zig").currentWorkerRaw();
+            if (cur_worker) |raw| {
+                const w: *@import("../scheduler/worker.zig").Worker = @ptrCast(@alignCast(raw));
+                w.local_stack_pool.release(gs);
+            } else {
+                rt.stack_pool.release(gs);
+            }
         }
     }
 

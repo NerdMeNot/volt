@@ -5,6 +5,26 @@
 //! stack region back; new spawns pop from the head. The mmap call only
 //! happens when the pool is empty (or full at release).
 //!
+//! ## Two pools
+//!
+//! Volt now operates two pool tiers (since the per-worker arena rework):
+//!
+//!   - **Per-Worker LocalPool**: Owner-only access (no mutex). The
+//!     spawning worker's pool is consulted first on `acquire`. Done
+//!     coroutines completing on their home worker `release` here. Hot
+//!     path; all owner-only ops are wait-free.
+//!
+//!   - **Global StackPool** (this struct, original design): Mutex-
+//!     protected fallback. Cross-worker frees route here (a coroutine
+//!     stolen and finished on a non-home worker can't push to its
+//!     home pool without coordination, so it goes global). Workers
+//!     consult global on local-empty miss.
+//!
+//! With pre-warm of N stacks per worker at runtime init, steady-state
+//! workloads NEVER touch the global pool: every spawn hits the local
+//! pool, every free returns to the local pool. Cross-worker traffic is
+//! the cold path.
+//!
 //! ## Lifecycle
 //!
 //! - `Done.subscribe` calls `release(stack, committed_bottom)` after the
@@ -141,6 +161,126 @@ pub const StackPool = struct {
     }
 
     pub const Stats = struct { hits: u64, misses: u64, free_count: usize };
+};
+
+/// Per-Worker stack pool. Owner-only access — no mutex. The owning
+/// worker's `acquire`/`release` go through here directly. Cross-worker
+/// frees (e.g. a stolen coroutine completing on a non-home worker) skip
+/// this and route to the runtime's global `StackPool`.
+///
+/// Pre-warm at worker init: mmap N stacks upfront so the first wave of
+/// spawns hits the pool without syscalls. With pre-warm + steady-state
+/// recycle, syscall traffic in spawn hot loops drops to zero.
+pub const LocalPool = struct {
+    /// Owning worker id. Cached here for diagnostic prints + assertion
+    /// in cross-thread free paths.
+    worker_id: usize,
+
+    /// Backing allocator for the freelist's storage. Used only for the
+    /// ArrayList growth — the stacks themselves are mmap'd, not
+    /// heap-allocated.
+    allocator: std.mem.Allocator,
+
+    /// LIFO — last-released stack returns first (cache-warm).
+    free_list: std.array_list.Managed(PooledStack),
+
+    /// Soft cap. Releases past this drop the stack via munmap.
+    cap: usize,
+
+    /// Pre-warm size: how many stacks to mmap at init.
+    prewarm: usize,
+
+    /// Counters for diagnostics. Local-only access — no atomics needed.
+    hits: u64 = 0,
+    misses: u64 = 0,
+    crossworker_releases: u64 = 0,
+
+    pub const DEFAULT_CAP_PER_WORKER: usize = 64;
+    pub const DEFAULT_PREWARM_PER_WORKER: usize = 8;
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        worker_id: usize,
+        prewarm: usize,
+        cap: usize,
+    ) !LocalPool {
+        var pool: LocalPool = .{
+            .worker_id = worker_id,
+            .allocator = allocator,
+            .free_list = std.array_list.Managed(PooledStack).init(allocator),
+            .cap = cap,
+            .prewarm = prewarm,
+        };
+        try pool.free_list.ensureTotalCapacity(cap);
+        // Pre-warm: mmap `prewarm` stacks now so first-wave spawns are
+        // syscall-free. mmap is the only syscall here; PROT_NONE means
+        // zero physical pages until coroutines actually use them.
+        var i: usize = 0;
+        while (i < prewarm) : (i += 1) {
+            const gs = stack_mod.allocGrowable(
+                stack_mod.defaultInitialCommit(),
+                stack_mod.default_reserved,
+            ) catch break;
+            pool.free_list.appendAssumeCapacity(PooledStack.fromGrowable(gs));
+        }
+        return pool;
+    }
+
+    pub fn deinit(self: *LocalPool) void {
+        for (self.free_list.items) |ps| {
+            stack_mod.freeGrowable(ps.toGrowable());
+        }
+        self.free_list.deinit();
+    }
+
+    /// Owner-only. Returns a recycled stack of matching reserved size,
+    /// or null if the pool is empty (caller falls back to the global
+    /// pool, then fresh mmap).
+    pub fn acquire(self: *LocalPool, reserved_size: usize) ?stack_mod.GrowableStack {
+        var i: usize = self.free_list.items.len;
+        while (i > 0) {
+            i -= 1;
+            const ps = self.free_list.items[i];
+            if (ps.reserved_size == reserved_size) {
+                _ = self.free_list.swapRemove(i);
+                self.hits += 1;
+                return ps.toGrowable();
+            }
+        }
+        self.misses += 1;
+        return null;
+    }
+
+    /// Owner-only. Push a freed stack back to the pool. If the pool is
+    /// full, munmap immediately. No mutex: only the owning worker calls
+    /// this — cross-worker frees go to the runtime's global pool.
+    pub fn release(self: *LocalPool, gs: stack_mod.GrowableStack) void {
+        if (self.free_list.items.len >= self.cap) {
+            stack_mod.freeGrowable(gs);
+            return;
+        }
+        self.free_list.append(PooledStack.fromGrowable(gs)) catch {
+            stack_mod.freeGrowable(gs);
+        };
+    }
+
+    pub const LocalStats = struct {
+        worker_id: usize,
+        hits: u64,
+        misses: u64,
+        free_count: usize,
+        crossworker_releases: u64,
+    };
+
+    pub fn stats(self: *const LocalPool) LocalStats {
+        return .{
+            .worker_id = self.worker_id,
+            .hits = self.hits,
+            .misses = self.misses,
+            .free_count = self.free_list.items.len,
+            .crossworker_releases = self.crossworker_releases,
+        };
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────

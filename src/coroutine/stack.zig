@@ -69,19 +69,23 @@ pub fn pageSize() usize {
 /// Default reserved range per coroutine — pure virtual address space
 /// until pages are committed on demand.
 ///
-/// 8 MiB is the cap on per-coroutine stack growth. Picked because:
+/// 1 MiB is the cap on per-coroutine stack growth. Picked because:
 ///   - It costs ~zero physical memory (PROT_NONE virtual until written).
-///   - 1M coroutines × 8 MiB = 8 TiB virtual, fits the 128 TiB user-space
-///     ceiling on 64-bit Linux/macOS with room to spare.
-///   - Big enough for recursive-descent parsers, regex backtracking,
-///     deep AST walks — the workloads that exhaust a 1 MiB cap.
-///   - Small enough that hitting it is a real signal of runaway
-///     recursion (vs. a normal workload that just needs more headroom).
+///   - 1M coroutines × 1 MiB = 1 TiB virtual, fits the 128 TiB user-space
+///     ceiling on 64-bit Linux/macOS comfortably.
+///   - Big enough for typical workloads (web handlers, RPC, channel
+///     pipelines, JSON parsers).
+///   - Small enough to keep TLB pressure modest.
+///   - Resident set per IDLE coroutine = 1 page (4 KiB Linux x86 / 16
+///     KiB macOS arm64) — comparable to Go's 2 KiB initial goroutine.
 ///
-/// A coroutine that exhausts 8 MiB surfaces `error.StackOverflow` to
-/// joiners; the runtime keeps running. To support workloads that
-/// genuinely need more, raise this constant.
-pub const default_reserved: usize = 8 * 1024 * 1024;
+/// Workloads that need deeper stacks (regex backtracking, recursive-
+/// descent parsers) can raise this via `Runtime.Config.stack_reserved`
+/// or call `volt.run` with an override.
+///
+/// A coroutine that exhausts the reserved range surfaces
+/// `error.StackOverflow` to joiners; the runtime keeps running.
+pub const default_reserved: usize = 1 * 1024 * 1024;
 
 /// Default initial committed region — exactly one page. The smallest
 /// possible footprint; subsequent pages are committed on guard-page

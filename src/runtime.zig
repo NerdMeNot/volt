@@ -591,23 +591,37 @@ pub const Runtime = struct {
         comptime user_fn: anytype,
         args: anytype,
     ) !spawn_mod.Created(@TypeOf(user_fn)) {
-        // Failure-cleanup state machine. We need different unwind
-        // actions depending on which step failed:
-        //   - stack pulled from pool but spawn_mod.create not yet called:
-        //     return stack to pool.
-        //   - spawn_mod.create succeeded, later step (pushOwned) failed:
-        //     free everything `created` owns (struct + extras + stack).
-        // Tracking the stage explicitly is clearer than chained
-        // errdefers and avoids the double-free that the layered
-        // errdefer-on-recycled + errdefer-on-created shape produced.
-        var stage: enum { initial, has_recycled, has_created } = .initial;
-        const recycled = self.stack_pool.acquire(stack_mod.default_reserved);
-        if (recycled != null) stage = .has_recycled;
+        // Resolve the calling worker first — we need it for the local
+        // stack pool below, and it's fast (one TLS read).
+        const w = currentWorker() orelse @panic(
+            "Runtime.createCoroutine called outside a worker thread. " ++
+                "Use Runtime.spawnRoot from the bootstrap thread instead.",
+        );
+
+        // Acquire a stack — three-tier search:
+        //   1. Worker's local pool (owner-only, no mutex). Hot path.
+        //   2. Runtime's global pool (mutex; cross-worker fallback).
+        //   3. Fresh `mmap` via spawn_mod.create when both pools empty.
+        // With pre-warmed local pools, steady-state hits tier 1 and
+        // does ZERO syscalls in the spawn hot loop.
+        var stage: enum { initial, has_local_recycled, has_global_recycled, has_created } = .initial;
+        const recycled = blk: {
+            if (w.local_stack_pool.acquire(stack_mod.default_reserved)) |gs| {
+                stage = .has_local_recycled;
+                break :blk @as(?stack_mod.GrowableStack, gs);
+            }
+            if (self.stack_pool.acquire(stack_mod.default_reserved)) |gs| {
+                stage = .has_global_recycled;
+                break :blk @as(?stack_mod.GrowableStack, gs);
+            }
+            break :blk null;
+        };
 
         var created: spawn_mod.Created(@TypeOf(user_fn)) = undefined;
         errdefer switch (stage) {
             .initial => {},
-            .has_recycled => if (recycled) |gs| self.stack_pool.release(gs),
+            .has_local_recycled => if (recycled) |gs| w.local_stack_pool.release(gs),
+            .has_global_recycled => if (recycled) |gs| self.stack_pool.release(gs),
             .has_created => {
                 created.coro.destroy_extras_fn(self.allocator, created.coro);
                 if (!created.coro.stack_pooled.load(.acquire)) {
@@ -634,10 +648,6 @@ pub const Runtime = struct {
             created.coro.parent_id = @intFromPtr(parent);
         }
 
-        const w = currentWorker() orelse @panic(
-            "Runtime.createCoroutine called outside a worker thread. " ++
-                "Use Runtime.spawnRoot from the bootstrap thread instead.",
-        );
         // Push to deque BEFORE registering live: if pushOwned fails
         // (OOM growing the deque), the errdefer cleans `created` —
         // unwinding a registerLive would also race with snapshot

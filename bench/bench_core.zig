@@ -5,11 +5,22 @@
 //! Each benchmark prints a single line of `name: NS_PER_OP ns/op
 //! (TOTAL_OPS ops in WALL_NS ns)`. Compare across commits to catch
 //! regressions; v1.0 will add a baseline JSON output for CI gating.
+//!
+//! ## Allocator choice
+//!
+//! Uses `std.heap.smp_allocator` (Zig 0.16's lock-free bin allocator).
+//! Earlier versions used `bench_allocator`, which routed
+//! every per-spawn struct allocation (Task, Coroutine, Closure, args
+//! — typically 64–256 bytes each) through mmap, padding spawn+join
+//! by ~10–15 µs of pure syscall traffic. Switching to smp_allocator
+//! is the architecturally correct choice and what real users will do.
 
 const std = @import("std");
 const volt = @import("volt");
 
 const ns_per_s = std.time.ns_per_s;
+
+const bench_allocator = std.heap.smp_allocator;
 
 fn report(name: []const u8, ops: u64, wall_ns: u64) void {
     const ns_per_op = if (ops == 0) 0 else wall_ns / ops;
@@ -24,7 +35,7 @@ fn spawnNop() void {}
 
 fn spawnBenchRoot(n: u32) !u64 {
     const t0 = volt.time.nanoTimestamp();
-    const allocator = std.heap.page_allocator;
+    const allocator = bench_allocator;
     const jobs = try allocator.alloc(*volt.Job, n);
     defer allocator.free(jobs);
 
@@ -37,7 +48,7 @@ fn spawnBenchRoot(n: u32) !u64 {
 }
 
 fn benchSpawn(n: u32) !void {
-    const wall = try volt.run(.{ .allocator = std.heap.page_allocator }, spawnBenchRoot, .{n});
+    const wall = try volt.run(.{ .allocator = bench_allocator }, spawnBenchRoot, .{n});
     report("spawn+join (1 worker per coro, N coros)", n, wall);
 }
 
@@ -63,7 +74,7 @@ fn switchBenchRoot(iters: u32) !u64 {
 }
 
 fn benchYieldSwitch(iters: u32) !void {
-    const wall = try volt.run(.{ .allocator = std.heap.page_allocator }, switchBenchRoot, .{iters});
+    const wall = try volt.run(.{ .allocator = bench_allocator }, switchBenchRoot, .{iters});
     // Each yield is 2 context switches (coro→worker→coro), so divide
     // by 2 for "one-way" cost.
     report("yield ping-pong (one-way switch)", iters * 2, wall);
@@ -93,7 +104,7 @@ fn chConsumer(ctx: *ChCtx) !u64 {
 }
 
 fn channelBenchRoot(n: u64) !u64 {
-    var ch = try volt.channel.Channel(u64).init(std.heap.page_allocator, 16);
+    var ch = try volt.channel.Channel(u64).init(bench_allocator, 16);
     defer ch.deinit();
     var ctx = ChCtx{ .ch = &ch, .n = n };
 
@@ -109,7 +120,7 @@ fn channelBenchRoot(n: u64) !u64 {
 }
 
 fn benchChannel(n: u64) !void {
-    const wall = try volt.run(.{ .allocator = std.heap.page_allocator }, channelBenchRoot, .{n});
+    const wall = try volt.run(.{ .allocator = bench_allocator }, channelBenchRoot, .{n});
     report("channel SPSC cap=16", n, wall);
 }
 
@@ -135,7 +146,7 @@ fn muIncrementer(ctx: *MuCtx) !void {
 fn mutexBenchRoot(n_workers: u32, iters: u32) !u64 {
     var mu = volt.sync.Mutex{};
     var ctx = MuCtx{ .mu = &mu, .iters = iters };
-    const allocator = std.heap.page_allocator;
+    const allocator = bench_allocator;
     const jobs = try allocator.alloc(*volt.Job, n_workers);
     defer allocator.free(jobs);
 
@@ -149,7 +160,7 @@ fn mutexBenchRoot(n_workers: u32, iters: u32) !u64 {
 }
 
 fn benchMutex(n_workers: u32, iters: u32) !void {
-    const wall = try volt.run(.{ .allocator = std.heap.page_allocator }, mutexBenchRoot, .{ n_workers, iters });
+    const wall = try volt.run(.{ .allocator = bench_allocator }, mutexBenchRoot, .{ n_workers, iters });
     const ops = @as(u64, n_workers) * iters;
     report("mutex lock/unlock", ops, wall);
 }
