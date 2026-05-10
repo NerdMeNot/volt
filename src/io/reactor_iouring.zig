@@ -230,6 +230,13 @@ pub const Reactor = struct {
         return self.pending.load(.acquire);
     }
 
+    /// Decrement `pending` with an underflow guard. See kqueue's
+    /// pendingDec for D4 rationale.
+    inline fn pendingDec(self: *Reactor) void {
+        std.debug.assert(self.pending.load(.acquire) > 0);
+        _ = self.pending.fetchSub(1, .release);
+    }
+
     pub fn tickle(self: *Reactor) void {
         const one: u64 = 1;
         const buf: []const u8 = std.mem.asBytes(&one);
@@ -299,7 +306,7 @@ pub const Reactor = struct {
                 // eventual stale CQE (with old user_data / -ECANCELED)
                 // hits poll's stale-CQE arm which intentionally does NOT
                 // decrement again — the cancel path owns the bookkeeping.
-                _ = self.pending.fetchSub(1, .release);
+                self.pendingDec();
             }
         }
     }
@@ -326,7 +333,7 @@ pub const Reactor = struct {
         sqe.user_data = ud.pack();
         _ = self.pending.fetchAdd(1, .release);
         _ = self.ring.submit() catch {
-            _ = self.pending.fetchSub(1, .release);
+            self.pendingDec();
             return error.RegistrationFailed;
         };
     }
@@ -360,7 +367,7 @@ pub const Reactor = struct {
         // pending++ before submit (R2 ordering rule).
         _ = self.pending.fetchAdd(1, .release);
         _ = self.ring.submit() catch {
-            _ = self.pending.fetchSub(1, .release);
+            self.pendingDec();
             return error.RegistrationFailed;
         };
         return ud.pack();
@@ -443,7 +450,7 @@ pub const Reactor = struct {
             // synchronous decrement that kqueue/epoll do on
             // unregister*. Poll's stale-CQE arm must NOT decrement
             // again or we'd underflow.
-            _ = self.pending.fetchSub(1, .release);
+            self.pendingDec();
             return .{
                 .slot = @intCast(entry.key),
                 .original_generation = orig_gen,
@@ -506,7 +513,7 @@ pub const Reactor = struct {
                         // register.
                         continue;
                     };
-                    _ = self.pending.fetchSub(1, .release);
+                    self.pendingDec();
                     try wakeFn(wake_ctx, target);
                     woken += 1;
                 },

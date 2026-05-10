@@ -122,6 +122,13 @@ pub const Reactor = struct {
         return self.pending.load(.acquire);
     }
 
+    /// Decrement `pending` with an underflow guard. See kqueue's
+    /// pendingDec for D4 rationale.
+    inline fn pendingDec(self: *Reactor) void {
+        std.debug.assert(self.pending.load(.acquire) > 0);
+        _ = self.pending.fetchSub(1, .release);
+    }
+
     /// Cross-thread wake: write 1 to the eventfd; the polling worker's
     /// epoll_wait returns immediately.
     pub fn tickle(self: *Reactor) void {
@@ -155,6 +162,10 @@ pub const Reactor = struct {
         };
 
         self.mutex.lock();
+        // D4 invariant: same fd+kind shouldn't already be registered.
+        // If it is, our protocol has gone wrong (double register without
+        // intervening unregister). Catches reactor-state corruption.
+        std.debug.assert(!self.waiters.contains(key));
         self.waiters.put(key, {}) catch {
             self.mutex.unlock();
             return error.OutOfMemory;
@@ -177,13 +188,13 @@ pub const Reactor = struct {
                 const rc2 = linux.epoll_ctl(self.epfd, linux.EPOLL.CTL_MOD, fd, &ev);
                 if (rc2 != 0) {
                     _ = self.waiters.remove(key);
-                    _ = self.pending.fetchSub(1, .release);
+                    self.pendingDec();
                     self.mutex.unlock();
                     return error.RegistrationFailed;
                 }
             } else {
                 _ = self.waiters.remove(key);
-                _ = self.pending.fetchSub(1, .release);
+                self.pendingDec();
                 self.mutex.unlock();
                 return error.RegistrationFailed;
             }
@@ -255,7 +266,7 @@ pub const Reactor = struct {
         _ = linux.epoll_ctl(self.epfd, linux.EPOLL.CTL_DEL, tfd, null);
         syscall.close(tfd);
         self.allocator.destroy(entry);
-        _ = self.pending.fetchSub(1, .release);
+        self.pendingDec();
     }
 
     /// Cancel a pending fd wait. Same shape as `unregisterTimer`.
@@ -265,7 +276,7 @@ pub const Reactor = struct {
         const key = WaitKey{ .fd = @intCast(fd), .kind_tag = @intFromEnum(kind) };
         _ = self.waiters.remove(key);
         self.mutex.unlock();
-        _ = self.pending.fetchSub(1, .release);
+        self.pendingDec();
     }
 
     /// Block on epoll_wait for up to `timeout_ns`. For each ready
@@ -307,7 +318,7 @@ pub const Reactor = struct {
                 // single-poller-per-reactor (only one thread runs poll).
                 syscall.close(entry.timerfd);
                 self.allocator.destroy(entry);
-                _ = self.pending.fetchSub(1, .release);
+                self.pendingDec();
                 try wakeFn(wake_ctx, target_ptr);
                 woken += 1;
                 continue;
@@ -321,7 +332,7 @@ pub const Reactor = struct {
             // best-effort: we decrement pending and call wakeFn.
             // Memory cleanup of the map happens on the next
             // registerWait collision or at deinit.
-            _ = self.pending.fetchSub(1, .release);
+            self.pendingDec();
             try wakeFn(wake_ctx, target);
             woken += 1;
         }

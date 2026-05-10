@@ -129,6 +129,17 @@ pub const Reactor = struct {
         return self.pending.load(.acquire);
     }
 
+    /// Decrement `pending` with an underflow guard. D4 invariant —
+    /// pending should never wrap below 0; if a fetchSub on 0 ever
+    /// fires, our register/unregister bookkeeping has gone wrong
+    /// and we'd silently corrupt the counter (usize wraps to MAX).
+    /// Catches double-decrement bugs eagerly. Stripped in
+    /// ReleaseFast (`std.debug.assert` is `unreachable`-in-Debug-only).
+    inline fn pendingDec(self: *Reactor) void {
+        std.debug.assert(self.pending.load(.acquire) > 0);
+        _ = self.pending.fetchSub(1, .release);
+    }
+
     /// Arm a one-shot timer that fires after `duration_ns` nanoseconds.
     /// When it fires, the reactor invokes `wakeFn(wake_ctx, target)` —
     /// same dispatch shape as fd-based waits.
@@ -158,7 +169,7 @@ pub const Reactor = struct {
         // increment would underflow pending.
         _ = self.pending.fetchAdd(1, .release);
         _ = syscall.kevent(self.kq, &changes, &dummy, null) catch {
-            _ = self.pending.fetchSub(1, .release);
+            self.pendingDec();
             return error.RegistrationFailed;
         };
         return id;
@@ -181,7 +192,7 @@ pub const Reactor = struct {
         const changes = [_]posix.Kevent{ev};
         var dummy: [0]posix.Kevent = undefined;
         if (syscall.kevent(self.kq, &changes, &dummy, null)) |_| {
-            _ = self.pending.fetchSub(1, .release);
+            self.pendingDec();
         } else |err| switch (err) {
             error.EventNotFound => {}, // already fired — poll decremented
             else => {}, // best-effort; don't escalate cleanup errors
@@ -232,7 +243,7 @@ pub const Reactor = struct {
         const had_it = self.waiters.remove(key);
         self.mutex.unlock();
         if (had_it) {
-            _ = self.pending.fetchSub(1, .release);
+            self.pendingDec();
             trace.record(.unregister_remove_true, @intCast(fd), @intFromEnum(kind), self.pending.load(.monotonic));
         } else {
             trace.record(.unregister_remove_false, @intCast(fd), @intFromEnum(kind), self.pending.load(.monotonic));
@@ -301,7 +312,7 @@ pub const Reactor = struct {
             // with respect to a concurrent poll() seeing inconsistent
             // state.
             _ = self.waiters.remove(key);
-            _ = self.pending.fetchSub(1, .release);
+            self.pendingDec();
             self.mutex.unlock();
             trace.record(.register_fail_kevent, @intCast(fd), @intFromEnum(kind), self.pending.load(.monotonic));
             return error.RegistrationFailed;
@@ -341,7 +352,7 @@ pub const Reactor = struct {
             if (ev.filter == system.EVFILT.TIMER) {
                 // Timer events aren't in the waiters map (no fd key).
                 // EV_ONESHOT ensures kernel auto-removes the kevent.
-                _ = self.pending.fetchSub(1, .release);
+                self.pendingDec();
                 trace.record(.timer_unregister_ok, -1, 0xFF, self.pending.load(.monotonic));
                 try wakeFn(wake_ctx, target);
                 woken += 1;
@@ -358,7 +369,7 @@ pub const Reactor = struct {
             const removed = self.waiters.remove(key);
             self.mutex.unlock();
             if (removed) {
-                _ = self.pending.fetchSub(1, .release);
+                self.pendingDec();
                 trace.record(.poll_remove_true, fd_signed, kind_byte, self.pending.load(.monotonic));
                 trace.record(.poll_wakefn_invoked, fd_signed, kind_byte, self.pending.load(.monotonic));
                 try wakeFn(wake_ctx, target);
