@@ -257,21 +257,37 @@ pub fn createWithFrameSource(
         .result_ptr = &frame.result,
     };
 
-    frame.coro = .{
-        // scheduler_ctx is set on every dispatch. Until then, leave it
-        // pointing at our own ctx (safe sentinel — we never use it before
-        // dispatch).
-        .scheduler_ctx = &frame.coro.ctx,
-        // pending_event, done_flag, join_park, cancel_flag all default to
-        // their zero/initial values via the struct's field defaults.
-        .stack = stack,
-        .stack_committed_bottom = std.atomic.Value(usize).init(gs.committed_bottom),
-        .destroy_extras_fn = &F.destroyFrame,
-        .closure_ptr = @ptrCast(&frame.closure),
-        .args_ptr = @ptrCast(&frame.args),
-        .from_pool = from_pool,
-        .owning_worker_id = pool_worker_id,
-    };
+    // Go-style init: memset Coroutine to zero, then poke only the
+    // fields that need non-zero values. The struct-literal alternative
+    // (`frame.coro = .{ .field = value, ... }`) was compiling into
+    // 20+ individual field stores because every `std.atomic.Value(T)`
+    // field has a default `init(0)` that the compiler doesn't fold
+    // into the surrounding memset.
+    //
+    // This matches Go's `newproc1` which does
+    //   memclrNoHeapPointers(&newg.sched, sizeof(sched))
+    // followed by ~5 targeted stores.
+    //
+    // Non-zero defaults that we must re-establish after the memset:
+    //   pending_event = &yield_singleton (we set it explicitly below)
+    //   join_park.es.subscribe_fn = &Park.subscribe (re-init the Park)
+    //   mwait_park.es.subscribe_fn = &Park.subscribe (re-init the Park)
+    // Everything else (atomic.Value(T) of bools/ints/ptrs) is zero-init.
+    const event_source_mod = @import("event_source.zig");
+    const Park = @import("../scheduler/park.zig").Park;
+    @memset(@as([*]u8, @ptrCast(&frame.coro))[0..@sizeOf(Coroutine)], 0);
+    frame.coro.scheduler_ctx = &frame.coro.ctx;
+    frame.coro.pending_event = &event_source_mod.yield_singleton;
+    frame.coro.stack = stack;
+    frame.coro.stack_committed_bottom = std.atomic.Value(usize).init(gs.committed_bottom);
+    frame.coro.destroy_extras_fn = &F.destroyFrame;
+    frame.coro.closure_ptr = @ptrCast(&frame.closure);
+    frame.coro.args_ptr = @ptrCast(&frame.args);
+    frame.coro.from_pool = from_pool;
+    frame.coro.owning_worker_id = pool_worker_id;
+    // Re-establish Park defaults that memset zeroed.
+    frame.coro.join_park = Park{};
+    frame.coro.mwait_park = Park{};
 
     ctx.initContext(&frame.coro.ctx, stack_mod.topOf(stack), &frame.closure);
 
