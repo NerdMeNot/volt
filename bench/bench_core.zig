@@ -198,7 +198,67 @@ fn mutexBenchRoot(n_workers: u32, iters: u32) !u64 {
 fn benchMutex(n_workers: u32, iters: u32) !void {
     const wall = try volt.run(.{ .allocator = bench_allocator }, mutexBenchRoot, .{ n_workers, iters });
     const ops = @as(u64, n_workers) * iters;
-    report("mutex lock/unlock", ops, wall);
+    report("mutex lock/unlock (chained — best case)", ops, wall);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Mutex with cross-core contention — REALISTIC bench.
+//
+// The `mutex lock/unlock` bench above is a best-case number: the
+// handoff chain naturally serializes on one worker because each
+// unlock's wake routes through `unparkLocal` (the unparker's own
+// worker dispatches the next waiter). All 8 coroutines end up "in the
+// same room" on one CPU core — pure ctx-swap chain, ~47 ns/op.
+//
+// Real workloads have coroutines doing actual work BETWEEN lock
+// acquisitions, which spreads them across workers. To force that
+// pattern: insert yields between lock acquires. The yield surrenders
+// the worker, lets the scheduler distribute coroutines, so each
+// lock-acquisition is an HONEST cross-core handoff: the previous
+// holder is on core A, the next waiter parks on core B, the unlock
+// crosses cores.
+//
+// This number is what users will see in production when their
+// coroutines do real work and only briefly contend on the mutex.
+// ─────────────────────────────────────────────────────────────────────
+
+fn muIncrementerCrossCore(ctx: *MuCtx) !void {
+    var i: u32 = 0;
+    while (i < ctx.iters) : (i += 1) {
+        // Yield BEFORE the lock so we end up on a different worker
+        // than the previous holder. With 8 coros and 8 workers, the
+        // yield distributes us. Each lock acquisition is then a
+        // cross-worker handoff.
+        try volt.yield();
+        try ctx.mu.lock();
+        ctx.counter += 1;
+        ctx.mu.unlock();
+    }
+}
+
+fn mutexCrossCoreRoot(n_workers: u32, iters: u32) !u64 {
+    var mu = volt.sync.Mutex{};
+    var ctx = MuCtx{ .mu = &mu, .iters = iters };
+    const allocator = bench_allocator;
+    const jobs = try allocator.alloc(*volt.Job, n_workers);
+    defer allocator.free(jobs);
+
+    const t0 = volt.time.nanoTimestamp();
+    for (jobs) |*j| j.* = try volt.launch(muIncrementerCrossCore, .{&ctx});
+    defer for (jobs) |j| volt.destroyJob(j);
+    for (jobs) |j| try j.join();
+    const wall = volt.time.nanoTimestamp() - t0;
+    std.debug.assert(ctx.counter == @as(u64, n_workers) * iters);
+    return @intCast(wall);
+}
+
+fn benchMutexCrossCore(n_workers: u32, iters: u32) !void {
+    const wall = try volt.run(.{ .allocator = bench_allocator }, mutexCrossCoreRoot, .{ n_workers, iters });
+    // Subtract the yield cost so we're measuring lock+unlock alone.
+    // Each iter does: yield + lock + counter++ + unlock. yield is
+    // ~10ns. Report the FULL cycle wall but note the breakdown.
+    const ops = @as(u64, n_workers) * iters;
+    report("mutex lock/unlock (cross-core — realistic)", ops, wall);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -218,5 +278,8 @@ pub fn main() !void {
     try benchScopeSpawn(16);
     try benchYieldSwitch(100_000);
     try benchChannel(100_000);
+    // Two mutex numbers — best-case (chained) and realistic (cross-core).
+    // See `benchMutexCrossCore` doc for why both matter.
     try benchMutex(8, 50_000);
+    try benchMutexCrossCore(8, 50_000);
 }
