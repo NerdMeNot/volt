@@ -308,17 +308,21 @@ test "broadcast: 4 receivers each see 50 messages, sum invariant" {
 
 const LaggedCtx = struct {
     b: *Broadcast(u32),
+    subscribed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     lag_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 };
 
 fn slowReceiver(ctx: *LaggedCtx) !void {
     var rx = ctx.b.subscribe();
+    // Signal that we've subscribed BEFORE the sender starts. Without
+    // this barrier, the sender can blast messages while rx is still
+    // not yet in the subscriber set — rx then misses the entire lag
+    // window and the test races.
+    ctx.subscribed.store(true, .release);
     while (true) {
         // Yield every recv so the sender (which doesn't yield) gets
-        // dispatched and outruns us. Without this, scheduler can keep
-        // sender + receiver in lockstep on most runs — the test then
-        // races on whether sender ever pulls ahead by more than `cap`.
-        // The deterministic yield ensures we ARE slow.
+        // dispatched and outruns us. The deterministic yield ensures
+        // we ARE slow relative to the sender.
         try volt.yield();
         switch (try rx.recv()) {
             .value => continue,
@@ -332,8 +336,11 @@ fn slowReceiver(ctx: *LaggedCtx) !void {
 }
 
 fn fastSender(ctx: *LaggedCtx) !void {
-    // Subscribe a slow receiver, then blast 100 messages without
-    // yielding so it lags past capacity (cap=4).
+    // Wait until receiver has subscribed. Spin-yield until the
+    // barrier signals — no Park primitive needed for a one-shot.
+    while (!ctx.subscribed.load(.acquire)) try volt.yield();
+    // Now blast 100 messages without yielding so receiver lags past
+    // capacity (cap=4).
     var i: u32 = 0;
     while (i < 100) : (i += 1) try ctx.b.send(i);
     ctx.b.close();
@@ -346,9 +353,6 @@ fn laggedRoot() !u32 {
 
     var rx = try volt.spawn(slowReceiver, .{&ctx});
     defer volt.destroyTask(rx);
-
-    // Yield so the receiver has a chance to subscribe before sender starts.
-    try volt.yield();
 
     var sender = try volt.spawn(fastSender, .{&ctx});
     defer volt.destroyTask(sender);
