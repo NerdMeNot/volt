@@ -275,17 +275,25 @@ test "notify: notify-before-wait stores permit for next wait" {
 
 const SingleAllCtx = struct {
     notify: *Notify,
+    about_to_wait: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     woke: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 };
 
 fn singleAllWaiter(ctx: *SingleAllCtx) WaitError!void {
+    ctx.about_to_wait.store(true, .release);
     try ctx.notify.wait();
     _ = ctx.woke.fetchAdd(1, .monotonic);
 }
 
 fn singleAllerFn(ctx: *SingleAllCtx) !void {
+    // Yield-spin until waiter has signaled it's about to park. Then a
+    // few extra yields to ensure waiter has actually entered park
+    // (the about_to_wait flag is set BEFORE the wait() call). Without
+    // this barrier, scheduling jitter can let the notifier fire before
+    // the waiter parks, missing the wake.
+    while (!ctx.about_to_wait.load(.acquire)) try volt.yield();
     var i: u32 = 0;
-    while (i < 8) : (i += 1) try volt.yield();
+    while (i < 16) : (i += 1) try volt.yield();
     ctx.notify.notifyAll();
 }
 

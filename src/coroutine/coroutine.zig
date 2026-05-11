@@ -151,6 +151,18 @@ pub const Coroutine = struct {
     //     by a cancel mid-wait (cancelled coros pass the grant through
     //     and exit on resume).
 
+    /// True if the Frame for this coroutine was allocated from a
+    /// per-worker FramePool slab, false if from the user allocator
+    /// (fallback path on pool exhaustion). Determines how
+    /// destroy_extras_fn frees the Frame.
+    from_pool: bool = false,
+
+    /// Worker id whose FramePool owns this coroutine's Frame. Only
+    /// valid when `from_pool` is true. Used by `destroy_extras_fn` to
+    /// route the free to the right per-worker pool's freelist (which
+    /// is a lock-free atomic push, so cross-worker free is safe).
+    owning_worker_id: u16 = 0,
+
     /// MCS queue next-pointer. Written by predecessor; read by me on
     /// unlock to find my successor.
     mwait_next: std.atomic.Value(?*Coroutine) = std.atomic.Value(?*Coroutine).init(null),

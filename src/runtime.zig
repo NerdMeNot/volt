@@ -656,8 +656,19 @@ pub const Runtime = struct {
             },
         };
 
-        created = try spawn_mod.create(
+        // Route Frame allocation through the calling worker's slab
+        // FramePool first (fast path: ~5ns bump+freelist pop). Falls
+        // back to `frame_allocator` only on pool exhaustion or for
+        // Frame types too large to fit any size class. The pool is
+        // safe to use cross-thread on free (lock-free single-link
+        // push); alloc is owner-only here so no contention.
+        const frame_source = spawn_mod.FrameSource{
+            .pool = &w.frame_pool,
+            .pool_worker_id = @intCast(w.id),
+        };
+        created = try spawn_mod.createWithFrameSource(
             frame_allocator,
+            frame_source,
             .{ .reserved = stack_mod.default_reserved },
             recycled,
             user_fn,

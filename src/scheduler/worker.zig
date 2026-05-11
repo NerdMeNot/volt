@@ -28,6 +28,7 @@ const co = @import("../coroutine/coroutine.zig");
 const Coroutine = co.Coroutine;
 const stack_mod = @import("../coroutine/stack.zig");
 const stack_pool_mod = @import("../coroutine/stack_pool.zig");
+const frame_pool_mod = @import("../coroutine/frame_pool.zig");
 const stack_overflow = @import("../coroutine/stack_overflow.zig");
 const event_source = @import("../coroutine/event_source.zig");
 const Deque = @import("deque.zig").Deque;
@@ -165,6 +166,13 @@ pub const Worker = struct {
     /// spawns are syscall-free. See `stack_pool.LocalPool`.
     local_stack_pool: stack_pool_mod.LocalPool,
 
+    /// Per-worker Frame slab pool. Type-erased with comptime size
+    /// classes. Replaces `smp_allocator.create(Frame)` in the spawn
+    /// hot path — saves ~80 ns/spawn on average. Backing region (1 MB)
+    /// is mmap'd once at init. Cross-worker free is lock-free via
+    /// atomic single-link push.
+    frame_pool: frame_pool_mod.FramePool,
+
     /// Per-worker monotonic counters. Lock-free atomics. Written by
     /// the worker (and one other thread for `steals_from_me`); read
     /// by `volt.observability.metrics(rt)` for diagnostic dashboards.
@@ -204,6 +212,7 @@ pub const Worker = struct {
                 stack_pool_mod.LocalPool.DEFAULT_PREWARM_PER_WORKER,
                 stack_pool_mod.LocalPool.DEFAULT_CAP_PER_WORKER,
             ),
+            .frame_pool = try frame_pool_mod.FramePool.init(id),
             .rng = std.Random.DefaultPrng.init(rng_seed),
         };
     }
@@ -217,6 +226,7 @@ pub const Worker = struct {
         // ownership — that pattern accumulated forever for long-
         // running services. See P1.
         self.local_stack_pool.deinit();
+        self.frame_pool.deinit();
         self.run_queue.deinit();
     }
 

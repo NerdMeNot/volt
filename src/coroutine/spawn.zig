@@ -130,15 +130,30 @@ pub fn Frame(comptime user_fn: anytype, comptime Args: type) type {
         result: ResultSlot(Payload),
 
         /// Free the entire frame. Called by lifecycleRelease via the
-        /// `destroy_extras_fn` slot in Coroutine — except we now repurpose
-        /// it to free THE WHOLE FRAME (Coroutine field included). The
-        /// caller's subsequent `allocator.destroy(coro)` becomes a no-op
-        /// (we set destroy_extras_fn to a function that frees the frame
-        /// AND coroutine.lifecycleRelease no longer separately destroys
-        /// the coro pointer). See Coroutine.lifecycleRelease for the
-        /// updated single-destroy lifecycle.
+        /// `destroy_extras_fn` slot in Coroutine.
+        ///
+        /// Two paths:
+        /// - `from_pool == true`: Frame came from the originating
+        ///   worker's `FramePool` slab. Return to that pool's freelist
+        ///   via lock-free push (safe cross-worker).
+        /// - `from_pool == false`: Frame came from the user allocator
+        ///   (pool exhaustion fallback). Standard allocator.destroy.
         pub fn destroyFrame(allocator: std.mem.Allocator, coro: *Coroutine) void {
             const frame: *Self = @fieldParentPtr("coro", coro);
+            if (coro.from_pool) {
+                // Route to the originating worker's FramePool freelist.
+                const runtime_mod = @import("../runtime.zig");
+                if (runtime_mod.currentRuntime()) |rt| {
+                    if (coro.owning_worker_id < rt.workers.len) {
+                        rt.workers[coro.owning_worker_id].frame_pool.free(Self, frame);
+                        return;
+                    }
+                }
+                // No runtime context (e.g. test teardown) — fall through
+                // to allocator.destroy as a safe-but-leaky fallback. The
+                // pool's munmap will reclaim the memory on Worker.deinit.
+                // We deliberately don't try to recover the worker here.
+            }
             allocator.destroy(frame);
         }
     };
@@ -173,8 +188,27 @@ pub const StackOptions = struct {
 /// `recycled_stack`: if non-null, reuses that GrowableStack instead of
 /// calling `allocGrowable`. Used by Runtime to recycle stacks via the
 /// stack pool. Pass null on first-spawn paths or when no pool is wired.
+/// Per-worker frame pool handle. Optional argument to `create` that
+/// lets the spawn path bypass the user allocator entirely. `null` =>
+/// fall back to user allocator.
+pub const FrameSource = struct {
+    pool: ?*@import("frame_pool.zig").FramePool = null,
+    pool_worker_id: u16 = 0,
+};
+
 pub fn create(
     allocator: std.mem.Allocator,
+    stack_opts: StackOptions,
+    recycled_stack: ?stack_mod.GrowableStack,
+    comptime user_fn: anytype,
+    args: anytype,
+) !Created(@TypeOf(user_fn)) {
+    return createWithFrameSource(allocator, .{}, stack_opts, recycled_stack, user_fn, args);
+}
+
+pub fn createWithFrameSource(
+    allocator: std.mem.Allocator,
+    frame_source: FrameSource,
     stack_opts: StackOptions,
     recycled_stack: ?stack_mod.GrowableStack,
     comptime user_fn: anytype,
@@ -184,11 +218,25 @@ pub fn create(
     const Cl = Closure(user_fn, Args);
     const F = Frame(user_fn, Args);
 
-    // Single allocation for the entire frame: Coroutine + Closure + args
-    // + result slot. Replaces the prior four separate allocator.create()
-    // calls — 4× fewer allocator-traffic ops on the spawn hot path.
-    const frame = try allocator.create(F);
-    errdefer allocator.destroy(frame);
+    // Try the per-worker FramePool first (fast path — comptime-resolved
+    // size class, no allocator-vtable call). On miss (pool exhausted or
+    // Frame too large for any size class) fall back to user allocator.
+    var from_pool = false;
+    var pool_worker_id: u16 = 0;
+    const frame: *F = blk: {
+        if (frame_source.pool) |pool| {
+            if (pool.alloc(F)) |p| {
+                from_pool = true;
+                pool_worker_id = frame_source.pool_worker_id;
+                break :blk p;
+            }
+        }
+        break :blk try allocator.create(F);
+    };
+    errdefer if (from_pool)
+        (frame_source.pool.?).free(F, frame)
+    else
+        allocator.destroy(frame);
 
     frame.args = args;
     frame.result = .{};
@@ -221,6 +269,8 @@ pub fn create(
         .destroy_extras_fn = &F.destroyFrame,
         .closure_ptr = @ptrCast(&frame.closure),
         .args_ptr = @ptrCast(&frame.args),
+        .from_pool = from_pool,
+        .owning_worker_id = pool_worker_id,
     };
 
     ctx.initContext(&frame.coro.ctx, stack_mod.topOf(stack), &frame.closure);
