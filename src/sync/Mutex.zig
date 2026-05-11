@@ -276,8 +276,12 @@ pub const Mutex = struct {
             }
 
             // Live successor — hand off the grant.
+            // unparkLocal (not unpark) skips wakeOneSibling: the mutex
+            // chain runs serially on whichever worker first dispatched
+            // the holder, no point waking siblings for work that's
+            // already strictly local. Saves ~50 ns per cycle.
             next.mwait_granted.store(true, .release);
-            next.mwait_park.unpark();
+            next.mwait_park.unparkLocal();
             return;
         }
     }

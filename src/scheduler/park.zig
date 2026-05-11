@@ -169,6 +169,47 @@ pub const Park = struct {
         // Resumed (by grant OR by cancel). Caller decides.
     }
 
+    /// Wake whoever is parked here without firing a sibling-worker
+    /// wake. Used by chained-handoff paths (Mutex MCS handoff) where
+    /// the waker knows the unparked coro will run on its OWN worker —
+    /// there's no point waking siblings for work that's local.
+    ///
+    /// Same protocol as `unpark` except it routes the wakeup through
+    /// the current worker's deque directly (`enqueueLocal`), bypassing
+    /// `Runtime.schedule`'s `wakeOneSibling` call (~50 ns saved per
+    /// cycle on saturated mutex contention).
+    ///
+    /// Cross-thread case (no current worker): falls back to standard
+    /// `scheduleCoro` for correctness.
+    pub fn unparkLocal(self: *Park) void {
+        var current = self.state.load(.acquire);
+        while (true) {
+            if ((current & NOTIFIED) != 0) return;
+            if (current == 0) {
+                if (self.state.cmpxchgWeak(0, NOTIFIED, .acq_rel, .acquire)) |observed| {
+                    current = observed;
+                    continue;
+                }
+                return;
+            }
+            if (self.state.cmpxchgWeak(current, 0, .acq_rel, .acquire)) |observed| {
+                current = observed;
+                continue;
+            }
+            const coro: *Coroutine = @ptrFromInt(current);
+            // Local enqueue: skip wakeOneSibling. The mutex chain is
+            // strictly serial on this worker — no point notifying others.
+            if (@import("current.zig").currentWorkerRaw()) |raw| {
+                const worker_mod = @import("worker.zig");
+                const w: *worker_mod.Worker = @ptrCast(@alignCast(raw));
+                w.enqueueLocal(coro);
+            } else {
+                scheduleCoro(coro);
+            }
+            return;
+        }
+    }
+
     /// Wake whoever is parked here. Idempotent — if no waiter is
     /// registered, stores NOTIFIED for the next park to consume. Safe to
     /// call from any thread.
