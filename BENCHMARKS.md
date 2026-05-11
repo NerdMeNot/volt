@@ -12,10 +12,10 @@ Reproducible via `zig build compare`. Median of 11 iterations after 3 warmup rou
 
 | Workload | Volt | Go | Volt / Go |
 |---|---|---|---|
-| yield (one-way ctx switch) | **10 ns/op** | 37 ns/op | **0.27× ★★** |
-| spawn + waitgroup-wait | 3,833 ns/op | 146 ns/op | 26.25× |
-| spawn + per-coro join | 3,837 ns/op | 145 ns/op | 26.46× |
-| channel SPSC cap=16 | 177 ns/op | 32 ns/op | 5.53× |
+| yield (one-way ctx switch) | **10 ns/op** | 38 ns/op | **0.26× ★★** |
+| spawn + waitgroup-wait | 3,868 ns/op | 147 ns/op | 26.31× |
+| spawn + per-coro join | 4,026 ns/op | 145 ns/op | 27.77× |
+| channel SPSC cap=16 | 175 ns/op | 33 ns/op | 5.30× |
 | mutex contended (8 coros) | **41 ns/op** | 82 ns/op | **0.50× ★** |
 
 ★★ = ≥2× faster · ★ = 5-50% faster · blank = slower

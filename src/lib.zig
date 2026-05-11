@@ -228,6 +228,7 @@ pub const sync = struct {
     pub const RwLock = @import("sync/RwLock.zig").RwLock;
     pub const Barrier = @import("sync/Barrier.zig").Barrier;
     pub const OnceCell = @import("sync/OnceCell.zig").OnceCell;
+    pub const WaitGroup = @import("sync/WaitGroup.zig").WaitGroup;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -442,6 +443,7 @@ test {
     _ = @import("sync/RwLock.zig");
     _ = @import("sync/Barrier.zig");
     _ = @import("sync/OnceCell.zig");
+    _ = @import("sync/WaitGroup.zig");
     _ = @import("sync/Scope.zig");
     _ = @import("sync/JoinSet.zig");
     _ = @import("sync/CancellationToken.zig");

@@ -67,32 +67,22 @@ fn benchSpawnJoin(n: u32) !u64 {
 }
 
 // Apples-to-apples with Go's `go func + wg.Wait`: spawn N coros that
-// signal done via an atomic counter, await the counter (not per-coro
-// join). Removes the 10k×park/unpark cycles that `for (jobs) |j| j.join()`
-// incurs and matches Go's WaitGroup pattern.
+// `defer wg.done()`, parent calls `wg.wait()`. ONE park-unpark cycle
+// regardless of N, vs the 10k×park-unpark of `for (jobs) |j| j.join()`.
 
-const WgCtx = struct {
-    remaining: std.atomic.Value(u32),
-    done_notify: *volt.sync.Notify,
-};
-fn wgCoro(ctx: *WgCtx) void {
-    if (ctx.remaining.fetchSub(1, .acq_rel) == 1) {
-        ctx.done_notify.notifyOne();
-    }
+fn wgCoro(wg: *volt.sync.WaitGroup) void {
+    wg.done();
 }
 fn spawnWaitgroupRoot(n: u32) !u64 {
-    var notify = volt.sync.Notify{};
-    var ctx = WgCtx{
-        .remaining = std.atomic.Value(u32).init(n),
-        .done_notify = &notify,
-    };
+    var wg = volt.sync.WaitGroup{};
+    wg.add(n);
     const jobs = try bench_allocator.alloc(*volt.Job, n);
     defer bench_allocator.free(jobs);
 
     const t0 = volt.time.nanoTimestamp();
-    for (jobs) |*j| j.* = try volt.launch(wgCoro, .{&ctx});
+    for (jobs) |*j| j.* = try volt.launch(wgCoro, .{&wg});
     defer for (jobs) |j| volt.destroyJob(j);
-    try notify.wait();
+    try wg.wait();
     const wall = volt.time.nanoTimestamp() - t0;
     return @intCast(wall);
 }
