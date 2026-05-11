@@ -136,6 +136,24 @@ pub fn Channel(comptime T: type) type {
         send_waiters: WaiterList = .{},
         recv_waiters: WaiterList = .{},
 
+        // ── Waiter-count atomics for fast-path skip ──────────────────
+        //
+        // wakeOneSendWaiter / wakeOneRecvWaiter (called from the hot
+        // recv/send paths) used to take `waiter_mutex` unconditionally
+        // just to discover the list was empty. For SPSC-style workloads
+        // the list is empty 99%+ of the time — pure mutex overhead.
+        //
+        // These counters are written under `waiter_mutex` (atomic with
+        // the list push/pop) and read lock-free in the wake helpers.
+        // Correctness argument: a recv that queues itself does
+        // tryRecvNoWake under the lock first. If the sender added a
+        // value while the recv was contending for the lock, recv sees
+        // it and returns without queueing. So a 0→non-zero count
+        // transition can only happen when the slot was observed empty
+        // — meaning the sender's next push will see count>0 and wake.
+        send_waiter_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        recv_waiter_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
         /// Initialize a channel with `capacity` slots. Capacity is
         /// rounded up to the next power of two so we can use bitmask
         /// indexing instead of modulo, with a floor of 2.
@@ -293,6 +311,7 @@ pub fn Channel(comptime T: type) type {
                             },
                             .full => {
                                 self.send_waiters.pushBack(&waiter);
+                                _ = self.send_waiter_count.fetchAdd(1, .release);
                                 self.waiter_mutex.unlock();
                                 waiter.park.parkCurrent() catch |err| switch (err) {
                                     error.Cancelled => {
@@ -330,6 +349,7 @@ pub fn Channel(comptime T: type) type {
                             },
                             .empty => {
                                 self.recv_waiters.pushBack(&waiter);
+                                _ = self.recv_waiter_count.fetchAdd(1, .release);
                                 self.waiter_mutex.unlock();
                                 waiter.park.parkCurrent() catch |err| switch (err) {
                                     error.Cancelled => {
@@ -353,9 +373,11 @@ pub fn Channel(comptime T: type) type {
             _ = self.tail.fetchOr(CLOSED_BIT, .acq_rel);
             self.waiter_mutex.lock();
             while (self.send_waiters.popFront()) |w| {
+                _ = self.send_waiter_count.fetchSub(1, .release);
                 w.park.unpark();
             }
             while (self.recv_waiters.popFront()) |w| {
+                _ = self.recv_waiter_count.fetchSub(1, .release);
                 w.park.unpark();
             }
             self.waiter_mutex.unlock();
@@ -364,15 +386,21 @@ pub fn Channel(comptime T: type) type {
         // ─── Wake helpers (called from fast path) ────────────────────
 
         fn wakeOneSendWaiter(self: *Self) void {
+            // Fast path: no waiters → skip mutex entirely.
+            if (self.send_waiter_count.load(.acquire) == 0) return;
             self.waiter_mutex.lock();
             const w = self.send_waiters.popFront();
+            if (w != null) _ = self.send_waiter_count.fetchSub(1, .release);
             self.waiter_mutex.unlock();
             if (w) |waiter| waiter.park.unpark();
         }
 
         fn wakeOneRecvWaiter(self: *Self) void {
+            // Fast path: no waiters → skip mutex entirely.
+            if (self.recv_waiter_count.load(.acquire) == 0) return;
             self.waiter_mutex.lock();
             const w = self.recv_waiters.popFront();
+            if (w != null) _ = self.recv_waiter_count.fetchSub(1, .release);
             self.waiter_mutex.unlock();
             if (w) |waiter| waiter.park.unpark();
         }
@@ -390,6 +418,14 @@ pub fn Channel(comptime T: type) type {
                     if (prev) |p| p.next = w.next else list.head = w.next;
                     if (list.tail == w) list.tail = prev;
                     w.next = null;
+                    // Maintain the waiter-count atomic. The counter is
+                    // shared between both lists' helpers; decrement the
+                    // right one based on `list` identity.
+                    if (list == &self.send_waiters) {
+                        _ = self.send_waiter_count.fetchSub(1, .release);
+                    } else {
+                        _ = self.recv_waiter_count.fetchSub(1, .release);
+                    }
                     return;
                 }
                 prev = w;
