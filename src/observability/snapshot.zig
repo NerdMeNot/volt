@@ -57,47 +57,57 @@ pub fn snapshot(allocator: std.mem.Allocator, rt: *runtime_mod.Runtime) ![]TaskS
     var list: std.array_list.Managed(TaskSnapshot) = .init(allocator);
     errdefer list.deinit();
 
-    rt.live_mutex.lock();
-    defer rt.live_mutex.unlock();
+    // Walk all live-registry shards. Each shard is independently
+    // locked — readers don't block writers to other shards. Snapshot
+    // is not strongly consistent across shards (a coro registered to
+    // shard 3 while we're walking shard 1 may or may not be seen),
+    // but that's fine for diagnostics.
+    for (&rt.live_shards) |*shard| {
+        shard.mutex.lock();
+        defer shard.mutex.unlock();
 
-    var cur = rt.live_coroutines;
-    while (cur) |coro| : (cur = coro.next_alive) {
-        try list.append(.{
-            .id = @intFromPtr(coro),
-            .state = classifyState(coro),
-            .is_cancelled = coro.isCancelled(),
-            .is_overflowed = coro.overflow_flag.load(.acquire),
-            .is_root = coro.is_root,
-            .name = coro.name,
-            .spawn_site = coro.spawn_site,
-            .parent_id = coro.parent_id,
-        });
+        var cur = shard.head;
+        while (cur) |coro| : (cur = coro.next_alive) {
+            try list.append(.{
+                .id = @intFromPtr(coro),
+                .state = classifyState(coro),
+                .is_cancelled = coro.isCancelled(),
+                .is_overflowed = coro.overflow_flag.load(.acquire),
+                .is_root = coro.is_root,
+                .name = coro.name,
+                .spawn_site = coro.spawn_site,
+                .parent_id = coro.parent_id,
+            });
+        }
     }
 
     return list.toOwnedSlice();
 }
 
 /// Total count of coroutines the runtime owns (alive or done but not
-/// yet reaped). Cheap — no allocation. Walks the live registry under
-/// `live_mutex`.
+/// yet reaped). Cheap — no allocation. Walks the live registry shards.
 pub fn count(rt: *runtime_mod.Runtime) usize {
-    rt.live_mutex.lock();
-    defer rt.live_mutex.unlock();
     var total: usize = 0;
-    var cur = rt.live_coroutines;
-    while (cur) |coro| : (cur = coro.next_alive) total += 1;
+    for (&rt.live_shards) |*shard| {
+        shard.mutex.lock();
+        defer shard.mutex.unlock();
+        var cur = shard.head;
+        while (cur) |coro| : (cur = coro.next_alive) total += 1;
+    }
     return total;
 }
 
 /// Count just the still-alive coroutines (excludes those whose
-/// `done_flag` has fired). Walks the live registry under `live_mutex`.
+/// `done_flag` has fired). Walks the live registry shards.
 pub fn liveCount(rt: *runtime_mod.Runtime) usize {
-    rt.live_mutex.lock();
-    defer rt.live_mutex.unlock();
     var total: usize = 0;
-    var cur = rt.live_coroutines;
-    while (cur) |coro| : (cur = coro.next_alive) {
-        if (!coro.isDone()) total += 1;
+    for (&rt.live_shards) |*shard| {
+        shard.mutex.lock();
+        defer shard.mutex.unlock();
+        var cur = shard.head;
+        while (cur) |coro| : (cur = coro.next_alive) {
+            if (!coro.isDone()) total += 1;
+        }
     }
     return total;
 }
