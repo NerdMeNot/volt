@@ -107,6 +107,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "io-traits", .src = "bench/bench_io_traits.zig", .step = "bench-io-traits", .desc = "Run BufReader-via-trait pipe throughput (compare to bench-io-baseline; ≤10% slower)" },
         .{ .name = "sleep-reset", .src = "bench/bench_sleep_reset.zig", .step = "bench-sleep-reset", .desc = "Cost of cancel-and-new-sleep (resettable timeout pattern)" },
         .{ .name = "spawn-profile", .src = "bench/bench_spawn_profile.zig", .step = "bench-spawn-profile", .desc = "Decompose spawn+join into launch / join / dispatch phases" },
+        .{ .name = "compare", .src = "benchmarks/volt_compare.zig", .step = "volt-compare-bin", .desc = "(internal) Build Volt side of the vs-Go comparison; emits JSON" },
     };
     for (benches) |b_| {
         const mod = b.createModule(.{
@@ -119,8 +120,45 @@ pub fn build(b: *std.Build) void {
             .name = b.fmt("volt-bench-{s}", .{b_.name}),
             .root_module = mod,
         });
+        const install = b.addInstallArtifact(exe, .{});
         const run = b.addRunArtifact(exe);
+        run.step.dependOn(&install.step);
         b.step(b_.step, b_.desc).dependOn(&run.step);
+    }
+
+    // Volt vs Go comparison orchestrator: `zig build compare`.
+    // Builds + runs both the Volt and Go benchmark binaries, parses
+    // their JSON output, prints a side-by-side comparison.
+    {
+        const compare_mod = b.createModule(.{
+            .root_source_file = b.path("benchmarks/compare.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        });
+        const compare_exe = b.addExecutable(.{
+            .name = "volt-compare",
+            .root_module = compare_mod,
+        });
+        const compare_run = b.addRunArtifact(compare_exe);
+        // The orchestrator invokes `./zig-out/bin/volt-bench-compare`
+        // so the volt-compare bench must be installed first.
+        const volt_compare_install = b.addInstallArtifact(
+            b.addExecutable(.{
+                .name = "volt-bench-compare",
+                .root_module = blk: {
+                    const mod = b.createModule(.{
+                        .root_source_file = b.path("benchmarks/volt_compare.zig"),
+                        .target = target,
+                        .optimize = .ReleaseFast,
+                    });
+                    mod.addImport("volt", b.modules.get("volt").?);
+                    break :blk mod;
+                },
+            }),
+            .{},
+        );
+        compare_run.step.dependOn(&volt_compare_install.step);
+        b.step("compare", "Run Volt vs Go comparative benchmarks (median of 11 iters)").dependOn(&compare_run.step);
     }
 
     // Cookbook examples — `zig build run-echo`, `zig build run-fan-out`,

@@ -68,8 +68,9 @@ Desktop.ini
 .prototools
 .zig-version
 
-# Empty directories
-benchmarks/
+# Benchmark binaries (sources are tracked; binary artifact ignored
+# via benchmarks/.gitignore)
+benchmarks/go/compare-bin
 
 # Build temp files
 build.zig.tmp

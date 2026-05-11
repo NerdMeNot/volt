@@ -1,171 +1,203 @@
-# Volt Benchmarks
+# Volt vs Go — Comparative Benchmarks
 
-Performance comparison between Volt and [Tokio](https://github.com/tokio-rs/tokio).
+> Not for bragging rights. Go is a massive, brilliantly-engineered runtime —
+> 15 years of work by some of the best systems engineers alive — and we look
+> at it as the target. Where Volt is ahead, we keep pushing; where Volt
+> trails, we have specific work to do. Both honest.
 
-## Standing on Tokio's Shoulders
+Last measured: **2026-05-12**, macOS arm64 (Apple Silicon), Zig 0.16.0, Go 1.23.2.
+Reproducible via `zig build compare`. Median of 11 iterations after 3 warmup rounds.
 
-Tokio has been the gold standard for async I/O runtimes since 2018. It powers networking,
-synchronization, and task scheduling in a huge fraction of the Rust ecosystem, and its design
-has influenced every async runtime that followed -- including this one.
+## Headline numbers
 
-Volt wouldn't exist without Tokio. Its ScheduledIo state machine, its work-stealing
-scheduler, its sync primitives, its approach to cooperative budgeting -- we studied and learned
-from all of it. Where Volt differs, it's because Zig's comptime specialization, value
-semantics, and zero-cost intrusive data structures open up paths that weren't available in Rust,
-not because we found flaws in Tokio's design. Every architectural decision in Volt traces back
-to something the Tokio team got right first.
+| Workload | Volt | Go | Volt / Go |
+|---|---|---|---|
+| yield (one-way ctx switch) | **10 ns/op** | 37 ns/op | **0.27× ★★** |
+| spawn + waitgroup-wait | 3,833 ns/op | 146 ns/op | 26.25× |
+| spawn + per-coro join | 3,837 ns/op | 145 ns/op | 26.46× |
+| channel SPSC cap=16 | 177 ns/op | 32 ns/op | 5.53× |
+| mutex contended (8 coros) | **41 ns/op** | 82 ns/op | **0.50× ★** |
 
-We benchmark against Tokio to keep ourselves honest, not to claim superiority. Tokio is a
-mature, battle-tested runtime with years of production use powering services at massive scale.
-Volt is new. These numbers are a snapshot in time on one machine -- your mileage will vary.
+★★ = ≥2× faster · ★ = 5-50% faster · blank = slower
 
-## Test Platform
+## What the numbers mean
 
-- **Machine**: MacBook Pro (Apple M3 Pro, 11 cores, 18 GB RAM)
-- **OS**: macOS (arm64)
-- **Zig**: 0.15.2
-- **Rust**: 1.86.0 (Tokio 1.43)
-- **Statistics**: Median of 10 iterations after 5 warmup discarded
+### Where Volt is ahead
 
-## Running Benchmarks
+- **Context switch (yield) — 3.7× faster.** Hand-written AAPCS64 / SysV-x86_64
+  asm context swap with no scheduler-side bookkeeping per swap. Go's
+  `runtime.Gosched` goes through the full scheduler each time. The 10 ns
+  number is the raw cost of two register-set saves + restores plus an
+  atomic state read — about as low as a stackful runtime can go.
+- **Mutex saturated contention — 2× faster.** Volt's MCS lock-free queue
+  with `unparkLocal` (skips inter-core wake when the handoff chain stays
+  worker-local) drops the per-cycle cost dramatically. Fair FIFO is
+  preserved by construction.
 
-```bash
+### Where Volt trails Go significantly
+
+- **Spawn + join — 26× slower.** This is the headline gap. Go's per-P
+  `gFree` slab + 2 KiB initial stacks with copy-grow are 15 years of
+  optimization. Volt's per-worker `FramePool` + 1 MiB virtual stacks
+  with mmap-grow are correct but not yet on parity. The remaining 3.6 µs
+  per spawn lives in the **scheduler dispatch cycle** — Worker.findWork →
+  dispatch → Done.subscribe → park/unpark — not in any single
+  allocation or atomic op. We have a profiling bench
+  (`zig build bench-spawn-profile`) to drive future optimization.
+- **Channel SPSC — 5.5× slower.** Volt's Vyukov MPMC channel with
+  guarding parks has more per-element overhead than Go's tightly tuned
+  `chan`. Some is the cost of being lock-free MPMC; some is optimization
+  we haven't done yet.
+
+## What we measured
+
+### yield (one-way ctx switch)
+
+Two coroutines (Volt) or one goroutine (Go) ping-pong via the scheduler:
+yield → re-dispatch → yield → ... 100,000 times. Wall time / (iters × 2) =
+one-way ctx switch cost.
+
+### spawn + waitgroup-wait
+
+The canonical Go pattern: spawn N = 10,000 goroutines that each call
+`wg.Done()`, then `wg.Wait()` for all. Volt analog: spawn N coros that
+decrement an atomic counter and `notify.notifyOne()`, parent
+`notify.wait()`. Measures spawn rate + the single batched wait.
+
+### spawn + per-coro join
+
+Volt's natural pattern: spawn N, then `for (jobs) |j| try j.join()`. The
+sequential per-job join exposes 10k park/unpark cycles. Go's `chan` /
+`WaitGroup` are the only join idioms — there's no per-goroutine handle —
+so the Go side just calls the same `WaitGroup`-based function for
+symmetry. The Volt number is for honesty: this is what `for-loop +
+.join()` actually costs.
+
+### channel SPSC cap=16
+
+Single producer, single consumer. Producer sends 100,000 monotonic
+u64s through a capacity-16 channel; consumer drains. Per-op = wall / N.
+
+### mutex contended (8 coros)
+
+8 coroutines, each acquires a shared mutex and increments a u64
+50,000 times (400k total acquires). The classic saturated-contention
+worst-case for a fair mutex. Per-op = wall / total_acquires.
+
+## What's NOT measured (yet)
+
+- **TCP echo throughput** — Volt's io_uring vs Go's netpoll.
+- **HTTP request/response lifecycle** — full server on TCP.
+- **Memory per idle coroutine** — Volt ~16 KiB resident vs Go ~8 KiB.
+- **Cancellation latency** — time from `.cancel()` to coroutine exit.
+- **Realistic mixed workload** — coroutines doing real work between
+  lock acquisitions / channel ops. Most production code looks like
+  this; the saturated micros aren't representative.
+
+These are v1.x bench targets.
+
+## How Volt's allocation differs from Go's
+
+| Aspect | Go | Volt |
+|---|---|---|
+| Stack growth | Copy-grow (compiler stackmaps fix pointers) | Virtual-memory grow (mmap + mprotect on guard hit) |
+| Initial committed stack | 2 KiB | 4 KiB (Linux x86) / 16 KiB (macOS arm64) — one page |
+| Per-coro alloc | Per-P `gFree` slab pool | Per-worker `FramePool` (1 MiB mmap'd, comptime size classes) |
+| Heap source | Go's `mheap` (invisible to user) | User passes allocator once at `volt.run`; per-worker FramePool sits on top |
+| GC | Tracing GC with write barriers | None — user owns allocator lifecycle |
+
+### Volt's allocation design in one paragraph
+
+The user passes an allocator **once** at `volt.run(.{ .allocator = ... })`
+and never again. After that, the spawn hot path bypasses the user
+allocator entirely: each Worker has its own 1 MiB `FramePool` (one
+mmap call at worker init) for spawn metadata, and its own `LocalPool`
+of recycled mmap'd 1 MiB stack regions. The user's allocator is for
+runtime startup, channel buffers (when user calls `Channel.init`), and
+fallback when the FramePool is exhausted. Same shape as Go's per-P
+caches, but with the user controlling the bulk allocator choice
+instead of a GC-managed heap.
+
+## Why Volt does what Go does — and where the gaps live
+
+### Where Volt copied Go (well, with Zig adaptations)
+
+- **Per-worker slab pool for spawn metadata.** Go's `gFree` per-P;
+  Volt's `FramePool` per-Worker. Same idea, Zig has comptime size
+  classes so the slot-class lookup is comptime-resolved.
+- **Work-stealing scheduler with Chase-Lev deques.** Same algorithm
+  as Go's per-P run queues.
+- **LIFO slot for cache-warm continuations.** Go does this; Tokio
+  also; we copied it.
+- **Adaptive park/wake (parker bitmap).** Go's idle-P bitmap; Volt's
+  parked-workers bitmap. Same shape.
+- **Stack-overflow handler that grows on demand.** Go does morestack;
+  Volt does mprotect on guard-page hit. Different mechanism (we don't
+  have stackmaps), same outcome (transparent growth).
+
+### Where Volt does it differently because of Zig
+
+- **No GC.** User owns allocator. Means we can't copy-grow stacks
+  (no stackmaps to fix pointers) — but we don't need a write barrier
+  on every pointer write either.
+- **Comptime specialization.** Spawn closure types are monomorphized
+  at the call site. No virtual dispatch through `dyn Future`.
+- **Intrusive containers everywhere.** MCS waiter nodes in
+  `Coroutine`. `live_coroutines` link in `Coroutine`. No allocator
+  pressure for queue nodes.
+- **Explicit allocator.** User gets full control + predictability;
+  pays in API verbosity vs Go's hidden runtime allocator.
+
+### Where Volt has work to do
+
+- **Scheduler dispatch cycle** is ~4 µs per coro on this bench; Go
+  achieves ~150 ns. The work isn't in any one atomic op or allocator
+  call — it's the accumulated cost of `Worker.findWork` + dispatch
+  state setup + Done.subscribe + park/unpark. Closing this needs
+  either a much tighter dispatch hot path or a different scheduler
+  architecture (e.g. inline the Done path so completed coros don't
+  round-trip through post-swap).
+- **Channel send/recv overhead.** Volt is at 177 ns/op SPSC; Go is at
+  32 ns/op. We use a Vyukov MPMC ring with parks-on-block; Go's `chan`
+  has a specialized fast path for the SPSC case. Optimization target
+  for v1.x.
+
+## Running the benchmarks yourself
+
+```sh
 zig build compare
 ```
 
-This builds and runs both Volt (Zig) and Tokio (Rust) benchmarks with identical
-configurations, then prints a side-by-side comparison table.
+Prerequisites:
+- Zig 0.16.0
+- Go 1.23+
 
-## Results
-
-### Synchronization -- Uncontended
-
-| Benchmark | Volt | Tokio | B/op (Volt) | B/op (Tokio) | Winner |
-|-----------|----------|-------|--------------|--------------|--------|
-| Mutex | 31.8 ns | 28.2 ns | 0 | 0 | Tokio +1.1x |
-| RwLock (read) | 25.3 ns | 27.1 ns | 0 | 0 | Volt +1.1x |
-| RwLock (write) | 20.7 ns | 25.2 ns | 0 | 0 | Volt +1.2x |
-| Semaphore | 22.7 ns | 33.7 ns | 0 | 0 | Volt +1.5x |
-
-### Synchronization -- Contended
-
-Multiple async tasks competing for the same resource on 4 worker threads.
-
-| Benchmark | Volt | Tokio | B/op (Volt) | B/op (Tokio) | Winner |
-|-----------|----------|-------|--------------|--------------|--------|
-| Mutex (4 tasks) | 91.7 ns | 207.9 ns | 0.1 | 0.2 | Volt +2.3x |
-| RwLock (4R + 2W) | 149.5 ns | 247.4 ns | 0.1 | 0.2 | Volt +1.7x |
-| Semaphore (8T, 2 permits) | 139.4 ns | 323.0 ns | 0.2 | 0.2 | Volt +2.3x |
-
-### Channels
-
-| Benchmark | Volt | Tokio | B/op (Volt) | B/op (Tokio) | Winner |
-|-----------|----------|-------|--------------|--------------|--------|
-| Channel send | 11.1 ns | 16.3 ns | 21 | 9 | Volt +1.5x |
-| Channel recv | 11.4 ns | 22.3 ns | 21 | 9 | Volt +2.0x |
-| Channel roundtrip | 23.1 ns | 37.8 ns | 0 | 0 | Volt +1.6x |
-| Channel MPMC (4P + 4C) | 73.3 ns | 132.8 ns | 1.8 | 2.1 | Volt +1.8x |
-| Oneshot | 27.1 ns | 51.5 ns | 0 | 72 | Volt +1.9x |
-| Broadcast (4 receivers) | 95.2 ns | 143.8 ns | 16 | 126.9 | Volt +1.5x |
-| Watch | 45.7 ns | 145.4 ns | 0 | 0 | Volt +3.2x |
-
-### OnceCell
-
-| Benchmark | Volt | Tokio | B/op (Volt) | B/op (Tokio) | Winner |
-|-----------|----------|-------|--------------|--------------|--------|
-| OnceCell get (hot path) | 2.0 ns | 1.0 ns | 0 | 0 | Tokio +2.0x |
-| OnceCell set | 41.8 ns | 90.8 ns | 0 | 64 | Volt +2.2x |
-
-### Coordination
-
-| Benchmark | Volt | Tokio | B/op (Volt) | B/op (Tokio) | Winner |
-|-----------|----------|-------|--------------|--------------|--------|
-| Barrier | 50.9 ns | 1,312.8 ns | 0 | 1,064 | Volt +25.8x |
-| Notify | 15.6 ns | 18.9 ns | 0 | 0 | Volt +1.2x |
-
-### Task Scheduling
-
-| Benchmark | Volt | Tokio | B/op (Volt) | B/op (Tokio) | Winner |
-|-----------|----------|-------|--------------|--------------|--------|
-| Spawn + await | 29,597 ns | 18,946 ns | 80 | 128 | Tokio +1.6x |
-| Spawn batch (per task) | 601.0 ns | 611.4 ns | 80 | 136 | Tie |
-| Blocking spawn | 25,037 ns | 12,483 ns | 64 | 256 | Tokio +2.0x |
-
-### Summary
-
-```
-Volt wins: 16 / 21    Tokio wins: 4 / 21    Tie: 1 / 21
-
-Total bytes per op:   Volt 284.1    Tokio 1,867.6  (6.6x less)
-Total allocs per op:  Volt 3.0      Tokio 17.1     (5.7x fewer)
-```
-
-## Where Tokio Wins
-
-Tokio outperforms Volt in four benchmarks, with two being significant:
-
-- **Spawn + await** (by 1.6x). Tokio's `tokio::spawn` has years of optimization for the
-  single-task spawn-and-join pattern, including optimized `JoinHandle` internals and a highly
-  tuned `RawTask` implementation. Volt's `FutureTask` setup overhead is higher per task.
-
-- **Blocking spawn** (by 2.0x). Tokio's blocking pool has years of tuning for thread
-  wake latency and reuse. The gap reflects condvar/futex interaction differences between
-  Tokio's `parking_lot` and Zig's `std.Thread.Condition`.
-
-- **Mutex uncontended** (by 1.1x) and **OnceCell get** (by 2.0x). Minor advantages from
-  Tokio's `parking_lot`-style adaptive spinning and Rust's extremely optimized `std::sync::Once`
-  implementation. The OnceCell hot path is a single relaxed atomic load in both implementations,
-  so the 2x gap likely reflects measurement noise at the sub-nanosecond scale.
-
-## What Helps Volt
-
-Most of Volt's advantages come from Zig's language properties and a zero-allocation
-architecture rather than algorithmic breakthroughs:
-
-- **Intrusive waiters** -- waiter nodes are embedded directly in futures on the stack,
-  eliminating the heap allocations Tokio makes for waiter bookkeeping. This is the single
-  largest factor: 284 bytes/op vs 1,868 bytes/op across all benchmarks.
-
-- **Comptime specialization** -- generic lock and channel types are monomorphized at compile
-  time with concrete waker types, removing the virtual dispatch Tokio pays through
-  `dyn Future` trait objects and `Waker` vtables.
-
-- **Vyukov MPMC ring buffer** -- the bounded channel uses a lock-free ring buffer with
-  per-slot sequence counters, power-of-2 bitmask indexing, and interleaved slot layout for
-  spatial locality. The channel MPMC benchmark shows Volt at 73ns vs Tokio at 133ns (1.8x).
-
-- **Lock-free semaphore release** -- the `fast_waiter` atomic slot allows `release()` to
-  serve the most recent waiter via a single atomic swap, bypassing the mutex entirely. Under
-  the contended semaphore benchmark (8 tasks, 2 permits), this delivers 139ns vs Tokio's 323ns
-  (2.3x).
-
-- **O(1) bitmap worker waking** -- the scheduler uses `@ctz` on a packed bitmap to find idle
-  workers in constant time, where Tokio scans a list.
-
-- **Zero-allocation oneshot and barrier** -- Tokio's oneshot allocates a shared `Arc<Inner>`
-  (72 bytes) and its barrier allocates tracking state (1,064 bytes). Volt uses
-  stack-embedded atomics for both.
-
-The work-stealing scheduler, the cooperative budgeting, the ScheduledIo state machine,
-the sync primitive designs -- these are all Tokio's ideas, adapted for Zig. Volt's
-performance comes from applying Tokio's proven architecture in a language that gives us
-value semantics, comptime generics, and zero-cost intrusive containers.
-
-## Caveats
-
-- Single machine, single OS -- results on Linux x86_64 may differ significantly
-- Microbenchmarks, not real workloads -- production performance depends on many factors
-- Zig and Rust have different compilation models; some differences may reflect compiler
-  optimization strategy rather than runtime design
-- Run-to-run variance is typically 5-15% on these benchmarks
-- Tokio is mature and battle-tested at scale; Volt is new and less proven in production
-- Bytes-per-op reflects allocator overhead in the benchmark harness, not necessarily
-  application-level memory usage
+The orchestrator builds both binaries, runs them sequentially (to avoid
+cache/thermal interference), and prints the table above. Each side
+runs 11 iterations after 3 warmup rounds; the median is reported.
 
 ## Acknowledgments
 
-- [Tokio](https://github.com/tokio-rs/tokio) -- the runtime that defined how async I/O should work. We would not be here without the years of design, iteration, and documentation that the Tokio team invested. Every core pattern in Volt -- the scheduler, the state machine, the sync primitives, cooperative budgeting -- was learned from Tokio.
-- [Mio](https://github.com/tokio-rs/mio) -- platform I/O abstraction we study for every backend
-- [parking_lot](https://github.com/Amanieu/parking_lot) -- adaptive locking strategies
-- [Crossbeam](https://github.com/crossbeam-rs/crossbeam) -- lock-free channel designs
-- [Vyukov MPMC](https://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue) -- bounded ring buffer for channels
+- **Go runtime** — the gold standard for stackful concurrent runtimes.
+  Every core pattern in Volt (per-P caches, work-stealing, idle-worker
+  bitmap, stack management) traces back to something Go did first. Volt
+  exists because Go has shown how good a stackful runtime can be.
+- **Tokio** — Rust's stackless equivalent. We learned from its scheduler,
+  cooperative budgeting, and sync-primitive designs.
+- **may** (Rust stackful) — confirmed several design choices for the
+  stackful approach in Rust; we made different tradeoffs but learned
+  from theirs.
+- **Vyukov MPMC** — bounded ring buffer paper, used for Volt's channel.
+
+## Caveats
+
+- Single machine, single OS (macOS arm64) — results on Linux x86_64
+  may differ.
+- Microbenchmarks, not real workloads — production performance
+  depends on many factors not captured here.
+- Both Zig and Go have compilation/runtime tradeoffs; some differences
+  may reflect compiler optimization strategy rather than runtime design.
+- Run-to-run variance is typically 5-15% on these benchmarks. The
+  median-of-11 helps but doesn't eliminate it.
+- Go is mature and battle-tested at massive scale; Volt is new. **Take
+  the spawn+join gap seriously, not the yield/mutex wins.**
