@@ -386,7 +386,14 @@ pub const Worker = struct {
     }
 
     fn dispatch(self: *Worker, coro: *Coroutine) void {
-        _ = self.dispatch_count.fetchAdd(1, .monotonic);
+        // dispatch_count is a diagnostic counter — comptime-gated in
+        // release builds so the hot path takes zero atomic ops just to
+        // bump a stat counter. (Was firing per coro = 10k atomic ops
+        // per 10k-coro bench, all on the worker's own cache line —
+        // not contended but still an instruction in the critical path.)
+        if (comptime @import("builtin").mode == .Debug) {
+            _ = self.dispatch_count.fetchAdd(1, .monotonic);
+        }
         current.setCurrent(coro, @ptrCast(self.runtime));
         coro.scheduler_ctx = &self.main_ctx;
 

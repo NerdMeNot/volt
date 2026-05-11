@@ -111,7 +111,13 @@ fn doneSubscribe(opaque_self: *anyopaque, coro: *Coroutine) void {
         }
     }
 
-    coro.join_park.unpark();
+    // Unpark joiner WITHOUT firing wakeOneSibling. The joiner is by
+    // construction the coro that called `.join()` — typically a single
+    // coro. Waking a sibling worker here is pure overhead: the joiner
+    // resumes on the current worker (via enqueueLocal), siblings have
+    // nothing to do. Saves ~50 ns / completion on the burst-completion
+    // hot path (10k coros completing → 10k bitmap CAS ops removed).
+    coro.join_park.unparkLocal();
 
     if (coro.is_root) {
         // The bootstrap thread in `runUntilDone` polls `until_done.isDone()`
