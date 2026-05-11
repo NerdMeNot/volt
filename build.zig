@@ -106,6 +106,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "io-baseline", .src = "bench/bench_io_baseline.zig", .step = "bench-io-baseline", .desc = "Run pipe-throughput baseline used as the P1 trait-overhead gate" },
         .{ .name = "io-traits", .src = "bench/bench_io_traits.zig", .step = "bench-io-traits", .desc = "Run BufReader-via-trait pipe throughput (compare to bench-io-baseline; ≤10% slower)" },
         .{ .name = "sleep-reset", .src = "bench/bench_sleep_reset.zig", .step = "bench-sleep-reset", .desc = "Cost of cancel-and-new-sleep (resettable timeout pattern)" },
+        .{ .name = "spawn-profile", .src = "bench/bench_spawn_profile.zig", .step = "bench-spawn-profile", .desc = "Decompose spawn+join into launch / join / dispatch phases" },
     };
     for (benches) |b_| {
         const mod = b.createModule(.{
