@@ -442,15 +442,21 @@ pub const Runtime = struct {
         const exclude_bit = @as(u64, 1) << @intCast(self_id % 64);
         if (self.takeOneFromBitmap(exclude_word, exclude_bit)) |idx| {
             self.workers[idx].unpark();
-            return;
         }
-        // Fallback: a worker may be mid-park (no bit set yet). Buffer
-        // a NOTIFIED on a round-robin target so its next state CAS
-        // sees it.
-        const rr = self.notify_rr.fetchAdd(1, .monotonic);
-        var idx = rr % self.workers.len;
-        if (idx == self_id) idx = (idx + 1) % self.workers.len;
-        self.workers[idx].unpark();
+        // No fallback. The previous design unconditionally fired a
+        // round-robin unpark when no sibling was observably parked,
+        // intended to handle the mid-park race (worker between
+        // findWork-empty and bitmap.fetchOr). That fallback fires on
+        // EVERY spawn under burst load, hammering a busy sibling's
+        // parker.state cache line with cross-core atomic CAS — pure
+        // overhead because the target was already running.
+        //
+        // We accept the rare mid-park race: a worker that just decided
+        // to park (but hasn't set its bit yet) might miss this wake.
+        // The next spawn / schedule fires wakeOneSibling again and
+        // catches them. For burst workloads (the perf case), the
+        // bounded delay is microseconds. For lone spawns, the spawner
+        // owns the work — siblings being parked doesn't lose anything.
     }
 
     /// Sentinel for `takeOneFromBitmap` — out-of-range word index meaning
