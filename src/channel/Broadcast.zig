@@ -314,6 +314,12 @@ const LaggedCtx = struct {
 fn slowReceiver(ctx: *LaggedCtx) !void {
     var rx = ctx.b.subscribe();
     while (true) {
+        // Yield every recv so the sender (which doesn't yield) gets
+        // dispatched and outruns us. Without this, scheduler can keep
+        // sender + receiver in lockstep on most runs — the test then
+        // races on whether sender ever pulls ahead by more than `cap`.
+        // The deterministic yield ensures we ARE slow.
+        try volt.yield();
         switch (try rx.recv()) {
             .value => continue,
             .lagged => {
@@ -340,6 +346,9 @@ fn laggedRoot() !u32 {
 
     var rx = try volt.spawn(slowReceiver, .{&ctx});
     defer volt.destroyTask(rx);
+
+    // Yield so the receiver has a chance to subscribe before sender starts.
+    try volt.yield();
 
     var sender = try volt.spawn(fastSender, .{&ctx});
     defer volt.destroyTask(sender);
