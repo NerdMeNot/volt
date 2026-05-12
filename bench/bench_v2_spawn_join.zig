@@ -53,7 +53,7 @@ pub fn main() !void {
     std.debug.print("\n=== v2 spawn+join (multi-worker) ===\n", .{});
     std.debug.print("Platform: ReleaseFast, n={d}, reps={d}\n\n", .{ N, REPS });
 
-    inline for (.{ 1, 2, 4, 8 }) |w_count| {
+    inline for (.{ 1, 2, 4, 8, 11 }) |w_count| {
         var samples: [REPS]i128 = undefined;
         var w: u32 = 0;
         while (w < WARMUPS) : (w += 1) _ = try benchOnce(smp, N, w_count);

@@ -77,13 +77,14 @@ pub const Runtime = struct {
     pending: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     reactor: Reactor = .{},
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// Bit i set ⇔ workers[i] is parked.
+    /// Bit i set ⇔ workers[i] is parked. Worker 0 is the driver
+    /// thread that called Runtime.run; workers 1..N-1 are spawned
+    /// pthreads. Worker 0 participates in the same parked-bitmap
+    /// machinery as the rest — uniform model, no special case.
     parked_workers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// CAS-claim "I am the current reactor poller" — only one worker
     /// polls kqueue at a time.
     reactor_poller_taken: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// Driver thread parks here while waiting for `pending` to hit 0.
-    driver_parker: Parker = .{},
 
     pub fn init(cfg: Config) !*Runtime {
         const n = cfg.workers orelse @max(1, try std.Thread.getCpuCount());
@@ -97,24 +98,28 @@ pub const Runtime = struct {
             .workers = try cfg.allocator.alloc(Worker, n),
             .reactor = try Reactor.init(),
         };
-        rt.driver_parker.init();
         for (rt.workers, 0..) |*w, i| w.init(i, rt);
 
-        // Spawn worker pthreads.
-        for (rt.workers) |*w| {
-            w.thread = try std.Thread.spawn(.{}, workerLoop, .{ rt, w });
+        // Spawn pthread workers 1..N-1. Worker 0 is the driver thread
+        // (the thread that called Runtime.init / will call Runtime.run);
+        // it joins the pool in `run()`. This makes the calling thread
+        // a first-class worker rather than a special parker-on-WG case.
+        for (rt.workers[1..]) |*w| {
+            w.thread = try std.Thread.spawn(.{}, workerThreadEntry, .{ rt, w });
         }
         return rt;
     }
 
     pub fn deinit(self: *Runtime) void {
         self.shutdown.store(true, .release);
-        // Wake every worker so they observe shutdown.
-        for (self.workers) |*w| w.parker.unpark();
-        for (self.workers) |*w| w.thread.join();
+        // Wake every spawned worker so it observes shutdown.
+        // Worker 0 is the driver thread — by this point it has
+        // already returned from run() and is on the deinit path,
+        // so it doesn't need an unpark.
+        for (self.workers[1..]) |*w| w.parker.unpark();
+        for (self.workers[1..]) |*w| w.thread.join();
         for (self.workers) |*w| w.deinit();
         self.allocator.free(self.workers);
-        self.driver_parker.deinit();
         self.reactor.deinit();
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -225,75 +230,103 @@ pub const Runtime = struct {
         self.reactor_poller_taken.store(false, .release);
     }
 
-    /// Run `user_fn(args)` as the root coroutine and block this
-    /// thread until it completes. Spawns workers internally.
+    /// Run `user_fn(args)` as the root coroutine. The calling thread
+    /// participates as worker 0 — it runs the dispatch loop alongside
+    /// the spawned pthread workers, exiting only when the root
+    /// coroutine's WaitGroup hits 0.
+    ///
+    /// No special driver path: this is the same workerLoop the
+    /// spawned threads run, with one additional exit condition.
     pub fn run(
         self: *Runtime,
         comptime user_fn: anytype,
         args: anytype,
     ) !@typeInfo(@TypeOf(user_fn)).@"fn".return_type.? {
         var task = try self.spawn(user_fn, args);
-        // Wait on the root completing. We can't park ourselves on
-        // the WaitGroup the same way coroutines do (we're a regular
-        // OS thread), so spin-poll on a Parker. The last `done()` on
-        // the root's wg won't fire driver_parker — we instead poll.
-        // Simpler: spin-wait on task.wg.count() via the parker.
-        // Use the `pending == 0` signal: every coro completion does
-        // pending.fetchSub; when it hits 0, all coros are done.
-        while (self.pending.load(.acquire) > 0) {
-            self.driver_parker.park();
-        }
+        // Calling thread becomes worker 0 for the duration of run().
+        // After this returns, deinit will shut down the other workers.
+        workerLoopUntilTaskDone(self, &self.workers[0], &task.wg);
         return task.join();
     }
 };
 
-/// Worker thread entry. Sets TLS, runs dispatch loop until shutdown.
-fn workerLoop(rt: *Runtime, w: *Worker) void {
+/// Entry point for pthread-spawned workers (workers 1..N-1).
+/// Runs the dispatch loop until shutdown.
+fn workerThreadEntry(rt: *Runtime, w: *Worker) void {
     worker_mod.currentWorkerSet(@ptrCast(w));
     defer worker_mod.currentWorkerSet(null);
+    workerLoopUntilShutdown(rt, w);
+}
 
-    while (!rt.shutdown.load(.acquire)) {
-        // 1. LIFO slot + local FIFO queue (popLocal handles both).
-        if (w.popLocal()) |c| {
-            dispatch(rt, w, c);
-            continue;
+/// Worker 0 (driver thread) loop variant: same dispatch as the spawned
+/// workers, but exits when the target WaitGroup hits 0 (root coro done)
+/// rather than waiting for shutdown.
+fn workerLoopUntilTaskDone(rt: *Runtime, w: *Worker, target_wg: *WaitGroup) void {
+    worker_mod.currentWorkerSet(@ptrCast(w));
+    defer worker_mod.currentWorkerSet(null);
+    while (target_wg.count() != 0) {
+        if (!tryOneDispatchCycle(rt, w)) {
+            // No work found anywhere. Park if target still pending.
+            if (target_wg.count() == 0) return;
+            parkWorker(rt, w);
         }
-        // 2. Global injection (cross-thread spawns, reactor unparks,
-        //    spillover from other workers' overflow).
-        if (rt.injection.pop()) |c| {
-            dispatch(rt, w, c);
-            continue;
-        }
-        // 3. Steal from random sibling. stealInto moves half of the
-        //    victim's queue into our local; returns the first stolen
-        //    task to dispatch immediately.
-        if (stealFromSiblings(rt, w)) |c| {
-            dispatch(rt, w, c);
-            continue;
-        }
-        // 4. Park strategy.
-        //
-        // If the reactor has in-flight registrations AND we can
-        // claim the poller role, do a BLOCKING reactor poll. This
-        // is the "park-on-reactor" path: kqueue.kevent blocks until
-        // any registered fd fires, then unparks the coroutines.
-        //
-        // Otherwise (no IO pending or another worker is polling),
-        // park on the parker. Cross-thread spawns / unparks wake us
-        // via the parked_workers bitmap.
-        if (rt.reactor.pending > 0 and rt.tryClaimPoller()) {
-            _ = rt.reactor.poll(true);
-            rt.releasePoller();
-            continue;
-        }
-        rt.markParked(w);
-        defer rt.unmarkParked(w);
-        // Recheck — work may have arrived between findWork and mark.
-        if (w.lifo_slot.load(.acquire) != null) continue;
-        if (!w.local.isEmpty() or !rt.injection.isEmpty() or rt.shutdown.load(.acquire)) continue;
-        if (rt.reactor.pending > 0) continue;
-        w.parker.park();
     }
+}
+
+/// Spawned-worker loop variant: runs until shutdown.
+fn workerLoopUntilShutdown(rt: *Runtime, w: *Worker) void {
+    while (!rt.shutdown.load(.acquire)) {
+        if (!tryOneDispatchCycle(rt, w)) {
+            if (rt.shutdown.load(.acquire)) return;
+            parkWorker(rt, w);
+        }
+    }
+}
+
+/// Try one full dispatch cycle: local → injection → steal → reactor.
+/// Returns true if a coroutine was dispatched OR the reactor was
+/// polled (work may have arrived). Returns false if nothing was
+/// found anywhere — caller should park.
+fn tryOneDispatchCycle(rt: *Runtime, w: *Worker) bool {
+    // 1. LIFO slot + local FIFO queue.
+    if (w.popLocal()) |c| {
+        dispatch(rt, w, c);
+        return true;
+    }
+    // 2. Global injection (cross-thread spawns, reactor unparks, overflow).
+    if (rt.injection.pop()) |c| {
+        dispatch(rt, w, c);
+        return true;
+    }
+    // 3. Steal from sibling. stealInto moves half of victim's queue
+    //    into ours, returning the first stolen task.
+    if (stealFromSiblings(rt, w)) |c| {
+        dispatch(rt, w, c);
+        return true;
+    }
+    // 4. Reactor poll. If any worker has in-flight IO AND we can
+    //    claim the poller role, block on kevent. Events deliver via
+    //    unpark → injection → next iteration picks them up.
+    if (rt.reactor.pending > 0 and rt.tryClaimPoller()) {
+        _ = rt.reactor.poll(true);
+        rt.releasePoller();
+        return true;
+    }
+    return false;
+}
+
+/// Park this worker. Adds self to parked_workers bitmap, rechecks
+/// queues + reactor for race-arrived work, then blocks on the
+/// parker. Cross-thread spawns / unparks wake via wakeOneParked.
+fn parkWorker(rt: *Runtime, w: *Worker) void {
+    rt.markParked(w);
+    defer rt.unmarkParked(w);
+    // Recheck — work may have arrived between findWork and mark.
+    if (w.lifo_slot.load(.acquire) != null) return;
+    if (!w.local.isEmpty() or !rt.injection.isEmpty()) return;
+    if (rt.reactor.pending > 0) return;
+    if (rt.shutdown.load(.acquire)) return;
+    w.parker.park();
 }
 
 fn stealFromSiblings(rt: *Runtime, self: *Worker) ?*Coroutine {
@@ -328,7 +361,13 @@ fn dispatch(rt: *Runtime, w: *Worker, c: *Coroutine) void {
             rt.allocator.free(c.stack);
             rt.allocator.destroy(c);
             const prev = rt.pending.fetchSub(1, .acq_rel);
-            if (prev == 1) rt.driver_parker.unpark();
+            if (prev == 1) {
+                // Last coroutine just completed — wake worker 0
+                // (the driver thread) specifically so it can observe
+                // its target_wg = 0 and exit run(). If worker 0 isn't
+                // parked, this is a no-op stored notification.
+                rt.workers[0].parker.unpark();
+            }
         },
     }
 }
