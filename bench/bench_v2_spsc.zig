@@ -20,40 +20,44 @@ fn nanosNow() i128 {
 
 const Channel = volt2.Spsc(u64, 16);
 
-const Ctx = struct {
+const BenchCtx = struct {
     ch: *Channel,
     n: u64,
     sum: u64 = 0,
+    wall_ns: i128 = 0,
 };
 
-fn producer(ctx: *Ctx) !void {
+fn producer(ctx: *BenchCtx) !void {
     var i: u64 = 0;
     while (i < ctx.n) : (i += 1) try ctx.ch.send(i);
     ctx.ch.close();
 }
 
-fn consumer(ctx: *Ctx) !void {
+fn consumer(ctx: *BenchCtx) !void {
     while (true) {
         const v = ctx.ch.recv() catch return;
         ctx.sum +%= v;
     }
 }
 
-fn benchOnce(allocator: std.mem.Allocator, n: u64) !i128 {
-    var rt = try volt2.Runtime.init(allocator);
-    defer rt.deinit();
-
-    var ch = Channel{};
-    var ctx = Ctx{ .ch = &ch, .n = n };
-
+fn benchRoot(ctx: *BenchCtx) !void {
+    const rt: *volt2.Runtime = @ptrCast(@alignCast(volt2.current.require().runtime));
     const start = nanosNow();
-    var prod = try rt.spawn(producer, .{&ctx});
-    var cons = try rt.spawn(consumer, .{&ctx});
-    rt.run();
+    var prod = try rt.spawn(producer, .{ctx});
+    var cons = try rt.spawn(consumer, .{ctx});
     _ = prod.join() catch unreachable;
     _ = cons.join() catch unreachable;
     const end = nanosNow();
-    return @divTrunc(end - start, n);
+    ctx.wall_ns = end - start;
+}
+
+fn benchOnce(allocator: std.mem.Allocator, n: u64) !i128 {
+    var rt = try volt2.Runtime.init(.{ .allocator = allocator, .workers = 1 });
+    defer rt.deinit();
+    var ch = Channel{};
+    var ctx = BenchCtx{ .ch = &ch, .n = n };
+    try (try rt.run(benchRoot, .{&ctx}));
+    return @divTrunc(ctx.wall_ns, n);
 }
 
 const REPS = 11;

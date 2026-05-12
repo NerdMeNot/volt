@@ -200,11 +200,9 @@ fn testListenerLifecycle() !void {
 }
 
 test "TcpListener: bind + localAddress" {
-    var rt = try runtime.Runtime.init(test_allocator);
+    var rt = try runtime.Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
     defer rt.deinit();
-    var task = try rt.spawn(testListenerLifecycle, .{});
-    rt.run();
-    _ = task.join() catch unreachable;
+    try rt.run(testListenerLifecycle, .{});
 }
 
 const EchoTestCtx = struct {
@@ -235,20 +233,24 @@ fn testEchoClient(ctx: *EchoTestCtx) !void {
     ctx.client_done = true;
 }
 
+fn echoTestRoot(ctx: *EchoTestCtx) !void {
+    const cur = @import("current.zig");
+    const rt: *runtime.Runtime = @ptrCast(@alignCast(cur.require().runtime));
+    var server_task = try rt.spawn(testEchoServer, .{ctx});
+    var client_task = try rt.spawn(testEchoClient, .{ctx});
+    _ = server_task.join() catch |err| return err;
+    _ = client_task.join() catch |err| return err;
+}
+
 test "TCP echo single client round-trip" {
-    var rt = try runtime.Runtime.init(test_allocator);
+    var rt = try runtime.Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
     defer rt.deinit();
 
     var listener = try TcpListener.bindAddress(Address.loopback(0));
     defer listener.close();
     var ctx = EchoTestCtx{ .listener = &listener };
     ctx.addr = try listener.localAddress();
-
-    var server_task = try rt.spawn(testEchoServer, .{&ctx});
-    var client_task = try rt.spawn(testEchoClient, .{&ctx});
-    rt.run();
-    _ = server_task.join() catch |err| return err;
-    _ = client_task.join() catch |err| return err;
+    try rt.run(echoTestRoot, .{&ctx});
 
     try std.testing.expect(ctx.server_done);
     try std.testing.expect(ctx.client_done);

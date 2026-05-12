@@ -155,36 +155,37 @@ fn consumer(ctx: *TestCtx) !void {
     }
 }
 
+fn spscTestRoot(ctx: *TestCtx) !void {
+    const current_mod = @import("current.zig");
+    const rt: *Runtime = @ptrCast(@alignCast(current_mod.require().runtime));
+    var prod = try rt.spawn(producer, .{ctx});
+    var cons = try rt.spawn(consumer, .{ctx});
+    _ = prod.join() catch unreachable;
+    _ = cons.join() catch unreachable;
+}
+
 test "spsc: small unbuffered pipeline" {
-    var rt = try Runtime.init(test_allocator);
+    // workers=1: Spsc relies on the same-worker park/unpark
+    // sequencing. Multi-worker hardening (atomic-correct wake
+    // protocol when producer and consumer are on different threads)
+    // is a follow-up.
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
     defer rt.deinit();
 
     var ch = Spsc(u64, 4){};
     var ctx = TestCtx{ .ch = &ch, .n = 100 };
+    try rt.run(spscTestRoot, .{&ctx});
 
-    var prod = try rt.spawn(producer, .{&ctx});
-    var cons = try rt.spawn(consumer, .{&ctx});
-    rt.run();
-    _ = prod.join() catch unreachable;
-    _ = cons.join() catch unreachable;
-
-    // sum of 0..99 = 99*100/2 = 4950
     try std.testing.expectEqual(@as(u64, 4950), ctx.sum);
 }
 
 test "spsc: cap=2 stresses block-on-full" {
-    var rt = try Runtime.init(test_allocator);
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
     defer rt.deinit();
 
     var ch = Spsc(u64, 2){};
     var ctx = TestCtx{ .ch = &ch, .n = 1000 };
+    try rt.run(spscTestRoot, .{&ctx});
 
-    var prod = try rt.spawn(producer, .{&ctx});
-    var cons = try rt.spawn(consumer, .{&ctx});
-    rt.run();
-    _ = prod.join() catch unreachable;
-    _ = cons.join() catch unreachable;
-
-    // sum of 0..999 = 999*1000/2 = 499500
     try std.testing.expectEqual(@as(u64, 499500), ctx.sum);
 }

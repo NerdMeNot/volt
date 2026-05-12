@@ -177,18 +177,25 @@ fn mutexInc(ctx: *MutexCtx) void {
     }
 }
 
+fn mutexTestRoot(ctx: *MutexCtx) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var tasks: [8]*@import("task.zig").Task(void) = undefined;
+    for (&tasks) |*t| t.* = try rt.spawn(mutexInc, .{ctx});
+    for (&tasks) |t| t.join();
+}
+
 test "Mutex: serializes 8 coros each doing 1k increments" {
-    var rt = try Runtime.init(test_allocator);
+    // workers=1: sync primitives are single-thread-safe only at the
+    // moment; multi-worker hardening (atomic locked, lock-protected
+    // wait queues) is a follow-up. Cooperative scheduling with one
+    // worker still exercises the wait queue + park/unpark paths.
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
     defer rt.deinit();
 
     var mu = Mutex{};
     var counter: u32 = 0;
     var ctx = MutexCtx{ .mu = &mu, .counter = &counter, .iters = 1000 };
-
-    var tasks: [8]*@import("task.zig").Task(void) = undefined;
-    for (&tasks) |*t| t.* = try rt.spawn(mutexInc, .{&ctx});
-    rt.run();
-    for (&tasks) |t| t.join();
+    try rt.run(mutexTestRoot, .{&ctx});
 
     try std.testing.expectEqual(@as(u32, 8 * 1000), counter);
 }
@@ -207,19 +214,22 @@ fn notifySender(ctx: *NotifyCtx) void {
     ctx.note.notifyOne();
 }
 
+fn notifyTestRoot(ctx: *NotifyCtx) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var waiter = try rt.spawn(notifyWaiter, .{ctx});
+    var sender = try rt.spawn(notifySender, .{ctx});
+    waiter.join();
+    sender.join();
+}
+
 test "Notify: wait + notifyOne handshake" {
-    var rt = try Runtime.init(test_allocator);
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
     defer rt.deinit();
 
     var note = Notify{};
     var fired = false;
     var ctx = NotifyCtx{ .note = &note, .fired = &fired };
-
-    var waiter = try rt.spawn(notifyWaiter, .{&ctx});
-    var sender = try rt.spawn(notifySender, .{&ctx});
-    rt.run();
-    waiter.join();
-    sender.join();
+    try rt.run(notifyTestRoot, .{&ctx});
 
     try std.testing.expect(fired);
 }
@@ -235,18 +245,25 @@ fn semWorker(ctx: *SemCtx) void {
     ctx.sem.release();
 }
 
+fn semTestRoot(ctx: *SemCtx) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var tasks: [100]*@import("task.zig").Task(void) = undefined;
+    for (&tasks) |*t| t.* = try rt.spawn(semWorker, .{ctx});
+    for (&tasks) |t| t.join();
+}
+
 test "Semaphore: 100 coros acquire/release with cap=3" {
-    var rt = try Runtime.init(test_allocator);
+    // workers=1: sync primitives are single-thread-safe only at the
+    // moment; multi-worker hardening (atomic locked, lock-protected
+    // wait queues) is a follow-up. Cooperative scheduling with one
+    // worker still exercises the wait queue + park/unpark paths.
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
     defer rt.deinit();
 
     var sem = Semaphore.init(3);
     var counter: u32 = 0;
     var ctx = SemCtx{ .sem = &sem, .counter = &counter };
-
-    var tasks: [100]*@import("task.zig").Task(void) = undefined;
-    for (&tasks) |*t| t.* = try rt.spawn(semWorker, .{&ctx});
-    rt.run();
-    for (&tasks) |t| t.join();
+    try rt.run(semTestRoot, .{&ctx});
 
     try std.testing.expectEqual(@as(u32, 100), counter);
     try std.testing.expectEqual(@as(u32, 3), sem.permits);

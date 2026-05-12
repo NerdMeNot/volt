@@ -90,13 +90,10 @@ fn root(ctx: *RootCtx) !void {
 }
 
 fn benchOnce(allocator: std.mem.Allocator, n_clients: u32) !i128 {
-    var rt = try volt2.Runtime.init(allocator);
+    var rt = try volt2.Runtime.init(.{ .allocator = allocator, .workers = 1 });
     defer rt.deinit();
-
     var ctx = RootCtx{ .n_clients = n_clients };
-    var task = try rt.spawn(root, .{&ctx});
-    rt.run();
-    _ = task.join() catch unreachable;
+    try (try rt.run(root, .{&ctx}));
     const total_rtts: i128 = @as(i128, n_clients) * @as(i128, REQS_PER_CLIENT);
     return @divTrunc(ctx.wall_ns, total_rtts);
 }

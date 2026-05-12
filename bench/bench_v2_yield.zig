@@ -1,10 +1,6 @@
 //! Bench — v2 yield ping-pong (one-way ctx-switch cost via cooperative
 //! scheduler dispatch).
 //!
-//! Pattern: one coroutine yields N times. Each yield = swap to main,
-//! re-queue, pop, swap back. So per yield = 2 ctx swaps + dispatch.
-//! ns/op divided by 2 for one-way.
-//!
 //! Reference numbers:
 //!   POC-A wide-save raw ctx switch:    6 ns/swap
 //!   Volt v0.x yield (BENCHMARKS.md):  11 ns/swap one-way
@@ -24,18 +20,28 @@ fn yieldNTimes(n: u32) void {
     while (i < n) : (i += 1) volt2.yield();
 }
 
-fn benchOnce(allocator: std.mem.Allocator, n: u32) !i128 {
-    var rt = try volt2.Runtime.init(allocator);
-    defer rt.deinit();
+const BenchCtx = struct {
+    n: u32,
+    wall_ns: i128 = 0,
+};
 
-    var task = try rt.spawn(yieldNTimes, .{n});
-
+fn benchRoot(ctx: *BenchCtx) !void {
+    const rt: *volt2.Runtime = @ptrCast(@alignCast(volt2.current.require().runtime));
+    var task = try rt.spawn(yieldNTimes, .{ctx.n});
     const start = nanosNow();
-    rt.run();
-    const end = nanosNow();
     task.join();
-    // Each yield = 2 swaps; divide for one-way cost.
-    return @divTrunc(end - start, @as(i128, n) * 2);
+    const end = nanosNow();
+    ctx.wall_ns = end - start;
+}
+
+fn benchOnce(allocator: std.mem.Allocator, n: u32) !i128 {
+    // workers=1: yield is a cooperative same-worker primitive; the
+    // ctx-switch cost has nothing to do with multi-thread parallelism.
+    var rt = try volt2.Runtime.init(.{ .allocator = allocator, .workers = 1 });
+    defer rt.deinit();
+    var ctx = BenchCtx{ .n = n };
+    try (try rt.run(benchRoot, .{&ctx}));
+    return @divTrunc(ctx.wall_ns, @as(i128, n) * 2);
 }
 
 const REPS = 11;

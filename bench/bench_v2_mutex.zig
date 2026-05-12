@@ -29,25 +29,37 @@ fn incLoop(ctx: *Ctx) void {
     }
 }
 
-fn benchOnce(allocator: std.mem.Allocator, workers: u32, iters: u32) !i128 {
-    var rt = try volt2.Runtime.init(allocator);
-    defer rt.deinit();
+const BenchCtx = struct {
+    inner: Ctx,
+    workers: u32,
+    wall_ns: i128 = 0,
+};
 
+fn benchRoot(ctx: *BenchCtx) !void {
+    const rt: *volt2.Runtime = @ptrCast(@alignCast(volt2.current.require().runtime));
+    const tasks = try rt.allocator.alloc(*volt2.Task(void), ctx.workers);
+    defer rt.allocator.free(tasks);
+    const start = nanosNow();
+    for (tasks) |*t| t.* = try rt.spawn(incLoop, .{&ctx.inner});
+    for (tasks) |t| t.join();
+    const end = nanosNow();
+    ctx.wall_ns = end - start;
+}
+
+fn benchOnce(allocator: std.mem.Allocator, workers: u32, iters: u32) !i128 {
+    // workers=1: sync primitives are single-thread-safe only;
+    // multi-worker hardening is a follow-up.
+    var rt = try volt2.Runtime.init(.{ .allocator = allocator, .workers = 1 });
+    defer rt.deinit();
     var mu = volt2.Mutex{};
     var counter: u64 = 0;
-    var ctx = Ctx{ .mu = &mu, .counter = &counter, .iters = iters };
-
-    const tasks = try allocator.alloc(*volt2.Task(void), workers);
-    defer allocator.free(tasks);
-
-    const start = nanosNow();
-    for (tasks) |*t| t.* = try rt.spawn(incLoop, .{&ctx});
-    rt.run();
-    const end = nanosNow();
-    for (tasks) |t| t.join();
-
+    var ctx = BenchCtx{
+        .inner = Ctx{ .mu = &mu, .counter = &counter, .iters = iters },
+        .workers = workers,
+    };
+    try (try rt.run(benchRoot, .{&ctx}));
     std.debug.assert(counter == @as(u64, workers) * iters);
-    return @divTrunc(end - start, @as(i128, workers) * @as(i128, iters));
+    return @divTrunc(ctx.wall_ns, @as(i128, workers) * @as(i128, iters));
 }
 
 const REPS = 11;
