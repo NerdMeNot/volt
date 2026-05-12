@@ -74,7 +74,6 @@ pub const Runtime = struct {
     allocator: std.mem.Allocator,
     workers: []Worker,
     injection: worker_mod.InjectionQueue = .{},
-    pending: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     reactor: Reactor = .{},
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Bit i set ⇔ workers[i] is parked. Worker 0 is the driver
@@ -82,6 +81,19 @@ pub const Runtime = struct {
     /// pthreads. Worker 0 participates in the same parked-bitmap
     /// machinery as the rest — uniform model, no special case.
     parked_workers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Count of workers currently in the find-work phase of the
+    /// dispatch loop — i.e. actively looking for the next task to
+    /// run. Anti-herd: `wakeOneParked` returns immediately when
+    /// num_searching > 0, since the searching worker will find any
+    /// newly-pushed work on its current or next pass.
+    ///
+    /// Critically does NOT count workers that are currently
+    /// dispatching a coroutine. A worker running a long CPU-bound
+    /// coro can't pick up new work — wakeOneParked must NOT skip
+    /// the wake on its account. Workers fetchAdd entering findWork
+    /// and fetchSub on exit (either committing to dispatch or
+    /// committing to park).
+    num_searching: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// CAS-claim "I am the current reactor poller" — only one worker
     /// polls kqueue at a time.
     reactor_poller_taken: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -172,7 +184,6 @@ pub const Runtime = struct {
         };
         c.wg = @ptrCast(&task.wg);
 
-        _ = self.pending.fetchAdd(1, .acq_rel);
         self.pushNew(c);
         return task;
     }
@@ -196,8 +207,15 @@ pub const Runtime = struct {
 
     /// Find a parked worker via the bitmap, atomically claim it
     /// (clear its bit), unpark its Parker. Safe to call from any
-    /// thread; no-op if no worker is parked.
+    /// thread; no-op if no worker is parked OR if another worker
+    /// is already searching for work (anti-herd guard).
     pub fn wakeOneParked(self: *Runtime) void {
+        // Anti-herd: if any worker is already searching, it will
+        // find the new work on its current or next dispatch cycle.
+        // No need to wake a parked sibling — that's just thrashing
+        // the bitmap cache line + paying ulock_wake overhead.
+        if (self.num_searching.load(.acquire) > 0) return;
+
         var bitmap = self.parked_workers.load(.acquire);
         while (bitmap != 0) {
             const idx = @ctz(bitmap);
@@ -243,6 +261,11 @@ pub const Runtime = struct {
         args: anytype,
     ) !@typeInfo(@TypeOf(user_fn)).@"fn".return_type.? {
         var task = try self.spawn(user_fn, args);
+        // Register the driver thread's parker on the root task's
+        // WaitGroup so `done()` will wake the driver when the root
+        // completes — wherever it completes from (worker 0 itself or
+        // any spawned worker).
+        task.wg.thread_waiter.store(&self.workers[0].parker, .release);
         // Calling thread becomes worker 0 for the duration of run().
         // After this returns, deinit will shut down the other workers.
         workerLoopUntilTaskDone(self, &self.workers[0], &task.wg);
@@ -265,49 +288,65 @@ fn workerLoopUntilTaskDone(rt: *Runtime, w: *Worker, target_wg: *WaitGroup) void
     worker_mod.currentWorkerSet(@ptrCast(w));
     defer worker_mod.currentWorkerSet(null);
     while (target_wg.count() != 0) {
-        if (!tryOneDispatchCycle(rt, w)) {
-            // No work found anywhere. Park if target still pending.
-            if (target_wg.count() == 0) return;
-            parkWorker(rt, w);
+        // Enter find-work phase: count this worker as searching.
+        // Anti-herd: pushers see num_searching > 0 and skip the
+        // bitmap CAS + ulock_wake, knowing we'll pick up their push.
+        _ = rt.num_searching.fetchAdd(1, .acq_rel);
+        if (tryFindAndDispatch(rt, w)) {
+            // tryFindAndDispatch decrements num_searching on hit
+            // before swapping into the coroutine. We're back from
+            // the swap now; loop iterates and fetchAdds again.
+            continue;
         }
+        // No work found. Leave find-work phase and park.
+        _ = rt.num_searching.fetchSub(1, .acq_rel);
+        if (target_wg.count() == 0) return;
+        parkWorker(rt, w);
     }
 }
 
 /// Spawned-worker loop variant: runs until shutdown.
 fn workerLoopUntilShutdown(rt: *Runtime, w: *Worker) void {
     while (!rt.shutdown.load(.acquire)) {
-        if (!tryOneDispatchCycle(rt, w)) {
-            if (rt.shutdown.load(.acquire)) return;
-            parkWorker(rt, w);
-        }
+        _ = rt.num_searching.fetchAdd(1, .acq_rel);
+        if (tryFindAndDispatch(rt, w)) continue;
+        _ = rt.num_searching.fetchSub(1, .acq_rel);
+        if (rt.shutdown.load(.acquire)) return;
+        parkWorker(rt, w);
     }
 }
 
-/// Try one full dispatch cycle: local → injection → steal → reactor.
-/// Returns true if a coroutine was dispatched OR the reactor was
-/// polled (work may have arrived). Returns false if nothing was
+/// Find one piece of work and dispatch it. Returns true if anything
+/// was dispatched / reactor polled. Returns false if no work was
 /// found anywhere — caller should park.
-fn tryOneDispatchCycle(rt: *Runtime, w: *Worker) bool {
-    // 1. LIFO slot + local FIFO queue.
+///
+/// IMPORTANT: this function maintains the searching/dispatching
+/// invariant. On entry, the caller has fetchAdd'd num_searching
+/// (worker is "in find-work phase"). When we commit to dispatching,
+/// we fetchSub *before* the ctx swap so other pushers correctly see
+/// that we're no longer searching. (A worker mid-dispatch can't
+/// pick up new work; it must not count as searching.)
+fn tryFindAndDispatch(rt: *Runtime, w: *Worker) bool {
     if (w.popLocal()) |c| {
+        _ = rt.num_searching.fetchSub(1, .acq_rel);
         dispatch(rt, w, c);
         return true;
     }
-    // 2. Global injection (cross-thread spawns, reactor unparks, overflow).
     if (rt.injection.pop()) |c| {
+        _ = rt.num_searching.fetchSub(1, .acq_rel);
         dispatch(rt, w, c);
         return true;
     }
-    // 3. Steal from sibling. stealInto moves half of victim's queue
-    //    into ours, returning the first stolen task.
     if (stealFromSiblings(rt, w)) |c| {
+        _ = rt.num_searching.fetchSub(1, .acq_rel);
         dispatch(rt, w, c);
         return true;
     }
-    // 4. Reactor poll. If any worker has in-flight IO AND we can
-    //    claim the poller role, block on kevent. Events deliver via
-    //    unpark → injection → next iteration picks them up.
     if (rt.reactor.pending > 0 and rt.tryClaimPoller()) {
+        // Drop searching count while inside the blocking kevent —
+        // this thread can't pick up other work while in the syscall,
+        // and pushers should be able to wake parked siblings.
+        _ = rt.num_searching.fetchSub(1, .acq_rel);
         _ = rt.reactor.poll(true);
         rt.releasePoller();
         return true;
@@ -318,6 +357,9 @@ fn tryOneDispatchCycle(rt: *Runtime, w: *Worker) bool {
 /// Park this worker. Adds self to parked_workers bitmap, rechecks
 /// queues + reactor for race-arrived work, then blocks on the
 /// parker. Cross-thread spawns / unparks wake via wakeOneParked.
+///
+/// Called from a non-searching state — the caller has already
+/// fetchSub'd num_searching when it decided not to find more work.
 fn parkWorker(rt: *Runtime, w: *Worker) void {
     rt.markParked(w);
     defer rt.unmarkParked(w);
@@ -360,14 +402,11 @@ fn dispatch(rt: *Runtime, w: *Worker, c: *Coroutine) void {
             }
             rt.allocator.free(c.stack);
             rt.allocator.destroy(c);
-            const prev = rt.pending.fetchSub(1, .acq_rel);
-            if (prev == 1) {
-                // Last coroutine just completed — wake worker 0
-                // (the driver thread) specifically so it can observe
-                // its target_wg = 0 and exit run(). If worker 0 isn't
-                // parked, this is a no-op stored notification.
-                rt.workers[0].parker.unpark();
-            }
+            // No global pending counter to decrement. If this coro
+            // was the driver's root task, `wg_typed.done()` above
+            // already woke the driver via `thread_waiter` (set by
+            // Runtime.run). For other tasks, the joiner (a
+            // coroutine) was woken via `waiter`.
         },
     }
 }
