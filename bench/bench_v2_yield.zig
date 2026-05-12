@@ -25,7 +25,7 @@ fn yieldNTimes(n: u32) void {
 }
 
 fn benchOnce(allocator: std.mem.Allocator, n: u32) !i128 {
-    var rt = volt2.Runtime.init(allocator);
+    var rt = try volt2.Runtime.init(allocator);
     defer rt.deinit();
 
     var task = try rt.spawn(yieldNTimes, .{n});

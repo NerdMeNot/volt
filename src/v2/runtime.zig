@@ -15,12 +15,14 @@ const coroutine = @import("coroutine.zig");
 const wait_group = @import("wait_group.zig");
 const task_mod = @import("task.zig");
 const current = @import("current.zig");
+const reactor_mod = @import("reactor_kqueue.zig");
 
 pub const Coroutine = coroutine.Coroutine;
 pub const Frame = coroutine.Frame;
 pub const PendingKind = coroutine.PendingKind;
 pub const WaitGroup = wait_group.WaitGroup;
 pub const Task = task_mod.Task;
+pub const Reactor = reactor_mod.Reactor;
 pub const STACK_SIZE: usize = 16 * 1024;
 
 /// Cooperative yield. Re-queues the current coroutine after letting
@@ -34,28 +36,63 @@ pub fn yield() void {
     // re-dispatching us (so the next swap-back defaults to terminal).
 }
 
+/// Suspend the current coroutine until another path calls
+/// `unpark(coro)`. The worker observes `pending == .park` after the
+/// swap-back, does NOT re-queue — leaves the coroutine alone until
+/// the eventual unpark.
+///
+/// Caller must arrange for the unparker to have a reference to this
+/// coroutine before calling `park` (e.g. by storing
+/// `current.require()` in a wait-list field on the synchronization
+/// object that's about to be observed in its "ready" state).
+pub fn park() void {
+    const c = current.require();
+    c.pending = .park;
+    context.swap(&c.ctx, c.main_ctx);
+}
+
+/// Re-queue a parked coroutine. Pushes back to its owning runtime's
+/// queue. Safe to call from inside another coroutine or from any
+/// thread (the queue is lock-free).
+pub fn unpark(c: *Coroutine) void {
+    const rt: *Runtime = @ptrCast(@alignCast(c.runtime));
+    rt.queue.push(c);
+}
+
+/// FIFO run queue. Single-worker — no atomics; reactor.poll runs on
+/// the same thread so unpark from poll is serialized with worker
+/// dispatch.
+///
+/// FIFO is REQUIRED for cooperative scheduling fairness: if a
+/// coroutine yields after spawning N children, LIFO would put the
+/// yielder right back at the front (since it was pushed most
+/// recently), starving the children indefinitely. FIFO guarantees
+/// each yielded coroutine waits for all currently-queued tasks to
+/// run before resuming.
+///
+/// Multi-worker (Phase 3.3) will replace this with per-worker
+/// Chase-Lev deques + cross-worker steal.
 pub const RunQueue = struct {
-    head: std.atomic.Value(?*Coroutine) = std.atomic.Value(?*Coroutine).init(null),
+    head: ?*Coroutine = null,
+    tail: ?*Coroutine = null,
 
     pub fn push(self: *RunQueue, c: *Coroutine) void {
-        var cur = self.head.load(.monotonic);
-        while (true) {
-            c.next = cur;
-            if (self.head.cmpxchgWeak(cur, c, .release, .monotonic)) |observed| {
-                cur = observed;
-            } else return;
+        c.next = null;
+        if (self.tail) |t| {
+            t.next = c;
+            self.tail = c;
+        } else {
+            self.head = c;
+            self.tail = c;
         }
     }
 
     pub fn pop(self: *RunQueue) ?*Coroutine {
-        var cur = self.head.load(.acquire);
-        while (cur) |c| {
-            const next = c.next;
-            if (self.head.cmpxchgWeak(cur, next, .acq_rel, .acquire)) |observed| {
-                cur = observed;
-            } else return c;
-        }
-        return null;
+        const h = self.head orelse return null;
+        self.head = h.next;
+        if (self.head == null) self.tail = null;
+        h.next = null;
+        return h;
     }
 };
 
@@ -64,13 +101,18 @@ pub const Runtime = struct {
     queue: RunQueue = .{},
     main_ctx: context.Context = .{},
     pending: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    reactor: Reactor = .{},
 
-    pub fn init(allocator: std.mem.Allocator) Runtime {
-        return .{ .allocator = allocator };
+    pub fn init(allocator: std.mem.Allocator) !Runtime {
+        return .{
+            .allocator = allocator,
+            .reactor = try Reactor.init(),
+        };
     }
 
     pub fn deinit(self: *Runtime) void {
         std.debug.assert(self.pending.load(.acquire) == 0);
+        self.reactor.deinit();
     }
 
     /// Comptime-typed spawn. Returns a *Task(T) where T is the return
@@ -105,6 +147,7 @@ pub const Runtime = struct {
             .frame_ptr = frame,
             .frame_destroy = &F.destroy,
             .main_ctx = &self.main_ctx,
+            .runtime = self,
             .has_task = true,
             .wg = null, // Task carries its own WG
         };
@@ -150,7 +193,7 @@ pub const Runtime = struct {
                     },
                     .done => {
                         if (c.wg) |w| {
-                            const wg_typed: *WaitGroup = @ptrCast(w);
+                            const wg_typed: *WaitGroup = @ptrCast(@alignCast(w));
                             wg_typed.done();
                         }
                         if (!c.has_task) {
@@ -165,7 +208,15 @@ pub const Runtime = struct {
                 }
                 continue;
             }
-            std.atomic.spinLoopHint();
+            // Queue empty. If reactor has pending IO, block on it.
+            // Otherwise we're stuck (parked coros but no IO to wake
+            // them) — that's a deadlock; spin so the watchdog can
+            // catch it.
+            if (self.reactor.pending > 0) {
+                _ = self.reactor.poll(true);
+            } else {
+                std.atomic.spinLoopHint();
+            }
         }
     }
 };
@@ -189,7 +240,7 @@ fn noReturn(counter: *std.atomic.Value(u32)) void {
 }
 
 test "runtime: spawn typed fn returning u32" {
-    var rt = Runtime.init(test_allocator);
+    var rt = try Runtime.init(test_allocator);
     defer rt.deinit();
 
     var task = try rt.spawn(returnInt, .{@as(u32, 21)});
@@ -200,7 +251,7 @@ test "runtime: spawn typed fn returning u32" {
 }
 
 test "runtime: spawn typed fn returning slice" {
-    var rt = Runtime.init(test_allocator);
+    var rt = try Runtime.init(test_allocator);
     defer rt.deinit();
 
     var task = try rt.spawn(returnString, .{});
@@ -211,7 +262,7 @@ test "runtime: spawn typed fn returning slice" {
 }
 
 test "runtime: spawn 100 typed fns with pointer arg" {
-    var rt = Runtime.init(test_allocator);
+    var rt = try Runtime.init(test_allocator);
     defer rt.deinit();
 
     var counter = std.atomic.Value(u32).init(0);
@@ -232,7 +283,7 @@ fn yieldingWorker(counter: *std.atomic.Value(u32), n: u32) void {
 }
 
 test "runtime: yield re-queues coroutine" {
-    var rt = Runtime.init(test_allocator);
+    var rt = try Runtime.init(test_allocator);
     defer rt.deinit();
 
     var counter = std.atomic.Value(u32).init(0);
@@ -244,7 +295,7 @@ test "runtime: yield re-queues coroutine" {
 }
 
 test "runtime: two yielding coroutines interleave" {
-    var rt = Runtime.init(test_allocator);
+    var rt = try Runtime.init(test_allocator);
     defer rt.deinit();
 
     var counter = std.atomic.Value(u32).init(0);

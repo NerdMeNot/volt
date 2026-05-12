@@ -24,7 +24,7 @@ fn nanosNow() i128 {
 fn nopFn() void {}
 
 fn benchOnce(allocator: std.mem.Allocator, n: u32) !i128 {
-    var rt = volt2.Runtime.init(allocator);
+    var rt = try volt2.Runtime.init(allocator);
     defer rt.deinit();
     const Task = volt2.Task(void);
 

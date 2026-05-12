@@ -10,13 +10,16 @@
 //!     (because Task owns it).
 //!   * Caller calls `task.join()` → reads Frame.result, frees Frame + Task.
 //!
-//! Task is NOT thread-safe — it's expected to be joined on the same
-//! worker that spawned it (single-worker v2 makes this trivial; multi-
-//! worker v2 will need to enforce single-joiner).
+//! `join()` is cooperative: if called from inside a coroutine, it
+//! yields until the task is done. If called from the runtime driver
+//! (main thread, after `rt.run()` returned), the task is already done
+//! and join completes immediately.
 
 const std = @import("std");
 const coroutine = @import("coroutine.zig");
 const wait_group = @import("wait_group.zig");
+const current = @import("current.zig");
+const runtime = @import("runtime.zig");
 
 pub fn Task(comptime T: type) type {
     return struct {
@@ -32,15 +35,21 @@ pub fn Task(comptime T: type) type {
         /// WaitGroup with count 1; decremented on coroutine completion.
         wg: wait_group.WaitGroup,
 
-        /// Spin until the coroutine completes, return its result, free
-        /// Frame + Task. Single-worker semantics: caller is presumed
-        /// to be the runtime driver (call `rt.run()` before `task.join()`).
+        /// Wait for the coroutine to complete, return its result,
+        /// free Frame + Task.
         ///
-        /// For now `join` ASSUMES the WaitGroup has been driven to 0
-        /// by `rt.run()`. A future multi-worker version will park the
-        /// joiner on the WG.
+        /// If called from inside a coroutine, parks on the
+        /// WaitGroup. The coroutine's `done` decrement unparks the
+        /// waiter. If called from outside (the runtime driver,
+        /// post-`rt.run()`), the wg is already 0 and wait() returns
+        /// immediately.
         pub fn join(self: *Self) T {
-            std.debug.assert(self.wg.count() == 0);
+            if (self.wg.count() != 0) {
+                if (current.get() == null) {
+                    @panic("Task.join called outside a coroutine and before rt.run()");
+                }
+                self.wg.wait();
+            }
             const result = self.result_ptr.*;
             self.frame_destroy(self.frame_ptr, self.allocator);
             self.allocator.destroy(self);

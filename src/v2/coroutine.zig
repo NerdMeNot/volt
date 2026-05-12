@@ -44,6 +44,10 @@ pub const Coroutine = struct {
     ctx: context.Context = .{},
     /// Worker's main context.
     main_ctx: *context.Context = undefined,
+    /// Owning runtime, type-erased to avoid the Coroutine ↔ Runtime
+    /// import cycle. Cast back to `*Runtime` via @ptrCast/@alignCast
+    /// when needed (e.g. `unpark` to push back to the queue).
+    runtime: *anyopaque = undefined,
     /// Heap-alloc'd 16-byte-aligned stack slice.
     stack: []align(16) u8 = undefined,
     /// Pointer to the Frame (comptime-generated).

@@ -153,6 +153,8 @@ pub fn build(b: *std.Build) void {
     const v2_benches = [_]struct { name: []const u8, src: []const u8, step: []const u8, desc: []const u8 }{
         .{ .name = "v2-spawn-join", .src = "bench/bench_v2_spawn_join.zig", .step = "bench-v2-spawn-join", .desc = "v2 Runtime spawn+join (target ≤ 150 ns/op, beats Go)" },
         .{ .name = "v2-yield", .src = "bench/bench_v2_yield.zig", .step = "bench-v2-yield", .desc = "v2 yield one-way ctx switch (target ≤ 12 ns/op)" },
+        .{ .name = "v2-spsc", .src = "bench/bench_v2_spsc.zig", .step = "bench-v2-spsc", .desc = "v2 Spsc channel send+recv (target ≤ 35 ns/op, beats Go)" },
+        .{ .name = "v2-tcp-echo", .src = "bench/bench_v2_tcp_echo.zig", .step = "bench-v2-tcp-echo", .desc = "v2 TCP echo 64 clients × 16 RTT × 1 KB (target ≤ 9500 ns/RTT, beats Go)" },
     };
     for (v2_benches) |b_| {
         const mod = b.createModule(.{

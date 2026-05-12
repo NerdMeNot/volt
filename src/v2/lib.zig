@@ -26,11 +26,19 @@ pub const RunQueue = @import("runtime.zig").RunQueue;
 pub const STACK_SIZE = @import("runtime.zig").STACK_SIZE;
 pub const Frame = @import("runtime.zig").Frame;
 pub const yield = @import("runtime.zig").yield;
+pub const park = @import("runtime.zig").park;
+pub const unpark = @import("runtime.zig").unpark;
 
 pub const Coroutine = @import("coroutine.zig").Coroutine;
 pub const PendingKind = @import("coroutine.zig").PendingKind;
 pub const WaitGroup = @import("wait_group.zig").WaitGroup;
 pub const Task = @import("task.zig").Task;
+
+pub const channel = @import("channel.zig");
+pub const Spsc = channel.Spsc;
+
+pub const net = @import("net.zig");
+pub const reactor = @import("reactor_kqueue.zig");
 
 pub const context = @import("context_arm64.zig");
 pub const current = @import("current.zig");
