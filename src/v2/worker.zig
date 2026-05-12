@@ -1,54 +1,33 @@
-//! v2 Worker — one OS thread, one local run queue.
+//! v2 Worker — one OS thread, one local work-steal queue, one LIFO slot.
 //!
 //! Each Worker owns:
-//!   - A pthread on which the dispatch loop runs
-//!   - A local FIFO run queue (mutex-protected for steal access)
-//!   - A Parker (for cross-thread sleep when no work)
-//!   - Its own `main_ctx` to swap to from coroutines
+//!   * A pthread on which the dispatch loop runs
+//!   * A fixed-256 lock-free WorkStealQueue (LocalQueue) — owner FIFO pop,
+//!     stealers steal half. Overflow spills to the global InjectionQueue.
+//!   * A single LIFO slot (`lifo_slot`) — most-recently-pushed continuation.
+//!     Checked first on dispatch for cache-warmth on spawn chains.
+//!   * A pthread-cond Parker (cross-thread sleep on idle)
+//!   * Its own `main_ctx` to swap to from coroutines
 //!
-//! Dispatch loop priority:
-//!   1. Local queue (FIFO, owner-favored)
-//!   2. Global injection queue (cross-thread spawns + unparks land here)
-//!   3. Steal from random sibling (FIFO from victim's queue front)
-//!   4. Try claim reactor-poller role; if claimed, poll with timeout
-//!   5. Park
-//!
-//! Cross-thread wake protocol:
-//!   - `wakeOne()` finds a parked worker via the runtime's bitmap and
-//!     unparks it. Called whenever new work is pushed (spawn, unpark,
-//!     reactor delivery).
+//! See `work_steal_queue.zig` for the IO-geared SPMC ring design.
+//! See `runtime.zig` for the dispatch loop priority + steal/park logic.
 
 const std = @import("std");
 const coroutine = @import("coroutine.zig");
 const parker_mod = @import("parker.zig");
 const context = @import("context_arm64.zig");
-const current = @import("current.zig");
-const wait_group = @import("wait_group.zig");
-const deque_mod = @import("deque.zig");
+const wsq_mod = @import("work_steal_queue.zig");
 
 pub const Coroutine = coroutine.Coroutine;
 pub const Parker = parker_mod.Parker;
+pub const LocalQueue = wsq_mod.WorkStealQueue;
 
-/// Per-worker Chase-Lev lock-free work-stealing deque.
-/// Owner pushes/pops bottom (LIFO from owner). Stealers take from
-/// top (FIFO of stealable items). Cache-line padded between top and
-/// bottom to avoid false sharing.
-///
-/// Initial capacity 256; doubles on overflow via the deque's grow path.
-pub const LocalQueue = deque_mod.Deque(*Coroutine);
-/// 16 K slots × 8 B = 128 KiB per worker. Generous enough that the
-/// deque's `grow` path doesn't fire on typical workloads (the grow
-/// path immediately frees the old buffer, which races with in-flight
-/// steals on different threads — same caveat as blitz's reference
-/// implementation, fix tracked as a perf/correctness follow-up).
-pub const LOCAL_INITIAL_CAP: usize = 16384;
-
-/// Lock-free MPMC injection queue (Treiber stack). Used for
-/// cross-thread spawns from non-worker threads, and as a fallback
-/// when a worker's local queue is empty AND siblings have nothing.
-///
-/// LIFO is fine here: workers consume from it in parallel; ordering
-/// fairness is handled by per-worker FIFO above.
+/// Lock-free MPMC global injection queue. Treiber stack threaded
+/// through `Coroutine.next`. Used for:
+///   * Cross-thread spawns from non-worker contexts (driver before
+///     entering rt.run, sync primitive unpark, reactor wake)
+///   * Overflow from a worker's LocalQueue when push hits CAPACITY
+///   * Coroutines that get unparked while no worker is on-CPU
 pub const InjectionQueue = struct {
     head: std.atomic.Value(?*Coroutine) = std.atomic.Value(?*Coroutine).init(null),
 
@@ -83,9 +62,6 @@ pub const InjectionQueue = struct {
 
 threadlocal var current_worker: ?*anyopaque = null;
 
-/// Get the current worker for the calling thread (returns null if not
-/// on a Worker pthread — e.g. the runtime driver thread before it
-/// has parked).
 pub fn currentWorker() ?*anyopaque {
     return current_worker;
 }
@@ -99,15 +75,22 @@ pub const Worker = struct {
     runtime: *anyopaque, // *Runtime; opaque to avoid cycle
     main_ctx: context.Context = .{},
     local: LocalQueue,
+    /// Single-slot LIFO cache for the just-pushed continuation. Spawn
+    /// uses this to make the next-spawned coro run before older
+    /// queued items on the same worker — pure cache-warmth
+    /// optimization. Stored as an atomic so the worker can claim it
+    /// without locks; a sibling steal does NOT touch the lifo_slot,
+    /// keeping the warm continuation owner-local.
+    lifo_slot: std.atomic.Value(?*Coroutine) = std.atomic.Value(?*Coroutine).init(null),
     parker: Parker = .{},
     thread: std.Thread = undefined,
     rng: std.Random.DefaultPrng = undefined,
 
-    pub fn init(self: *Worker, id: usize, runtime: *anyopaque, allocator: std.mem.Allocator) !void {
+    pub fn init(self: *Worker, id: usize, runtime: *anyopaque) void {
         self.* = .{
             .id = id,
             .runtime = runtime,
-            .local = try LocalQueue.init(allocator, LOCAL_INITIAL_CAP),
+            .local = LocalQueue.init(),
             .rng = std.Random.DefaultPrng.init(@intCast(id +% 0xDEADBEEF)),
         };
         self.parker.init();
@@ -115,6 +98,27 @@ pub const Worker = struct {
 
     pub fn deinit(self: *Worker) void {
         self.parker.deinit();
-        self.local.deinit();
+    }
+
+    /// Owner-side push that uses the LIFO slot first. If the slot
+    /// already holds a coro, evict it to the main queue and put the
+    /// new one in the slot. Spawn-on-this-worker uses this so the
+    /// just-spawned continuation has the lowest dispatch latency.
+    pub fn pushLifo(self: *Worker, c: *Coroutine, global: *InjectionQueue) void {
+        const evicted = self.lifo_slot.swap(c, .acq_rel);
+        if (evicted) |e| self.local.push(e, global);
+    }
+
+    /// Owner-side push that goes straight to the main queue. Used for
+    /// yield (re-queue a yielding coro at the tail for fairness — we
+    /// don't want yield to bounce back to the front via lifo_slot).
+    pub fn pushQueue(self: *Worker, c: *Coroutine, global: *InjectionQueue) void {
+        self.local.push(c, global);
+    }
+
+    /// Owner-side pop in dispatch priority: lifo_slot first, then queue.
+    pub fn popLocal(self: *Worker) ?*Coroutine {
+        if (self.lifo_slot.swap(null, .acq_rel)) |c| return c;
+        return self.local.pop();
     }
 };

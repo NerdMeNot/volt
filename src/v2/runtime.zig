@@ -45,7 +45,8 @@ pub const Config = struct {
 };
 
 /// Cooperative yield. Re-queues the current coroutine onto the
-/// running worker's local queue.
+/// running worker's local queue (tail, FIFO — yields don't bounce
+/// to the front via lifo_slot).
 pub fn yield() void {
     const c = current.require();
     c.pending = .yield;
@@ -60,14 +61,9 @@ pub fn park() void {
     context.swap(&c.ctx, c.main_ctx);
 }
 
-/// Re-queue a parked coroutine. Always pushes to the global injection
-/// queue so that ANY worker — including parked siblings — can pick it
-/// up. Wakes one parked worker if any.
-///
-/// We could push to the caller's local queue for locality, but that
-/// would leave the coro stranded if the caller-worker is busy and
-/// parked workers exist that could run it sooner. Injection-then-wake
-/// is the safer default; locality optimization is a follow-up.
+/// Re-queue a parked coroutine. Pushes to global injection so any
+/// worker — including parked siblings — can pick it up. Wakes one
+/// parked worker if any.
 pub fn unpark(c: *Coroutine) void {
     const rt: *Runtime = @ptrCast(@alignCast(c.runtime));
     rt.injection.push(c);
@@ -102,7 +98,7 @@ pub const Runtime = struct {
             .reactor = try Reactor.init(),
         };
         rt.driver_parker.init();
-        for (rt.workers, 0..) |*w, i| try w.init(i, rt, cfg.allocator);
+        for (rt.workers, 0..) |*w, i| w.init(i, rt);
 
         // Spawn worker pthreads.
         for (rt.workers) |*w| {
@@ -176,12 +172,17 @@ pub const Runtime = struct {
         return task;
     }
 
-    /// Push a coroutine onto the local queue if called from a worker,
-    /// else onto the global injection queue. Wakes a parked worker.
+    /// Push a freshly-spawned coroutine. If called from inside a
+    /// coroutine on a worker, uses that worker's `pushLifo` so the
+    /// just-spawned continuation has the lowest dispatch latency
+    /// (single-slot LIFO cache, with the evicted slot landing in
+    /// the queue tail for fairness). Otherwise (driver thread or
+    /// any non-worker context) injects globally.
+    /// Wakes a parked worker in either case.
     fn pushNew(self: *Runtime, c: *Coroutine) void {
         if (worker_mod.currentWorker()) |w_raw| {
             const w: *Worker = @ptrCast(@alignCast(w_raw));
-            w.local.push(c);
+            w.pushLifo(c, &self.injection);
         } else {
             self.injection.push(c);
         }
@@ -252,18 +253,20 @@ fn workerLoop(rt: *Runtime, w: *Worker) void {
     defer worker_mod.currentWorkerSet(null);
 
     while (!rt.shutdown.load(.acquire)) {
-        // 1. Local queue (FIFO, owner-favored).
-        if (w.local.pop()) |c| {
+        // 1. LIFO slot + local FIFO queue (popLocal handles both).
+        if (w.popLocal()) |c| {
             dispatch(rt, w, c);
             continue;
         }
-        // 2. Global injection (cross-thread spawns, reactor unparks
-        //    when called from non-worker context).
+        // 2. Global injection (cross-thread spawns, reactor unparks,
+        //    spillover from other workers' overflow).
         if (rt.injection.pop()) |c| {
             dispatch(rt, w, c);
             continue;
         }
-        // 3. Steal from random sibling.
+        // 3. Steal from random sibling. stealInto moves half of the
+        //    victim's queue into our local; returns the first stolen
+        //    task to dispatch immediately.
         if (stealFromSiblings(rt, w)) |c| {
             dispatch(rt, w, c);
             continue;
@@ -286,8 +289,8 @@ fn workerLoop(rt: *Runtime, w: *Worker) void {
         rt.markParked(w);
         defer rt.unmarkParked(w);
         // Recheck — work may have arrived between findWork and mark.
+        if (w.lifo_slot.load(.acquire) != null) continue;
         if (!w.local.isEmpty() or !rt.injection.isEmpty() or rt.shutdown.load(.acquire)) continue;
-        // Also recheck whether reactor work appeared.
         if (rt.reactor.pending > 0) continue;
         w.parker.park();
     }
@@ -300,11 +303,7 @@ fn stealFromSiblings(rt: *Runtime, self: *Worker) ?*Coroutine {
     while (attempts < rt.workers.len) : (attempts += 1) {
         const idx = (start + attempts) % rt.workers.len;
         if (idx == self.id) continue;
-        const r = rt.workers[idx].local.steal();
-        switch (r.result) {
-            .success => return r.item,
-            .empty, .retry => continue, // try next sibling
-        }
+        if (rt.workers[idx].local.stealInto(&self.local)) |c| return c;
     }
     return null;
 }
@@ -316,7 +315,7 @@ fn dispatch(rt: *Runtime, w: *Worker, c: *Coroutine) void {
     context.swap(&w.main_ctx, &c.ctx);
     current.clear();
     switch (c.pending) {
-        .yield => w.local.push(c),
+        .yield => w.pushQueue(c, &rt.injection),
         .park => {}, // some external path will re-queue
         .done => {
             if (c.wg) |wg_atomic| {
