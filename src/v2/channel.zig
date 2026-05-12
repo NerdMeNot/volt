@@ -1,20 +1,26 @@
 //! v2 Channels.
 //!
-//! Two flavors:
-//!   - `Spsc(T, cap)` — comptime-specialized single-producer
-//!     single-consumer ring buffer. POC-F shape (4 atomics per
-//!     send+recv pair). For Volt's common pipeline case.
-//!   - `Mpmc(T, cap)` — Vyukov-style MPMC (TODO, Phase 3.5 follow-up).
+//! `Spsc(T, cap)` — comptime-specialized single-producer single-consumer
+//! ring buffer. "SPSC" means the channel takes ONE producer and ONE
+//! consumer (a *placement* constraint), NOT "single thread." The
+//! producer and consumer can be coroutines running on any two OS
+//! threads. The atomics + release/acquire fences carry the data
+//! correctly across the thread boundary.
 //!
-//! In v2 single-worker, "concurrent" producer + consumer means two
-//! coroutines on the same OS thread, alternating via park/unpark.
-//! There's no true cross-thread contention. The same channel types
-//! work cross-thread once Phase 3.3 (multi-worker) lands — the head/
-//! tail atomics are already correct for that.
+//! Memory model:
+//!   - `ring[i]`: producer writes; `head` release-store carries the
+//!     write to any consumer doing `head` acquire-load.
+//!   - `head`: producer-only writer, atomic for cross-thread visibility.
+//!   - `tail`: consumer-only writer, atomic for cross-thread visibility.
+//!   - `head` and `tail` on separate cache lines (no false sharing).
+//!   - `recv_waiter` / `send_waiter`: atomic slots for the parked
+//!     opposite-side coroutine. Wait protocol uses the standard
+//!     "store waiter; re-check condition; park or undo" pattern, which
+//!     closes the race with the matching side under multi-thread
+//!     interleaving (see WaitGroup.wait for the same pattern).
 //!
-//! Blocking behavior: send on full → park current; recv on empty →
-//! park current. The other side's op unparks the waiter after making
-//! the queue non-full / non-empty.
+//! `Mpmc(T, cap)` — TODO (#150). Vyukov ring or similar for the
+//! general multi-producer / multi-consumer case.
 
 const std = @import("std");
 const coroutine = @import("coroutine.zig");
@@ -164,12 +170,8 @@ fn spscTestRoot(ctx: *TestCtx) !void {
     _ = cons.join() catch unreachable;
 }
 
-test "spsc: small unbuffered pipeline" {
-    // workers=1: Spsc relies on the same-worker park/unpark
-    // sequencing. Multi-worker hardening (atomic-correct wake
-    // protocol when producer and consumer are on different threads)
-    // is a follow-up.
-    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
+test "spsc: small unbuffered pipeline (multi-worker default)" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
     defer rt.deinit();
 
     var ch = Spsc(u64, 4){};
@@ -179,11 +181,22 @@ test "spsc: small unbuffered pipeline" {
     try std.testing.expectEqual(@as(u64, 4950), ctx.sum);
 }
 
-test "spsc: cap=2 stresses block-on-full" {
-    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
+test "spsc: cap=2 stresses block-on-full, multi-worker" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
     defer rt.deinit();
 
     var ch = Spsc(u64, 2){};
+    var ctx = TestCtx{ .ch = &ch, .n = 1000 };
+    try rt.run(spscTestRoot, .{&ctx});
+
+    try std.testing.expectEqual(@as(u64, 499500), ctx.sum);
+}
+
+test "spsc: works at workers=1 (degenerate configuration)" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
+    defer rt.deinit();
+
+    var ch = Spsc(u64, 4){};
     var ctx = TestCtx{ .ch = &ch, .n = 1000 };
     try rt.run(spscTestRoot, .{&ctx});
 
