@@ -11,6 +11,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"runtime"
 	"sort"
@@ -92,6 +94,127 @@ func benchChannelSpsc(n int) uint64 {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Workload: TCP echo, N concurrent clients, K requests each.
+// Match Volt's params: msg=1024 bytes, reqs_per_client=16.
+// ─────────────────────────────────────────────────────────────────────
+
+const (
+	tcpMsgSize        = 1024
+	tcpReqsPerClient  = 16
+)
+
+func tcpEchoConn(c net.Conn) {
+	defer c.Close()
+	buf := make([]byte, tcpMsgSize)
+	for i := 0; i < tcpReqsPerClient; i++ {
+		if _, err := io.ReadFull(c, buf); err != nil {
+			return
+		}
+		if _, err := c.Write(buf); err != nil {
+			return
+		}
+	}
+}
+
+func tcpClient(addr string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	send := make([]byte, tcpMsgSize)
+	for i := range send {
+		send[i] = byte(i & 0xff)
+	}
+	recv := make([]byte, tcpMsgSize)
+	for i := 0; i < tcpReqsPerClient; i++ {
+		if _, err := c.Write(send); err != nil {
+			return
+		}
+		if _, err := io.ReadFull(c, recv); err != nil {
+			return
+		}
+	}
+}
+
+func benchTcpEcho(nClients int) uint64 {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "listen: %v\n", err)
+		os.Exit(1)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	// Server accept loop, exactly nClients connections.
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		for i := 0; i < nClients; i++ {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go tcpEchoConn(c)
+		}
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(nClients)
+	t0 := time.Now()
+	for i := 0; i < nClients; i++ {
+		go tcpClient(addr, &wg)
+	}
+	wg.Wait()
+	wall := time.Since(t0).Nanoseconds()
+	<-serverDone
+
+	totalRtts := uint64(nClients) * uint64(tcpReqsPerClient)
+	return uint64(wall) / totalRtts
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Workload: channel pipeline (producer → middle → consumer).
+// Two channels (cap 64), modest per-message work.
+// ─────────────────────────────────────────────────────────────────────
+
+func benchChannelPipeline(n int) uint64 {
+	in := make(chan uint64, 64)
+	out := make(chan uint64, 64)
+	done := make(chan struct{})
+
+	t0 := time.Now()
+	go func() {
+		for i := 0; i < n; i++ {
+			in <- uint64(i)
+		}
+		close(in)
+	}()
+	go func() {
+		for v := range in {
+			h := v
+			h ^= h >> 13
+			h *= 0x100000001b3
+			h ^= h >> 23
+			out <- h
+		}
+		close(out)
+	}()
+	go func() {
+		var sum uint64
+		for v := range out {
+			sum += v
+		}
+		_ = sum
+		close(done)
+	}()
+	<-done
+	wall := time.Since(t0).Nanoseconds()
+	return uint64(wall) / uint64(n)
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Workload: mutex contended (8 × 50k)
 // ─────────────────────────────────────────────────────────────────────
 
@@ -146,6 +269,8 @@ type Results struct {
 	SpawnWaitgroupNs  uint64 `json:"spawn_waitgroup_ns"`
 	ChannelSpsc16Ns   uint64 `json:"channel_spsc_16_ns"`
 	MutexContended8Ns uint64 `json:"mutex_contended_8_ns"`
+	TcpEchoRttNs      uint64 `json:"tcp_echo_rtt_ns"`
+	ChannelPipelineNs uint64 `json:"channel_pipeline_ns"`
 }
 
 func main() {
@@ -164,6 +289,8 @@ func main() {
 		SpawnWaitgroupNs:  runMedian(func() uint64 { return benchSpawnJoin(10_000) }),
 		ChannelSpsc16Ns:   runMedian(func() uint64 { return benchChannelSpsc(100_000) }),
 		MutexContended8Ns: runMedian(func() uint64 { return benchMutex(8, 50_000) }),
+		TcpEchoRttNs:      runMedian(func() uint64 { return benchTcpEcho(64) }),
+		ChannelPipelineNs: runMedian(func() uint64 { return benchChannelPipeline(50_000) }),
 	}
 
 	out, err := json.MarshalIndent(r, "", "  ")

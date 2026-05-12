@@ -195,7 +195,15 @@ pub const LocalPool = struct {
     misses: u64 = 0,
     crossworker_releases: u64 = 0,
 
-    pub const DEFAULT_CAP_PER_WORKER: usize = 64;
+    // Cap controls the trade-off between memory residency and mmap
+    // churn. Empirically, on the 1M spawn+join hot loop:
+    //   cap=64   → 24% of CPU in __mmap + __munmap + __mprotect
+    //   cap=4096 → < 1% (stacks fully recycled batch-over-batch)
+    // Each stack is a 1 MiB virtual reservation that's PROT_NONE until
+    // a coroutine actually grows it, so physical footprint stays small
+    // even at high cap. (Workload-dependent: deep-recursion-heavy code
+    // would commit more pages per stack and grow physical residency.)
+    pub const DEFAULT_CAP_PER_WORKER: usize = 4096;
     pub const DEFAULT_PREWARM_PER_WORKER: usize = 8;
 
     pub fn init(

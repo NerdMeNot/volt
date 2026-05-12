@@ -28,9 +28,15 @@ const Results = struct {
     spawn_waitgroup_ns: u64 = 0,
     channel_spsc_16_ns: u64 = 0,
     mutex_contended_8_ns: u64 = 0,
+    tcp_echo_rtt_ns: u64 = 0,
+    channel_pipeline_ns: u64 = 0,
 
     pub fn parseFrom(json: []const u8, allocator: std.mem.Allocator) !Results {
-        const parsed = try std.json.parseFromSlice(Results, allocator, json, .{});
+        // ignore_unknown_fields keeps the orchestrator forward-compatible
+        // with either side adding new measurements before the other.
+        const parsed = try std.json.parseFromSlice(Results, allocator, json, .{
+            .ignore_unknown_fields = true,
+        });
         defer parsed.deinit();
         return parsed.value;
     }
@@ -40,9 +46,16 @@ const Bench = struct {
     name: []const u8,
     field: []const u8,
     unit: []const u8 = "ns/op",
+    section: Section = .synthetic,
 };
 
+const Section = enum { real_workload, synthetic };
+
+// Real-workload benches first — these are the ones to take seriously.
+// Synthetic microbenches follow as context, not headlines.
 const BENCHES = [_]Bench{
+    .{ .name = "TCP echo (per RTT, 64 clients)", .field = "tcp_echo_rtt_ns", .section = .real_workload },
+    .{ .name = "channel pipeline (3-stage)", .field = "channel_pipeline_ns", .section = .real_workload },
     .{ .name = "yield (one-way ctx switch)", .field = "yield_one_way_ns" },
     .{ .name = "spawn + waitgroup-wait", .field = "spawn_waitgroup_ns" },
     .{ .name = "spawn + per-coro join", .field = "spawn_join_ns" },
@@ -147,7 +160,17 @@ pub fn main(init: std.process.Init) !void {
     });
     std.debug.print("  {s}{s}{s}\n", .{ Color.dim, "─" ** 78, Color.reset });
 
+    var printed_synthetic_header = false;
+    var printed_real_header = false;
     for (BENCHES) |b| {
+        if (b.section == .real_workload and !printed_real_header) {
+            std.debug.print("  {s}{s}— Real-workload benches —{s}\n", .{ Color.bold, Color.cyan, Color.reset });
+            printed_real_header = true;
+        }
+        if (b.section == .synthetic and !printed_synthetic_header) {
+            std.debug.print("  {s}{s}— Synthetic microbenches (context, not victory conditions) —{s}\n", .{ Color.bold, Color.dim, Color.reset });
+            printed_synthetic_header = true;
+        }
         const volt_ns = fieldValue(volt_res, b.field);
         const go_ns = fieldValue(go_res, b.field);
         const ratio: f64 = @as(f64, @floatFromInt(volt_ns)) / @as(f64, @floatFromInt(go_ns));
