@@ -59,8 +59,13 @@ pub const Coroutine = struct {
     /// `.done` before the terminal swap. `yield()` and `park()`
     /// helpers set it to `.yield` / `.park` before swapping.
     pending: PendingKind = .done,
-    /// Intrusive next pointer (Treiber stack).
+    /// Intrusive next pointer for the run queue (FIFO linked list).
     next: ?*Coroutine = null,
+    /// Intrusive next pointer for synchronization-primitive wait
+    /// queues (Mutex, Notify, Semaphore). Distinct from `next` so a
+    /// coroutine can be on a wait queue without conflict — and
+    /// becomes part of the run queue when unparked.
+    wait_next: ?*Coroutine = null,
     /// Optional WaitGroup. Auto-decremented on terminal swap-back.
     wg: ?*WaitGroupAtomic = null,
     /// Non-null when a Task handle exists.

@@ -40,5 +40,10 @@ pub const Spsc = channel.Spsc;
 pub const net = @import("net.zig");
 pub const reactor = @import("reactor_kqueue.zig");
 
+pub const sync = @import("sync.zig");
+pub const Mutex = sync.Mutex;
+pub const Notify = sync.Notify;
+pub const Semaphore = sync.Semaphore;
+
 pub const context = @import("context_arm64.zig");
 pub const current = @import("current.zig");
