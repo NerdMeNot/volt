@@ -156,6 +156,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "v2-spsc", .src = "bench/bench_v2_spsc.zig", .step = "bench-v2-spsc", .desc = "v2 Spsc channel send+recv (target ≤ 35 ns/op, beats Go)" },
         .{ .name = "v2-tcp-echo", .src = "bench/bench_v2_tcp_echo.zig", .step = "bench-v2-tcp-echo", .desc = "v2 TCP echo 64 clients × 16 RTT × 1 KB (target ≤ 9500 ns/RTT, beats Go)" },
         .{ .name = "v2-mutex", .src = "bench/bench_v2_mutex.zig", .step = "bench-v2-mutex", .desc = "v2 Mutex contended (8 coros × 50k acquires)" },
+        .{ .name = "v2-parallel-compute", .src = "bench/bench_v2_parallel_compute.zig", .step = "bench-v2-parallel-compute", .desc = "v2 parallel CPU-bound work across N workers — demonstrates multi-worker speedup" },
     };
     for (v2_benches) |b_| {
         const mod = b.createModule(.{
