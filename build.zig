@@ -59,6 +59,27 @@ pub fn build(b: *std.Build) void {
         volt_mod.addAssemblyFile(b.path("src/coroutine/context_x86_64.S"));
     }
 
+    // v2 module — POC-validated rewrite under src/v2/. Grows alongside
+    // v0.x (`volt` module above) until feature parity. At that point
+    // src/v2/ moves up to src/ and the old tree is removed.
+    const volt2_mod = b.addModule("volt2", .{
+        .root_source_file = b.path("src/v2/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    volt2_mod.link_libc = true;
+
+    // v2 unit tests. Separate target so we can iterate v2 without
+    // dragging v0.x test breakage along.
+    const volt2_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/v2/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    volt2_test_mod.link_libc = true;
+    const volt2_tests = b.addTest(.{ .root_module = volt2_test_mod });
+    b.step("test-v2", "Run v2 unit tests").dependOn(&b.addRunArtifact(volt2_tests).step);
+
     // Unit tests — runs every inline test in src/.
     const unit_test_mod = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
@@ -118,6 +139,28 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
         });
         mod.addImport("volt", b.modules.get("volt").?);
+        const exe = b.addExecutable(.{
+            .name = b.fmt("volt-bench-{s}", .{b_.name}),
+            .root_module = mod,
+        });
+        const install = b.addInstallArtifact(exe, .{});
+        const run = b.addRunArtifact(exe);
+        run.step.dependOn(&install.step);
+        b.step(b_.step, b_.desc).dependOn(&run.step);
+    }
+
+    // v2 benches — import the `volt2` module instead of `volt`.
+    const v2_benches = [_]struct { name: []const u8, src: []const u8, step: []const u8, desc: []const u8 }{
+        .{ .name = "v2-spawn-join", .src = "bench/bench_v2_spawn_join.zig", .step = "bench-v2-spawn-join", .desc = "v2 Runtime spawn+join (target ≤ 150 ns/op, beats Go)" },
+        .{ .name = "v2-yield", .src = "bench/bench_v2_yield.zig", .step = "bench-v2-yield", .desc = "v2 yield one-way ctx switch (target ≤ 12 ns/op)" },
+    };
+    for (v2_benches) |b_| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(b_.src),
+            .target = target,
+            .optimize = .ReleaseFast,
+        });
+        mod.addImport("volt2", b.modules.get("volt2").?);
         const exe = b.addExecutable(.{
             .name = b.fmt("volt-bench-{s}", .{b_.name}),
             .root_module = mod,
