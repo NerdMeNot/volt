@@ -102,7 +102,7 @@ pub const Runtime = struct {
             .reactor = try Reactor.init(),
         };
         rt.driver_parker.init();
-        for (rt.workers, 0..) |*w, i| w.init(i, rt);
+        for (rt.workers, 0..) |*w, i| try w.init(i, rt, cfg.allocator);
 
         // Spawn worker pthreads.
         for (rt.workers) |*w| {
@@ -300,7 +300,11 @@ fn stealFromSiblings(rt: *Runtime, self: *Worker) ?*Coroutine {
     while (attempts < rt.workers.len) : (attempts += 1) {
         const idx = (start + attempts) % rt.workers.len;
         if (idx == self.id) continue;
-        if (rt.workers[idx].local.steal()) |c| return c;
+        const r = rt.workers[idx].local.steal();
+        switch (r.result) {
+            .success => return r.item,
+            .empty, .retry => continue, // try next sibling
+        }
     }
     return null;
 }

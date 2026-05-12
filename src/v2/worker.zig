@@ -24,68 +24,24 @@ const parker_mod = @import("parker.zig");
 const context = @import("context_arm64.zig");
 const current = @import("current.zig");
 const wait_group = @import("wait_group.zig");
+const deque_mod = @import("deque.zig");
 
 pub const Coroutine = coroutine.Coroutine;
 pub const Parker = parker_mod.Parker;
 
-const PthreadMutex = extern struct { _opaque: [8]u64 = @splat(0) };
-extern "c" fn pthread_mutex_init(m: *PthreadMutex, attr: ?*anyopaque) c_int;
-extern "c" fn pthread_mutex_destroy(m: *PthreadMutex) c_int;
-extern "c" fn pthread_mutex_lock(m: *PthreadMutex) c_int;
-extern "c" fn pthread_mutex_unlock(m: *PthreadMutex) c_int;
-
-/// Per-worker FIFO queue. Owner enqueues/dequeues; siblings only
-/// steal (which competes for the same mutex). Mutex-protected for
-/// simplicity; Chase-Lev deque can replace this later for higher
-/// throughput at high worker counts.
-pub const LocalQueue = struct {
-    mutex: PthreadMutex = .{},
-    head: ?*Coroutine = null,
-    tail: ?*Coroutine = null,
-    len: usize = 0,
-
-    pub fn init(self: *LocalQueue) void {
-        _ = pthread_mutex_init(&self.mutex, null);
-    }
-
-    pub fn deinit(self: *LocalQueue) void {
-        _ = pthread_mutex_destroy(&self.mutex);
-    }
-
-    pub fn push(self: *LocalQueue, c: *Coroutine) void {
-        _ = pthread_mutex_lock(&self.mutex);
-        defer _ = pthread_mutex_unlock(&self.mutex);
-        c.next = null;
-        if (self.tail) |t| {
-            t.next = c;
-            self.tail = c;
-        } else {
-            self.head = c;
-            self.tail = c;
-        }
-        self.len += 1;
-    }
-
-    pub fn pop(self: *LocalQueue) ?*Coroutine {
-        _ = pthread_mutex_lock(&self.mutex);
-        defer _ = pthread_mutex_unlock(&self.mutex);
-        const h = self.head orelse return null;
-        self.head = h.next;
-        if (self.head == null) self.tail = null;
-        h.next = null;
-        self.len -= 1;
-        return h;
-    }
-
-    /// Steal from the front of the queue (oldest item, fair).
-    pub fn steal(self: *LocalQueue) ?*Coroutine {
-        return self.pop();
-    }
-
-    pub fn isEmpty(self: *const LocalQueue) bool {
-        return @atomicLoad(?*Coroutine, &self.head, .acquire) == null;
-    }
-};
+/// Per-worker Chase-Lev lock-free work-stealing deque.
+/// Owner pushes/pops bottom (LIFO from owner). Stealers take from
+/// top (FIFO of stealable items). Cache-line padded between top and
+/// bottom to avoid false sharing.
+///
+/// Initial capacity 256; doubles on overflow via the deque's grow path.
+pub const LocalQueue = deque_mod.Deque(*Coroutine);
+/// 16 K slots × 8 B = 128 KiB per worker. Generous enough that the
+/// deque's `grow` path doesn't fire on typical workloads (the grow
+/// path immediately frees the old buffer, which races with in-flight
+/// steals on different threads — same caveat as blitz's reference
+/// implementation, fix tracked as a perf/correctness follow-up).
+pub const LOCAL_INITIAL_CAP: usize = 16384;
 
 /// Lock-free MPMC injection queue (Treiber stack). Used for
 /// cross-thread spawns from non-worker threads, and as a fallback
@@ -142,18 +98,18 @@ pub const Worker = struct {
     id: usize,
     runtime: *anyopaque, // *Runtime; opaque to avoid cycle
     main_ctx: context.Context = .{},
-    local: LocalQueue = .{},
+    local: LocalQueue,
     parker: Parker = .{},
     thread: std.Thread = undefined,
     rng: std.Random.DefaultPrng = undefined,
 
-    pub fn init(self: *Worker, id: usize, runtime: *anyopaque) void {
+    pub fn init(self: *Worker, id: usize, runtime: *anyopaque, allocator: std.mem.Allocator) !void {
         self.* = .{
             .id = id,
             .runtime = runtime,
+            .local = try LocalQueue.init(allocator, LOCAL_INITIAL_CAP),
             .rng = std.Random.DefaultPrng.init(@intCast(id +% 0xDEADBEEF)),
         };
-        self.local.init();
         self.parker.init();
     }
 
