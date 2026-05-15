@@ -43,6 +43,7 @@ pub const Task = @import("task.zig").Task;
 
 pub const channel = @import("channel.zig");
 pub const Spsc = channel.Spsc;
+pub const Mpmc = channel.Mpmc;
 
 pub const net = @import("net.zig");
 pub const reactor = @import("reactor_kqueue.zig");

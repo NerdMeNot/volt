@@ -58,7 +58,7 @@ That's the whole shape. No `async`, no `await`, no `Future`, no `.poll()`, no ma
 - **M:N work-stealing scheduler.** Each OS thread (`M`) is bound to a logical processor (`P`) with its own work-stealing queue, LIFO slot, mailbox, and per-P coroutine/stack pools. The driver thread participates as a worker.
 - **Typed `Task(T)` handle** with `join()` returning the spawned function's result.
 - **Direct handoff in `Task.join`** when the joinee is in the same M's lifo slot — skips the park/unpark round trip for the common spawn-then-await pattern (Go's `gopark`/`goready` shape).
-- **Single Spsc channel** comptime-specialized at the call site — `volt.Spsc(T, cap)`. `Mpmc` is on the roadmap.
+- **Channels** comptime-specialized at the call site — `volt.Spsc(T, cap)` for single-producer/single-consumer, `volt.Mpmc(T, cap)` (Vyukov bounded ring) for the general case. Both block on full/empty via the parking lot.
 - **Sync primitives** — `Mutex`, `Notify`, `Semaphore` — built on a shared parking lot.
 - **kqueue reactor** for Darwin/BSD — non-blocking sockets with single-poller claim. Linux (epoll/io_uring) and Windows (IOCP) backends planned; not currently shipped.
 
