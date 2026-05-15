@@ -2,15 +2,15 @@
 
 All notable changes to Volt are documented here.
 
-## Unreleased
+## Unreleased — heading to v1.0.0-zig0.16.0
 
 Volt was rewritten on a stackful coroutine substrate after the
 Future/Poll machine and an earlier stackful follow-on both proved
-architecturally limited. `src/` is the current tree; earlier trees
-are preserved only via git tags (`pre-stackful-pivot`,
-`v1.0.0-zig0.15.2`, `v1.1.0-zig0.15.2`). The decision and the POC
-numbers that drove the rewrite are recorded in `spike/SYNTHESIS.md`;
-the per-area design docs are under `docs/internals/`.
+architecturally limited. `src/` is the current tree; the
+pre-stackful runtime is preserved via the `pre-stackful-pivot` git
+tag and `v1.0.0-zig0.15.2`. The decision and the POC numbers that
+drove the rewrite are recorded in `spike/SYNTHESIS.md`; the per-area
+design docs are under `docs/internals/`.
 
 ### Added
 
@@ -105,35 +105,6 @@ trail and `docs/internals/multi-worker-profile.md` for the scheduler
 investigation.
 
 ---
-
-## v1.1.0-zig0.15.2 (legacy — Future/Poll runtime)
-
-### Added
-
-- **Memory-mapped files** (`MappedFile`, `mmapFile`, `mmapHandle`) — zero-copy file access via `mmap`. Supports read-only (`MAP_PRIVATE`) and read-write (`MAP_SHARED`) protection, sequential/random/populate hints, `sync()` (`msync`), `advise()` (`madvise`), and `unmap()`.
-- **Advisory file hints** (`File.advise`, `File.adviseRange`) — tell the kernel about expected access patterns. Uses `posix_fadvise` on Linux and `fcntl(F_RDAHEAD)` on macOS.
-- **`fs.fileSize`** — get file size in bytes without opening a handle.
-- **`File.readFull`** — fill a buffer as much as possible, returning the byte count instead of erroring on EOF. Useful for streaming parsers that process partial chunks.
-- Cooperative budgeting (128 polls/tick), matching Tokio's model.
-- `JoinHandle` waker fix for correct task resumption.
-- Concurrent `race`/`select` combinators for task coordination.
-- io_uring `close` support on Linux.
-- Integration test suite (25 async tests).
-- Apache 2.0 license.
-
-### Fixed
-
-- Scheduler shutdown reliability on slow machines.
-- Notify integration tests wait for waiters before firing.
-- Work stealing test determinism.
-- Windows compatibility: replaced `yield` with `sleep` in busy-wait loops.
-- Test suite thread oversubscription when running all suites.
-
-### CI
-
-- Added `timeout-minutes` to all CI and nightly jobs.
-- Integration tests added to CI and nightly workflows.
-- macOS Intel runner for nightly builds.
 
 ## v1.0.0-zig0.15.2 (legacy — Future/Poll runtime)
 
