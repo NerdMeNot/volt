@@ -2,9 +2,13 @@
 zig-out/
 .zig-cache/
 libroot.a
+lib.lib
 
 # Test and benchmark binaries (Mach-O / ELF executables)
 *.exe
+
+# Scratch / generated
+tmp/
 
 # Rust build artifacts (entire target directory)
 bench/rust_bench/target/

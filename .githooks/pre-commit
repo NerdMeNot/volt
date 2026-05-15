@@ -1,20 +1,25 @@
 #!/bin/sh
 # Pre-commit hook: format check + unit tests
 # Install: git config core.hooksPath .githooks
+#
+# Set $ZIG to point at a specific zig binary if the system zig
+# (e.g. broken proto shim) is unavailable.
 
 set -e
 
+ZIG_BIN="${ZIG:-zig}"
+
 echo "==> Checking zig fmt..."
-if ! zig fmt --check src/ tests/ bench/ build.zig 2>/dev/null; then
+if ! "$ZIG_BIN" fmt --check src/ bench/ build.zig 2>/dev/null; then
     echo ""
     echo "ERROR: Zig formatting check failed."
-    echo "Run: zig fmt src/ tests/ bench/ build.zig"
+    echo "Run: $ZIG_BIN fmt src/ bench/ build.zig"
     echo ""
     exit 1
 fi
 
 echo "==> Running unit tests..."
-if ! zig build test 2>&1 | tail -5; then
+if ! "$ZIG_BIN" build test 2>&1 | tail -5; then
     echo ""
     echo "ERROR: Unit tests failed."
     echo ""
