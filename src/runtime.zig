@@ -825,3 +825,79 @@ test "runtime: tryDispatchInline returns false when target is not in lifo_slot" 
     try rt.run(inlineMissRoot, .{&out});
     try std.testing.expectEqual(@as(u32, 84), out);
 }
+
+fn yieldThenReturn() u32 {
+    yield(); // pending = .yield → swap back to whoever dispatched us
+    return 7;
+}
+
+fn inlineYieldRoot(out: *u32) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    // Spawn a coro that yields immediately, then call tryDispatchInline.
+    // Expected: tryDispatchInline returns FALSE (target yielded, not done).
+    // The target lands back on the local queue and gets dispatched by the
+    // normal loop. The subsequent task.join completes normally.
+    const t = try rt.spawn(yieldThenReturn, .{});
+    const got = tryDispatchInline(t.coro);
+    if (got) @panic("tryDispatchInline must return false when target yielded");
+    out.* = t.join();
+}
+
+test "runtime: tryDispatchInline returns false when target yields, target completes via normal dispatch" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
+    defer rt.deinit();
+    var out: u32 = 0;
+    try rt.run(inlineYieldRoot, .{&out});
+    try std.testing.expectEqual(@as(u32, 7), out);
+}
+
+const ParkCtx = struct {
+    note: *@import("sync.zig").Notify,
+    flag: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+};
+
+fn waitOnNotify(ctx: *ParkCtx) u32 {
+    ctx.note.wait();
+    _ = ctx.flag.fetchAdd(1, .acq_rel);
+    return 99;
+}
+
+fn waker(ctx: *ParkCtx) void {
+    // Yield until the waiter has had a chance to park.
+    while (ctx.flag.load(.acquire) == 0) {
+        // Tiny pause; spin if waiter still queued.
+        yield();
+        // After one yield, if the waiter parked, notify will wake it.
+        ctx.note.notifyOne();
+        yield();
+        break;
+    }
+}
+
+fn inlineParkRoot(out: *u32) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var note = @import("sync.zig").Notify.init();
+    defer note.deinit();
+    var pctx = ParkCtx{ .note = &note };
+
+    // Spawn the waiter, then tryDispatchInline. The waiter will park
+    // inside `note.wait()`. tryDispatchInline must return false and the
+    // waiter must end up properly registered in the parking lot for the
+    // subsequent waker to unpark it.
+    const waiter_t = try rt.spawn(waitOnNotify, .{&pctx});
+    const got = tryDispatchInline(waiter_t.coro);
+    if (got) @panic("tryDispatchInline must return false when target parks");
+
+    // Spawn the waker which fires the notify, then join everyone.
+    const waker_t = try rt.spawn(waker, .{&pctx});
+    waker_t.join();
+    out.* = waiter_t.join();
+}
+
+test "runtime: tryDispatchInline returns false when target parks, target completes after unpark" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+    var out: u32 = 0;
+    try rt.run(inlineParkRoot, .{&out});
+    try std.testing.expectEqual(@as(u32, 99), out);
+}

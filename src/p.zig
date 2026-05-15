@@ -227,3 +227,46 @@ test "P.tryRemoveLifo: different coro in slot returns false and leaves slot" {
     // Slot is unchanged.
     try std.testing.expectEqual(@as(?*Coroutine, &coro_a), p.lifo_slot.load(.acquire));
 }
+
+test "P.coro_pool: alloc/free round-trip recycles the same struct" {
+    var p: P = undefined;
+    p.init(0, undefined);
+    const a = std.testing.allocator;
+    const c1 = try p.allocCoroutine(a);
+    p.freeCoroutine(c1, a);
+    // Same struct should come back from the pool.
+    const c2 = try p.allocCoroutine(a);
+    try std.testing.expectEqual(c1, c2);
+    // Drain restores it to the underlying allocator (no leak).
+    p.freeCoroutine(c2, a);
+    p.drainPools(a, 16 * 1024);
+}
+
+test "P.coro_pool: over-cap entries go to allocator (no overflow)" {
+    var p: P = undefined;
+    p.init(0, undefined);
+    const a = std.testing.allocator;
+    // Fill the pool up to POOL_CAP. After this, additional free's
+    // must allocator.destroy without growing pool_count past cap.
+    var i: u16 = 0;
+    while (i < POOL_CAP + 5) : (i += 1) {
+        const c = try a.create(Coroutine);
+        p.freeCoroutine(c, a);
+    }
+    try std.testing.expect(p.coro_pool_count == POOL_CAP);
+    p.drainPools(a, 16 * 1024);
+    try std.testing.expect(p.coro_pool_count == 0);
+}
+
+test "P.stack_pool: alloc/free round-trip recycles the same memory" {
+    var p: P = undefined;
+    p.init(0, undefined);
+    const a = std.testing.allocator;
+    const SIZE = 16 * 1024;
+    const s1 = try p.allocStack(a, SIZE);
+    p.freeStack(s1, a, SIZE);
+    const s2 = try p.allocStack(a, SIZE);
+    try std.testing.expectEqual(s1.ptr, s2.ptr);
+    p.freeStack(s2, a, SIZE);
+    p.drainPools(a, SIZE);
+}
