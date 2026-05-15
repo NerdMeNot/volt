@@ -117,6 +117,14 @@ Variance is high on the spawn benches — take 5-run medians, not single
 runs. `bench-rss` and `bench-scaling` are receipt benches; their numbers
 must move with the changes they're claimed to enable.
 
+### Memory-leak gate
+
+All `src/*.zig` unit tests use `std.testing.allocator` (the leak-
+detecting `GeneralPurposeAllocator{ .safety = true }`). A test that
+leaks memory fails `zig build test`. Adding a new allocation path
+to the runtime requires a test that exercises both alloc and free
+of that path so the leak detector validates it.
+
 ## Measurement discipline
 
 All benchmark claims are made against:
