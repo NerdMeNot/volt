@@ -1,879 +1,844 @@
-//! Runtime: top-level handle to the Volt scheduler + reactor.
+//! Runtime — multi-worker stackful scheduler (M:N, Phase 1).
 //!
-//! Owns the worker pool, the global injection queue, the I/O reactor, and
-//! the shutdown signal. Users construct a Runtime via `volt.run(config,
-//! root_fn, args)` — they don't usually touch this type directly.
+//! N OS threads (Ms) each run a dispatch loop. Each M is bound 1:1
+//! to a P (processor / scheduler unit) for the lifetime of the
+//! Runtime in Phase 1. Later phases will allow M ↔ P detach.
 //!
-//! ## Scheduler model
+//!   * `Runtime.run(fn, args)` is the bootstrap. The calling thread
+//!     joins the pool as M[0]/P[0], spawns N-1 pthreads for M[1..N-1],
+//!     queues the root coroutine, runs the dispatch loop until the
+//!     root's `done` flag is set, returns the root's result. Other
+//!     Ms stay alive until `deinit`.
+//!   * `Runtime.spawn(fn, args)` inside a coroutine pushes onto the
+//!     current P's lifo_slot for the warmest possible dispatch
+//!     latency. From a non-coroutine thread, pushes to the global
+//!     injection queue.
 //!
-//!   - N OS threads. Worker 0 is the bootstrap thread (the caller of
-//!     `volt.run`). Workers 1..N-1 are dedicated threads spawned by `start`.
-//!   - Each worker owns a Chase-Lev work-stealing deque (LIFO push/pop for
-//!     the owner, FIFO steal for thieves).
-//!   - Cross-thread spawns and reactor wakes go through the global injection
-//!     queue; workers check it after their local deque.
-//!   - Shared reactor with single-poller-at-a-time claim. Whichever worker
-//!     idles first claims the lock and polls; events are pushed to that
-//!     worker's local deque.
+//! Architecture:
+//!   * Per-P fixed-256 lock-free work-stealing queue. Owner pops
+//!     FIFO; stealers claim half. Overflow spills HALF to global
+//!     injection (Tokio strategy).
+//!   * Single-slot LIFO cache on each P for spawn-chain locality.
+//!   * Lock-free Treiber-stack global injection queue (will become
+//!     per-P mailbox in Phase 2).
+//!   * P dispatch priority: lifo_slot → local → injection → steal
+//!     → reactor poll → park.
+//!   * Parker built on `__ulock_wait` (Darwin) / `FUTEX_WAIT` (Linux),
+//!     lives on M.
+//!   * Cross-thread wake via parked-Ms bitmap (acq_rel CAS claims
+//!     one victim).
+//!   * Anti-herd: `num_searching` lets pushers skip the wake when
+//!     another M is already scanning for work.
+//!   * Periodic fairness: every 61 dispatches, check injection
+//!     before local — prevents starvation of injected work when a
+//!     P's local queue is repeatedly fed by yields.
 
 const std = @import("std");
-const ctx = @import("coroutine/context.zig");
-const Coroutine = @import("coroutine/coroutine.zig").Coroutine;
-const spawn_mod = @import("coroutine/spawn.zig");
-const stack_mod = @import("coroutine/stack.zig");
-// Import the functions directly (not the module as `current`) because
-// this file uses `current` as a local variable name in CAS loops.
-const sched_current = @import("scheduler/current.zig");
-const currentCoroutine = sched_current.currentCoroutine;
-const currentRuntimeRaw = sched_current.currentRuntimeRaw;
-const currentWorkerRaw = sched_current.currentWorkerRaw;
-const setCurrent = sched_current.setCurrent;
-const clearCurrent = sched_current.clearCurrent;
-const setCurrentWorker = sched_current.setCurrentWorker;
-const clearCurrentWorker = sched_current.clearCurrentWorker;
-const setRuntime = sched_current.setRuntime;
-const clearRuntime = sched_current.clearRuntime;
-const reactor_mod = @import("io/reactor.zig");
-const Worker = @import("scheduler/worker.zig").Worker;
-const Injection = @import("scheduler/injection.zig").Injection;
-const time_mod = @import("time.zig");
-const thread = @import("internal/thread.zig");
+const context = @import("context_arm64.zig");
+const coroutine = @import("coroutine.zig");
+const task_mod = @import("task.zig");
+const current = @import("current.zig");
+const reactor_mod = @import("reactor_kqueue.zig");
+const worker_mod = @import("worker.zig");
+const p_mod = @import("p.zig");
+const parker_mod = @import("parker.zig");
+const park_mod = @import("park.zig");
 
-/// Maximum supported worker count. Sharded across `BITMAP_WORDS` 64-bit
-/// atomics in `parked_workers`. Raise both constants together.
-pub const MAX_WORKERS: usize = 256;
-pub const BITMAP_WORDS: usize = (MAX_WORKERS + 63) / 64;
+pub const Coroutine = coroutine.Coroutine;
+pub const Frame = coroutine.Frame;
+pub const PendingKind = coroutine.PendingKind;
+pub const Task = task_mod.Task;
+pub const Reactor = reactor_mod.Reactor;
+pub const M = worker_mod.M;
+pub const P = p_mod.P;
+pub const Parker = parker_mod.Parker;
+pub const STACK_SIZE: usize = 16 * 1024;
+pub const MAX_WORKERS: usize = 64; // bitmap is u64
 
-/// Number of shards in the live-coroutine registry. Hash distributes
-/// coros across shards to reduce contention on register/unregister.
-/// With 16 shards and 8 workers, contention is ~1/16th of single-mutex
-/// design. Must be a power of 2 (we use bitmask, not modulo).
-pub const LIVE_SHARDS: usize = 16;
-
-/// One bucket of the sharded live-coroutine registry.
-pub const LiveShard = struct {
-    mutex: thread.Mutex = .{},
-    head: ?*Coroutine = null,
+pub const Config = struct {
+    allocator: std.mem.Allocator,
+    /// Worker thread count. null = std.Thread.getCpuCount.
+    workers: ?usize = null,
 };
 
-/// Hash a coroutine pointer to a shard index. Mixes high bits so
-/// consecutive allocations from a slab pool don't all land in shard 0.
-inline fn shardFor(coro: *const Coroutine) usize {
-    const p = @intFromPtr(coro);
-    // Drop low bits (alignment), then mask. xor in high bits for
-    // better distribution under slab allocators that hand out
-    // sequential addresses.
-    return ((p >> 6) ^ (p >> 12)) & (LIVE_SHARDS - 1);
+/// Cooperative yield. Re-queues the current coroutine onto the
+/// running worker's local queue (tail, FIFO — yields don't bounce
+/// to the front via lifo_slot).
+pub fn yield() void {
+    const c = current.require();
+    c.pending = .yield;
+    context.swap(&c.ctx, c.main_ctx);
 }
 
-/// Volt's per-coroutine stack model is opinionated and not configurable
-/// — like Go's 2 KiB initial stack. Each coroutine gets:
-///   - **1 MiB reserved** virtual address space (cheap on 64-bit).
-///   - **1 page committed** at the top (4 KiB on Linux/Intel, 16 KiB
-///     on Apple Silicon — the smallest unit `mprotect` operates on,
-///     and equivalent in spirit to Go's 2 KiB minimum).
-///   - **Grow-on-demand** via the SIGSEGV handler (`coroutine/stack.zig`),
-///     transparent to user code, no compiler help required.
-///   - **Graceful failure** when the 1 MiB ceiling is hit — joiners
-///     receive `error.StackOverflow`; the runtime keeps running.
-pub const Config = struct {
-    /// Allocator used for the worker pool, the injection queue, the
-    /// reactor, and per-coroutine stacks. Required.
-    allocator: std.mem.Allocator,
+/// Suspend the current coroutine until `unpark(coro)` is called.
+///
+/// `park_state` machine closes the register-then-park race:
+///
+/// 1. A primitive that wants to wait registers the coroutine in its
+///    own waiter slot (so an unparker can find it).
+/// 2. The primitive calls `runtime.park()`.
+/// 3. The coroutine swaps out. Dispatch then atomically transitions
+///    `park_state` RUNNING → PARKED.
+/// 4. If at step 3 we observe NOTIFIED (unpark fired while we were
+///    still on-CPU), dispatch immediately re-queues the coroutine
+///    instead of leaving it parked.
+///
+/// Without this, an unpark fired between (1) and the actual
+/// `context.swap` in (2) would push the coroutine onto the run
+/// queue while it is *still being executed* by its owning worker —
+/// a second worker would then dispatch it and two workers would
+/// race on the same stack.
+pub fn park() void {
+    const c = current.require();
+    c.pending = .park;
+    context.swap(&c.ctx, c.main_ctx);
+}
 
-    /// Number of worker threads. `null` = use the CPU count (with a
-    /// floor of 1). Multi-worker is the default — set to 1 only for
-    /// deterministic tests / debugging.
-    workers: ?usize = null,
+/// Re-queue a coroutine that asked (or will ask) to park.
+///
+/// Three cases:
+///   PARKED   → CAS to RUNNING, push to injection, wake a parked worker.
+///   RUNNING  → CAS to NOTIFIED. Dispatch sees NOTIFIED in its `.park`
+///              branch and re-queues immediately — no double-dispatch.
+///   NOTIFIED → no-op (already queued for self-wake by dispatch).
+pub fn unpark(c: *Coroutine) void {
+    while (true) {
+        const s = c.park_state.load(.acquire);
+        switch (s) {
+            ParkState.PARKED => {
+                if (c.park_state.cmpxchgWeak(
+                    ParkState.PARKED,
+                    ParkState.RUNNING,
+                    .acq_rel,
+                    .acquire,
+                )) |_| continue;
+                const rt: *Runtime = @ptrCast(@alignCast(c.runtime));
+                // Push to a P's mailbox. If we're on an M, use that
+                // M's P (preserves locality); otherwise default to
+                // P[0]. Stealing will distribute work if needed.
+                const target_p = if (worker_mod.currentM()) |m_raw| blk: {
+                    const m: *M = @ptrCast(@alignCast(m_raw));
+                    break :blk m.p;
+                } else &rt.ps[0];
+                target_p.mailbox.push(c);
+                _ = target_p.stat_unparks_to_inject.fetchAdd(1, .monotonic);
+                rt.wakeOneParked();
+                return;
+            },
+            ParkState.RUNNING => {
+                if (c.park_state.cmpxchgWeak(
+                    ParkState.RUNNING,
+                    ParkState.NOTIFIED,
+                    .acq_rel,
+                    .acquire,
+                )) |_| continue;
+                return;
+            },
+            ParkState.NOTIFIED => return,
+            else => unreachable,
+        }
+    }
+}
 
-    /// Deterministic mode: single worker, fixed RNG seed (`steal-rng`
-    /// becomes pure-pseudo), no time-based jitter. Pairs with the
-    /// loom-style model checker. Forces `workers = 1` if set; the
-    /// `workers` field is ignored in this mode.
-    ///
-    /// NB: this doesn't fully eliminate non-determinism (the OS thread
-    /// scheduler still nudges futex wakes, the syscall layer can
-    /// re-order). But it removes Volt's own contributions, which is
-    /// enough for "same seed → same scheduler trace" for most tests.
-    deterministic: bool = false,
+/// Direct handoff: dispatch `target` inline on the current M, returning
+/// to the calling coroutine when `target` finishes, yields, or parks.
+/// Saves the park→unpark→wake round-trip that a normal `Task.join`
+/// would otherwise pay.
+///
+/// Returns `true` if `target` ran to completion (caller can proceed);
+/// `false` otherwise — either we couldn't claim `target` from the
+/// lifo slot, or target yielded/parked partway and is now queued or
+/// waiting for an unparker. On `false`, the caller's contract is to
+/// fall through to the normal blocking path (`parkOn` etc.).
+///
+/// **Precondition**: must be called from inside a coroutine on a worker
+/// M. `target` must be in this M's P's `lifo_slot` (we only handle that
+/// case in v1; future work extends to local WSQ).
+///
+/// Why this is safe wrt fairness:
+/// * `target` was just spawned by the caller on this M; it hasn't been
+///   stolen yet (lifo_slot is owner-only — siblings only steal from
+///   the local queue).
+/// * If we lose the lifo CAS, `target` already moved (evicted to local
+///   queue by another spawn) and the caller takes the slow path — no
+///   priority inversion.
+pub fn tryDispatchInline(target: *Coroutine) bool {
+    const m_raw = worker_mod.currentM() orelse return false;
+    const m: *M = @ptrCast(@alignCast(m_raw));
+    if (!m.p.tryRemoveLifo(target)) return false;
 
-    /// Pin each worker thread to a CPU core (worker `i` → core
-    /// `i % cpu_count`). Reduces cross-core cache traffic on
-    /// latency-sensitive workloads. Linux: `pthread_setaffinity_np`.
-    /// Darwin: a no-op (Darwin's QoS-class APIs aren't a clean fit;
-    /// Future releases may add opt-in support via `thread_policy_set`).
-    pin_workers: bool = false,
-};
+    const caller = current.require();
+    const rt: *Runtime = @ptrCast(@alignCast(caller.runtime));
+
+    // Route target's swap-back to the caller's ctx, not the M's
+    // dispatch loop. When target completes (or yields/parks), it
+    // executes `context.swap(&target.ctx, target.main_ctx)` — which
+    // is the caller's ctx, so we resume here in `tryDispatchInline`.
+    target.pending = .done;
+    target.main_ctx = &caller.ctx;
+
+    current.set(target);
+    context.swap(&caller.ctx, &target.ctx);
+    // Back from target's swap-back. Restore the threadlocal `current`
+    // to the caller — we're running on the caller's stack again.
+    current.set(caller);
+
+    switch (target.pending) {
+        .done => {
+            // Same cleanup as the M's dispatch `.done` branch. We
+            // duplicate it here rather than calling into dispatch
+            // because dispatch expects an M.main_ctx swap path.
+            if (target.task_done) |done| {
+                done.store(task_mod.DONE, .release);
+                _ = park_mod.unparkOne(rt, done);
+            }
+            if (target.task_thread_parker) |p| p.unpark();
+            if (!target.has_task) {
+                if (target.frame_destroy) |destroy_fn| destroy_fn(target.frame_ptr, rt.allocator);
+            }
+            _ = m.p.stat_done.fetchAdd(1, .monotonic);
+            m.p.freeStack(target.stack, rt.allocator, STACK_SIZE);
+            m.p.freeCoroutine(target, rt.allocator);
+            return true;
+        },
+        .yield => {
+            // Target yielded partway. Re-queue to local; some M will
+            // pick it up. Caller falls through to its normal wait.
+            // `target.main_ctx` is stale (points to caller.ctx) but
+            // gets overwritten on next dispatch entry — no leak.
+            m.p.pushQueue(target);
+            return false;
+        },
+        .park => {
+            // Target is mid-parking. Mirrors dispatch's `.park` branch:
+            // CAS RUNNING → PARKED. If we observe NOTIFIED instead, an
+            // unpark fired between the primitive's register step and
+            // this swap-back; re-queue immediately rather than leaving
+            // the coro stranded.
+            if (target.park_state.cmpxchgStrong(
+                ParkState.RUNNING,
+                ParkState.PARKED,
+                .acq_rel,
+                .acquire,
+            )) |observed| {
+                std.debug.assert(observed == ParkState.NOTIFIED);
+                target.park_state.store(ParkState.RUNNING, .release);
+                m.p.mailbox.push(target);
+                rt.wakeOneParked();
+            }
+            return false;
+        },
+    }
+}
+
+const ParkState = coroutine.ParkState;
 
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
-    config: Config,
-    workers: []Worker,
-    injection: Injection,
-    reactor: reactor_mod.Reactor,
-
-    /// Single-poller-at-a-time claim flag. Workers `cmpxchg false → true`
-    /// before calling `reactor.poll`, store false after. Atomic, no mutex.
-    poll_claim: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    /// Set once when the bootstrap thread is ready to tear down. Workers
-    /// observe this in their main loop and exit.
-    shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    /// Quiescence counter — workers `fetchAdd(1)` exactly once when their
-    /// `run()` loop returns. `runUntilDone` waits on this counter after
-    /// `thread.join` to formally observe shutdown completion (rather than
-    /// relying purely on join's implicit serialization). Provides explicit
-    /// telemetry: a hung worker shows up as `quiesced_count < workers.len`,
-    /// not as a silent join hang. See `docs/internals/architecture.md`.
-    quiesced_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-
-    /// Round-robin counter for spreading wake-ups across workers (used by
-    /// notifyOneWorker to absorb the about-to-park race).
-    notify_rr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-
-    /// Bitmap of currently parked workers, sharded across `BITMAP_WORDS`
-    /// 64-bit atomics. Bit `i` (= `1 << (i % 64)` in word `i / 64`) is set
-    /// iff worker `i` is inside `cond.wait`. Each Parker maintains its
-    /// own bit.
+    /// M[i] (OS thread) and P[i] (scheduler state) are 1:1-bound in
+    /// Phase 1 of the M:N restructure. Later phases will allow
+    /// dynamic re-binding via P.attached_m.
     ///
-    /// `MAX_WORKERS = 256` covers EPYC/Threadripper (192 cores) with room.
-    /// To extend further, raise `BITMAP_WORDS`. O(1) wake selection still
-    /// holds: at most `BITMAP_WORDS` word-loads + a CAS to claim a bit.
-    parked_workers: [BITMAP_WORDS]std.atomic.Value(u64) =
-        .{std.atomic.Value(u64).init(0)} ** BITMAP_WORDS,
+    /// Each P owns a `mailbox` (per-P MPMC queue); cross-P pushes
+    /// target a specific P's mailbox instead of one global queue,
+    /// reducing cache-line contention.
+    ms: []M,
+    ps: []P,
+    reactor: Reactor = .{},
+    shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Bit i set ⇔ ms[i] is parked. M[0] is the driver thread.
+    parked_workers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Count of workers currently in the find-work phase of the
+    /// dispatch loop. Anti-herd: `wakeOneParked` skips when > 0.
+    num_searching: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// CAS-claim "I am the current reactor poller".
+    reactor_poller_taken: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Shared parking lot — one wait/wake mechanism for every
+    /// coroutine-level sync primitive (Mutex, Notify, Semaphore,
+    /// channel block paths, Task.join, etc.). See `src/park.zig`
+    /// and `docs/internals/parking-lot.md`.
+    parking_lot: park_mod.ParkingLot,
+    // Diagnostic counters live per-P now (see `P.stat_*`) — they
+    // were on Runtime as shared atomics, but every spawn / done /
+    // unpark hit the same cache line, costing ~40 % of multi-worker
+    // throughput. Summed at `dumpState` time.
 
-    /// Lazily-initialized blocking-thread pool for `spawnBlocking`.
-    /// First `spawnBlocking` call creates it; runtime deinit shuts it
-    /// down. Pointer-not-null is the "initialized" check (CAS-based
-    /// install for thread safety).
-    blocking_pool: std.atomic.Value(?*@import("blocking/Pool.zig").Pool) =
-        std.atomic.Value(?*@import("blocking/Pool.zig").Pool).init(null),
+    pub fn init(cfg: Config) !*Runtime {
+        const n = cfg.workers orelse @max(1, try std.Thread.getCpuCount());
+        if (n > MAX_WORKERS) return error.TooManyWorkers;
 
-    /// Recycled coroutine stacks. `Done.subscribe` pushes here; new
-    /// `createCoroutine` calls pop from here before falling back to
-    /// `mmap`. Drastically reduces spawn-cost syscalls under steady-
-    /// state spawn-and-complete workloads.
-    stack_pool: @import("coroutine/stack_pool.zig").StackPool,
+        const rt = try cfg.allocator.create(Runtime);
+        errdefer cfg.allocator.destroy(rt);
 
-    /// Sharded live-coroutine registry. Used by
-    /// `volt.observability.snapshot` to walk every live coroutine.
-    /// `Runtime.createCoroutine` / `spawnRoot` insert; `lifecycleRelease`
-    /// removes.
-    ///
-    /// Sharded (16 buckets) to reduce contention under concurrent
-    /// spawn: each spawn locks ONE shard, not the global registry.
-    /// With 8 workers and 16 shards, contention is ~1/16th of the
-    /// single-mutex design. Each shard is otherwise the same intrusive
-    /// doubly-linked list as before.
-    ///
-    /// Backwards compat aliases: `live_coroutines` and `live_mutex`
-    /// remain pointing at shard 0 for any code (snapshot) that walked
-    /// them directly — but those readers now use `iterateLive` which
-    /// walks all shards.
-    live_shards: [LIVE_SHARDS]LiveShard = .{LiveShard{}} ** LIVE_SHARDS,
+        const ms = try cfg.allocator.alloc(M, n);
+        errdefer cfg.allocator.free(ms);
+        const ps = try cfg.allocator.alloc(P, n);
+        errdefer cfg.allocator.free(ps);
 
-    pub fn init(config: Config) !Runtime {
-        // Reset the diagnostic reactor trace so each runtime gets a
-        // clean ring (no events from prior test runs contaminating the
-        // dump if THIS runtime leaks). No-op when -Dreactor-trace=false.
-        @import("io/reactor_trace.zig").reset();
-
-        const allocator = config.allocator;
-        const num_workers = blk: {
-            // Determinism mode: force single worker, ignore `workers`.
-            if (config.deterministic) break :blk @as(usize, 1);
-            if (config.workers) |n| {
-                if (n == 0) return error.InvalidWorkerCount;
-                if (n > MAX_WORKERS) return error.TooManyWorkers;
-                break :blk n;
-            }
-            const detected = @max(1, std.Thread.getCpuCount() catch 1);
-            // Cap at MAX_WORKERS so we always fit in the parked-workers
-            // bitmap. Future systems above this — extend `BITMAP_WORDS`.
-            break :blk @min(detected, MAX_WORKERS);
+        rt.* = .{
+            .allocator = cfg.allocator,
+            .ms = ms,
+            .ps = ps,
+            .reactor = try Reactor.init(),
+            .parking_lot = park_mod.ParkingLot.init(),
         };
+        // Initialize each P, then bind each M to its P (1:1 in Phase 1).
+        for (rt.ps, 0..) |*p, i| p.init(i, rt);
+        for (rt.ms, 0..) |*m, i| m.init(&rt.ps[i]);
 
-        var rt: Runtime = .{
-            .allocator = allocator,
-            .config = config,
-            .workers = try allocator.alloc(Worker, num_workers),
-            .injection = Injection.init(allocator),
-            .reactor = try reactor_mod.Reactor.init(allocator),
-            .stack_pool = @import("coroutine/stack_pool.zig").StackPool.init(allocator),
-        };
-        errdefer allocator.free(rt.workers);
-        errdefer rt.injection.deinit();
-        errdefer rt.reactor.deinit();
-
-        // Initialize each worker. Workers point back at the runtime; we
-        // pass the owning Runtime pointer up to its caller (volt.run) so
-        // it can hand out a stable address before workers start running.
-        var initialized: usize = 0;
-        errdefer for (rt.workers[0..initialized]) |*w| w.deinit(allocator);
-        // Deterministic mode uses a fixed seed; otherwise a time-based
-        // one for steal-victim variation across runs.
-        const base_seed: i128 = if (config.deterministic) 0xC0FFEE else time_mod.nanoTimestamp();
-        for (rt.workers, 0..) |*w, i| {
-            const seed: u64 = @as(u64, @bitCast(@as(i64, @truncate(base_seed ^ @as(i128, @intCast(i))))));
-            w.* = try Worker.init(allocator, i, undefined, seed);
-            initialized += 1;
+        // Spawn pthread workers 1..N-1. M[0] is the driver thread
+        // (the thread that called Runtime.init / will call
+        // Runtime.run); it joins the pool in `run()`. This makes
+        // the calling thread a first-class M rather than a special
+        // parker-on-WG case.
+        for (rt.ms[1..]) |*m| {
+            m.thread = try std.Thread.spawn(.{}, workerThreadEntry, .{ rt, m });
         }
-
         return rt;
     }
 
-    /// Patch each worker's `runtime` pointer to point at our final stable
-    /// location, and register each into the parked-workers bitmap. Called
-    /// by `volt.run` after the Runtime value has been stored at its
-    /// long-lived address (typically a stack slot in `run`).
-    pub fn bindWorkers(self: *Runtime) void {
-        for (self.workers) |*w| {
-            w.runtime = self;
-            const word_idx = w.id / 64;
-            const bit_in_word = w.id % 64;
-            w.bindBitmap(&self.parked_workers[word_idx], @as(u64, 1) << @intCast(bit_in_word));
-        }
-    }
-
     pub fn deinit(self: *Runtime) void {
-        // Cleanliness invariants. If these fire, the runtime is leaking
-        // kernel registrations or has live coroutines we'll about to
-        // abandon — both classes of bug we want to catch loudly.
-        //
-        //   - reactor.pendingCount() == 0: every register* must have a
-        //     paired unregister* by shutdown time. The Phase 1 audit
-        //     scripts (`audit_park_sites.sh`, `audit_registrations.sh`)
-        //     enforce the source-level pairing; this assert is the
-        //     runtime gate.
-        //
-        // We `assert` (not panic) so ReleaseFast strips the check —
-        // the cost is zero in production but the gate fires loud in
-        // test/Debug builds, which is exactly when leaks should
-        // surface.
-        // Cleanliness invariant: every register* must be paired with
-        // exactly one decrement (by unregisterWait or by poll consuming
-        // the kernel event) before the runtime tears down. Closed in R2
-        // by fixing the registerWait race: waiters.put now happens
-        // BEFORE kevent ADD, so kqueue-fired events never miss the
-        // waiters lookup. See docs/internals/cancellation-contract.md.
-        //
-        // Re-enabled as a hard assert — under -Dreactor-trace, the
-        // print + dump still fire first so a regression's evidence is
-        // preserved.
-        const pc = self.reactor.pendingCount();
-        if (pc != 0) {
-            std.debug.print(
-                "[runtime.deinit] reactor leak: pendingCount = {d}\n",
-                .{pc},
-            );
-            const trace = @import("io/reactor_trace.zig");
-            if (comptime trace.enabled) {
-                std.debug.print("[runtime.deinit] dumping reactor trace (all events)\n", .{});
-                trace.dumpAll();
-            }
-        }
-        std.debug.assert(pc == 0);
-
-        // Sanity bound on the quiescence counter. The actual correctness
-        // gate is `waitForQuiescence` inside `runUntilDone`; this assert
-        // just catches a counter that has somehow exceeded the worker
-        // count (would indicate a double-fetchAdd bug).
-        std.debug.assert(self.quiesced_count.load(.acquire) <= self.workers.len);
-
-        if (self.blocking_pool.load(.acquire)) |pool| pool.deinit();
-
-        // Defense-in-depth leak gate. With P1's rendezvous, every
-        // coroutine should be reclaimed before deinit (Done.subscribe ↔
-        // destroyJob/destroyTask). Anything still in `live_coroutines`
-        // at deinit time is a user-visible leak — they forgot to call
-        // destroyJob/destroyTask on a Job/Task they spawned. Drain the
-        // list so we don't leak the structs / extras / stacks; print
-        // a warning so the leak is observable.
-        {
-            var leaked: usize = 0;
-            // Walk all shards. By deinit time, all workers have quiesced
-            // (waitForQuiescence guarantees), so no concurrent register/
-            // unregister can race with this drain. Still take per-shard
-            // locks for hygiene.
-            for (&self.live_shards) |*shard| {
-                shard.mutex.lock();
-                var cur = shard.head;
-                while (cur) |coro| {
-                    const next = coro.next_alive;
-                    coro.prev_alive = null;
-                    coro.next_alive = null;
-                    coro.destroy_extras_fn(self.allocator, coro);
-                    if (!coro.stack_pooled.load(.acquire)) {
-                        stack_mod.free(self.allocator, coro.stack);
-                    }
-                    // No separate allocator.destroy(coro) — destroy_extras_fn
-                    // frees the whole Frame (which includes coro).
-                    leaked += 1;
-                    cur = next;
-                }
-                shard.head = null;
-                shard.mutex.unlock();
-            }
-            if (leaked > 0) {
-                std.debug.print(
-                    "[runtime.deinit] {d} coroutine(s) still alive at " ++
-                        "shutdown — caller forgot destroyJob/destroyTask. " ++
-                        "Reclaimed defensively.\n",
-                    .{leaked},
-                );
-            }
-        }
-
-        for (self.workers) |*w| w.deinit(self.allocator);
-        self.allocator.free(self.workers);
-        self.stack_pool.deinit();
-        self.injection.deinit();
+        self.shutdown.store(true, .release);
+        // Wake every spawned M so it observes shutdown. M[0] is the
+        // driver thread — by this point it has already returned from
+        // run() and is on the deinit path, so it doesn't need an unpark.
+        for (self.ms[1..]) |*m| m.parker.unpark();
+        for (self.ms[1..]) |*m| m.thread.join();
+        for (self.ms) |*m| m.deinit();
+        // Pools are quiescent now — every M has stopped dispatching,
+        // so no further spawn/done can touch them. Release whatever
+        // is still cached back to the allocator.
+        for (self.ps) |*p| p.drainPools(self.allocator, STACK_SIZE);
+        self.allocator.free(self.ms);
+        self.allocator.free(self.ps);
         self.reactor.deinit();
+        self.parking_lot.deinit();
+        const allocator = self.allocator;
+        allocator.destroy(self);
     }
 
-    /// Default thread count for the blocking pool (Tokio default — 512
-    /// is enough for most workloads without exhausting OS thread limits).
-    pub const DEFAULT_BLOCKING_THREADS: usize = 512;
-
-    /// Get (or lazily create) the blocking-thread pool.
-    pub fn blockingPool(self: *Runtime) !*@import("blocking/Pool.zig").Pool {
-        if (self.blocking_pool.load(.acquire)) |p| return p;
-        // Race-safe lazy init: build the pool, CAS-install. If we lose
-        // the race, free our copy and use the winner's.
-        const Pool = @import("blocking/Pool.zig").Pool;
-        const new_pool = try Pool.init(self.allocator, @ptrCast(self), DEFAULT_BLOCKING_THREADS);
-        if (self.blocking_pool.cmpxchgStrong(null, new_pool, .acq_rel, .acquire)) |existing| {
-            new_pool.deinit();
-            return existing.?;
-        }
-        return new_pool;
-    }
-
-    pub fn shutdownRequested(self: *const Runtime) bool {
-        return self.shutdown_flag.load(.acquire);
-    }
-
-    pub fn requestShutdown(self: *Runtime) void {
-        self.shutdown_flag.store(true, .release);
-        self.notifyAllWorkers();
-    }
-
-    /// Maximum time `waitForQuiescence` polls before panicking with a
-    /// diagnostic dump. 10s is generous: a healthy shutdown completes in
-    /// microseconds (workers observe `shutdown_flag` on their next
-    /// `findWork`/wake cycle). If this fires, a worker is genuinely stuck
-    /// — almost always a lost wake or a coroutine that won't yield to a
-    /// cancellation. We want a loud failure, not a silent hang.
-    pub const SHUTDOWN_DEADLINE_NS: u64 = 10 * std.time.ns_per_s;
-
-    /// Block until every worker's `run()` has returned (observable via
-    /// `quiesced_count == workers.len`). Returns `error.Timeout` if the
-    /// deadline elapses — `runUntilDone` translates that into a panic
-    /// with diagnostics.
-    pub fn waitForQuiescence(self: *Runtime, timeout_ns: u64) error{Timeout}!void {
-        const start_ns = time_mod.nanoTimestamp();
-        const target = self.workers.len;
-        while (self.quiesced_count.load(.acquire) < target) {
-            const elapsed_ns: u64 = @intCast(time_mod.nanoTimestamp() - start_ns);
-            if (elapsed_ns > timeout_ns) return error.Timeout;
-            // Yield CPU briefly. The poll resolution doesn't matter — this
-            // path runs at most once per shutdown, on the bootstrap thread,
-            // and the workers all unblock together once `shutdown_flag` is
-            // visible.
-            thread.sleep(1 * std.time.ns_per_ms);
-        }
-    }
-
-    pub fn tryClaimReactorPoll(self: *Runtime) bool {
-        return self.poll_claim.cmpxchgStrong(false, true, .acq_rel, .monotonic) == null;
-    }
-
-    pub fn releaseReactorPoll(self: *Runtime) void {
-        self.poll_claim.store(false, .release);
-    }
-
-    /// Wake one parked worker — used when new work appears on the injection
-    /// queue or shutdown is signaled.
+    /// Comptime-typed spawn. Allocates one Combined{Frame, Task} struct
+    /// + Coroutine + stack (3 allocations total — Coroutine and stack
+    /// come from per-P pools after the first spawn), pushes coro to
+    /// the current worker's local queue. Wakes a parked worker.
     ///
-    /// Anti-herd invariant: skip the wake entirely if a worker is already
-    /// "searching" (woken, scanning, hasn't found work yet) — the searcher
-    /// will discover the new push on its next iteration. Otherwise pick a
-    /// parked worker via the O(1) bitmap and atomically reserve a search
-    /// slot before unparking.
-    ///
-    /// Two paths to absorb:
-    ///   1. The reactor poller is blocked in `kevent`. `EV_USER` tickle
-    ///      returns it immediately.
-    ///   2. A worker is in `cond.wait` — find it via `parked_workers` and
-    ///      atomically claim it.
-    ///
-    /// If nothing is parked AND nothing is searching, buffer the wake on a
-    /// round-robin victim (its `Parker.unpark` stores NOTIFIED, drained by
-    /// the next park). This absorbs the worker-between-findWork-and-park
-    /// race that the bitmap can't see.
-    pub fn notifyOneWorker(self: *Runtime) void {
-        if (self.poll_claim.load(.acquire)) self.reactor.tickle();
-        // No exclusion — any parked worker is fair game.
-        if (self.takeOneFromBitmap(no_exclude_word, 0)) |idx| {
-            self.workers[idx].unpark();
-            return;
-        }
-        const rr = self.notify_rr.fetchAdd(1, .monotonic);
-        self.workers[rr % self.workers.len].unpark();
-    }
-
-    pub fn notifyAllWorkers(self: *Runtime) void {
-        if (self.poll_claim.load(.acquire)) self.reactor.tickle();
-        for (self.workers) |*w| w.unpark();
-    }
-
-    /// Place a runnable coroutine on a worker.
-    ///
-    /// Strategy: if we're on a worker thread, push to the calling worker's
-    /// own deque (cache-warm; safe under Chase-Lev because owner-only
-    /// pushes are legal) AND nudge one parked sibling so it has a chance
-    /// to steal. Without the sibling nudge, parked workers stay parked
-    /// until a `Done` event fires — which is after the work has run, by
-    /// which time the deque is empty. That collapses parallelism: small
-    /// bursts of spawns end up running serially on one worker.
-    ///
-    /// If we're not on a worker thread (cross-thread wake), inject
-    /// globally and wake one parked worker via `notifyOneWorker`.
-    ///
-    /// This is the single chokepoint for "I have a runnable coroutine,
-    /// please run it." Park.unpark, the bootstrap, and any future cross-
-    /// thread wake all funnel through here.
-    pub fn schedule(self: *Runtime, coro: *Coroutine) void {
-        if (currentWorker()) |me| {
-            // Schedule path = "I just made this runnable; run it next on
-            // my core." Goes through the LIFO slot for cache locality.
-            me.enqueueLocal(coro);
-            self.wakeOneSibling(me.id);
-            return;
-        }
-        self.injectGlobal(coro);
-    }
-
-    /// Nudge one parked sibling so it can steal from the current worker.
-    ///
-    /// History (M1): an earlier anti-herd check (`if num_searching != 0
-    /// skip`) modelled after Tokio/Go was removed during early debugging
-    /// of a re-entrant mutex bug in Channel's blocking-path recheck;
-    /// restoring it is gated on the model-checker stress harness so the
-    /// missed-wake corner cases can be flushed out properly. For now we
-    /// wake unconditionally — a few extra futex-wakes per scheduling
-    /// event, but obviously correct.
-    ///
-    /// Race absorption: if `takeOneFromBitmap` returns null (no worker
-    /// is observably in the bitmap right now), we fall back to a
-    /// round-robin unpark. This buffers a NOTIFIED on the target
-    /// parker so a worker that's mid-park (between findWork and
-    /// bitmap.fetchOr) consumes it on its next state CAS instead of
-    /// missing the wake. Same shape `notifyOneWorker` uses for cross-
-    /// thread injection.
-    pub fn wakeOneSibling(self: *Runtime, self_id: usize) void {
-        if (self.workers.len <= 1) return;
-        const exclude_word = self_id / 64;
-        const exclude_bit = @as(u64, 1) << @intCast(self_id % 64);
-        if (self.takeOneFromBitmap(exclude_word, exclude_bit)) |idx| {
-            self.workers[idx].unpark();
-        }
-        // No fallback. The previous design unconditionally fired a
-        // round-robin unpark when no sibling was observably parked,
-        // intended to handle the mid-park race (worker between
-        // findWork-empty and bitmap.fetchOr). That fallback fires on
-        // EVERY spawn under burst load, hammering a busy sibling's
-        // parker.state cache line with cross-core atomic CAS — pure
-        // overhead because the target was already running.
-        //
-        // We accept the rare mid-park race: a worker that just decided
-        // to park (but hasn't set its bit yet) might miss this wake.
-        // The next spawn / schedule fires wakeOneSibling again and
-        // catches them. For burst workloads (the perf case), the
-        // bounded delay is microseconds. For lone spawns, the spawner
-        // owns the work — siblings being parked doesn't lose anything.
-    }
-
-    /// Sentinel for `takeOneFromBitmap` — out-of-range word index meaning
-    /// "no worker is excluded."
-    const no_exclude_word: usize = std.math.maxInt(usize);
-
-    /// Atomically pick and clear one parked-worker bit, optionally
-    /// excluding the specific (word, bit) of the calling worker. Returns
-    /// the worker index if claimed, null if no parked worker exists
-    /// (excluding the exclusion).
-    ///
-    /// Walks the sharded bitmap starting from a round-robin position,
-    /// preferring bits at or above the start (within the first word) and
-    /// continuing into subsequent words on wrap-around. The RR rotation
-    /// spreads wakes across workers rather than hammering the lowest-
-    /// indexed parked sibling.
-    ///
-    /// O(BITMAP_WORDS) word loads in the worst case (typical: 1). The
-    /// CAS-loop within a word converges in 1–2 iterations under typical
-    /// contention.
-    fn takeOneFromBitmap(self: *Runtime, exclude_word: usize, exclude_bit: u64) ?usize {
-        const rr = self.notify_rr.fetchAdd(1, .monotonic);
-        const start_global: usize = rr % @max(@as(usize, 1), self.workers.len);
-        const start_word: usize = start_global / 64;
-        const start_bit_in_word: u6 = @intCast(start_global % 64);
-
-        // Pass 1: from `start_word` forward (wrapping), prefer at-or-above
-        // start_bit_in_word in the first word.
-        var i: usize = 0;
-        while (i < BITMAP_WORDS) : (i += 1) {
-            const word_idx = (start_word + i) % BITMAP_WORDS;
-            if (self.tryClaimInWord(word_idx, exclude_word, exclude_bit, if (i == 0) start_bit_in_word else 0)) |idx| {
-                return idx;
-            }
-        }
-        // Pass 2 (wrap): the first word's bits BELOW start_bit_in_word
-        // weren't checked. Try them now.
-        if (start_bit_in_word != 0) {
-            if (self.tryClaimBelow(start_word, exclude_word, exclude_bit, start_bit_in_word)) |idx| {
-                return idx;
-            }
-        }
-        return null;
-    }
-
-    /// Try to claim a bit in `word_idx` at or above `min_bit`. Returns the
-    /// worker index on success.
-    fn tryClaimInWord(
+    /// The Frame + Task combine matches Go's `g` allocation shape:
+    /// the per-spawn closure and the user-visible handle live in one
+    /// allocation, freed together by `Task.join`. Saves one allocator
+    /// round-trip per spawn vs the previous 4-alloc layout.
+    pub fn spawn(
         self: *Runtime,
-        word_idx: usize,
-        exclude_word: usize,
-        exclude_bit: u64,
-        min_bit: u6,
-    ) ?usize {
-        var current = self.parked_workers[word_idx].load(.acquire);
-        while (true) {
-            var candidates = current;
-            if (word_idx == exclude_word) candidates &= ~exclude_bit;
-            // Restrict to bits at or above min_bit.
-            candidates &= ~@as(u64, 0) << min_bit;
-            if (candidates == 0) return null;
+        comptime user_fn: anytype,
+        args: anytype,
+    ) !*Task(@typeInfo(@TypeOf(user_fn)).@"fn".return_type.?) {
+        const F = Frame(user_fn, @TypeOf(args));
+        const T = F.Result;
 
-            const target_bit = candidates & (~candidates +% 1);
-            const next = current & ~target_bit;
-            if (self.parked_workers[word_idx].cmpxchgWeak(current, next, .acq_rel, .acquire)) |observed| {
-                current = observed;
+        // Frame + Task in a single allocation. `frame` MUST be the
+        // first field — voltCoroEntry reads `*(x19) = frame.run_fn`
+        // and we pass `&combined.frame` as the closure pointer; that
+        // pointer must alias `&combined`, which requires offset 0.
+        const Combined = struct {
+            frame: F,
+            task: Task(T),
+
+            fn destroy(frame_ptr: *anyopaque, alloc: std.mem.Allocator) void {
+                // frame_ptr is &combined.frame; cast to *@This().
+                const fp: *F = @ptrCast(@alignCast(frame_ptr));
+                const self_combined: *@This() = @fieldParentPtr("frame", fp);
+                alloc.destroy(self_combined);
+            }
+        };
+
+        const combined = try self.allocator.create(Combined);
+        errdefer self.allocator.destroy(combined);
+
+        const owning_p: ?*P = if (worker_mod.currentM()) |m_raw| blk: {
+            const m: *M = @ptrCast(@alignCast(m_raw));
+            break :blk m.p;
+        } else null;
+
+        const c = if (owning_p) |p|
+            try p.allocCoroutine(self.allocator)
+        else
+            try self.allocator.create(Coroutine);
+        errdefer if (owning_p) |p| p.freeCoroutine(c, self.allocator) else self.allocator.destroy(c);
+
+        const stack = if (owning_p) |p|
+            try p.allocStack(self.allocator, STACK_SIZE)
+        else
+            try self.allocator.alignedAlloc(u8, .@"16", STACK_SIZE);
+        errdefer if (owning_p) |p| p.freeStack(stack, self.allocator, STACK_SIZE) else self.allocator.free(stack);
+
+        combined.frame = .{ .args = args, .coro = c };
+        c.* = .{
+            .stack = stack,
+            .frame_ptr = &combined.frame,
+            .frame_destroy = &Combined.destroy,
+            // main_ctx is set by the dispatching worker; placeholder here.
+            .main_ctx = undefined,
+            .runtime = self,
+            .has_task = true,
+        };
+        const stack_top: [*]u8 = stack.ptr + STACK_SIZE;
+        context.initContext(&c.ctx, stack_top, &combined.frame);
+
+        combined.task = .{
+            .coro = c,
+            .result_ptr = &combined.frame.result,
+            .frame_ptr = &combined.frame,
+            .frame_destroy = &Combined.destroy,
+            .allocator = self.allocator,
+            .done = std.atomic.Value(u32).init(task_mod.NOT_DONE),
+        };
+        c.task_done = &combined.task.done;
+
+        if (owning_p) |p| {
+            _ = p.stat_spawned.fetchAdd(1, .monotonic);
+        } else {
+            _ = self.ps[0].stat_spawned.fetchAdd(1, .monotonic);
+        }
+        self.pushNew(c);
+        return &combined.task;
+    }
+
+    /// Push a freshly-spawned coroutine.
+    ///
+    /// If called from inside a coroutine on an M, uses that M's P's
+    /// `pushLifo` so the just-spawned continuation has the lowest
+    /// dispatch latency (single-slot LIFO cache, with the evicted
+    /// slot landing in that P's local queue / mailbox).
+    ///
+    /// From a non-M context (driver pre-`run()`), pushes to P[0]'s
+    /// mailbox — P[0] will be the driver in a moment.
+    ///
+    /// Wakes a parked M in either case.
+    fn pushNew(self: *Runtime, c: *Coroutine) void {
+        if (worker_mod.currentM()) |m_raw| {
+            const m: *M = @ptrCast(@alignCast(m_raw));
+            m.p.pushLifo(c);
+        } else {
+            self.ps[0].mailbox.push(c);
+        }
+        self.wakeOneParked();
+    }
+
+    /// Find a parked M via the bitmap, atomically claim it (clear
+    /// its bit), unpark its Parker. Safe to call from any thread;
+    /// no-op if no M is parked OR if another M is already searching
+    /// for work (anti-herd guard).
+    pub fn wakeOneParked(self: *Runtime) void {
+        // Anti-herd: if any M is already searching, it will find
+        // the new work on its current or next dispatch cycle. No
+        // need to wake a parked sibling — that's just thrashing
+        // the bitmap cache line + paying ulock_wake overhead.
+        if (self.num_searching.load(.acquire) > 0) return;
+
+        var bitmap = self.parked_workers.load(.acquire);
+        while (bitmap != 0) {
+            const idx = @ctz(bitmap);
+            const bit: u64 = @as(u64, 1) << @intCast(idx);
+            if (self.parked_workers.cmpxchgWeak(bitmap, bitmap & ~bit, .acq_rel, .acquire)) |observed| {
+                bitmap = observed;
                 continue;
             }
-            const bit_in_word: u6 = @intCast(@ctz(target_bit));
-            return word_idx * 64 + bit_in_word;
-        }
-    }
-
-    /// Try to claim a bit in `word_idx` strictly below `max_bit`.
-    fn tryClaimBelow(
-        self: *Runtime,
-        word_idx: usize,
-        exclude_word: usize,
-        exclude_bit: u64,
-        max_bit: u6,
-    ) ?usize {
-        var current = self.parked_workers[word_idx].load(.acquire);
-        while (true) {
-            var candidates = current;
-            if (word_idx == exclude_word) candidates &= ~exclude_bit;
-            // Restrict to bits below max_bit.
-            const max_bit_wide: u7 = max_bit;
-            const below_mask: u64 = (@as(u64, 1) << @intCast(max_bit_wide)) - 1;
-            candidates &= below_mask;
-            if (candidates == 0) return null;
-
-            const target_bit = candidates & (~candidates +% 1);
-            const next = current & ~target_bit;
-            if (self.parked_workers[word_idx].cmpxchgWeak(current, next, .acq_rel, .acquire)) |observed| {
-                current = observed;
-                continue;
-            }
-            const bit_in_word: u6 = @intCast(@ctz(target_bit));
-            return word_idx * 64 + bit_in_word;
-        }
-    }
-
-    /// Push a coroutine onto the global injection queue and wake a worker.
-    /// Called from non-worker threads, or as a fallback when local deque
-    /// access isn't possible.
-    pub fn injectGlobal(self: *Runtime, coro: *Coroutine) void {
-        if (self.injection.push(coro)) {
-            self.notifyOneWorker();
+            // We cleared the bit for `idx`. Unpark that M.
+            self.ms[idx].parker.unpark();
             return;
-        } else |err| switch (err) {
-            error.QueueFull => self.injectBlocking(coro),
-            error.OutOfMemory => @panic("injection.push: OOM"),
         }
     }
 
-    /// Backpressure path when injection is full. Spins-then-yields until
-    /// the queue drains. Should be vanishingly rare — default cap is 16K.
-    fn injectBlocking(self: *Runtime, coro: *Coroutine) void {
-        var attempts: usize = 0;
-        while (true) : (attempts += 1) {
-            if (self.injection.push(coro)) {
-                self.notifyOneWorker();
-                return;
-            } else |err| switch (err) {
-                error.QueueFull => {
-                    if (attempts > 64) std.Thread.yield() catch {};
-                    std.atomic.spinLoopHint();
-                },
-                error.OutOfMemory => @panic("injection.push: OOM"),
-            }
+    fn markParked(self: *Runtime, m: *M) void {
+        const bit: u64 = @as(u64, 1) << @intCast(m.p.id);
+        _ = self.parked_workers.fetchOr(bit, .acq_rel);
+    }
+
+    fn unmarkParked(self: *Runtime, m: *M) void {
+        const bit: u64 = @as(u64, 1) << @intCast(m.p.id);
+        _ = self.parked_workers.fetchAnd(~bit, .acq_rel);
+    }
+
+    fn tryClaimPoller(self: *Runtime) bool {
+        return self.reactor_poller_taken.cmpxchgStrong(false, true, .acq_rel, .acquire) == null;
+    }
+
+    fn releasePoller(self: *Runtime) void {
+        self.reactor_poller_taken.store(false, .release);
+    }
+
+    /// Diagnostic — dumps the scheduler's atomic state to stderr.
+    /// Safe to call from any thread (reads atomics with .acquire),
+    /// but the snapshot is non-coherent across the multiple loads.
+    /// Intended for hang investigation only.
+    pub fn dumpState(self: *Runtime) void {
+        std.debug.print("\n=== Runtime.dumpState ===\n", .{});
+        std.debug.print("  shutdown:           {}\n", .{self.shutdown.load(.acquire)});
+        std.debug.print("  parked_workers:     0b{b}\n", .{self.parked_workers.load(.acquire)});
+        std.debug.print("  num_searching:      {d}\n", .{self.num_searching.load(.acquire)});
+        std.debug.print("  reactor_poller:     {}\n", .{self.reactor_poller_taken.load(.acquire)});
+        std.debug.print("  reactor_pending:    {d}\n", .{self.reactor.pendingCount()});
+        // Per-P stat counters summed across all P's (sharded to
+        // avoid cache-line contention on the hot path).
+        var spawned: u64 = 0;
+        var done: u64 = 0;
+        var fairness_hits: u64 = 0;
+        var unparks_to_inject: u64 = 0;
+        for (self.ps) |*p| {
+            spawned += p.stat_spawned.load(.monotonic);
+            done += p.stat_done.load(.monotonic);
+            fairness_hits += p.stat_fairness_hits.load(.monotonic);
+            unparks_to_inject += p.stat_unparks_to_inject.load(.monotonic);
         }
-    }
-
-    /// Variant of `createCoroutine` that allocates the spawn Frame from
-    /// the given allocator instead of `self.allocator`. Used by
-    /// `volt.scope` to allocate children's Frames from a scope-local
-    /// arena. See `api/launch.zig:launchWith`.
-    pub fn createCoroutineWith(
-        self: *Runtime,
-        allocator: std.mem.Allocator,
-        comptime user_fn: anytype,
-        args: anytype,
-    ) !spawn_mod.Created(@TypeOf(user_fn)) {
-        return self.createCoroutineImpl(allocator, user_fn, args);
-    }
-
-    /// Spawn a coroutine for `user_fn(args)` on the calling worker's deque.
-    /// MUST be called from a worker thread.
-    pub fn createCoroutine(
-        self: *Runtime,
-        comptime user_fn: anytype,
-        args: anytype,
-    ) !spawn_mod.Created(@TypeOf(user_fn)) {
-        return self.createCoroutineImpl(self.allocator, user_fn, args);
-    }
-
-    fn createCoroutineImpl(
-        self: *Runtime,
-        frame_allocator: std.mem.Allocator,
-        comptime user_fn: anytype,
-        args: anytype,
-    ) !spawn_mod.Created(@TypeOf(user_fn)) {
-        // Resolve the calling worker first — we need it for the local
-        // stack pool below, and it's fast (one TLS read).
-        const w = currentWorker() orelse @panic(
-            "Runtime.createCoroutine called outside a worker thread. " ++
-                "Use Runtime.spawnRoot from the bootstrap thread instead.",
-        );
-
-        // Acquire a stack — three-tier search:
-        //   1. Worker's local pool (owner-only, no mutex). Hot path.
-        //   2. Runtime's global pool (mutex; cross-worker fallback).
-        //   3. Fresh `mmap` via spawn_mod.create when both pools empty.
-        // With pre-warmed local pools, steady-state hits tier 1 and
-        // does ZERO syscalls in the spawn hot loop.
-        var stage: enum { initial, has_local_recycled, has_global_recycled, has_created } = .initial;
-        const recycled = blk: {
-            if (w.local_stack_pool.acquire(stack_mod.default_reserved)) |gs| {
-                stage = .has_local_recycled;
-                break :blk @as(?stack_mod.GrowableStack, gs);
-            }
-            if (self.stack_pool.acquire(stack_mod.default_reserved)) |gs| {
-                stage = .has_global_recycled;
-                break :blk @as(?stack_mod.GrowableStack, gs);
-            }
-            break :blk null;
-        };
-
-        var created: spawn_mod.Created(@TypeOf(user_fn)) = undefined;
-        errdefer switch (stage) {
-            .initial => {},
-            .has_local_recycled => if (recycled) |gs| w.local_stack_pool.release(gs),
-            .has_global_recycled => if (recycled) |gs| self.stack_pool.release(gs),
-            .has_created => {
-                if (!created.coro.stack_pooled.load(.acquire)) {
-                    stack_mod.free(self.allocator, created.coro.stack);
-                }
-                // destroy_extras_fn frees the whole frame (Coroutine
-                // included) — no separate allocator.destroy needed.
-                // Frame uses frame_allocator (may differ from self.allocator
-                // when called via createCoroutineWith for scope-inline).
-                created.coro.destroy_extras_fn(frame_allocator, created.coro);
-            },
-        };
-
-        // Route Frame allocation through the calling worker's slab
-        // FramePool first (fast path: ~5ns bump+freelist pop). Falls
-        // back to `frame_allocator` only on pool exhaustion or for
-        // Frame types too large to fit any size class. The pool is
-        // safe to use cross-thread on free (lock-free single-link
-        // push); alloc is owner-only here so no contention.
-        const frame_source = spawn_mod.FrameSource{
-            .pool = &w.frame_pool,
-            .pool_worker_id = @intCast(w.id),
-        };
-        created = try spawn_mod.createWithFrameSource(
-            frame_allocator,
-            frame_source,
-            .{ .reserved = stack_mod.default_reserved },
-            recycled,
-            user_fn,
-            args,
-        );
-        // Ownership of the recycled stack is now inside `created`.
-        // Bump stage so the errdefer no longer tries to return it to
-        // the pool (would double-account vs the `has_created` branch).
-        stage = .has_created;
-
-        // Capture the parent for async-backtrace ancestry.
-        if (currentCoroutine()) |parent| {
-            created.coro.parent_id = @intFromPtr(parent);
+        std.debug.print("  total_spawned:      {d}\n", .{spawned});
+        std.debug.print("  total_done:         {d}\n", .{done});
+        std.debug.print("  spawned - done:     {d}  ← non-zero = lost coroutines\n", .{spawned -% done});
+        std.debug.print("  fairness_hits:      {d}\n", .{fairness_hits});
+        std.debug.print("  unparks_to_inject:  {d}\n", .{unparks_to_inject});
+        for (self.ms, self.ps, 0..) |*m, *p, i| {
+            const lifo_set = p.lifo_slot.load(.acquire) != null;
+            const local_empty = p.local.isEmpty();
+            const mailbox_empty = p.mailbox.isEmpty();
+            const parker_state = m.parker.state.load(.acquire);
+            std.debug.print("  m[{d}]/p[{d}]: lifo_set={}, local_empty={}, mailbox_empty={}, parker_state={d}\n", .{ i, p.id, lifo_set, local_empty, mailbox_empty, parker_state });
         }
-
-        // Push to deque BEFORE registering live: if pushOwned fails
-        // (OOM growing the deque), the errdefer cleans `created` —
-        // unwinding a registerLive would also race with snapshot
-        // iterators that hold `live_mutex`.
-        try w.pushOwned(created.coro);
-        self.registerLive(created.coro);
-        // Wake a parked sibling so it has a chance to steal. Same reasoning
-        // as `schedule`: without this, parallelism collapses on bursty
-        // spawn patterns.
-        self.wakeOneSibling(w.id);
-        return created;
+        std.debug.print("=========================\n", .{});
     }
 
-    /// Bootstrap-only: create the root coroutine and place it on worker 0's
-    /// deque. Called from `volt.run` BEFORE any worker thread has been
-    /// spawned, so concurrent access is impossible.
-    pub fn spawnRoot(
+    /// Run `user_fn(args)` as the root coroutine. The calling thread
+    /// participates as worker 0 — it runs the dispatch loop alongside
+    /// the spawned pthread workers, exiting only when the root
+    /// coroutine's `done` flag is set.
+    ///
+    /// The driver thread isn't a coroutine, so the parking-lot path
+    /// doesn't apply to wake it. Instead, the root Coroutine carries
+    /// `task_thread_parker = &workers[0].parker`, and dispatch's
+    /// `.done` branch directly unparks it when the root completes.
+    pub fn run(
         self: *Runtime,
         comptime user_fn: anytype,
         args: anytype,
-    ) !spawn_mod.Created(@TypeOf(user_fn)) {
-        const created = try spawn_mod.create(
-            self.allocator,
-            .{ .reserved = stack_mod.default_reserved },
-            null, // root never recycles — pool is empty at startup
-            user_fn,
-            args,
-        );
-        // Mark as the until-done watch target. Done.subscribe uses this to
-        // wake worker 0 (the bootstrap watcher) on completion — without
-        // having to broadcast a wake to every worker.
-        created.coro.is_root = true;
-        self.registerLive(created.coro);
-        try self.workers[0].pushOwned(created.coro);
-        return created;
-    }
-
-    /// Insert `coro` at the head of the per-runtime live registry.
-    /// Called by `createCoroutine` / `spawnRoot`. Cleared by
-    /// `unregisterLive` on lifecycle release. The intrusive
-    /// prev/next pointers live on the Coroutine struct itself, so no
-    /// per-spawn allocation.
-    pub fn registerLive(self: *Runtime, coro: *Coroutine) void {
-        const shard = &self.live_shards[shardFor(coro)];
-        shard.mutex.lock();
-        defer shard.mutex.unlock();
-        coro.prev_alive = null;
-        coro.next_alive = shard.head;
-        if (shard.head) |old_head| old_head.prev_alive = coro;
-        shard.head = coro;
-    }
-
-    /// Remove `coro` from the live registry. Called from
-    /// `coroutine.lifecycleRelease` (and `lifecycleReleaseRoot`)
-    /// before freeing the struct. Idempotent: a coro that was never
-    /// registered (or already unregistered) is a no-op.
-    pub fn unregisterLive(self: *Runtime, coro: *Coroutine) void {
-        const shard = &self.live_shards[shardFor(coro)];
-        shard.mutex.lock();
-        defer shard.mutex.unlock();
-        if (coro.prev_alive) |p| {
-            p.next_alive = coro.next_alive;
-        } else if (shard.head == coro) {
-            shard.head = coro.next_alive;
-        }
-        if (coro.next_alive) |n| {
-            n.prev_alive = coro.prev_alive;
-        }
-        coro.prev_alive = null;
-        coro.next_alive = null;
-    }
-
-    /// Start workers 1..N-1 as dedicated threads. Worker 0 is the caller
-    /// (bootstrap) thread. Returns once the threads have been spawned.
-    pub fn start(self: *Runtime) !void {
-        var started: usize = 1;
-        errdefer {
-            // Best-effort tear-down: signal shutdown, join what started.
-            self.shutdown_flag.store(true, .release);
-            for (self.workers[1..started]) |*w| w.unpark();
-            for (self.workers[1..started]) |*w| {
-                if (w.thread) |t| {
-                    t.join();
-                    w.thread = null;
-                }
-            }
-        }
-        for (self.workers[1..]) |*w| {
-            w.thread = try std.Thread.spawn(.{}, workerThreadEntry, .{w});
-            started += 1;
-        }
-    }
-
-    /// Drive worker 0 (this thread) until `until_done` reaches `.done`.
-    /// Then signal shutdown and join the other workers.
-    pub fn runUntilDone(self: *Runtime, until_done: *Coroutine) void {
-        self.workers[0].run(until_done);
-
-        // Root finished — signal shutdown and reap the other workers.
-        self.requestShutdown();
-
-        for (self.workers[1..]) |*w| {
-            if (w.thread) |t| {
-                t.join();
-                w.thread = null;
-            }
-        }
-
-        // Formal quiescence gate. After thread.join, every worker's
-        // `run()` has returned and incremented `quiesced_count`. This
-        // wait is normally a no-op (counter already at target by the
-        // time we get here), but exists as a hard observability point:
-        // if we ever introduce a code path that bypasses the per-worker
-        // `defer fetchAdd` (e.g. a panic that escapes), the counter
-        // catches it. The deadline panic surfaces the bug loudly.
-        self.waitForQuiescence(SHUTDOWN_DEADLINE_NS) catch {
-            std.debug.panic(
-                "Runtime.runUntilDone: workers did not quiesce within {d}ms — " ++
-                    "quiesced={d}/{d}. A worker's run() did not return; either " ++
-                    "thread.join hung (lost wake?) or a panic bypassed the " ++
-                    "fetchAdd. Stack traces should follow.",
-                .{
-                    SHUTDOWN_DEADLINE_NS / std.time.ns_per_ms,
-                    self.quiesced_count.load(.acquire),
-                    self.workers.len,
-                },
-            );
-        };
+    ) !@typeInfo(@TypeOf(user_fn)).@"fn".return_type.? {
+        var task = try self.spawn(user_fn, args);
+        // The driver is M[0]; wake its parker when the root task
+        // completes (regardless of which M dispatches the root's
+        // `.done`).
+        task.coro.task_thread_parker = &self.ms[0].parker;
+        // Calling thread becomes M[0] for the duration of run().
+        // After this returns, deinit will shut down the other Ms.
+        workerLoopUntilTaskDone(self, &self.ms[0], &task.done);
+        return task.join();
     }
 };
 
-fn workerThreadEntry(w: *Worker) void {
-    w.run(null);
+/// Entry point for pthread-spawned Ms (M[1..N-1]).
+/// Runs the dispatch loop until shutdown.
+fn workerThreadEntry(rt: *Runtime, m: *M) void {
+    worker_mod.currentMSet(@ptrCast(m));
+    defer worker_mod.currentMSet(null);
+    workerLoopUntilShutdown(rt, m);
 }
 
-/// Recover a *Runtime from the type-erased TLS slot.
-pub fn currentRuntime() ?*Runtime {
-    const raw = currentRuntimeRaw() orelse return null;
-    return @ptrCast(@alignCast(raw));
+/// M[0] (driver thread) loop variant: same dispatch as the spawned
+/// Ms, but exits when the target task's `done` flag is set (root
+/// coro complete) rather than waiting for shutdown.
+fn workerLoopUntilTaskDone(rt: *Runtime, m: *M, target_done: *std.atomic.Value(u32)) void {
+    worker_mod.currentMSet(@ptrCast(m));
+    defer worker_mod.currentMSet(null);
+    while (target_done.load(.acquire) == task_mod.NOT_DONE) {
+        // Enter find-work phase: count this M as searching.
+        // Anti-herd: pushers see num_searching > 0 and skip the
+        // bitmap CAS + ulock_wake, knowing we'll pick up their push.
+        _ = rt.num_searching.fetchAdd(1, .acq_rel);
+        if (tryFindAndDispatch(rt, m)) {
+            // tryFindAndDispatch decrements num_searching on hit
+            // before swapping into the coroutine. We're back from
+            // the swap now; loop iterates and fetchAdds again.
+            continue;
+        }
+        // No work found. Leave find-work phase and park.
+        _ = rt.num_searching.fetchSub(1, .acq_rel);
+        if (target_done.load(.acquire) == task_mod.DONE) return;
+        parkWorker(rt, m);
+    }
 }
 
-pub fn currentWorker() ?*Worker {
-    const raw = currentWorkerRaw() orelse return null;
-    return @ptrCast(@alignCast(raw));
+/// Spawned-M loop variant: runs until shutdown.
+fn workerLoopUntilShutdown(rt: *Runtime, m: *M) void {
+    while (!rt.shutdown.load(.acquire)) {
+        _ = rt.num_searching.fetchAdd(1, .acq_rel);
+        if (tryFindAndDispatch(rt, m)) continue;
+        _ = rt.num_searching.fetchSub(1, .acq_rel);
+        if (rt.shutdown.load(.acquire)) return;
+        parkWorker(rt, m);
+    }
 }
 
-test "runtime: init/deinit cycle" {
-    var rt = try Runtime.init(.{ .allocator = std.testing.allocator, .workers = 2 });
+/// Find one piece of work and dispatch it. Returns true if anything
+/// was dispatched / reactor polled. Returns false if no work was
+/// found anywhere — caller should park.
+///
+/// IMPORTANT: this function maintains the searching/dispatching
+/// invariant. On entry, the caller has fetchAdd'd num_searching
+/// (worker is "in find-work phase"). When we commit to dispatching,
+/// we fetchSub *before* the ctx swap so other pushers correctly see
+/// that we're no longer searching. (A worker mid-dispatch can't
+/// pick up new work; it must not count as searching.)
+/// Every Nth dispatch, check the injection queue BEFORE the local
+/// queue. Without this, a worker whose local queue is repeatedly
+/// fed (e.g. a tight yield loop) never observes coroutines that
+/// get unparked into the injection queue — the local-first
+/// priority starves them. Mirrors Go's `schedule.checkGlobalRunq`.
+const INJECTION_CHECK_INTERVAL: u32 = 61;
+
+fn tryFindAndDispatch(rt: *Runtime, m: *M) bool {
+    m.p.dispatch_count +%= 1;
+
+    // Periodic fairness: check own mailbox before local. Prevents
+    // starvation when local is fed by tight yield loops.
+    if (m.p.dispatch_count % INJECTION_CHECK_INTERVAL == 0) {
+        if (m.p.popMailbox()) |c| {
+            _ = m.p.stat_fairness_hits.fetchAdd(1, .monotonic);
+            _ = rt.num_searching.fetchSub(1, .acq_rel);
+            dispatch(rt, m, c);
+            return true;
+        }
+    }
+
+    if (m.p.popLocal()) |c| {
+        _ = rt.num_searching.fetchSub(1, .acq_rel);
+        dispatch(rt, m, c);
+        return true;
+    }
+    if (m.p.popMailbox()) |c| {
+        _ = rt.num_searching.fetchSub(1, .acq_rel);
+        dispatch(rt, m, c);
+        return true;
+    }
+    if (stealFromSiblings(rt, m)) |c| {
+        _ = rt.num_searching.fetchSub(1, .acq_rel);
+        dispatch(rt, m, c);
+        return true;
+    }
+    if (rt.reactor.pendingCount() > 0 and rt.tryClaimPoller()) {
+        // Drop searching count while inside the blocking kevent —
+        // this thread can't pick up other work while in the syscall,
+        // and pushers should be able to wake parked siblings.
+        _ = rt.num_searching.fetchSub(1, .acq_rel);
+        _ = rt.reactor.poll(true);
+        rt.releasePoller();
+        return true;
+    }
+    return false;
+}
+
+/// Park this M. Adds self to parked_workers bitmap, rechecks its P's
+/// queues + reactor for race-arrived work, then blocks on the parker.
+/// Cross-thread spawns / unparks wake via wakeOneParked.
+///
+/// Called from a non-searching state — the caller has already
+/// fetchSub'd num_searching when it decided not to find more work.
+fn parkWorker(rt: *Runtime, m: *M) void {
+    rt.markParked(m);
+    defer rt.unmarkParked(m);
+    // Recheck — work may have arrived between findWork and mark.
+    if (m.p.lifo_slot.load(.acquire) != null) return;
+    if (!m.p.local.isEmpty()) return;
+    if (!m.p.mailbox.isEmpty()) return;
+    // Don't sniff sibling mailboxes here — stealing will find them
+    // on the next loop iteration if we get woken.
+    if (rt.reactor.pendingCount() > 0) return;
+    if (rt.shutdown.load(.acquire)) return;
+    m.parker.park();
+}
+
+/// Steal from a sibling P. Tries to steal a batch from the sibling's
+/// local queue first (preserves the work-stealing protocol); if
+/// that fails, peeks at the sibling's mailbox (single-pop fallback,
+/// since mailbox is MPMC). Returns one coroutine to dispatch.
+fn stealFromSiblings(rt: *Runtime, self: *M) ?*Coroutine {
+    if (rt.ps.len <= 1) return null;
+    const start: usize = self.p.rng.random().uintLessThan(usize, rt.ps.len);
+    var attempts: usize = 0;
+    while (attempts < rt.ps.len) : (attempts += 1) {
+        const idx = (start + attempts) % rt.ps.len;
+        if (idx == self.p.id) continue;
+        const sibling = &rt.ps[idx];
+        if (sibling.local.stealInto(&self.p.local)) |c| return c;
+        if (sibling.mailbox.pop()) |c| return c;
+    }
+    return null;
+}
+
+fn dispatch(rt: *Runtime, m: *M, c: *Coroutine) void {
+    c.pending = .done;
+    c.main_ctx = &m.main_ctx;
+    current.set(c);
+    context.swap(&m.main_ctx, &c.ctx);
+    current.clear();
+    switch (c.pending) {
+        .yield => m.p.pushQueue(c),
+        .park => {
+            // Transition RUNNING → PARKED. If we observe NOTIFIED
+            // instead, an unpark fired between the primitive's
+            // waiter-register step and this swap-back. The
+            // coroutine is logically wake-pending; re-queue
+            // immediately rather than leaving it stranded.
+            if (c.park_state.cmpxchgStrong(
+                ParkState.RUNNING,
+                ParkState.PARKED,
+                .acq_rel,
+                .acquire,
+            )) |observed| {
+                std.debug.assert(observed == ParkState.NOTIFIED);
+                c.park_state.store(ParkState.RUNNING, .release);
+                m.p.mailbox.push(c);
+                rt.wakeOneParked();
+            }
+        },
+        .done => {
+            // Signal the joiner. The parking-lot's validator-under-
+            // lock guarantees no register-then-park race here: a
+            // joiner that observes `done == DONE` in its validator
+            // bails without parking; otherwise it's enqueued under
+            // the bucket lock and our `unparkOne` pops it.
+            if (c.task_done) |done| {
+                done.store(task_mod.DONE, .release);
+                _ = park_mod.unparkOne(rt, done);
+            }
+            // The driver thread (worker 0) parks via its Parker,
+            // not via the parking lot. The root task carries a
+            // direct Parker pointer; wake it here.
+            if (c.task_thread_parker) |p| p.unpark();
+            if (!c.has_task) {
+                if (c.frame_destroy) |destroy_fn| destroy_fn(c.frame_ptr, rt.allocator);
+            }
+            _ = m.p.stat_done.fetchAdd(1, .monotonic);
+            // Recycle the stack + Coroutine into the current P's pools
+            // (LIFO, cache-warm). Handing them to the next spawn on
+            // this P avoids the allocator round-trip.
+            m.p.freeStack(c.stack, rt.allocator, STACK_SIZE);
+            m.p.freeCoroutine(c, rt.allocator);
+        },
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────
+
+const test_allocator = std.testing.allocator;
+
+fn returnInt(x: u32) u32 {
+    return x * 2;
+}
+
+fn returnString() []const u8 {
+    return "hello from coro";
+}
+
+fn noReturn(counter: *std.atomic.Value(u32)) void {
+    _ = counter.fetchAdd(1, .acq_rel);
+}
+
+test "runtime: spawn typed fn returning u32" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
     defer rt.deinit();
-    try std.testing.expectEqual(@as(usize, 2), rt.workers.len);
+    const result = try rt.run(returnInt, .{@as(u32, 21)});
+    try std.testing.expectEqual(@as(u32, 42), result);
+}
+
+test "runtime: spawn typed fn returning slice" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+    const result = try rt.run(returnString, .{});
+    try std.testing.expectEqualStrings("hello from coro", result);
+}
+
+fn fanOutRoot(counter: *std.atomic.Value(u32)) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var tasks: [100]*Task(void) = undefined;
+    for (&tasks) |*t| t.* = try rt.spawn(noReturn, .{counter});
+    for (&tasks) |t| t.join();
+}
+
+test "runtime: 100 coros fanned out across workers" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 4 });
+    defer rt.deinit();
+    var counter = std.atomic.Value(u32).init(0);
+    try rt.run(fanOutRoot, .{&counter});
+    try std.testing.expectEqual(@as(u32, 100), counter.load(.acquire));
+}
+
+fn yieldingWorker(counter: *std.atomic.Value(u32), n: u32) void {
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        _ = counter.fetchAdd(1, .acq_rel);
+        yield();
+    }
+}
+
+fn yieldRoot(counter: *std.atomic.Value(u32)) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var t1 = try rt.spawn(yieldingWorker, .{ counter, @as(u32, 10) });
+    var t2 = try rt.spawn(yieldingWorker, .{ counter, @as(u32, 10) });
+    t1.join();
+    t2.join();
+}
+
+test "runtime: two yielding coroutines interleave across workers" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+    var counter = std.atomic.Value(u32).init(0);
+    try rt.run(yieldRoot, .{&counter});
+    try std.testing.expectEqual(@as(u32, 20), counter.load(.acquire));
+}
+
+// ─── tryDispatchInline tests ──────────────────────────────────────────
+
+fn returnFortyTwo() u32 {
+    return 42;
+}
+
+fn inlineRoot(out: *u32) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    // Spawn a task that will sit in our P's lifo_slot.
+    const task = try rt.spawn(returnFortyTwo, .{});
+    // Direct-handoff dispatch the spawned coro. After this returns
+    // true, target.coro and its stack are freed; task struct + frame
+    // still alive for join().
+    const did_handoff = tryDispatchInline(task.coro);
+    if (!did_handoff) @panic("expected lifo handoff to succeed on freshly-spawned task");
+    // task.done should now be DONE — join returns immediately.
+    out.* = task.join();
+}
+
+test "runtime: tryDispatchInline runs target inline and join returns result" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
+    defer rt.deinit();
+    var out: u32 = 0;
+    try rt.run(inlineRoot, .{&out});
+    try std.testing.expectEqual(@as(u32, 42), out);
+}
+
+fn inlineMissRoot(out: *u32) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    // Spawn TWO tasks. The second push evicts the first from lifo_slot
+    // into the local queue. So the FIRST task is no longer in lifo,
+    // and tryDispatchInline must return false for it.
+    const t1 = try rt.spawn(returnFortyTwo, .{});
+    const t2 = try rt.spawn(returnFortyTwo, .{});
+    const got1 = tryDispatchInline(t1.coro);
+    if (got1) @panic("expected lifo handoff to MISS for evicted t1");
+    // The second (still in lifo) should hit.
+    const got2 = tryDispatchInline(t2.coro);
+    if (!got2) @panic("expected lifo handoff to hit for fresh t2");
+    out.* = t1.join() + t2.join();
+}
+
+test "runtime: tryDispatchInline returns false when target is not in lifo_slot" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
+    defer rt.deinit();
+    var out: u32 = 0;
+    try rt.run(inlineMissRoot, .{&out});
+    try std.testing.expectEqual(@as(u32, 84), out);
 }

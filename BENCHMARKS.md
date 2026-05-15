@@ -1,265 +1,181 @@
-# Volt vs Go — Comparative Benchmarks
+# Volt benchmarks
 
-> Not for bragging rights. Go is a massive, brilliantly-engineered runtime —
-> 15 years of work by some of the best systems engineers alive — and we look
-> at it as the target. Where Volt is ahead, we keep pushing; where Volt
-> trails, we have specific work to do. Both honest.
+> Honest measurements. Volt wins on some workloads, lags Go on others.
+> The two sections below are the **Zig-native pitch** (what Volt is
+> built for) and the **Go side-by-side** (transparency on the
+> overlap). Both are receipts, not bragging rights.
 
-Last measured: **2026-05-12**, macOS arm64 (Apple Silicon), Zig 0.16.0, Go 1.23.2.
-Reproducible via `zig build compare`. Median of 11 iterations after 3 warmup rounds.
+All numbers: **Darwin arm64, 11 cores, ReleaseFast, smp_allocator.**
+Date: 2026-05-15. Go reference: 1.26.0 on the same hardware.
 
-## Read this first — what these numbers actually tell you
+Reproduce with `zig build bench-<name>` (Volt) or
+`go build bench/go/<name>.go && ./<name>` (Go).
 
-There are two kinds of benches below. **Real-workload benches are the
-ones to take seriously.** They look like the code consumers will write:
-TCP request/response, a 3-stage data pipeline. The synthetic
-microbenches (spawn-10k-noops, raw channel SPSC, saturated mutex) are
-useful for *diagnosing* internal performance but they are not what your
-application will look like, and they over-state the gap.
+---
 
-**The TL;DR**: on real workloads, Volt is within ~20% of Go on macOS
-arm64. The 26× spawn-join microbench gap does not translate. Why?
-Because in a real workload, the spawn cost is amortized over an actual
-unit of work (a few syscalls, some bytes copied, a channel hop). 4 µs
-of spawn overhead is invisible when the work itself is 10 µs.
+## Section 1: Zig-native metrics
 
-## Headline — real-workload benches
+What Volt is built for: tiny memory footprint, explicit allocation,
+predictable performance, no GC pauses. These are the metrics that
+matter for "stackful coroutines that cost what you ask them to cost."
 
-| Workload | Volt | Go | Volt / Go |
-|---|---|---|---|
-| TCP echo (per RTT, 64 clients × 16 reqs) | **10.96 µs** | 9.05 µs | **1.21×** |
-| Channel pipeline (3-stage, 50k msgs)     | **124 ns/msg** | 91 ns/msg | **1.36×** |
+### RSS per idle coroutine (`bench-rss`)
 
-Both are within striking distance of Go (1.2–1.4×). That's the headline.
+How much resident memory does a parked coroutine cost?
 
-## Synthetic microbenches (diagnostic, not headlines)
-
-| Workload | Volt | Go | Volt / Go |
-|---|---|---|---|
-| yield (one-way ctx switch) | **12 ns/op** | 42 ns/op | **0.29× ★★** |
-| spawn + waitgroup-wait | 3,749 ns/op | 147 ns/op | 25.50× |
-| spawn + per-coro join | 4,163 ns/op | 146 ns/op | 28.51× |
-| channel SPSC cap=16 | 180 ns/op | 32 ns/op | 5.63× |
-| mutex contended (8 coros) | **41 ns/op** | 81 ns/op | **0.51× ★** |
-
-★★ = ≥2× faster · ★ = 5-50% faster · blank = slower
-
-Keep these in mind for **internals work** — they tell us where the
-scheduler dispatch cycle, channel send path, and mutex acquire path
-have room to improve. They do not tell us about deliverable user
-performance; the real-workload table above does.
-
-## What the numbers mean
-
-### Real-workload reading
-
-- **TCP echo at 10.96 µs/RTT — 21% slower than Go.** 64 concurrent
-  clients × 16 round-trips × 1 KB each on loopback. Volt's kqueue
-  reactor + per-worker scheduling carry most of the cycle; the spawn
-  cost on the server-accept-side is dominated by the kernel syscall
-  cost and copy time. This is the bench that matters for NerdMeNot's
-  HTTP/S3/PG clients — the gap is real but not architectural.
-- **Channel pipeline at 124 ns/msg — 36% slower than Go.** Three
-  coroutines (producer → middle-with-FNV-fold → consumer), two cap-64
-  channels, 50k messages. Closer to data-processing pipelines like
-  DataFrame I/O than raw SPSC; the gap is still mostly in the channel
-  send/recv path (the same gap that produces the 5.6× SPSC microbench
-  number), only attenuated by the work done between channel ops.
-
-### Synthetic reading
-
-- **Context switch (yield) — 3.7× faster.** Hand-written AAPCS64 /
-  SysV-x86_64 asm context swap with no scheduler-side bookkeeping per
-  swap. Go's `runtime.Gosched` goes through the full scheduler each
-  time. The 10 ns number is the raw cost of two register-set saves +
-  restores plus an atomic state read — about as low as a stackful
-  runtime can go.
-- **Spawn + join — 25× slower.** Go's per-P `gFree` slab + 2 KiB initial
-  stacks with copy-grow are 15 years of optimization. Volt's per-worker
-  `FramePool` + 1 MiB virtual stacks with mmap-grow are correct but not
-  yet on parity. The 3.6 µs gap is in the scheduler dispatch cycle —
-  Worker.findWork → dispatch → Done.subscribe → park/unpark — not in
-  any single allocation or atomic op. **This does not appear in the
-  real-workload TCP/pipeline numbers** because real coroutines do work,
-  not nothing.
-- **Channel SPSC — 5.7× slower.** Volt's Vyukov MPMC ring with parking
-  has more per-element overhead than Go's specialized SPSC fast path
-  in `chan`. The pipeline bench above shows that with actual per-message
-  work the relative gap drops to 18%.
-- **Mutex saturated contention — 2× faster than Go.** Volt's MCS
-  lock-free queue with `unparkLocal` (skips inter-core wake when the
-  handoff chain stays worker-local) drops the per-cycle cost. Fair
-  FIFO is preserved by construction. Note: this number is
-  topology-sensitive — we have seen 10× variance run-to-run depending
-  on how the contention chain lands across workers. Production code
-  rarely hits saturated single-lock contention, so don't read too much
-  into either direction.
-
-## What we measured
-
-### Real-workload benches
-
-**TCP echo (per RTT, 64 clients × 16 reqs).** A loopback TCP server
-accepts 64 connections; for each, a coroutine/goroutine echoes 16
-rounds of 1 KB. 64 client coroutines connect, send, recv, close in
-parallel. Wall time / (64 × 16) = per-RTT cost. This is the closest
-match to a request/response service workload — what NerdMeNot's S3,
-HTTP, and PG clients will look like.
-
-**Channel pipeline (3-stage, 50k msgs).** Producer → middle worker
-(FNV-style fold per message) → consumer. Two capacity-64 channels.
-50,000 messages. Per-message cost = wall / 50,000. Matches data-flow
-pipelines (e.g. DataFrame I/O batched-row processing) — sends with a
-modest amount of CPU work between them. Far more representative than
-a tight `send/recv` loop.
-
-### Synthetic microbenches
-
-**yield (one-way ctx switch).**
-Two coroutines (Volt) or one goroutine (Go) ping-pong via the scheduler:
-yield → re-dispatch → yield → ... 100,000 times. Wall time / (iters × 2) =
-one-way ctx switch cost.
-
-### spawn + waitgroup-wait
-
-The canonical Go pattern: spawn N = 10,000 goroutines that each call
-`wg.Done()`, then `wg.Wait()` for all. Volt analog: spawn N coros that
-decrement an atomic counter and `notify.notifyOne()`, parent
-`notify.wait()`. Measures spawn rate + the single batched wait.
-
-### spawn + per-coro join
-
-Volt's natural pattern: spawn N, then `for (jobs) |j| try j.join()`. The
-sequential per-job join exposes 10k park/unpark cycles. Go's `chan` /
-`WaitGroup` are the only join idioms — there's no per-goroutine handle —
-so the Go side just calls the same `WaitGroup`-based function for
-symmetry. The Volt number is for honesty: this is what `for-loop +
-.join()` actually costs.
-
-### channel SPSC cap=16
-
-Single producer, single consumer. Producer sends 100,000 monotonic
-u64s through a capacity-16 channel; consumer drains. Per-op = wall / N.
-
-### mutex contended (8 coros)
-
-8 coroutines, each acquires a shared mutex and increments a u64
-50,000 times (400k total acquires). The classic saturated-contention
-worst-case for a fair mutex. Per-op = wall / total_acquires.
-
-## What's NOT measured (yet)
-
-- **TCP echo on Linux/io_uring vs Go's netpoll.** Current TCP echo
-  number is macOS/kqueue.
-- **HTTP request/response lifecycle** — full server with headers,
-  body, keep-alive — once we have a small HTTP layer to bench against.
-- **Memory per idle coroutine** — Volt ~16 KiB resident vs Go ~8 KiB.
-- **Cancellation latency** — time from `.cancel()` to coroutine exit.
-
-These are v1.x bench targets.
-
-## How Volt's allocation differs from Go's
-
-| Aspect | Go | Volt |
+| N idle coros | Peak RSS | per-coro |
 |---|---|---|
-| Stack growth | Copy-grow (compiler stackmaps fix pointers) | Virtual-memory grow (mmap + mprotect on guard hit) |
-| Initial committed stack | 2 KiB | 4 KiB (Linux x86) / 16 KiB (macOS arm64) — one page |
-| Per-coro alloc | Per-P `gFree` slab pool | Per-worker `FramePool` (1 MiB mmap'd, comptime size classes) |
-| Heap source | Go's `mheap` (invisible to user) | User passes allocator once at `volt.run`; per-worker FramePool sits on top |
-| GC | Tracing GC with write barriers | None — user owns allocator lifecycle |
+| 100 | 3,392 KiB | 33.9 KiB |
+| 1,000 | 18,112 KiB | 18.1 KiB |
+| 5,000 | 83,552 KiB | 16.7 KiB |
+| 10,000 | 165,248 KiB | **16.5 KiB** |
 
-### Volt's allocation design in one paragraph
+The steady-state figure (16.5 KiB per idle coro at N=10k) is
+dominated by the 16 KiB stack. Phase 4 (mmap-grow stacks, not yet
+re-landed) targets ~4 KiB per idle coro on Linux. On Darwin the
+16 KiB page size is the floor regardless.
 
-The user passes an allocator **once** at `volt.run(.{ .allocator = ... })`
-and never again. After that, the spawn hot path bypasses the user
-allocator entirely: each Worker has its own 1 MiB `FramePool` (one
-mmap call at worker init) for spawn metadata, and its own `LocalPool`
-of recycled mmap'd 1 MiB stack regions. The user's allocator is for
-runtime startup, channel buffers (when user calls `Channel.init`), and
-fallback when the FramePool is exhausted. Same shape as Go's per-P
-caches, but with the user controlling the bulk allocator choice
-instead of a GC-managed heap.
+### Real-work multi-worker scaling (`bench-parallel-compute`)
 
-## Why Volt does what Go does — and where the gaps live
+256 CPU-bound tasks across N workers (XorShift, ~50 µs each):
 
-### Where Volt copied Go (well, with Zig adaptations)
+| Workers | Per-task time | Speedup vs 1 |
+|---|---|---|
+| 1 | 85 µs | 1.00× |
+| 2 | 42 µs | 1.99× |
+| 4 | 22 µs | 3.75× |
+| 8 | 13 µs | **6.62×** |
 
-- **Per-worker slab pool for spawn metadata.** Go's `gFree` per-P;
-  Volt's `FramePool` per-Worker. Same idea, Zig has comptime size
-  classes so the slot-class lookup is comptime-resolved.
-- **Work-stealing scheduler with Chase-Lev deques.** Same algorithm
-  as Go's per-P run queues.
-- **LIFO slot for cache-warm continuations.** Go does this; Tokio
-  also; we copied it.
-- **Adaptive park/wake (parker bitmap).** Go's idle-P bitmap; Volt's
-  parked-workers bitmap. Same shape.
-- **Stack-overflow handler that grows on demand.** Go does morestack;
-  Volt does mprotect on guard-page hit. Different mechanism (we don't
-  have stackmaps), same outcome (transparent growth).
+Near-ideal scaling. Real parallel work amortizes the scheduler's
+coordination cost.
 
-### Where Volt does it differently because of Zig
+### Sustained mixed-primitive throughput (`bench-stress`)
 
-- **No GC.** User owns allocator. Means we can't copy-grow stacks
-  (no stackmaps to fix pointers) — but we don't need a write barrier
-  on every pointer write either.
-- **Comptime specialization.** Spawn closure types are monomorphized
-  at the call site. No virtual dispatch through `dyn Future`.
-- **Intrusive containers everywhere.** MCS waiter nodes in
-  `Coroutine`. `live_coroutines` link in `Coroutine`. No allocator
-  pressure for queue nodes.
-- **Explicit allocator.** User gets full control + predictability;
-  pays in API verbosity vs Go's hidden runtime allocator.
+3 phases × 15 s each: spawn-join, Mutex contention, Spsc channel
+ping-pong, all under multi-worker load with a watchdog.
 
-### Where Volt has work to do
+| Result | 134-141 M total ops over 45 s |
 
-- **Scheduler dispatch cycle** is ~4 µs per coro on this bench; Go
-  achieves ~150 ns. The work isn't in any one atomic op or allocator
-  call — it's the accumulated cost of `Worker.findWork` + dispatch
-  state setup + Done.subscribe + park/unpark. Closing this needs
-  either a much tighter dispatch hot path or a different scheduler
-  architecture (e.g. inline the Done path so completed coros don't
-  round-trip through post-swap).
-- **Channel send/recv overhead.** Volt is at 177 ns/op SPSC; Go is at
-  32 ns/op. We use a Vyukov MPMC ring with parks-on-block; Go's `chan`
-  has a specialized fast path for the SPSC case. Optimization target
-  for v1.x.
+Used as a pre-merge gate — must pass before any scheduler change
+lands.
 
-## Running the benchmarks yourself
+### Fan-out scaling (`bench-fanout-scaling`)
 
-```sh
-zig build compare
-```
+N driver coroutines, each running its own spawn+wait loop in
+parallel. Measures whether the scheduler can keep multiple
+independent producer/consumer pairs hot.
 
-Prerequisites:
-- Zig 0.16.0
-- Go 1.23+
+| Workers / drivers | ns/op | ratio vs w=1 |
+|---|---|---|
+| 1 | 73 | 1.00× |
+| 2 | 64 | 0.86× |
+| 4 | 89 | 1.20× |
+| 8 | 120 | 1.63× |
+| 11 | **117** | **1.59×** |
 
-The orchestrator builds both binaries, runs them sequentially (to avoid
-cache/thermal interference), and prints the table above. Each side
-runs 11 iterations after 3 warmup rounds; the median is reported.
+Workers=2 actually beats workers=1 (less contention per driver).
+The ratio stays under 1.7× across the whole curve, which is what
+"scales linearly enough for real work" looks like.
 
-## Acknowledgments
+---
 
-- **Go runtime** — the gold standard for stackful concurrent runtimes.
-  Every core pattern in Volt (per-P caches, work-stealing, idle-worker
-  bitmap, stack management) traces back to something Go did first. Volt
-  exists because Go has shown how good a stackful runtime can be.
-- **Tokio** — Rust's stackless equivalent. We learned from its scheduler,
-  cooperative budgeting, and sync-primitive designs.
-- **may** (Rust stackful) — confirmed several design choices for the
-  stackful approach in Rust; we made different tradeoffs but learned
-  from theirs.
-- **Vyukov MPMC** — bounded ring buffer paper, used for Volt's channel.
+## Section 2: Go side-by-side
 
-## Caveats
+For transparency on the metrics that overlap with Go's strengths.
+Same hardware, same bench shape, both runtimes' idiomatic patterns.
 
-- Single machine, single OS (macOS arm64) — results on Linux x86_64
-  may differ.
-- Microbenchmarks, not real workloads — production performance
-  depends on many factors not captured here.
-- Both Zig and Go have compilation/runtime tradeoffs; some differences
-  may reflect compiler optimization strategy rather than runtime design.
-- Run-to-run variance is typically 5-15% on these benchmarks. The
-  median-of-11 helps but doesn't eliminate it.
-- Go is mature and battle-tested at massive scale; Volt is new. **Take
-  the spawn+join gap seriously, not the yield/mutex wins.**
+### Microbenchmark floor
+
+| Bench | Volt | Go | Volt/Go |
+|---|---|---|---|
+| yield (one-way ctx switch) | **9 ns** | 42 ns | **0.21× — 4.7× faster** |
+| Spsc send+recv cap=16 | **12 ns** | 33 ns | **0.36× — 2.8× faster** |
+| TCP echo 64 × 16 RTT × 1 KB | **~7,000 ns** | 9,050 ns | **0.77× — 1.3× faster** |
+
+### Spawn + wait shapes (same bench, both sides)
+
+`bench-spawn-hot-waitall` (Volt, Notify barrier per batch) and
+`spawn_hot.go` (Go, `wg.Wait` per batch). One driver, BATCH=1000,
+10 s sustained.
+
+| Workers | Volt | Go | Volt/Go |
+|---|---|---|---|
+| 1 | **106 ns** | 137 ns | **0.77× — 1.3× faster** |
+| 2 | 201 | 155 | 1.30× |
+| 4 | 218 | 165 | 1.32× |
+| 8 | 399 | 167 | 2.39× |
+| 11 | **490** | 172 | **2.84×** |
+
+The single-worker fast path beats Go decisively. The multi-worker
+gap concentrates at high worker count on synthetic spawn-heavy
+workloads — a pattern where adding workers can only *hurt* because
+there's no parallel work to amortize coordination. See
+`docs/internals/multi-worker-profile.md` for the deep dive.
+
+### Fan-out scaling (Volt vs Go, matched shapes)
+
+N drivers, N workers, each driver spawns BATCH=100, `wg.Wait`,
+loops for 4 s.
+
+| Workers | Volt | Go | Volt/Go |
+|---|---|---|---|
+| 1 | 73 | 107 | **0.68× — 1.5× faster** |
+| 4 | 89 | 92 | 0.97× — parity |
+| 11 | **117** | 106 | **1.10× — parity** |
+
+This is the workload work-stealing schedulers are *built* for, and
+we're at parity with Go across the curve.
+
+### Spawn-hot with 1000 individual joins (`bench-spawn-hot`)
+
+This is a **Volt-specific cost** — calling `task.join` N times per
+batch is not what Go users write; they use `wg.Wait`. Tracked
+separately because some Volt API patterns may do this.
+
+| Workers | ns/op |
+|---|---|
+| 1 | ~100 |
+| 11 | ~1,700 |
+
+Each `task.join` does a frame_destroy + task cleanup. With 1000
+calls per batch, that overhead dominates. The matched bench
+(`bench-spawn-hot-waitall`) is the fair comparison vs Go.
+
+### Mutex contended
+
+8 coros × 50,000 acquires, NumCPU workers.
+
+| Mutex contended | Volt 644 ns | Go 81 ns | **8× behind** |
+
+Open work — needs adaptive spin + batched wake design.
+
+---
+
+## Methodology
+
+- **Run-to-run variance is real** on spawn benches (15-40 %).
+  Single-number claims are misleading. The numbers above are
+  **5-run medians** unless otherwise noted.
+- **Build mode**: `.ReleaseFast` for Volt benches, `go build`
+  (default optimizations) for Go.
+- **Allocator**: `std.heap.smp_allocator` for Volt.
+- **GOMAXPROCS**: matches the Volt `workers` setting (set via env
+  var `VOLT_BENCH_WORKERS` for Volt benches that support it).
+
+## Receipt benches gate scheduler changes
+
+Any landing that touches the scheduler, coroutine struct, sync
+primitives, or allocation path must show no regression on:
+
+- `bench-rss` (memory footprint)
+- `bench-scaling` (multi-worker latency curve)
+- `bench-fanout-scaling` (multi-driver parallelism)
+- The full microbench suite (`yield`, `spsc`, `mutex`, `tcp-echo`)
+- `stress` (3 runs, all PASS)
+
+If a change moves the median by < 20 % on the bench it claims to
+improve, it doesn't land — the change isn't clearly worth the
+complexity over the noise floor. This rule is set after a series of
+attempted "improvements" that turned out to be noise. See the
+`#171 baton-pass` and `#160 cache-padding` entries in the profile
+doc for examples of changes that didn't clear the bar.
