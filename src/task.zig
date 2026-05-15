@@ -91,3 +91,36 @@ pub fn Task(comptime T: type) type {
         }
     };
 }
+
+/// Combined `Frame + Task(T)` allocation unit. `Runtime.spawn`
+/// allocates one of these per spawn instead of two separate
+/// allocator calls.
+///
+/// Frame **must** be the first field — the trampoline (in
+/// `coroutine.Frame.trampoline`) does
+/// `*x19 = frame.run_fn` and we pass `&combined.frame` as the
+/// closure pointer; `@fieldParentPtr` works precisely because
+/// offset-of-frame is 0.
+///
+/// `destroy` recovers the parent pointer from any pointer to the
+/// embedded frame, so both `Task.join` (which holds
+/// `*FrameWithTask`) and dispatch's no-task path (which holds
+/// `*Frame`) free the same allocation correctly.
+pub fn FrameWithTask(comptime user_fn: anytype, comptime ArgsT: type) type {
+    const F = coroutine.Frame(user_fn, ArgsT);
+    const T = F.Result;
+    return struct {
+        const Self = @This();
+        pub const FrameT = F;
+        pub const TaskT = Task(T);
+
+        frame: F,
+        task: TaskT,
+
+        pub fn destroy(frame_ptr: *anyopaque, allocator: std.mem.Allocator) void {
+            const fp: *F = @ptrCast(@alignCast(frame_ptr));
+            const self: *Self = @fieldParentPtr("frame", fp);
+            allocator.destroy(self);
+        }
+    };
+}

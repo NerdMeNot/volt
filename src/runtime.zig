@@ -331,26 +331,9 @@ pub const Runtime = struct {
         comptime user_fn: anytype,
         args: anytype,
     ) !*Task(@typeInfo(@TypeOf(user_fn)).@"fn".return_type.?) {
-        const F = Frame(user_fn, @TypeOf(args));
-        const T = F.Result;
+        const FWT = task_mod.FrameWithTask(user_fn, @TypeOf(args));
 
-        // Frame + Task in a single allocation. `frame` MUST be the
-        // first field — voltCoroEntry reads `*(x19) = frame.run_fn`
-        // and we pass `&combined.frame` as the closure pointer; that
-        // pointer must alias `&combined`, which requires offset 0.
-        const Combined = struct {
-            frame: F,
-            task: Task(T),
-
-            fn destroy(frame_ptr: *anyopaque, alloc: std.mem.Allocator) void {
-                // frame_ptr is &combined.frame; cast to *@This().
-                const fp: *F = @ptrCast(@alignCast(frame_ptr));
-                const self_combined: *@This() = @fieldParentPtr("frame", fp);
-                alloc.destroy(self_combined);
-            }
-        };
-
-        const combined = try self.allocator.create(Combined);
+        const combined = try self.allocator.create(FWT);
         errdefer self.allocator.destroy(combined);
 
         const owning_p: ?*P = if (worker_mod.currentM()) |m_raw| blk: {
@@ -374,7 +357,7 @@ pub const Runtime = struct {
         c.* = .{
             .stack = stack,
             .frame_ptr = &combined.frame,
-            .frame_destroy = &Combined.destroy,
+            .frame_destroy = &FWT.destroy,
             // main_ctx is set by the dispatching worker; placeholder here.
             .main_ctx = undefined,
             .runtime = self,
@@ -387,7 +370,7 @@ pub const Runtime = struct {
             .coro = c,
             .result_ptr = &combined.frame.result,
             .frame_ptr = &combined.frame,
-            .frame_destroy = &Combined.destroy,
+            .frame_destroy = &FWT.destroy,
             .allocator = self.allocator,
             .done = std.atomic.Value(u32).init(task_mod.NOT_DONE),
         };
