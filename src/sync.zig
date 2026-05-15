@@ -114,76 +114,108 @@ const WaitQueue = struct {
 //
 // State machine (atomic u32):
 //   UNLOCKED  = 0   — free
-//   LOCKED    = 1   — held, no waiters
-//   CONTENDED = 2   — held, ≥1 waiter parked
+//   LOCKED    = 1   — held, no parked waiters (or unverified)
+//   CONTENDED = 2   — held, ≥1 waiter parked on `&state` in the lot
 //
 // Fast paths:
 //   lock:   CAS UNLOCKED → LOCKED. If succeeds, done.
 //   unlock: CAS LOCKED → UNLOCKED. If succeeds, done (no waiters).
 //
-// Slow paths use the internal mutex + wait queue. Direct handoff
-// preserves fairness: when unlock pops a waiter, ownership transfers
-// (state stays != UNLOCKED), so a sneaker can't beat the popped
-// waiter to the lock.
+// Slow paths use the parking lot keyed on `&state`. No pthread
+// mutex — the lot's bucket lock + validator-under-lock pattern
+// provides the wait/wake coordination we need.
+//
+// On contention the lock loop spins briefly before parking. Most
+// critical sections in practice are sub-µs; a few hundred ns of
+// spin avoids the park+unpark round-trip cost when the holder is
+// about to release. This is the same trick Go's runtime uses
+// (`sync.Mutex` spins `active_spin=4` iterations on multi-core).
+//
+// No direct handoff: unlock writes UNLOCKED and unparks one waiter;
+// the woken waiter re-CASes UNLOCKED→LOCKED. A new arrival could
+// steal between unpark and acquire, but `unparkOne` wakes exactly
+// one waiter per unlock so the herd is bounded to (1 woken + new
+// arrivals). Under steady contention this converges; under bursty
+// contention the spin loop covers the common case.
 
 pub const Mutex = struct {
     state: std.atomic.Value(u32) = std.atomic.Value(u32).init(UNLOCKED),
-    waiters: WaitQueue = .{},
-    inner: PthreadMutex,
 
     const UNLOCKED: u32 = 0;
     const LOCKED: u32 = 1;
     const CONTENDED: u32 = 2;
 
-    /// Eagerly initialize the inner pthread mutex. Required —
-    /// `Mutex{}` is rejected by the type system because `inner` has
-    /// no default. Lazy init has a race: two threads on the same
-    /// first-contention path would both call `pthread_mutex_init`.
+    /// Brief spin count on contention before parking. On Apple
+    /// Silicon a `pause`-class hint + 4 retries covers most
+    /// sub-µs critical sections (the typical case for fine-grained
+    /// counters / map updates).
+    const SPIN_LIMIT: u32 = 40;
+
     pub fn init() Mutex {
-        var m: Mutex = .{ .inner = .{} };
-        _ = pthread_mutex_init(&m.inner, null);
-        return m;
+        return .{};
     }
 
     pub fn deinit(self: *Mutex) void {
-        _ = pthread_mutex_destroy(&self.inner);
+        _ = self;
     }
 
     pub fn lock(self: *Mutex) void {
         // Fast path: UNLOCKED → LOCKED.
-        if (self.state.cmpxchgStrong(UNLOCKED, LOCKED, .acquire, .monotonic) == null) {
-            return;
+        if (self.state.cmpxchgStrong(UNLOCKED, LOCKED, .acquire, .monotonic) == null) return;
+        self.lockSlow();
+    }
+
+    fn lockSlow(self: *Mutex) void {
+        @branchHint(.cold);
+        var spin: u32 = 0;
+        // Once we've parked at least once we know the lot MAY still
+        // hold other waiters. We must therefore acquire as CONTENDED
+        // rather than LOCKED, so the next unlock goes slow-path and
+        // calls `unparkOne` to drain them. Otherwise other parked
+        // waiters would be orphaned the moment we (a non-marker
+        // owner) unlock via the fast path.
+        //
+        // Once the lot actually drains, an unparkOne misses, state
+        // settles to UNLOCKED, and fast-path acquire resumes for
+        // the next contention-free run.
+        var have_parked: bool = false;
+        while (true) {
+            const s = self.state.load(.monotonic);
+
+            if (s == UNLOCKED) {
+                const target: u32 = if (have_parked) CONTENDED else LOCKED;
+                if (self.state.cmpxchgWeak(UNLOCKED, target, .acquire, .monotonic) == null) return;
+                continue;
+            }
+
+            // Spin briefly if no one is parked yet — holder may
+            // release momentarily.
+            if (s == LOCKED and spin < SPIN_LIMIT) {
+                std.atomic.spinLoopHint();
+                spin += 1;
+                continue;
+            }
+
+            // Mark contended (if not already), then park on `&state`.
+            if (s != CONTENDED) {
+                if (self.state.cmpxchgWeak(s, CONTENDED, .monotonic, .monotonic) != null) {
+                    // CAS failed — state changed under us; loop and re-read.
+                    continue;
+                }
+            }
+            park.parkOn(&self.state, lockValidator);
+            have_parked = true;
+            spin = 0;
         }
-        const me = current.require();
-        // Slow path: take inner mutex, re-check state, mark contended.
-        _ = pthread_mutex_lock(&self.inner);
-        // Try fast path again — releaser may have raced between
-        // our first CAS and the inner-mutex acquire. Unlock's fast
-        // path does NOT take inner, so the race is real and we
-        // must re-check before parking.
-        if (self.state.cmpxchgStrong(UNLOCKED, LOCKED, .acquire, .monotonic) == null) {
-            _ = pthread_mutex_unlock(&self.inner);
-            return;
-        }
-        // Mark contended so unlock knows there's a waiter.
-        // CRITICAL: check the swap's return value — unlock's fast
-        // path may have set state to UNLOCKED between our re-try
-        // CAS above and this swap. If we see UNLOCKED, we've just
-        // acquired ownership (we wrote CONTENDED, but the queue is
-        // empty, so demote to LOCKED for the next unlock's fast
-        // path). Without this check, we'd push ourselves to a
-        // queue no one is going to pop and park forever.
-        const prev = self.state.swap(CONTENDED, .acq_rel);
-        if (prev == UNLOCKED) {
-            self.state.store(LOCKED, .release);
-            _ = pthread_mutex_unlock(&self.inner);
-            return;
-        }
-        self.waiters.push(me);
-        _ = pthread_mutex_unlock(&self.inner);
-        runtime.park();
-        // On wake: ownership has been directly handed to us by
-        // unlock's slow path.
+    }
+
+    /// Validator under bucket lock: stay parked only if state is
+    /// still CONTENDED. If unlock dropped it to UNLOCKED in between
+    /// our CAS and the parking lot's check, we exit park cleanly
+    /// instead of waiting for an unpark that already missed us.
+    fn lockValidator(addr: *const anyopaque) bool {
+        const sp: *const std.atomic.Value(u32) = @ptrCast(@alignCast(addr));
+        return sp.load(.acquire) == CONTENDED;
     }
 
     /// Non-blocking. Returns true if acquired.
@@ -192,28 +224,19 @@ pub const Mutex = struct {
     }
 
     pub fn unlock(self: *Mutex) void {
-        // Fast path: LOCKED → UNLOCKED. If no waiters, done.
-        if (self.state.cmpxchgStrong(LOCKED, UNLOCKED, .release, .monotonic) == null) {
-            return;
-        }
-        // Slow path: state is CONTENDED.
-        _ = pthread_mutex_lock(&self.inner);
-        const w = self.waiters.pop();
-        if (w == null) {
-            // Race: contended bit was set but waiter already popped
-            // (or never made it to queue). Drop to UNLOCKED.
-            self.state.store(UNLOCKED, .release);
-            _ = pthread_mutex_unlock(&self.inner);
-            return;
-        }
-        // Direct handoff: state stays != UNLOCKED. New owner is `w`.
-        // If queue is now empty, demote CONTENDED → LOCKED to enable
-        // unlock's fast path on the next release.
-        if (self.waiters.isEmpty()) {
-            self.state.store(LOCKED, .release);
-        }
-        _ = pthread_mutex_unlock(&self.inner);
-        runtime.unpark(w.?);
+        // Fast path: LOCKED → UNLOCKED, no parked waiters.
+        if (self.state.cmpxchgStrong(LOCKED, UNLOCKED, .release, .monotonic) == null) return;
+        self.unlockSlow();
+    }
+
+    fn unlockSlow(self: *Mutex) void {
+        @branchHint(.cold);
+        // state was CONTENDED. Drop to UNLOCKED first; then wake one.
+        // Future arrivals that observe UNLOCKED can fast-path-CAS
+        // for the lock. The woken waiter will re-CAS on wakeup.
+        self.state.store(UNLOCKED, .release);
+        const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+        _ = park.unparkOne(rt, &self.state);
     }
 };
 
