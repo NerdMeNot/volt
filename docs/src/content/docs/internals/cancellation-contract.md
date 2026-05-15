@@ -3,6 +3,17 @@ title: Cancellation contract
 description: The state machine that connects coroutine cancellation, the Park primitive, and reactor I/O — what every implementation MUST guarantee.
 ---
 
+:::caution
+**Stale (pre-v2 flattening).** Cancellation as a first-class
+feature (Coroutine.cancel, current_park, error.Cancelled
+propagation) is **not implemented** in the current build. This
+doc describes a contract the v0.x tree implemented; the design
+intent is still valid for re-landing, but the specifics (Park
+primitive, EventSource layer) no longer map to the current
+parking-lot + per-primitive design. Treat as historical /
+aspirational until re-validated.
+:::
+
 This page is the formal model of how cancellation interacts with parking and the reactor. Every Park-based primitive in Volt (Channel, Mutex, Sleep, Notify, etc.) and every reactor-backed wait (`waitReadable`, `waitWritable`) sits on top of this contract.
 
 Volt's substrate ambition forces correctness here: a runtime that intermittently leaks parked coroutines or wedges on shutdown can't be the foundation other libraries build on. This doc enumerates the state machine, the invariants every implementation must hold, and the proof obligations that make the implementation correct.

@@ -3,6 +3,16 @@ title: v1 plan — the best stackful coroutine runtime in Zig
 description: Pre-ship plan to incorporate per-worker arenas, structured concurrency, io_uring-default, deadlock detection, and Go-class spawn cost into v1.0.0-zig0.16.0 before tagging.
 ---
 
+:::caution
+**Historical (pre-v2 flattening).** This plan was written against
+the v0.x src tree (`src/api/`, `src/coroutine/`, `src/scheduler/`,
+`src/sync/`) which no longer exists. Many of the items here were
+implemented, some were retired, some are still open. The current
+state of the tree is documented in `architecture.md` and the
+multi-worker / direct-handoff docs. Kept for historical context;
+do not use as a roadmap.
+:::
+
 Volt's v1 hasn't shipped. This plan replaces the prior "ship the safe v1, defer the rest to v1.x" framing — we have one shot at the v1 mental model and we should make it the right one.
 
 The bar: **the best stackful coroutine runtime in Zig**, with all the Zig advantages (no GC, explicit allocators, comptime specialization) and Go-class performance on the spawn / context-switch / channel hot paths.

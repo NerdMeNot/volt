@@ -3,6 +3,14 @@ title: v1.x backlog
 description: Items deferred from v1 ship with reproductions, hypotheses, and ownership notes.
 ---
 
+:::caution
+**Historical (pre-v2 flattening).** Refers to the v0.x src tree
+(`src/coroutine/stack_overflow_windows.zig` etc.) which no longer
+exists. Some items were closed; some are still open against the v2
+tree under different file paths. Cross-check against current tasks
+before acting.
+:::
+
 Volt v1 ships with two known-but-deferred items. Each is documented here so future investigation has a starting point — reproduction, hypothesis, partial work landed, and what's blocking full resolution.
 
 The v1 ship gates are:
