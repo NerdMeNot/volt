@@ -103,7 +103,7 @@ The honest case for using Volt today: you want a stackful coroutine substrate fo
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .volt = .{
-            .url = "https://github.com/NerdMeNot/volt/archive/refs/heads/architecture-v2.tar.gz",
+            .url = "https://github.com/NerdMeNot/volt/archive/refs/heads/main.tar.gz",
             // .hash = ... (run `zig build` to get the correct hash)
         },
     },
