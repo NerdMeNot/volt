@@ -9,24 +9,25 @@ on:
 env:
   ZIG_VERSION: "0.16.0"
 
-# ─────────────────────────────────────────────────────────────────────────
-# CI structure
-# ─────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+# CI structure (v2 — Darwin arm64 only for runtime)
 #
-# 1. format       — `zig fmt --check`. Trivial gate, runs first.
-# 2. cross-compile — every (target, backend) parses + type-checks.
-# 3. test         — full unit + integration suite, native, on every (os,
-#                   backend) we ship: Darwin/kqueue x86+arm, Linux/epoll
-#                   x86+arm, Linux/iouring x86+arm. (Windows/IOCP is
-#                   cross-compile-only until W1–W8 land the native arms.)
-# 4. stress-pr    — `scripts/stress_test.sh` at N=50 on each first-tier
-#                   (os, backend) — Linux/epoll, Linux/iouring,
-#                   Darwin/kqueue. Catches schedule-sensitive flakes that
-#                   pass under one seed but fail under another.
-# 5. ci-success   — single boolean gate; required check on PRs.
+# Volt currently runs only on Darwin arm64 (kqueue reactor, AAPCS64
+# context switch). Other targets are cross-compile-only — they parse
+# and type-check but don't link, since kqueue symbols aren't available.
+# Linux (epoll/io_uring) and Windows (IOCP) backends are planned but
+# not implemented in v2.
 #
-# `allow_failure: true` is GONE — iouring is now a real ship-blocker.
-# ─────────────────────────────────────────────────────────────────────────
+# Jobs:
+# 1. format        — zig fmt --check on src/ + bench/ + build.zig
+# 2. cross-compile — every target parses + type-checks (catches
+#                    accidental Darwin-isms in portable code)
+# 3. test          — full unit test suite, native, Darwin arm64
+# 4. bench-smoke   — one bench builds + runs, Darwin arm64. Cheap
+#                    early signal that the runtime survives a
+#                    real workload — not a perf gate.
+# 5. ci-success    — single boolean gate
+# ─────────────────────────────────────────────────────────────────────
 
 jobs:
   format:
@@ -34,12 +35,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - name: Check formatting
-        run: zig fmt --check src/ bench/ examples/
+      - run: zig fmt --check src/ bench/ build.zig
 
   cross-compile:
     name: Cross-compile (${{ matrix.target }})
@@ -49,136 +48,57 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - x86_64-linux-gnu
-          - aarch64-linux-gnu
-          - x86_64-windows-gnu
-          - aarch64-windows-gnu
-          - x86_64-macos
           - aarch64-macos
+          - x86_64-macos
+          - aarch64-linux-gnu
+          - x86_64-linux-gnu
+          - aarch64-windows-gnu
+          - x86_64-windows-gnu
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - name: Cross-compile build-lib
-        run: zig build-lib src/lib.zig -target ${{ matrix.target }} -lc -fno-emit-bin
+      - run: zig build-lib src/lib.zig -target ${{ matrix.target }} -lc -fno-emit-bin
 
   test:
-    name: Test (${{ matrix.name }})
+    name: Test (macos-arm64-kqueue)
     needs: format
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux x86_64 — epoll + io_uring side-by-side.
-          - { os: ubuntu-latest,    name: linux-x86_64-epoll,   build_args: "" }
-          - { os: ubuntu-latest,    name: linux-x86_64-iouring, build_args: "-Dreactor=iouring" }
-          # Linux ARM64.
-          - { os: ubuntu-22.04-arm, name: linux-arm64-epoll,    build_args: "" }
-          - { os: ubuntu-22.04-arm, name: linux-arm64-iouring,  build_args: "-Dreactor=iouring" }
-          # Darwin (kqueue is the only backend).
-          # Apple Silicon is the v1 target; Intel macOS is cross-compile
-          # validated only. The Darwin x86_64 native run hit a SEGV in
-          # every spawn-using test (likely a SysV-on-Mach-O linker /
-          # sigaltstack interaction). Cross-compile catches signature
-          # drift; runtime support for Intel macs is deferred to v1.x.
-          - { os: macos-latest,     name: macos-arm64-kqueue,   build_args: "" }
-          # Windows IOCP — uncomment once W1–W8 land the native syscall arms.
-          # - { os: windows-latest, name: windows-x86_64-iocp,  build_args: "" }
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-      - name: System info
-        shell: bash
-        run: |
-          uname -a
-          if [[ "${{ runner.os }}" == "Linux" ]]; then
-            echo "Kernel: $(uname -r)"
-            grep -E '(io_uring|epoll)' /proc/kallsyms 2>/dev/null | head -3 || true
-          fi
-      - name: Unit + integration tests
-        run: zig build test ${{ matrix.build_args }}
-
-  # Bench gate — runs the core benchmarks (zig build bench) and fails
-  # the PR if any metric exceeds its ceiling. Catches perf regressions
-  # before they land. Thresholds defined in scripts/bench_gate.sh.
-  bench-gate:
-    name: Bench gate (${{ matrix.name }})
-    needs: format
+    runs-on: macos-latest
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-latest, name: linux-x86_64-epoll }
-          - { os: macos-latest,  name: macos-arm64-kqueue }
-    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - name: Bench gate
-        run: scripts/bench_gate.sh
+      - run: zig build test
 
-  # Stress gate — runs the full suite under random seeds, with a per-
-  # iteration timeout. N=50 is the PR-tier budget; nightly runs N=500.
-  # Catches:
-  #   - schedule-sensitive flakes (different seed → different worker
-  #     dispatch order → exposes dormant races)
-  #   - lost-wake bugs (each iteration drives the runtime through full
-  #     init + teardown; the quiescence ack panics if shutdown wedges)
-  stress-pr:
-    name: Stress N=50 (${{ matrix.name }})
+  bench-smoke:
+    name: Bench smoke (macos-arm64-kqueue)
     needs: format
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-latest, name: linux-x86_64-epoll,   build_args: "" }
-          - { os: ubuntu-latest, name: linux-x86_64-iouring, build_args: "-Dreactor=iouring" }
-          - { os: macos-latest,  name: macos-arm64-kqueue,   build_args: "" }
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - name: Stress run (N=50)
-        shell: bash
-        run: N=50 TIMEOUT_SECS=120 scripts/stress_test.sh ${{ matrix.build_args }}
-      - name: Upload failed-iteration logs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: stress-logs-${{ matrix.name }}
-          path: tmp/stress/
-          if-no-files-found: ignore
-          retention-days: 14
+      - run: zig build bench-yield bench-spsc bench-rss -Doptimize=ReleaseFast
 
   ci-success:
     name: CI Success
-    needs: [test, cross-compile, stress-pr, bench-gate]
+    needs: [format, cross-compile, test, bench-smoke]
     runs-on: ubuntu-latest
     if: always()
     steps:
       - run: |
           fail=0
-          for r in test cross-compile stress-pr bench-gate; do
+          for r in format cross-compile test bench-smoke; do
             case "$r" in
-              test)          got="${{ needs.test.result }}" ;;
+              format)        got="${{ needs.format.result }}" ;;
               cross-compile) got="${{ needs.cross-compile.result }}" ;;
-              stress-pr)     got="${{ needs.stress-pr.result }}" ;;
-              bench-gate)    got="${{ needs.bench-gate.result }}" ;;
+              test)          got="${{ needs.test.result }}" ;;
+              bench-smoke)   got="${{ needs.bench-smoke.result }}" ;;
             esac
             if [[ "$got" != "success" ]]; then
               echo "::error::$r → $got"
