@@ -69,6 +69,7 @@ Numbers measured on the same Darwin arm64 hardware, ReleaseFast vs `go build`. S
 | Workload | Volt | Go | Volt/Go |
 |---|---|---|---|
 | yield (one-way ctx switch) | **9 ns** | 42 ns | **0.21× — 4.7× faster** |
+| Mutex contended (8 coros × 50k acquires) | **14 ns** | 81 ns | **0.17× — 5.8× faster** |
 | Spsc send+recv (cap=16) | **12 ns** | 33 ns | **0.36× — 2.8× faster** |
 | TCP echo (64 clients × 16 RTT × 1 KB) | **~7,000 ns** | 9,050 ns | **0.77× — 1.3× faster** |
 | spawn+wait_all workers=1 | **106 ns** | 137 ns | **0.77× — 1.3× faster** |
@@ -89,7 +90,7 @@ Numbers measured on the same Darwin arm64 hardware, ReleaseFast vs `go build`. S
 | Windows | Not yet — IOCP backend planned |
 | Cancellation | Not implemented — earlier design retired, re-landing planned |
 | File I/O / DNS / TLS | Not yet — these belong in libraries on top of Volt, not in core |
-| Mutex throughput | Real but slow — 8× behind Go on contended micro-bench; redesign planned |
+| Mutex throughput | Parking-lot + spin loop redesign on 2026-05-16 — contended-Mutex bench now 14 ns/op, ~5.8× faster than Go's 81 ns |
 
 The honest case for using Volt today: you want a stackful coroutine substrate for Zig on Darwin arm64, you want the synchronous-shape ergonomics, you can live with the multi-worker spawn-heavy gap to Go, and you can wait for the Linux/Windows backends.
 

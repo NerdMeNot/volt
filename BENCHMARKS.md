@@ -6,7 +6,7 @@
 > overlap). Both are receipts, not bragging rights.
 
 All numbers: **Darwin arm64, 11 cores, ReleaseFast, smp_allocator.**
-Date: 2026-05-15. Go reference: 1.26.0 on the same hardware.
+Date: 2026-05-16. Go reference: 1.26.0 on the same hardware.
 
 Reproduce with `zig build bench-<name>` (Volt) or
 `go build bench/go/<name>.go && ./<name>` (Go).
@@ -25,15 +25,18 @@ How much resident memory does a parked coroutine cost?
 
 | N idle coros | Peak RSS | per-coro |
 |---|---|---|
-| 100 | 3,392 KiB | 33.9 KiB |
-| 1,000 | 18,112 KiB | 18.1 KiB |
-| 5,000 | 83,552 KiB | 16.7 KiB |
-| 10,000 | 165,248 KiB | **16.5 KiB** |
+| 100 | 3,376 KiB | 33.8 KiB |
+| 1,000 | 18,160 KiB | 18.2 KiB |
+| 5,000 | 83,728 KiB | 16.7 KiB |
+| 10,000 | 165,792 KiB | **16.6 KiB** |
 
-The steady-state figure (16.5 KiB per idle coro at N=10k) is
-dominated by the 16 KiB stack. Phase 4 (mmap-grow stacks, not yet
-re-landed) targets ~4 KiB per idle coro on Linux. On Darwin the
-16 KiB page size is the floor regardless.
+The steady-state figure (16.6 KiB per idle coro at N=10k) is the
+top-of-stack body region. Stacks reserve 256 KiB of virtual address
+space per coro but commit only the top page initially (16 KiB on
+Darwin, 4 KiB on Linux); the growable region below is PROT_NONE
+and contributes zero RSS until SIGSEGV grows it on demand. The
+bottom page is the true guard — overflow into it aborts cleanly
+instead of corrupting the heap.
 
 ### Real-work multi-worker scaling (`bench-parallel-compute`)
 
@@ -54,10 +57,12 @@ coordination cost.
 3 phases × 15 s each: spawn-join, Mutex contention, Spsc channel
 ping-pong, all under multi-worker load with a watchdog.
 
-| Result | 134-141 M total ops over 45 s |
+| Result | **~840 M total ops over 45 s** |
 
 Used as a pre-merge gate — must pass before any scheduler change
-lands.
+lands. The Mutex redesign on the parking lot (2026-05-16) brought
+phase 2 from ~600 ns/op to ~14 ns/op, lifting total throughput
+~6× over the prior ~140 M baseline.
 
 ### Fan-out scaling (`bench-fanout-scaling`)
 
@@ -145,9 +150,15 @@ calls per batch, that overhead dominates. The canonical bench
 
 8 coros × 50,000 acquires, NumCPU workers.
 
-| Mutex contended | Volt 644 ns | Go 81 ns | **8× behind** |
+| Workload | Volt | Go | Volt/Go |
+|---|---|---|---|
+| Mutex contended | **14 ns** | 81 ns | **0.17× — 5.8× faster** |
 
-Open work — needs adaptive spin + batched wake design.
+The rewrite (2026-05-16) replaced the pthread-mutex-backed
+WaitQueue with a parking-lot state machine + brief spin loop.
+Short critical sections (counter increments, hashmap reads) almost
+always release within the spin window, avoiding the park+unpark
+round trip. Pre-rewrite this bench was 8× behind Go.
 
 ---
 
