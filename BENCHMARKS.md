@@ -94,7 +94,7 @@ Same hardware, same bench shape, both runtimes' idiomatic patterns.
 
 ### Spawn + wait shapes (same bench, both sides)
 
-`bench-spawn-hot-waitall` (Volt, Notify barrier per batch) and
+`bench-spawn-hot` (Volt, Notify barrier per batch) and
 `spawn_hot.go` (Go, `wg.Wait` per batch). One driver, BATCH=1000,
 10 s sustained.
 
@@ -126,20 +126,20 @@ loops for 4 s.
 This is the workload work-stealing schedulers are *built* for, and
 we're at parity with Go across the curve.
 
-### Spawn-hot with 1000 individual joins (`bench-spawn-hot`)
+### Spawn-hot with 1000 individual joins (`bench-spawn-hot-individual`)
 
-This is a **Volt-specific cost** — calling `task.join` N times per
-batch is not what Go users write; they use `wg.Wait`. Tracked
-separately because some Volt API patterns may do this.
+A **Volt-specific cost** — calling `task.join` N times per batch is
+not what Go users write; they use `wg.Wait`. Tracked separately
+because some Volt API patterns may do this.
 
 | Workers | ns/op |
 |---|---|
 | 1 | ~100 |
 | 11 | ~1,700 |
 
-Each `task.join` does a frame_destroy + task cleanup. With 1000
-calls per batch, that overhead dominates. The matched bench
-(`bench-spawn-hot-waitall`) is the fair comparison vs Go.
+Each `task.join` does a frame_destroy + Combined cleanup. With 1000
+calls per batch, that overhead dominates. The canonical bench
+(`bench-spawn-hot` above) is the fair comparison vs Go.
 
 ### Mutex contended
 

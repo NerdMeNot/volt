@@ -103,8 +103,8 @@ regressions.
 - `zig build bench-yield`
 - `zig build bench-spsc`
 - `zig build bench-mutex`
-- `zig build bench-spawn-hot` — 1000 individual `task.join` per batch (Volt-specific cost)
-- `zig build bench-spawn-hot-waitall` — single Notify barrier per batch (matches Go's `wg.Wait`)
+- `zig build bench-spawn-hot` — canonical: single Notify barrier per batch (matches Go's `wg.Wait`)
+- `zig build bench-spawn-hot-individual` — Volt-specific: 1000 individual `task.join` per batch
 - `zig build bench-spawn-join`
 - `zig build bench-fanout-scaling` — N drivers × N workers, real parallel work
 - `zig build bench-scaling` — single-driver curve (false-parallelism receipt)
@@ -126,7 +126,7 @@ All benchmark claims are made against:
    number in the same table.
 2. A **matched bench shape**. Volt's `bench-spawn-hot` and Go's
    `wg.Wait` benchmark are *not* the same shape — the matched
-   version is `bench-spawn-hot-waitall`. If we publish a comparison,
+   version is `bench-spawn-hot (Notify barrier shape — was `bench-spawn-hot-waitall` pre-rename)`. If we publish a comparison,
    it uses matched shapes.
 3. **5-run medians**, not single runs, for any spawn-heavy bench.
    Run-to-run variance can be 30-50 %.

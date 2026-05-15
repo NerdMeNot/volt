@@ -13,9 +13,10 @@ the rest was real wins from three specific changes.
 
 ## The starting picture
 
-Volt's `bench-spawn-hot` (one driver spawns 1000 trivial coros, then
-joins all 1000 individually, repeat for 10 s) showed dramatic
-multi-worker degradation:
+Volt's then-named `bench-spawn-hot` (one driver spawns 1000 trivial
+coros, then joins all 1000 individually, repeat for 10 s — this
+bench has since been renamed to `bench-spawn-hot-individual`) showed
+dramatic multi-worker degradation:
 
 | Workers | ns/op | vs w=1 |
 |---|---|---|
@@ -90,7 +91,7 @@ Ratio w=11/w=1 dropped from 2.73× to 1.82×.
 dispatch loop iter. Hypothesis: they're sharing a cache line, causing
 ping-pong. Padded both to dedicated 128-byte aligned cache lines.
 
-**Receipt**: spawn-hot-waitall median at w=11 moved from 631 → 597 ns
+**Receipt**: `bench-spawn-hot` (waitall shape) median at w=11 moved from 631 → 597 ns
 (within noise across 8-run samples). Tail-latency reduction wasn't
 reproducible across more runs. **Reverted.**
 
@@ -132,29 +133,30 @@ harm.
 | `bench-tcp-echo` | 7,282 ns | **6,940 ns** | +4.7 % |
 | `bench-fanout-scaling` ratio @ w=11 | 1.82× | **1.58×** | **−13 %** |
 | `bench-parallel-compute` @ 8 | 6.44× | 6.62× | +2.8 % |
-| `bench-spawn-hot` @ w=11 (1000 joins) | 1,861 | 1,874 (noise) | — |
+| `bench-spawn-hot-individual` @ w=11 | 1,861 | 1,874 (noise) | — |
 | `bench-scaling` ratio | 50× | 49× | — |
 
 Direct handoff fires when the joinee is in the joiner's lifo slot —
 that's true for spawn-then-immediately-join, the mutex bench's last
 worker, TCP echo workers, and fanout drivers. It does NOT fire for
-`bench-spawn-hot`'s shape (spawn 1000 then join 1000): by join-time,
-only the LAST task is in lifo; the rest are in local queue. Extending
-handoff to local queue requires a "pop specific item" WSQ operation
-not natively supported. Known limitation.
+`bench-spawn-hot-individual`'s shape (spawn 1000 then join 1000): by
+join-time, only the LAST task is in lifo; the rest are in local
+queue. Extending handoff to local queue requires a "pop specific
+item" WSQ operation not natively supported. Known limitation.
 
 ### 4. Combined `Frame` + `Task` into one allocation
 
-A bench-artifact comparison showed the real story. `bench-spawn-hot`
-does 1000 individual `task.join()` calls per batch; Go's bench does
+A bench-artifact comparison showed the real story. The original
+`bench-spawn-hot` (now renamed `bench-spawn-hot-individual`) did
+1000 individual `task.join()` calls per batch; Go's bench does
 one `wg.Wait()`. Each `task.join` cleanup pays a frame_destroy +
 task destroy. **Not apples-to-apples.**
 
-Built `bench-spawn-hot-waitall` — same workload but with an atomic
-counter + Notify barrier (one wait per batch, fast-path cleanup
-joins after). Matched-shape numbers at w=11: **559 ns vs the
-original 1700+ ns** — most of the "10× behind Go" was the
-benchmark shape, not the scheduler.
+Built a matched bench (now `bench-spawn-hot`) — same workload but
+with an atomic counter + Notify barrier (one wait per batch,
+fast-path cleanup joins after). Matched-shape numbers at w=11:
+**559 ns vs the original 1700+ ns** — most of the "10× behind Go"
+was the benchmark shape, not the scheduler.
 
 Of the remaining gap, allocation count was the obvious target:
 Volt's spawn does 4 allocations (Frame + Coroutine + Stack + Task)
@@ -182,7 +184,7 @@ Frame stays at offset 0 (the trampoline reads `*x19 = run_fn`).
 `Task.join` no longer calls `allocator.destroy(self)` separately —
 `self` lives inside the Combined; `frame_destroy` frees both.
 
-**Receipts on `bench-spawn-hot-waitall`** (5-run medians):
+**Receipts on `bench-spawn-hot`** (5-run medians):
 
 | W | Pre-combined | Post-combined | Δ |
 |---|---|---|---|
@@ -210,7 +212,7 @@ Plus +6 % on mutex, +5 % on fanout-scaling.
 
 ## Final side-by-side vs Go 1.26.0
 
-`bench-spawn-hot-waitall` (Volt, Notify barrier per batch) vs
+`bench-spawn-hot` (Volt, Notify barrier per batch) vs
 `spawn_hot.go` (Go, `wg.Wait` per batch). Same hardware,
 darwin/arm64, ReleaseFast / `go build`:
 

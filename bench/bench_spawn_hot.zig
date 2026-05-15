@@ -1,21 +1,19 @@
-//! Bench — long-running spawn+join hot loop for sampling profilers.
+//! Bench — spawn-hot (canonical / Go-shaped: single wait per batch).
 //!
-//! Runs `spawn+join` in batches for ~10 s wall-clock so a sampling
-//! profiler (samply / Instruments) gets enough data points to
-//! produce a useful flamegraph. The existing `bench_spawn_join.zig`
-//! runs in milliseconds — too short for sampling.
+//! The driver spawns BATCH=1000 coros, waits via an atomic-counter +
+//! Notify barrier (one wait per batch — matches Go's `wg.Wait`), then
+//! does fast-path joins to free Task structs. Loops for `DURATION_S`.
 //!
-//! Edit `WORKERS` / `DURATION_S` constants below to change worker
-//! count and runtime.
+//! Reports ns/op = wall_time / (batches × BATCH). This is the
+//! apples-to-apples comparison vs `bench/go/spawn_hot.go`.
 //!
-//! A watchdog OS thread fires if no batch completes for 2 s — it
-//! dumps Runtime scheduler state and exits, so hangs are loud.
-//!
-//! Usage:
-//!   samply record ./zig-out/bin/volt-bench-spawn-hot
+//! For the Volt-specific "1000 individual joins" pattern (with its
+//! per-task cleanup cost), see `bench-spawn-hot-individual`.
 
 const std = @import("std");
 const volt = @import("volt");
+
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 fn nanosNow() i128 {
     var ts: std.posix.timespec = undefined;
@@ -23,76 +21,58 @@ fn nanosNow() i128 {
     return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
 }
 
-fn nopFn() void {}
+const Bar = struct {
+    remaining: std.atomic.Value(u32),
+    note: *volt.Notify,
+};
+
+fn workerCoro(bar: *Bar) void {
+    if (bar.remaining.fetchSub(1, .acq_rel) == 1) {
+        bar.note.notifyOne();
+    }
+}
 
 const Ctx = struct {
     batch: u32,
     target_ns: i128,
     total_ops: u64 = 0,
     elapsed_ns: i128 = 0,
-    progress: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// Set after the timed loop ends so the watchdog can exit
-    /// cleanly instead of firing on a quiescent shutdown.
-    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
-
-extern "c" fn nanosleep(req: *const std.posix.timespec, rem: ?*std.posix.timespec) c_int;
-
-/// Watchdog — wakes every second, checks `progress` counter. If
-/// the counter hasn't moved for two ticks, dumps scheduler state
-/// and exits.
-fn watchdog(ctx: *Ctx, rt: *volt.Runtime) void {
-    var last_progress: u64 = 0;
-    var stale_secs: u32 = 0;
-    while (true) {
-        const ts = std.posix.timespec{ .sec = 1, .nsec = 0 };
-        _ = nanosleep(&ts, null);
-        if (ctx.done.load(.acquire)) return;
-        const cur = ctx.progress.load(.acquire);
-        if (cur == last_progress) {
-            stale_secs += 1;
-            if (stale_secs >= 2) {
-                std.debug.print("\n!!! WATCHDOG: no progress for {d}s (last batch count = {d}) !!!\n", .{ stale_secs, cur });
-                rt.dumpState();
-                std.process.exit(2);
-            }
-        } else {
-            stale_secs = 0;
-            last_progress = cur;
-        }
-    }
-}
 
 fn benchRoot(ctx: *Ctx) !void {
     const rt: *volt.Runtime = @ptrCast(@alignCast(volt.current.require().runtime));
     const tasks = try rt.allocator.alloc(*volt.Task(void), ctx.batch);
     defer rt.allocator.free(tasks);
 
-    // Warmup — a few batches before timing starts.
+    var note = volt.Notify.init();
+    defer note.deinit();
+
+    // Warmup — three batches.
     var w: u32 = 0;
     while (w < 3) : (w += 1) {
-        for (tasks) |*t| t.* = try rt.spawn(nopFn, .{});
+        var bar = Bar{ .remaining = std.atomic.Value(u32).init(ctx.batch), .note = &note };
+        for (tasks) |*t| t.* = try rt.spawn(workerCoro, .{&bar});
+        while (bar.remaining.load(.acquire) > 0) note.wait();
         for (tasks) |t| t.join();
     }
 
     var total_ops: u64 = 0;
     const start = nanosNow();
     while (true) {
-        for (tasks) |*t| t.* = try rt.spawn(nopFn, .{});
+        var bar = Bar{ .remaining = std.atomic.Value(u32).init(ctx.batch), .note = &note };
+        for (tasks) |*t| t.* = try rt.spawn(workerCoro, .{&bar});
+        // ONE wait — driver parks at most once per batch, woken by the
+        // last worker's notifyOne. Matches Go's wg.Wait.
+        while (bar.remaining.load(.acquire) > 0) note.wait();
+        // Cleanup joins — fast-path because remaining == 0 implies all
+        // done flags are set.
         for (tasks) |t| t.join();
         total_ops += ctx.batch;
-        _ = ctx.progress.fetchAdd(1, .release);
         if (nanosNow() - start >= ctx.target_ns) break;
     }
     ctx.elapsed_ns = nanosNow() - start;
     ctx.total_ops = total_ops;
-    ctx.done.store(true, .release);
 }
-
-const DURATION_S: u32 = 10;
-const BATCH: u32 = 1000;
-
-extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 fn parseWorkersEnv() ?usize {
     const raw = getenv("VOLT_BENCH_WORKERS") orelse return null;
@@ -100,10 +80,12 @@ fn parseWorkersEnv() ?usize {
     return std.fmt.parseInt(usize, slice, 10) catch null;
 }
 
+const DURATION_S: u32 = 10;
+const BATCH: u32 = 1000;
+
 pub fn main() !void {
     const allocator = std.heap.smp_allocator;
-    const workers: ?usize = parseWorkersEnv(); // null = std.Thread.getCpuCount()
-
+    const workers: ?usize = parseWorkersEnv();
     var ctx = Ctx{
         .batch = BATCH,
         .target_ns = @as(i128, DURATION_S) * std.time.ns_per_s,
@@ -112,11 +94,8 @@ pub fn main() !void {
     var rt = try volt.Runtime.init(.{ .allocator = allocator, .workers = workers });
     defer rt.deinit();
 
-    std.debug.print("=== spawn+join hot loop ===\n", .{});
-    std.debug.print("workers={?d} (null = NumCPU), batch={d}, duration={d}s\n", .{ workers, BATCH, DURATION_S });
-
-    const wd = try std.Thread.spawn(.{}, watchdog, .{ &ctx, rt });
-    wd.detach();
+    std.debug.print("=== spawn-hot (Notify barrier, Go wg.Wait shape) ===\n", .{});
+    std.debug.print("workers={?d} (null=NumCPU), batch={d}, duration={d}s\n", .{ workers, BATCH, DURATION_S });
 
     try (try rt.run(benchRoot, .{&ctx}));
 
