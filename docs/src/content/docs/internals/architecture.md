@@ -6,11 +6,12 @@ description: How Volt fits together — Runtime, Worker, Reactor, Coroutine, Par
 :::caution
 **Partially stale (2026-05-15).** Path references and some
 implementation details (cancellation, EventSource, 8 MiB stacks)
-predate the v2 flattening + parking-lot migration. The high-level
-shape (Runtime owns workers, work-stealing, reactor, suspend/resume
-via context switch) is still correct. Authoritative source for
-specifics: read the actual `src/*.zig` files. Path map below
-reflects the current tree; conceptual details flagged inline.
+predate the flattening + parking-lot migration that produced the
+current tree. The high-level shape (Runtime owns workers,
+work-stealing, reactor, suspend/resume via context switch) is still
+correct. Authoritative source for specifics: read the actual
+`src/*.zig` files. Path map below reflects the current tree;
+conceptual details flagged inline.
 :::
 
 This is the system map. If you're trying to understand a stack
@@ -154,10 +155,10 @@ from right after the suspension call.
 
 ## Cancellation propagation
 
-Not implemented in the current build. The v0.x tree had a
-`Coroutine.cancel` + `current_park` design (see
-`cancellation-contract.md`); that was retired with the v2 flattening
-and not yet re-built. Re-landing it is on the roadmap but unscoped.
+Not implemented in the current build. The pre-stackful tree had a
+`Coroutine.cancel` + `current_park` design; that was retired with the
+flattening and not yet re-built. Re-landing it is on the roadmap but
+unscoped.
 
 ## I/O wake path
 

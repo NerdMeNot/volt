@@ -1,9 +1,7 @@
 //! Volt build.
 //!
 //! Exposes the `volt` module, plus `zig build test`, `zig build docs`,
-//! per-bench targets, and POC-spike targets. The pre-stackful tree
-//! has been retired; v2 (POC-validated, multi-worker stackful) is now
-//! `src/`.
+//! per-bench targets, and POC-spike targets.
 
 const std = @import("std");
 

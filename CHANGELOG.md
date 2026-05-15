@@ -2,17 +2,15 @@
 
 All notable changes to Volt are documented here.
 
-## Unreleased — v2 architecture
+## Unreleased
 
-Volt was rewritten on a stackful coroutine substrate after the v1
-Future/Poll machine and the v1 stackful follow-on both proved
-architecturally limited. The v2 tree replaces both. The decision and
-the POC numbers that drove it are recorded in `spike/SYNTHESIS.md`;
+Volt was rewritten on a stackful coroutine substrate after the
+Future/Poll machine and an earlier stackful follow-on both proved
+architecturally limited. `src/` is the current tree; earlier trees
+are preserved only via git tags (`pre-stackful-pivot`,
+`v1.0.0-zig0.15.2`, `v1.1.0-zig0.15.2`). The decision and the POC
+numbers that drove the rewrite are recorded in `spike/SYNTHESIS.md`;
 the per-area design docs are under `docs/internals/`.
-
-There is **no separate "v2" namespace in the codebase** — the v2 tree
-is `src/`. Earlier trees are preserved only via git tags:
-`pre-stackful-pivot`, `v1.0.0-zig0.15.2`, `v1.1.0-zig0.15.2`.
 
 ### Added
 
@@ -68,18 +66,18 @@ and `docs/internals/multi-worker-profile.md`.
 
 ### Removed
 
-The v1 Future/Poll runtime in its entirety. Specifically:
+The Future/Poll runtime in its entirety. Specifically:
 
 - `Future`, `Poll`, manual state machines.
 - Linux backends (epoll, io_uring) and Windows (IOCP) — to be
-  re-landed on the v2 substrate in libraries, not core.
+  re-landed on the stackful substrate in libraries, not core.
 - File I/O (`File`, `AsyncFile`, `MappedFile`), DNS, UDP,
   Unix sockets, processes (`Command`, `Child`), signals, buffered
   readers/writers, timers (`sleep`/`interval`/`timeout`/`deadline`).
 - Combinators (`joinAll`, `tryJoinAll`, `race`, `select`),
   cancellation, broadcast/watch/oneshot/MPMC channels.
-- The `scheduler-rewrite` ship work (race-correctness R/L/W/S
-  workstreams, cancellation contract) — superseded by the pivot.
+- The earlier race-correctness + cancellation-contract ship work —
+  superseded by the rewrite.
 
 These belong in libraries on top of Volt, not the core runtime. The
 core stays small.

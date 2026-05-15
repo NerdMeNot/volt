@@ -8,10 +8,9 @@ Designed as the substrate for NerdMeNot's async/IO libs (S3 client, HTTP
 client, PG pool, DataFrame I/O).
 
 The pre-stackful tree (Future/Poll state machines) is preserved at git tag
-`pre-stackful-pivot`. The first stackful attempt (v0.x) was POC-validated
-against Go in `spike/`, then rewritten and retired in favour of the v2
-tree, which is now `src/`. There is no "v2" in the codebase — there is
-just Volt.
+`pre-stackful-pivot`. An earlier stackful attempt was POC-validated against
+Go in `spike/`, then rewritten — the resulting tree is what `src/` contains
+today. There is just Volt.
 
 ## Build
 

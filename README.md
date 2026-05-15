@@ -87,7 +87,7 @@ Numbers measured on the same Darwin arm64 hardware, ReleaseFast vs `go build`. S
 | Darwin arm64 kqueue | **Working** — primary dev platform |
 | Linux x86_64 / arm64 | Not yet — epoll backend planned |
 | Windows | Not yet — IOCP backend planned |
-| Cancellation | Not implemented in v2 — design retired, re-landing planned |
+| Cancellation | Not implemented — earlier design retired, re-landing planned |
 | File I/O / DNS / TLS | Not yet — these belong in libraries on top of Volt, not in core |
 | Mutex throughput | Real but slow — 8× behind Go on contended micro-bench; redesign planned |
 

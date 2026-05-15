@@ -10,13 +10,13 @@ env:
   ZIG_VERSION: "0.16.0"
 
 # ─────────────────────────────────────────────────────────────────────
-# CI structure (v2 — Darwin arm64 only for runtime)
+# CI structure (Darwin arm64 only for runtime)
 #
 # Volt currently runs only on Darwin arm64 (kqueue reactor, AAPCS64
 # context switch). Other targets are cross-compile-only — they parse
 # and type-check but don't link, since kqueue symbols aren't available.
 # Linux (epoll/io_uring) and Windows (IOCP) backends are planned but
-# not implemented in v2.
+# not yet implemented.
 #
 # Jobs:
 # 1. format        — zig fmt --check on src/ + bench/ + build.zig

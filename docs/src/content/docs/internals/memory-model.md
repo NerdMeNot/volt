@@ -442,8 +442,7 @@ When `workers = 1`, **all of the above orderings still apply**. The
 fences are present even when there's only one thread; the optimizer
 may elide some of them on a single-core target, but the *source code*
 makes the same guarantees. There are no `if (workers == 1)` fast paths
-that skip atomics in v2. Single-worker is a configuration, not a code
-path.
+that skip atomics. Single-worker is a configuration, not a code path.
 
 ## What's NOT covered by this document
 
@@ -459,7 +458,7 @@ path.
 
 ## How to use this document
 
-Adding shared state to v2? Add a section here first. State the
+Adding shared state? Add a section here first. State the
 *who-reads / who-writes / what-orders / what-happens-before*. If you
 can't fill in that template, your design isn't ready.
 
