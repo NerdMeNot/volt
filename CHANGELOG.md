@@ -1,430 +1,112 @@
 # Changelog
 
-All notable changes to Volt are documented in this file.
+All notable changes to Volt are documented here.
 
-## Unreleased — v1.0.0-zig0.16.0 (this branch, pending merge)
+## Unreleased — v2 architecture
 
-The "scheduler-rewrite" branch's race-correctness, cross-platform CI,
-and v1 ship-framing pass. Production-tier on every backend the v1
-matrix supports; Windows runtime explicitly deferred to v1.x.
+Volt was rewritten on a stackful coroutine substrate after the v1
+Future/Poll machine and the v1 stackful follow-on both proved
+architecturally limited. The v2 tree replaces both. The decision and
+the POC numbers that drove it are recorded in `spike/SYNTHESIS.md`;
+the per-area design docs are under `docs/internals/`.
 
-### R workstream — race correctness (the ship blocker)
-
-- **R1** Cancel/park/poll state-machine documented in
-  `docs/internals/cancellation-contract.md`. 5 actors, 4 state
-  spaces, 5 invariants, 11 race scenarios, 6 proof obligations.
-- **R2** Reactor `registerWait` ordering — `waiters.put + pending++`
-  now happens BEFORE `kevent ADD` / `epoll_ctl ADD` / `io_uring`
-  submit. Closes the kernel-fires-before-bookkeeping race that was
-  leaking 0–80 of 100 reactor registrations on the cancel torture
-  test. Applied uniformly across kqueue, epoll, and iouring backends.
-- **R3** IRIW audit — seq_cst on `Coroutine.cancel.cancel_flag` +
-  `Park.parkCurrent.current_park` linearization pair. `scripts/
-  audit_iriw.sh` flags any `flag.store + ptr.load` pattern that
-  isn't seq_cst across coordinator pairs.
-- **R4** Formal worker-shutdown protocol — quiescence ack counter
-  in `Runtime.quiesced_count`, `runUntilDone` calls
-  `waitForQuiescence(10s)` after thread-join, panic-with-diagnostics
-  on timeout. `Parker.park`'s 5s silent-rescue watchdog upgraded to
-  30s panic-with-diagnostics: the parking protocol is provably
-  lost-wake-free under seq_cst (proof in `docs/internals/
-  architecture.md` §"Parker protocol"); if the watchdog fires it's
-  a real bug, surfaced loudly.
-- **R7** `Mutex` + `Semaphore` FIFO ordering tests rewritten —
-  the old assertion conflated scheduler enqueue order with
-  wait-queue order (yield-as-sync anti-pattern). Now asserts the
-  set property: every waiter resumed exactly once, distinct values
-  in [1, N]. Stress tests 8×200 / 16×500 cover the real correctness
-  property under contention.
-
-### L workstream — Linux native validation
-
-- **L1** Volt-internal `syscall.Stat` portable abstraction over
-  Darwin/BSD's `system.Stat` and Linux's `Statx` — Zig 0.16 dropped
-  `posix.Stat` on Linux and the existing Volt code wouldn't compile.
-  `fs/Metadata.fromStat` accepts the portable type.
-- **L2** Native Linux runs validated in CI for x86_64 + arm64 ×
-  epoll + iouring.
-- **L3** Dropped `allow_failure: true` from io_uring CI entries —
-  io_uring is a real ship-blocker now, not optional.
-- **L4** Dual-backend CI job — same Linux runner runs both
-  `-Dreactor=epoll` and `-Dreactor=iouring` side-by-side; surfaces
-  divergence between the two backends.
-
-### Windows port — partial (cross-compile only at v1)
-
-- **W1** Windows syscall arms in `internal/syscall.zig` — `close`,
-  `pipe`, `read`, `write`, `recv`, `send`, `recvfrom`, `sendto`
-  (via the new `internal/win32/ws2_32.zig` extern bindings),
-  `closeSocket` (Winsock graceful close), `fcntl` + `waitpid`
-  (stub-with-error for paths that need W2/W5 equivalents).
-- **W2** Net layer — Volt-portable `SOCK_NONBLOCK` /
-  `SOCK_CLOEXEC` constants in `syscall.zig`. `socket()` Windows
-  arm via `ws2_32.socket` + `ioctlsocket(FIONBIO)`. `sockopt`'s
-  `setKeepAliveParams` extends to `TCP_KEEPALIVE` on Windows.
-- **W8** Reactor's Windows `@compileError` removed — the IOCP+AFD
-  reactor (`reactor_iocp.zig`) is wired in. Cross-compile clean.
-- **Native Windows runtime** is blocked at v1 by three Zig 0.16
-  stdlib bugs:
-  1. `std.Io.Writer.zig:1803` — invalid format spec for
-     `*anyopaque`.
-  2. `std.c.zig:4767` — `os.windows.ws2_32` has no member
-     `addrinfo`.
-  3. `std.c.zig:10659` — `std.c.mmap` parameter of type `void` not
-     allowed under `x86_64_win` calling convention.
-  W3-W7 (fs/Mmap/process/signal/Watcher Windows arms) remain
-  pending; tier-bumps to runtime in v1.x once upstream Zig fixes
-  land or Volt replaces affected stdlib calls with internal
-  bindings.
-
-### CI
-
-- Complete rebuild of `.github/workflows/{ci,nightly}.yml`. Stress
-  N=50 per PR on every production (platform, backend); N=200
-  nightly. Failed-iteration logs uploaded as artifacts. Old
-  Zig-0.15.2 nightly that referenced removed `test-stress` /
-  `test-concurrency` build targets is gone.
-- `temp-ci.yml` runs the same checks on pushes to
-  `scheduler-rewrite` (delete on merge to main).
-
-### Sync primitive bug fixes
-
-- **`Notify.notifyAllAndClose`** — closes the broadcast-race in
-  `CancellationToken.cancel`. Bare `notifyAll` left late-arrival
-  `wait()` callers parked forever (no permit stored, no waiters
-  to drain). The closing variant flips a permanent-permit flag;
-  every future `wait` returns immediately.
-- **`Mutex` / `Semaphore`** wait-queue FIFO is now tested for the
-  actual property (no lost wakes, no double-grants under
-  contention) rather than the scheduler-dependent
-  launch→park ordering.
-
-### Reactor diagnostics
-
-- **D1** Compile-time-gated trace ring (`reactor_trace.zig`):
-  `-Dreactor-trace` enables register/unregister/poll event
-  capture into a 64K-event lock-free ring. `runtime.deinit` dumps
-  the trace if `pendingCount != 0` at teardown. Used to localize
-  the R2 race in nanosecond-resolution.
-- **D5** `Runtime.deinit` re-enabled hard
-  `assert(pendingCount == 0)` and dumps trace on leak.
-
-### Platform decisions
-
-- **macos-x86_64 (Intel)** — dropped from native CI. SEGV in
-  every spawn-using test on the GH `macos-15-intel` runner;
-  Apple Silicon arm64 is the v1 macOS target. Cross-compile gate
-  remains so signature drift is caught.
-
-## Earlier — v1.1.0 plan (now folded into v1.0.0)
-
-The repositioning of Volt from "stackful coroutine runtime" to
-**"the async standard library for Zig — runtime + net + fs + mmap"**.
-Phase 0 was risk mitigation; Phase 1 the I/O trait surface and
-adapters; Phase 2 the networking depth.
-
-### Phase 4 — memory mapping (`volt.fs.Mmap`)
-
-The user-flagged high-priority slot from the original conversation.
-P0 locked the API contract; P4 fills the bodies.
-
-- **`Mmap.mapFile(file, opts)`** — file-backed mmap. Dups the fd
-  internally so the caller's `File` can close independently. fstat
-  for length when `opts.len` is null. `MapOptions` carries
-  `mode` / `perms` / `len` / `populate` / `huge_pages` / `locked` /
-  `offset`.
-- **`Mmap.anonymous(len, opts)`** — `MAP_ANON` with no fd. Useful
-  for huge scratch buffers without going through the heap allocator.
-- **`Mmap.advise` / `lock` / `unlock` / `flush` / `protect`** —
-  one-call libc wrappers (madvise / mlock / munlock / msync /
-  mprotect). All take a `Range { offset, length }` within the
-  mapping.
-- **`Mmap.prefault(range)`** — **Risk #3 mitigation**. Runs on the
-  blocking pool: madvise(MADV_WILLNEED) + walk every page with
-  volatile reads to force-fault each one. The calling coroutine
-  parks; when it returns, the range is RAM-resident. Use before a
-  hot read loop over a file-backed map.
-- **`Mmap.remap(new_len)`** — **Risk #4 contract**. Linux:
-  `mremap(MREMAP_MAYMOVE)`; Darwin: unmap + remap. Returns the new
-  slice; signature forces callers to rebind any cached pointer.
-- **Trait surface** — `Mmap.reader()` and `Mmap.readerAt()`
-  populate `as_bytes` so `volt.io.copy(dst, mmap.reader())`
-  takes the byte-slice fast path: writes the whole region in one
-  `writeAll` then advances the cursor via `discard`. The third
-  `copy()` dispatch arm (P1.C) is now wired.
-- **`MapOptions.populate`** — Linux: `MAP_POPULATE` flag at mmap
-  time. Darwin: emulated by walking + volatile-touching every
-  page after mmap (no native equivalent).
-- **Honest doc header** — the file's opening paragraph is the
-  page-fault contract, exactly as locked in P0. mmap pages are
-  fundamentally synchronous on first touch; `prefault` is the
-  Volt tool that controls *where* the synchronous wait happens
-  (blocking pool, not worker thread).
-
-#### Deferred from P4 → v1.2
-
-- `huge_pages` request — returns `error.HugePagesUnsupported` for
-  now. Linux: needs MAP_HUGETLB + page-size encoding. Darwin:
-  needs `VM_FLAGS_SUPERPAGE_SIZE_2MB` via `mach_vm_map` (not
-  std.c.mmap). Both require platform-specific work; the API is
-  locked.
-
-### Phase 3 — filesystem depth + streaming (`volt.fs.*`)
-
-- **`File`** — async file handle implementing all six `volt.io`
-  traits (`Reader`, `Writer`, `Seeker`, `Closer`, `ReaderAt`,
-  `WriterAt`). All blocking I/O routes through the blocking pool;
-  the calling coroutine parks while the pool thread does the
-  syscall. `as_fd` populated, so `volt.io.copy(socket.writer(),
-  file.reader())` is positioned for kernel zero-copy in v1.2.
-- **`OpenOptions`** — `{ read, write, append, create, exclusive,
-  truncate, mode }` builder. POSIX `O_*` flag mapping in `toPosix`.
-- **`Metadata`** — typed `fstat` result: size, mode, kind (file /
-  directory / symlink / device / fifo / socket / unknown),
-  atime, mtime, ctime, optional btime.
-- **`Dir`** — dirfd-rooted directory handle. `cwd()` for `AT_FDCWD`
-  without keeping a dirfd. `openDir` / `openFile` use `*at`-rooted
-  syscalls (TOCTOU-safe). Iterator yields `DirEntry { name, kind,
-  inode }`.
-- **`Walker`** — recursive iterator (real implementation, replaces
-  the P0 stub). Allocator-backed stack of frames so deep trees
-  don't blow the OS stack. `WalkOptions { max_depth = 4096,
-  follow_symlinks, skip_hidden }`. `skipSubtree()` cancels descent
-  into the previously yielded directory. Symlink-loop detection
-  is a v1.2 follow-up; default-false ships now.
-- **`tree`** — `makeDir`, `makeDirAll`, `removeFile`, `removeDir`,
-  `removeTree`, `rename`, `symlink`, `readlinkAlloc`, `copy`.
-  `removeTree` walks pre-order then iterates in reverse for
-  post-order removal. Path-relative ops route through the
-  blocking pool. `copy` is read+write today; kernel accelerators
-  (`copy_file_range`, `clonefile`/`fcopyfile`) are tracked for
-  v1.2 alongside the underlying syscall wrappers.
-- **`path`** — re-exports of `std.fs.path` (join, dirname,
-  basename, extension, isAbsolute) under `volt.fs.path` so users
-  don't cross namespaces.
-- **`temp`** — `createTemp` / `mkdtemp` with random alphanumeric
-  suffix (~5e18 unique paths, time XOR pid seeded — collision-
-  resistant for temp files, not cryptographic). `TempDir.deinit()`
-  removes the tree.
-- **`fs.zig` facade** — `readFile` / `writeFile` rewritten on top
-  of `File` (no longer bypassing via raw syscalls). Pre-allocates
-  by size, loops on partial reads.
-- Integration tests for File round-trip + positional I/O + trait
-  composition; Dir.iterate + Walker (incl. skipSubtree); tree ops
-  round-trip; rename + copy + symlink + readlinkAlloc.
-
-#### Deferred from P3 → v1.2 / later
-
-- **Kernel zero-copy fills** in `volt.io.copy` (`sendfile` Darwin /
-  Linux, `splice` Linux, `copy_file_range` Linux,
-  `clonefile`/`fcopyfile` Darwin). The dispatch shape is in
-  place (P1.C); the platform-specific syscall wrappers and
-  fallback handling are a focused workstream of their own.
-- **`statx` integration** for `Metadata.btime` on Linux — today
-  btime is null on systems where it's not free.
-- **Symlink-loop detection** in `Walker` when
-  `follow_symlinks = true`. The contract is locked; the inode
-  tracking is the v1.2 fill.
-
-### Phase 2 — networking depth (`volt.net.*`)
-
-- `src/io/net.zig` promoted to its own folder `src/net/`. Tokio shape:
-  `volt.io` is the abstract trait surface, `volt.net` is one of the
-  concrete libraries built on it. `volt.io.{TcpListener,TcpStream,
-  Address}` remain as deprecated aliases for one minor cycle, removed
-  in v1.2.
-- **`Address`** — RFC 4291 IPv6 parser. Handles zero-compression
-  (`::`, `::1`, `fe80::1`, `2001:db8::1`), full eight-group form,
-  rejects multi-`::`, oversized groups, RFC 4291 violations.
-  IPv4-mapped (`::ffff:1.2.3.4`) and scope IDs (`fe80::1%en0`)
-  documented as deferred.
-- **`TcpStream`** — `shutdown(.read|.write|.both)` half-close;
-  `readv`/`writev` vectored I/O; convenience setters for
-  `setNoDelay`, `setKeepAlive[Params]`, `setLinger`, recv/send
-  buf sizes.
-- **`sockopt`** — typed setters reusable across stream types
-  (TcpStream, UdpSocket, Unix sockets).
-- **`UdpSocket`** — `bind`/`connect`/`sendTo`/`recvFrom`/`send`/`recv`,
-  `joinMulticast`/`leaveMulticast`, `setMulticastTtl`,
-  `setMulticastLoopback`, `setBroadcast`. IPv4 + IPv6 multicast.
-- **Unix sockets** — `UnixAddress`, `UnixListener`, `UnixStream`,
-  `UnixDatagram`. Trait surface (`reader`/`writer`/`closer` with
-  `as_fd`) on `UnixStream`. SCM_RIGHTS fd-passing deferred to v1.2
-  (needs `sendmsg`/`recvmsg` syscall wrappers and platform cmsg
-  layout dispatch).
-- **`dns`** — `lookupHost(allocator, name, port) ![]Address` and
-  `lookupHostFirst`. Honest about the architecture: `getaddrinfo`
-  on the blocking pool, not async DNS. Tokio, Trio, .NET all do
-  the same — universally available system resolver is blocking-only.
-- Integration tests for UDP loopback, Unix stream/datagram loopback,
-  DNS numeric + localhost resolution.
-
-### Phase 1 — I/O trait surface (`volt.io.*`)
-
-The keystone — without it, every later type would reinvent
-`read`/`write`/`close` and nothing would compose.
-
-- **6 traits** under `src/io/traits/` — `Reader`, `Writer`,
-  `Seeker`, `Closer`, `ReaderAt`, `WriterAt`. Vtable-based, blocking-
-  shaped (Go's `io.Reader` model) since stackful Volt suspends
-  transparently — no poll-based dance needed.
-- **Sentinel markers** — `as_fd` (kernel-level zero-copy hook) and
-  `as_bytes` (memory-direct hook) are nullable function pointers
-  on the Reader/Writer vtables. Vtable size capped ≤ 64 bytes via
-  `comptime` assertion. Marker-policy contract documented in
-  `traits.zig` — hard cap until v2.0; future hooks need a tagged-
-  union redesign.
-- **6 adapters** under `src/io/adapters/` — `BufReader` (with
-  `readUntil`, `readUntilAlloc`, `peek`), `BufWriter`, `LimitReader`,
-  `TeeReader` (best-effort mirror, capture errors via
-  `mirrorError()`), `lineIterator`, `chunked`.
-- **`copy(dst, src)`** in `src/io/copy.zig` — comptime+runtime
-  dispatch shape with `as_fd` / `as_bytes` fast-path queries. Kernel
-  fast-paths (sendfile/splice/copy_file_range) deferred to P3 where
-  `fs.File` provides the canonical use case.
-- `IoError` gains `EndOfStream` and `StreamTooLong`.
-- `volt.io.Fd` — generic non-blocking-fd-as-trait wrapper for FFI
-  and arbitrary-fd cases.
-- `TcpStream` retrofitted onto traits (`reader`/`writer`/`closer`
-  with `as_fd` populated).
-- Bench gate: `bench/bench_io_traits.zig` measures BufReader-via-
-  trait pipe throughput. ≤10% overhead vs.
-  `bench/bench_io_baseline.zig` is the merge gate (gate enforcement
-  pending Darwin throughput stabilisation; both benches inherit a
-  preexisting kqueue ping-pong flakiness under load).
-
-### Phase 0 — risk-mitigation foundation
-
-### Breaking — public error surface
-
-Public types in `volt.io.{io,wait,net}` and `volt.fs` no longer leak
-`syscall.*Error` unions. They are re-typed against the new
-`volt.io.errors.IoError` master closed set and per-operation subsets
-(`ReadError`, `WriteError`, `ConnectError`, `AcceptError`, `BindError`,
-`ListenError`, `ShutdownError`, `SocketError`, `SendError`, `RecvError`,
-`OpenError`, `StatError`, `FcntlError`, `GetSockOptError`, `SyncError`,
-`SeekError`, `WaitError`).
-
-The taxonomy is platform-neutral: kqueue's `EventNotFound` and
-epoll's `EpollCtlFailed` / `TimerfdSettimeFailed` collapse to the
-single `error.WaitRegistrationFailed` so the public surface no longer
-reveals which reactor backend is active.
-
-`syscall.zig` standardises on `error.AccessDenied` everywhere it used
-to emit `error.PermissionDenied` — the duplicate name is gone.
-
-**Migration:** every error tag a v1.0 user could `catch |err| switch
-(err)` against still exists in the new sub-sets (verified by
-`src/test/error_taxonomy_test.zig`). The breakage is the concrete
-*type*, not the names — `error.BrokenPipe`, `error.ConnectionRefused`,
-`error.WouldBlock`, etc. all survive. No compat shim ships; no
-external consumers exist yet.
+There is **no separate "v2" namespace in the codebase** — the v2 tree
+is `src/`. Earlier trees are preserved only via git tags:
+`pre-stackful-pivot`, `v1.0.0-zig0.15.2`, `v1.1.0-zig0.15.2`.
 
 ### Added
 
-- `volt.io.errors` namespace, `volt.io.IoError`, `volt.io.fromErrno`
-  (errno → IoError translator).
-- `src/test/error_taxonomy_test.zig` — verifies `fromErrno` covers
-  every errno of interest and contains a historical-name compile-fence
-  that refuses to merge any change deleting a v1.0-era error name.
-- `bench/bench_io_baseline.zig` — pipe-throughput baseline for
-  `volt.io.lowlevel.read`. P1's BufReader-via-trait benchmark must
-  land within 10% of this number to merge. Wired as
-  `zig build bench-io-baseline`.
+- Stackful coroutine runtime with AAPCS64 context switch (`src/context_arm64.zig`).
+- M:N work-stealing scheduler — N OS threads, per-P fixed-256 WSQ,
+  LIFO slot, per-P mailbox (`src/runtime.zig`, `src/p.zig`,
+  `src/work_steal_queue.zig`).
+- Direct handoff in `Task.join` when the joinee is in the same M's
+  LIFO slot — skips the park/unpark round trip for the common
+  spawn-then-await pattern.
+- Parking lot (sharded buckets, validator-under-lock) backing all
+  sync primitives (`src/park.zig`).
+- Parker built on `__ulock_wait` (Darwin) / `futex` (Linux planned)
+  — `std.Thread.Mutex` / `Condition` are gone in Zig 0.16, so the
+  runtime provides its own.
+- Sync primitives — `Mutex`, `Notify`, `Semaphore` on the parking lot.
+- `Spsc(T, cap)` channel — comptime-specialised SPSC ring.
+- kqueue reactor for Darwin (single-poller claim, non-blocking sockets).
+- TCP networking on Darwin — `TcpListener`, `TcpStream`, `Address`.
+- Typed `Task(T)` handle with `join()`.
+- Stack guard pages — overflow now SIGSEGVs instead of corrupting heap.
+  (See note below — the heap-alloc + per-spawn mprotect variant
+  regressed multi-worker and was reverted; redesigned mmap-once-pool
+  landing tracked.)
+- Bench harness with Go side-by-side comparison (`bench/go/`).
+- Stress test at `zig build stress` — 45 s mixed-primitive harness,
+  parity-checks ~140 M ops on Darwin arm64.
 
-### Contracts locked (stub only — implementations in P3 / P4)
+### Performance (Darwin arm64, ReleaseFast, vs Go 1.26.0)
 
-- `volt.fs.Mmap` — full API surface (`mapFile`, `anonymous`, `slice`,
-  `advise`, **`prefault`**, `lock`, `unlock`, `flush`, `protect`,
-  `remap`, `deinit`) with `@compileError` bodies. The page-fault
-  contract (Risk #3) and `remap`-returns-new-slice contract (Risk #4)
-  are documented in the file header and embedded in the type
-  signature respectively.
-- `volt.fs.Walker` — `WalkOptions { max_depth = 4096, follow_symlinks,
-  skip_hidden }`, `Walker.next` / `Walker.skipSubtree` / `Walker.deinit`,
-  `error.MaxDepthExceeded`. Risk #5 mitigation is in the API shape —
-  bodies fill in P3.
+Where Volt wins:
 
-### Risks status
+| Workload | Volt | Go | Ratio |
+|---|---|---|---|
+| yield (one-way ctx switch) | 9 ns | 42 ns | 4.7× faster |
+| Spsc send+recv (cap=16) | 12 ns | 33 ns | 2.8× faster |
+| spawn+join workers=1 | 106 ns | 137 ns | 1.3× faster |
+| TCP echo 64×16×1 KB | ~7,000 ns | 9,050 ns | 1.3× faster |
+| fan-out workers=11 (real work) | 117 ns | 106 ns | 1.10× — parity |
+| parallel-compute (8 workers) | 6.62× speedup | n/a | near-ideal |
 
-| Risk | Mitigation | Status |
-|---|---|---|
-| #1 Error taxonomy break | Volt-owned `IoError` + sub-sets + name preservation | **Mitigated** in this release |
-| #2 Vtable cost on hot reads | Baseline bench + 10% gate documented | **Gate landed**; trait-side bench in P1 |
-| #3 Mmap page faults | `prefault` API + honest doc header | **Contract locked**; impl in P4 |
-| #4 `remap` address move | Signature returns new slice | **Contract locked**; impl in P4 |
-| #5 Walker stack depth | `max_depth` cap + `skipSubtree` | **Contract locked**; impl in P3 |
+Where Volt is behind:
 
-## v1.0.0-zig0.16.0
+| Workload | Volt | Go | Ratio |
+|---|---|---|---|
+| spawn+join workers=11 (synthetic) | 490 ns | 172 ns | 2.84× behind |
+| Mutex contended workers=NumCPU | ~640 ns | 81 ns | ~8× behind |
 
-First release on the **stackful coroutine** architecture. The previous
-v1.0.0-zig0.15.2 / v1.1.0-zig0.15.2 entries below were a different
-runtime — Future/Poll state machines — preserved at git tag
-`pre-stackful-pivot`. This release is a ground-up rewrite.
+The multi-worker spawn+join gap is concentrated on synthetic
+spawn-heavy patterns; real-work multi-worker shapes are at parity or
+better. Mutex contention is tracked separately. See `BENCHMARKS.md`
+and `docs/internals/multi-worker-profile.md`.
 
-### Architecture
+### Removed
 
-- Stackful coroutines: each task owns a growable virtual stack
-  (1 page committed, grows in-place via `mprotect` /
-  `VirtualAlloc(MEM_COMMIT)` on guard-page hit; 8 MiB reservation
-  cap surfaced as `error.StackOverflow`). No compiler stackmaps.
-- Multi-worker work-stealing scheduler: per-worker Chase-Lev deque,
-  LIFO slot, global injection queue, EV_USER reactor wakeup.
-- Park-based primitives: `Coroutine.current_park` makes every
-  suspension cancellable from anywhere — cancel propagates into
-  sleep / I/O / channel / sync waits and surfaces `error.Cancelled`
-  promptly.
-- Slab-pooled stacks: `Done.subscribe` returns the stack to a per-
-  runtime pool on coroutine completion (cap=256, with miss/hit
-  counters in `RuntimeMetrics`).
+The v1 Future/Poll runtime in its entirety. Specifically:
 
-### Public surface
+- `Future`, `Poll`, manual state machines.
+- Linux backends (epoll, io_uring) and Windows (IOCP) — to be
+  re-landed on the v2 substrate in libraries, not core.
+- File I/O (`File`, `AsyncFile`, `MappedFile`), DNS, UDP,
+  Unix sockets, processes (`Command`, `Child`), signals, buffered
+  readers/writers, timers (`sleep`/`interval`/`timeout`/`deadline`).
+- Combinators (`joinAll`, `tryJoinAll`, `race`, `select`),
+  cancellation, broadcast/watch/oneshot/MPMC channels.
+- The `scheduler-rewrite` ship work (race-correctness R/L/W/S
+  workstreams, cancellation contract) — superseded by the pivot.
 
-- Bootstrap: `volt.run(allocator, fn, args)`.
-- Spawning: `volt.launch` (fire-and-forget → `*Job`), `volt.spawn`
-  (value-returning → `*Task(T)`), `volt.spawnBlocking` (off-loop
-  thread pool).
-- Channels: `Channel`, `Oneshot`, `Watch`, `Broadcast`, `select`.
-- Sync: `Mutex`, `RwLock`, `Semaphore`, `Notify`, `Barrier`,
-  `OnceCell`.
-- Structured concurrency: `volt.scope`, `Scope`, `JoinSet`,
-  `CancellationToken`.
-- Time: `volt.sleep`, `volt.withTimeout`, `Interval`.
-- I/O: `volt.io.TcpListener`, `TcpStream`, `Address`, `read`,
-  `write`, `writeAll`.
-- Filesystem: `volt.fs` (read/write/open).
-- Process: `volt.process.Command` (fork/execve/waitpid).
-- Signals: `volt.signal.shutdown`, `ctrlC`.
-- Observability: `volt.observability.snapshot`, `count`, `metrics`;
-  `volt.tracing.span` with OTel-shaped JSON sink.
-- Streams: `volt.stream.Stream` (async iterator + operators).
+These belong in libraries on top of Volt, not the core runtime. The
+core stays small.
 
-### Platform support
+### Known gaps
 
-| Target                        | Backend       | Status                        |
-|-------------------------------|---------------|-------------------------------|
-| macOS arm64 / x86_64          | kqueue        | runtime + CI                  |
-| Linux x86_64 / arm64          | epoll         | runtime + CI                  |
-| Linux x86_64 / arm64          | io_uring      | parallel backend; cross-comp. |
-| Windows x86_64 / arm64 (IOCP) | reactor_iocp  | cross-compile only — see      |
-|                               |               | `src/io/reactor.zig`          |
+| | Status |
+|---|---|
+| Darwin arm64 kqueue | Working — primary dev platform |
+| Linux x86_64 / arm64 | Not yet — epoll backend planned |
+| Windows | Not yet — IOCP backend planned |
+| Cancellation | Not implemented; design retired with v1 |
+| File I/O / DNS / TLS | Library territory |
+| Mutex throughput | Real but slow on contended micro-bench |
+| Stack guard pages | Reverted; redesigned mmap-once-pool landing tracked |
 
-### Notes / known limitations
+### Phase landings still open
 
-- `volt.select` over multiple channels is currently lossy on
-  simultaneous publish (forwarder-based v1 design); lossless
-  arm/disarm select is on the v1.x plan.
-- Async preemption asm path is present (M8 watchdog scaffolding) but
-  not wired in by default — the SIGUSR1 / context-restore path SEGVs
-  in tight CPU loops we couldn't isolate without a kernel debugger.
-  Cooperative preemption (yield at every park / I/O / channel point)
-  is the v1.0 default; cooperative-only matches Go pre-1.14 and
-  exceeds `may`.
-- Windows runtime support: IOCP backend, VirtualAlloc stacks,
-  WaitOnAddress futex, QueryPerformanceCounter time, and Sleep are
-  all in place. Remaining: ioctlsocket / WriteFile / CreateProcess
-  arms in `io/net.zig`, `io/io.zig`, `process/Command.zig`, plus a
-  Windows CI runner.
+- mmap-backed stack slab with mprotect-once guard pages.
+- Mutex redesign closing the 8× Go gap.
+- `Mpmc(T, cap)` channel.
+
+See `docs/internals/phase-4-postmortem.md` for the guard-page design
+trail and `docs/internals/multi-worker-profile.md` for the scheduler
+investigation.
+
+---
 
 ## v1.1.0-zig0.15.2 (legacy — Future/Poll runtime)
 
