@@ -23,8 +23,9 @@
 //! All operations must be called from inside a coroutine — `current.require()`
 //! is used to find the Runtime for the unpark call.
 //!
-//! `Mpmc(T, cap)` — TODO (#150). Vyukov ring or similar for the
-//! general multi-producer / multi-consumer case.
+//! `Mpmc(T, cap)` — not yet implemented (task #174). Vyukov bounded
+//! ring or similar for the general multi-producer / multi-consumer
+//! case.
 
 const std = @import("std");
 const coroutine = @import("coroutine.zig");
