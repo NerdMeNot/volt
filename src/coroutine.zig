@@ -86,8 +86,12 @@ pub const Coroutine = struct {
     /// Intrusive next pointer for the run queue (FIFO linked list).
     next: ?*Coroutine = null,
     /// Intrusive next pointer for synchronization-primitive wait
-    /// queues (Mutex, Notify, Semaphore — pre-parking-lot). To be
-    /// removed once those primitives migrate to the parking lot.
+    /// queues (Mutex, Notify, Semaphore). The bespoke WaitQueue in
+    /// `src/sync.zig` uses this. **Tracked for removal in #168**:
+    /// migrating sync to the parking lot would let this field go
+    /// (saving 8 bytes per Coroutine + simplifying the struct), but
+    /// the migration involves a real fairness-vs-throughput design
+    /// choice that's separate from this field's existence.
     wait_next: ?*Coroutine = null,
     /// Optional task completion flag. Dispatch's `.done` branch
     /// stores 1 here and calls `parking_lot.unparkOne(&done)` to
