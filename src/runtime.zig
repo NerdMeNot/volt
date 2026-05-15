@@ -43,6 +43,7 @@ const worker_mod = @import("worker.zig");
 const p_mod = @import("p.zig");
 const parker_mod = @import("parker.zig");
 const park_mod = @import("park.zig");
+const stack_mod = @import("stack.zig");
 
 pub const Coroutine = coroutine.Coroutine;
 pub const Frame = coroutine.Frame;
@@ -52,7 +53,10 @@ pub const Reactor = reactor_mod.Reactor;
 pub const M = worker_mod.M;
 pub const P = p_mod.P;
 pub const Parker = parker_mod.Parker;
-pub const STACK_SIZE: usize = 16 * 1024;
+/// Usable per-coroutine stack size — `BODY_SIZE` from `stack.zig`.
+/// Re-exported here for downstream consumers (benches, docs) that
+/// historically referenced `volt.STACK_SIZE`.
+pub const STACK_SIZE: usize = stack_mod.BODY_SIZE;
 pub const MAX_WORKERS: usize = 64; // bitmap is u64
 
 pub const Config = struct {
@@ -197,7 +201,7 @@ pub fn tryDispatchInline(target: *Coroutine) bool {
                 if (target.frame_destroy) |destroy_fn| destroy_fn(target.frame_ptr, rt.allocator);
             }
             _ = m.p.stat_done.fetchAdd(1, .monotonic);
-            m.p.freeStack(target.stack, rt.allocator, STACK_SIZE);
+            m.p.freeStack(target.stack);
             m.p.freeCoroutine(target, rt.allocator);
             return true;
         },
@@ -308,7 +312,7 @@ pub const Runtime = struct {
         // Pools are quiescent now — every M has stopped dispatching,
         // so no further spawn/done can touch them. Release whatever
         // is still cached back to the allocator.
-        for (self.ps) |*p| p.drainPools(self.allocator, STACK_SIZE);
+        for (self.ps) |*p| p.drainPools(self.allocator);
         self.allocator.free(self.ms);
         self.allocator.free(self.ps);
         self.reactor.deinit();
@@ -348,10 +352,10 @@ pub const Runtime = struct {
         errdefer if (owning_p) |p| p.freeCoroutine(c, self.allocator) else self.allocator.destroy(c);
 
         const stack = if (owning_p) |p|
-            try p.allocStack(self.allocator, STACK_SIZE)
+            try p.allocStack()
         else
-            try self.allocator.alignedAlloc(u8, .@"16", STACK_SIZE);
-        errdefer if (owning_p) |p| p.freeStack(stack, self.allocator, STACK_SIZE) else self.allocator.free(stack);
+            try stack_mod.alloc();
+        errdefer if (owning_p) |p| p.freeStack(stack) else stack_mod.free(stack);
 
         combined.frame = .{ .args = args, .coro = c };
         c.* = .{
@@ -363,7 +367,9 @@ pub const Runtime = struct {
             .runtime = self,
             .has_task = true,
         };
-        const stack_top: [*]u8 = stack.ptr + STACK_SIZE;
+        // SP grows down from the top of the body region. The guard
+        // page sits below — overflow walks into PROT_NONE and SIGSEGVs.
+        const stack_top: [*]u8 = stack + stack_mod.totalSize();
         context.initContext(&c.ctx, stack_top, &combined.frame);
 
         combined.task = .{
@@ -699,7 +705,7 @@ fn dispatch(rt: *Runtime, m: *M, c: *Coroutine) void {
             // Recycle the stack + Coroutine into the current P's pools
             // (LIFO, cache-warm). Handing them to the next spawn on
             // this P avoids the allocator round-trip.
-            m.p.freeStack(c.stack, rt.allocator, STACK_SIZE);
+            m.p.freeStack(c.stack);
             m.p.freeCoroutine(c, rt.allocator);
         },
     }

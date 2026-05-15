@@ -22,9 +22,11 @@
 const std = @import("std");
 const coroutine = @import("coroutine.zig");
 const wsq_mod = @import("work_steal_queue.zig");
+const stack_mod = @import("stack.zig");
 
 pub const Coroutine = coroutine.Coroutine;
 pub const LocalQueue = wsq_mod.WorkStealQueue;
+pub const StackPtr = stack_mod.StackPtr;
 
 const Mailbox = @import("worker.zig").Mailbox;
 
@@ -69,10 +71,16 @@ pub const P = struct {
     stat_done: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stat_fairness_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stat_unparks_to_inject: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// Owner-only LIFO free list of recycled stacks. The next-pointer
-    /// is stored in the first 8 bytes of the freed stack itself (Go's
-    /// gFree shape) — saves the per-entry node allocation.
-    stack_pool: ?[*]align(16) u8 = null,
+    /// Owner-only LIFO free list of recycled (guard + body) stacks.
+    /// The intrusive next-pointer lives at offset `stack.usableOffset()`
+    /// from the entry's base, because the bottom page is PROT_NONE
+    /// (writing to it would SIGSEGV).
+    ///
+    /// Pool entries are mmap'd by `stack.alloc()` and never munmap'd
+    /// on the hot path — only at `drainPools()` time. This is the
+    /// whole point of the design: keep `mprotect` off the per-spawn
+    /// path (it serializes on the VM lock — see phase-4-postmortem).
+    stack_pool: ?StackPtr = null,
     stack_pool_count: u16 = 0,
 
     pub fn init(self: *P, id: usize, runtime: *anyopaque) void {
@@ -147,51 +155,49 @@ pub const P = struct {
         self.coro_pool_count += 1;
     }
 
-    /// Owner-only: take a recycled stack from the pool, or allocate
-    /// a fresh one.
-    pub fn allocStack(self: *P, allocator: std.mem.Allocator, stack_size: usize) ![]align(16) u8 {
-        if (self.stack_pool) |ptr| {
-            // First 8 bytes of the freed stack hold the next pointer.
-            const next_loc: *?[*]align(16) u8 = @ptrCast(@alignCast(ptr));
+    /// Owner-only: take a recycled (guard + body) stack from the
+    /// pool, or `mmap` a fresh one. Returns the full slice; SP top
+    /// is `slice.ptr + slice.len` (top of body).
+    pub fn allocStack(self: *P) !StackPtr {
+        if (self.stack_pool) |base| {
+            // Next-pointer lives at offset `usableOffset()` from base
+            // — the bottom page is PROT_NONE so we can't store
+            // metadata there.
+            const next_loc: *?StackPtr = @ptrCast(@alignCast(base + stack_mod.usableOffset()));
             self.stack_pool = next_loc.*;
             self.stack_pool_count -= 1;
-            return ptr[0..stack_size];
+            return base;
         }
-        return try allocator.alignedAlloc(u8, .@"16", stack_size);
+        return try stack_mod.alloc();
     }
 
-    /// Owner-only: return a stack to the pool. Pool only accepts
-    /// default-sized stacks (mixed sizes break the intrusive list);
-    /// other sizes go straight to the allocator. Pool cap eviction
-    /// also goes to the allocator.
-    pub fn freeStack(
-        self: *P,
-        stack: []align(16) u8,
-        allocator: std.mem.Allocator,
-        expected_size: usize,
-    ) void {
-        if (stack.len != expected_size or self.stack_pool_count >= POOL_CAP) {
-            allocator.free(stack);
+    /// Owner-only: return a stack to the pool. Pool-cap eviction
+    /// `munmap`s the entry — that hits the VM lock, but only fires
+    /// when an unusually deep spawn-burst overflows the cap.
+    pub fn freeStack(self: *P, base: StackPtr) void {
+        if (self.stack_pool_count >= POOL_CAP) {
+            stack_mod.free(base[0..stack_mod.totalSize()]);
             return;
         }
-        const next_loc: *?[*]align(16) u8 = @ptrCast(@alignCast(stack.ptr));
+        const next_loc: *?StackPtr = @ptrCast(@alignCast(base + stack_mod.usableOffset()));
         next_loc.* = self.stack_pool;
-        self.stack_pool = stack.ptr;
+        self.stack_pool = base;
         self.stack_pool_count += 1;
     }
 
     /// Release every entry held in the pools. Called from
     /// `Runtime.deinit` after all Ms have stopped.
-    pub fn drainPools(self: *P, allocator: std.mem.Allocator, stack_size: usize) void {
+    pub fn drainPools(self: *P, allocator: std.mem.Allocator) void {
         while (self.coro_pool) |c| {
             self.coro_pool = c.next;
             allocator.destroy(c);
         }
         self.coro_pool_count = 0;
-        while (self.stack_pool) |ptr| {
-            const next_loc: *?[*]align(16) u8 = @ptrCast(@alignCast(ptr));
+        const total = stack_mod.totalSize();
+        while (self.stack_pool) |base| {
+            const next_loc: *?StackPtr = @ptrCast(@alignCast(base + stack_mod.usableOffset()));
             self.stack_pool = next_loc.*;
-            allocator.free(ptr[0..stack_size]);
+            stack_mod.free(base[0..total]);
         }
         self.stack_pool_count = 0;
     }
@@ -239,7 +245,7 @@ test "P.coro_pool: alloc/free round-trip recycles the same struct" {
     try std.testing.expectEqual(c1, c2);
     // Drain restores it to the underlying allocator (no leak).
     p.freeCoroutine(c2, a);
-    p.drainPools(a, 16 * 1024);
+    p.drainPools(a);
 }
 
 test "P.coro_pool: over-cap entries go to allocator (no overflow)" {
@@ -254,7 +260,7 @@ test "P.coro_pool: over-cap entries go to allocator (no overflow)" {
         p.freeCoroutine(c, a);
     }
     try std.testing.expect(p.coro_pool_count == POOL_CAP);
-    p.drainPools(a, 16 * 1024);
+    p.drainPools(a);
     try std.testing.expect(p.coro_pool_count == 0);
 }
 
@@ -262,11 +268,10 @@ test "P.stack_pool: alloc/free round-trip recycles the same memory" {
     var p: P = undefined;
     p.init(0, undefined);
     const a = std.testing.allocator;
-    const SIZE = 16 * 1024;
-    const s1 = try p.allocStack(a, SIZE);
-    p.freeStack(s1, a, SIZE);
-    const s2 = try p.allocStack(a, SIZE);
-    try std.testing.expectEqual(s1.ptr, s2.ptr);
-    p.freeStack(s2, a, SIZE);
-    p.drainPools(a, SIZE);
+    const s1 = try p.allocStack();
+    p.freeStack(s1);
+    const s2 = try p.allocStack();
+    try std.testing.expectEqual(s1, s2);
+    p.freeStack(s2);
+    p.drainPools(a);
 }

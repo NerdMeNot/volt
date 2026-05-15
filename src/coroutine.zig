@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const context = @import("context_arm64.zig");
+const stack_mod = @import("stack.zig");
 
 /// User functions passed to `spawn` get monomorphized into a Frame
 /// (comptime-generated). The frame's FIRST field is always a
@@ -72,8 +73,10 @@ pub const Coroutine = struct {
     /// import cycle. Cast back to `*Runtime` via @ptrCast/@alignCast
     /// when needed (e.g. `unpark` to push back to the queue).
     runtime: *anyopaque = undefined,
-    /// Heap-alloc'd 16-byte-aligned stack slice.
-    stack: []align(16) u8 = undefined,
+    /// Base of the (guard + body) mapping returned by `stack.alloc()`.
+    /// SP top is `stack + stack.totalSize()`. The bottom `guardSize()`
+    /// bytes are PROT_NONE — any access SIGSEGVs.
+    stack: stack_mod.StackPtr = undefined,
     /// Pointer to the Frame (comptime-generated).
     frame_ptr: *anyopaque = undefined,
     /// Frees the Frame allocation.
