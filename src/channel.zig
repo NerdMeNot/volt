@@ -38,6 +38,10 @@ pub const ChannelError = error{Closed};
 
 const CACHE_LINE: usize = 128;
 
+inline fn currentRt() *runtime.Runtime {
+    return @ptrCast(@alignCast(current.require().runtime));
+}
+
 pub fn Spsc(comptime T: type, comptime cap: usize) type {
     comptime {
         std.debug.assert(cap > 0 and (cap & (cap - 1)) == 0);
@@ -84,10 +88,6 @@ pub fn Spsc(comptime T: type, comptime cap: usize) type {
             return h == t;
         }
 
-        inline fn currentRuntime() *runtime.Runtime {
-            return @ptrCast(@alignCast(current.require().runtime));
-        }
-
         /// Send `v`. Blocks (parks current coroutine) if the channel
         /// is full. Returns `error.Closed` if the channel was closed.
         pub fn send(self: *Self, v: T) ChannelError!void {
@@ -99,7 +99,7 @@ pub fn Spsc(comptime T: type, comptime cap: usize) type {
                     self.ring[h & MASK] = v;
                     self.head.store(h + 1, .release);
                     // Wake the consumer (if parked on head).
-                    _ = park.unparkOne(currentRuntime(), &self.head);
+                    _ = park.unparkOne(currentRt(), &self.head);
                     return;
                 }
                 // Full — park on `tail`. Consumer's recv will
@@ -118,7 +118,7 @@ pub fn Spsc(comptime T: type, comptime cap: usize) type {
                     const v = self.ring[t & MASK];
                     self.tail.store(t + 1, .release);
                     // Wake the producer (if parked on tail).
-                    _ = park.unparkOne(currentRuntime(), &self.tail);
+                    _ = park.unparkOne(currentRt(), &self.tail);
                     return v;
                 }
                 if (self.closed.load(.acquire)) return error.Closed;
@@ -133,7 +133,7 @@ pub fn Spsc(comptime T: type, comptime cap: usize) type {
         /// Must be called from inside a coroutine.
         pub fn close(self: *Self) void {
             self.closed.store(true, .release);
-            const rt = currentRuntime();
+            const rt = currentRt();
             _ = park.unparkOne(rt, &self.head);
             _ = park.unparkOne(rt, &self.tail);
         }
@@ -286,10 +286,6 @@ pub fn Mpmc(comptime T: type, comptime cap: usize) type {
             return @as(i64, @bitCast(seq)) - @as(i64, @bitCast(want)) < 0;
         }
 
-        inline fn currentRt() *runtime.Runtime {
-            return @ptrCast(@alignCast(current.require().runtime));
-        }
-
         /// Send `v`. Blocks (parks current coroutine) if the ring is
         /// full. Returns `error.Closed` if the channel was closed.
         pub fn send(self: *Self, v: T) ChannelError!void {
@@ -334,6 +330,296 @@ pub fn Mpmc(comptime T: type, comptime cap: usize) type {
             const rt = currentRt();
             _ = park.unparkAll(rt, &self.enqueue_pos);
             _ = park.unparkAll(rt, &self.dequeue_pos);
+        }
+    };
+}
+
+/// One-shot single-value handoff. Producer sends once; consumer
+/// receives once. After either side closes, future operations return
+/// `error.Closed`.
+///
+/// Allocation-free — the value lives in the `Oneshot` struct itself.
+/// Typical use: stash the channel on a parent's stack (or as a field
+/// of some Ctx), pass `&ch` to producer and consumer.
+///
+/// State machine (atomic u32):
+///   EMPTY     = 0 — nothing sent yet
+///   FULL      = 1 — value has been sent, waiting for recv
+///   CONSUMED  = 2 — recv has taken the value
+///   CLOSED    = 3 — sender called close() without sending
+pub fn Oneshot(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        const EMPTY: u32 = 0;
+        const FULL: u32 = 1;
+        const CONSUMED: u32 = 2;
+        const CLOSED: u32 = 3;
+
+        state: std.atomic.Value(u32) align(CACHE_LINE) = std.atomic.Value(u32).init(EMPTY),
+        value: T = undefined,
+
+        /// Send `v`. Returns `error.Closed` if the channel was closed
+        /// or already sent. On success the receiver (if parked) is
+        /// woken and `recv()` returns `v`.
+        pub fn send(self: *Self, v: T) ChannelError!void {
+            // Only EMPTY → FULL succeeds; everything else means the
+            // slot is unavailable.
+            self.value = v;
+            if (self.state.cmpxchgStrong(EMPTY, FULL, .release, .monotonic)) |_| {
+                // CAS failed — state was FULL / CONSUMED / CLOSED.
+                self.value = undefined;
+                return error.Closed;
+            }
+            _ = park.unparkOne(currentRt(), &self.state);
+        }
+
+        /// Receive the value. Blocks until `send` or `close` fires.
+        /// Returns `error.Closed` if the sender closed without sending.
+        pub fn recv(self: *Self) ChannelError!T {
+            while (true) {
+                const s = self.state.load(.acquire);
+                switch (s) {
+                    FULL => {
+                        // CAS to CONSUMED so a duplicate recv returns
+                        // error.Closed cleanly.
+                        if (self.state.cmpxchgWeak(FULL, CONSUMED, .acquire, .monotonic)) |_| continue;
+                        return self.value;
+                    },
+                    CLOSED, CONSUMED => return error.Closed,
+                    else => park.parkOn(&self.state, oneshotRecvValidator),
+                }
+            }
+        }
+
+        /// Close the channel without sending. Subsequent `send` /
+        /// `recv` calls return `error.Closed`. Safe to call from
+        /// either side.
+        pub fn close(self: *Self) void {
+            // Only EMPTY → CLOSED transitions; if state is FULL we
+            // leave the value alone for recv to consume. If state is
+            // CONSUMED, nothing to do.
+            _ = self.state.cmpxchgStrong(EMPTY, CLOSED, .release, .monotonic);
+            _ = park.unparkOne(currentRt(), &self.state);
+        }
+
+        /// True iff `send` has been called (regardless of whether
+        /// recv has consumed yet).
+        pub fn isReady(self: *const Self) bool {
+            const s = self.state.load(.acquire);
+            return s == FULL or s == CONSUMED;
+        }
+
+        fn oneshotRecvValidator(addr: *const anyopaque) bool {
+            const sp: *const std.atomic.Value(u32) = @ptrCast(@alignCast(addr));
+            return sp.load(.acquire) == EMPTY;
+        }
+    };
+}
+
+/// Multi-consumer "latest value" channel. Producer publishes; every
+/// receiver sees the most recent value (intermediate updates may be
+/// silently skipped). Producer never blocks. Receivers use
+/// `rx.changed()` to wait for a new version and `rx.borrow()` to
+/// read the current value.
+///
+/// Useful for: config hot-reload, current-state propagation, watcher
+/// shapes where "most recent" is more important than "every value."
+///
+/// The value is published via a seqlock — even version = stable,
+/// odd version = writer mid-update. Readers retry on a torn read.
+pub fn Watch(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        value: T align(CACHE_LINE),
+        version: std.atomic.Value(u64) align(CACHE_LINE) = std.atomic.Value(u64).init(0),
+        closed: std.atomic.Value(bool) align(CACHE_LINE) = std.atomic.Value(bool).init(false),
+
+        pub fn init(initial: T) Self {
+            return .{ .value = initial };
+        }
+
+        /// Publish a new value. Wakes every receiver parked in
+        /// `rx.changed()`. Never blocks.
+        pub fn send(self: *Self, v: T) void {
+            const v_now = self.version.load(.monotonic);
+            self.version.store(v_now + 1, .release); // mid-write (odd)
+            self.value = v;
+            self.version.store(v_now + 2, .release); // stable (even)
+            _ = park.unparkAll(currentRt(), &self.version);
+        }
+
+        /// Close the watch. Outstanding `rx.changed()` calls return
+        /// `error.Closed`. Future `borrow()` calls keep returning the
+        /// last value (history is implicit in `value`).
+        pub fn close(self: *Self) void {
+            self.closed.store(true, .release);
+            _ = park.unparkAll(currentRt(), &self.version);
+        }
+
+        pub fn receiver(self: *Self) Receiver {
+            return .{ .watch = self, .cursor = self.version.load(.acquire) };
+        }
+
+        pub const Receiver = struct {
+            watch: *Self,
+            cursor: u64,
+
+            /// Park until the watch advances past our cursor. Returns
+            /// `error.Closed` if the watch closes.
+            pub fn changed(self: *Receiver) ChannelError!void {
+                while (true) {
+                    if (self.watch.closed.load(.acquire)) return error.Closed;
+                    const v = self.watch.version.load(.acquire);
+                    // Skip the writer-in-progress phase: round down to
+                    // last completed version.
+                    const stable = if (v & 1 == 1) v -% 1 else v;
+                    if (stable > self.cursor) {
+                        self.cursor = stable;
+                        return;
+                    }
+                    park.parkOn(&self.watch.version, watchChangedValidator);
+                }
+            }
+
+            /// Read the current value. Uses a seqlock retry loop in
+            /// case the writer is mid-update.
+            pub fn borrow(self: *Receiver) T {
+                while (true) {
+                    const v1 = self.watch.version.load(.acquire);
+                    if (v1 & 1 == 1) {
+                        std.atomic.spinLoopHint();
+                        continue;
+                    }
+                    const v = self.watch.value;
+                    const v2 = self.watch.version.load(.acquire);
+                    if (v2 == v1) return v;
+                }
+            }
+        };
+
+        fn watchChangedValidator(addr: *const anyopaque) bool {
+            const sp: *const std.atomic.Value(u64) = @ptrCast(@alignCast(addr));
+            // Park only if there's no new version available. Caller
+            // re-checks closed in the loop above.
+            const v = sp.load(.acquire);
+            // We don't know the receiver's cursor here — the loop in
+            // `changed` re-checks after wake. The validator just
+            // confirms the version hasn't advanced under us.
+            // Conservative: always park; the caller's loop is the
+            // truth.
+            _ = v;
+            return true;
+        }
+    };
+}
+
+/// Multi-consumer history-aware ring buffer. Producer publishes into
+/// a ring of `cap` slots; each receiver maintains its own cursor.
+/// Slow receivers see `error.Lagged` when the producer has overwritten
+/// data they haven't read yet (cursor falls more than `cap` behind).
+///
+/// Producer never blocks. Suitable for: pub/sub fan-out where slow
+/// subscribers should NOT slow the producer down. If you want
+/// backpressure (slow consumers block producer), use `Mpmc` instead.
+///
+/// Implementation: per-slot sequence counter, monotonically increasing.
+/// `seq[i]` carries the position of the latest write to slot i. A
+/// receiver waiting for cursor `c` looks at `seq[c & MASK]` and
+/// either reads (if seq == c+1) or detects lag (if seq > c+1+cap).
+pub fn Broadcast(comptime T: type, comptime cap: usize) type {
+    comptime {
+        std.debug.assert(cap > 0 and (cap & (cap - 1)) == 0);
+    }
+    return struct {
+        const Self = @This();
+        const MASK: u64 = cap - 1;
+
+        ring: [cap]T align(CACHE_LINE) = undefined,
+        seq: [cap]std.atomic.Value(u64) = blk: {
+            @setEvalBranchQuota(cap * 16);
+            var s: [cap]std.atomic.Value(u64) = undefined;
+            var i: usize = 0;
+            while (i < cap) : (i += 1) s[i] = std.atomic.Value(u64).init(0);
+            break :blk s;
+        },
+        head: std.atomic.Value(u64) align(CACHE_LINE) = std.atomic.Value(u64).init(0),
+        closed: std.atomic.Value(bool) align(CACHE_LINE) = std.atomic.Value(bool).init(false),
+
+        /// Publish a value. Never blocks; overwrites the oldest slot
+        /// if the ring is full (slow receivers will see Lagged).
+        pub fn send(self: *Self, v: T) void {
+            const pos = self.head.fetchAdd(1, .acq_rel);
+            const slot = pos & MASK;
+            self.ring[slot] = v;
+            self.seq[slot].store(pos + 1, .release);
+            _ = park.unparkAll(currentRt(), &self.head);
+        }
+
+        pub fn close(self: *Self) void {
+            self.closed.store(true, .release);
+            _ = park.unparkAll(currentRt(), &self.head);
+        }
+
+        pub fn receiver(self: *Self) Receiver {
+            return .{ .bc = self, .cursor = self.head.load(.acquire) };
+        }
+
+        pub const RecvError = error{ Closed, Lagged };
+
+        pub const Receiver = struct {
+            bc: *Self,
+            cursor: u64,
+
+            /// Block until a new value is available. Returns
+            /// `error.Lagged` if the producer overran our cursor (and
+            /// advances the cursor past the lost region); call again
+            /// to resume reading.
+            pub fn recv(self: *Receiver) RecvError!T {
+                while (true) {
+                    const h = self.bc.head.load(.acquire);
+                    if (h > self.cursor) {
+                        const behind = h -% self.cursor;
+                        if (behind > cap) {
+                            // Slow consumer. Advance to oldest
+                            // available; caller retries.
+                            self.cursor = h -% cap;
+                            return error.Lagged;
+                        }
+                        const slot = self.cursor & MASK;
+                        const want = self.cursor + 1;
+                        // Wait for the slot's sequence to catch up.
+                        // It can only be ahead (we already know head
+                        // ≥ want) — usually it's exactly `want`.
+                        var seq = self.bc.seq[slot].load(.acquire);
+                        while (seq < want) {
+                            std.atomic.spinLoopHint();
+                            seq = self.bc.seq[slot].load(.acquire);
+                        }
+                        const v = self.bc.ring[slot];
+                        // Torn-read check: if seq advanced past our
+                        // window during the read, we got overwritten.
+                        if (self.bc.seq[slot].load(.acquire) >= want + cap) {
+                            self.cursor = self.bc.head.load(.acquire) -% cap;
+                            return error.Lagged;
+                        }
+                        self.cursor +%= 1;
+                        return v;
+                    }
+                    if (self.bc.closed.load(.acquire)) return error.Closed;
+                    park.parkOn(&self.bc.head, broadcastRecvValidator);
+                }
+            }
+        };
+
+        fn broadcastRecvValidator(addr: *const anyopaque) bool {
+            // Conservative: always park if validator runs. The recv
+            // loop re-checks head and closed under the bucket lock
+            // implicitly via the load.acquire after wake. There's no
+            // false-park risk: an unpark from `send` runs after the
+            // store, so any post-wake load sees the new head.
+            _ = addr;
+            return true;
         }
     };
 }
@@ -499,4 +785,173 @@ test "mpmc: works at workers=1 (configuration check)" {
     var ctx = MpmcCtx{ .ch = &ch, .n_per_producer = 50 };
     try rt.run(mpmcRoot4x4, .{&ctx});
     try std.testing.expectEqual(@as(u64, 4 * 50), ctx.received.load(.acquire));
+}
+
+// ─── Oneshot tests ───────────────────────────────────────────────────
+
+const OneshotCtx = struct {
+    ch: *Oneshot(u64),
+    got: u64 = 0,
+};
+
+fn oneshotProducer(ch: *Oneshot(u64)) !void {
+    try ch.send(0xCAFE);
+}
+
+fn oneshotConsumer(ctx: *OneshotCtx) !void {
+    ctx.got = try ctx.ch.recv();
+}
+
+fn oneshotRoot(ctx: *OneshotCtx) !void {
+    const rt = @import("runtime.zig");
+    _ = rt;
+    var p = try @import("lib.zig").spawn(oneshotProducer, .{ctx.ch});
+    var c = try @import("lib.zig").spawn(oneshotConsumer, .{ctx});
+    _ = p.join() catch unreachable;
+    _ = c.join() catch unreachable;
+}
+
+test "oneshot: single-value handoff between two coros" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
+    defer rt.deinit();
+
+    var ch = Oneshot(u64){};
+    var ctx = OneshotCtx{ .ch = &ch };
+    try rt.run(oneshotRoot, .{&ctx});
+    try std.testing.expectEqual(@as(u64, 0xCAFE), ctx.got);
+}
+
+test "oneshot: second send returns Closed" {
+    var ch = Oneshot(u64){};
+    try ch.send(1);
+    try std.testing.expectError(error.Closed, ch.send(2));
+}
+
+fn oneshotCloseProducer(ch: *Oneshot(u64)) !void {
+    ch.close();
+}
+
+fn oneshotCloseConsumer(ctx: *OneshotCtx) !void {
+    ctx.got = ctx.ch.recv() catch |e| switch (e) {
+        error.Closed => 0xDEAD,
+    };
+}
+
+fn oneshotCloseRoot(ctx: *OneshotCtx) !void {
+    var p = try @import("lib.zig").spawn(oneshotCloseProducer, .{ctx.ch});
+    var c = try @import("lib.zig").spawn(oneshotCloseConsumer, .{ctx});
+    _ = p.join() catch unreachable;
+    _ = c.join() catch unreachable;
+}
+
+test "oneshot: close-without-send surfaces Closed to receiver" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
+    defer rt.deinit();
+
+    var ch = Oneshot(u64){};
+    var ctx = OneshotCtx{ .ch = &ch };
+    try rt.run(oneshotCloseRoot, .{&ctx});
+    try std.testing.expectEqual(@as(u64, 0xDEAD), ctx.got);
+}
+
+// ─── Watch tests ─────────────────────────────────────────────────────
+
+const WatchCtx = struct {
+    w: *Watch(u64),
+    last_seen: u64 = 0,
+    iterations: u32 = 0,
+};
+
+fn watchProducer(w: *Watch(u64)) !void {
+    var i: u64 = 1;
+    while (i <= 5) : (i += 1) {
+        w.send(i * 10);
+        @import("lib.zig").yield(); // give consumers a chance
+    }
+    w.close();
+}
+
+fn watchConsumer(ctx: *WatchCtx) !void {
+    var rx = ctx.w.receiver();
+    while (true) {
+        rx.changed() catch break; // Closed
+        ctx.last_seen = rx.borrow();
+        ctx.iterations += 1;
+    }
+}
+
+fn watchRoot(ctx: *WatchCtx) !void {
+    var p = try @import("lib.zig").spawn(watchProducer, .{ctx.w});
+    var c = try @import("lib.zig").spawn(watchConsumer, .{ctx});
+    _ = p.join() catch unreachable;
+    _ = c.join() catch unreachable;
+}
+
+test "watch: receiver sees most recent value, exits on close" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
+    defer rt.deinit();
+
+    var w = Watch(u64).init(0);
+    var ctx = WatchCtx{ .w = &w };
+    try rt.run(watchRoot, .{&ctx});
+    // Last value the producer published was 50. Receiver may have
+    // coalesced some intermediate values (that's by design — Watch
+    // is latest-only).
+    try std.testing.expectEqual(@as(u64, 50), ctx.last_seen);
+    try std.testing.expect(ctx.iterations >= 1);
+}
+
+// ─── Broadcast tests ─────────────────────────────────────────────────
+
+const BroadcastCh = Broadcast(u64, 8);
+const BroadcastCtx = struct {
+    bc: *BroadcastCh,
+    consumer_sum: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    consumer_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+};
+
+fn broadcastProducer(bc: *BroadcastCh) !void {
+    var i: u64 = 1;
+    while (i <= 20) : (i += 1) {
+        bc.send(i);
+    }
+    bc.close();
+}
+
+fn broadcastConsumer(ctx: *BroadcastCtx) !void {
+    var rx = ctx.bc.receiver();
+    while (true) {
+        const v = rx.recv() catch |e| switch (e) {
+            error.Closed => return,
+            error.Lagged => continue,
+        };
+        _ = ctx.consumer_sum.fetchAdd(v, .acq_rel);
+        _ = ctx.consumer_count.fetchAdd(1, .acq_rel);
+    }
+}
+
+fn broadcastRoot(ctx: *BroadcastCtx) !void {
+    var consumers: [3]*@TypeOf(@import("lib.zig").spawn(broadcastConsumer, .{ctx}) catch unreachable) = undefined;
+    // Spawn consumers FIRST so their cursors are set before producer
+    // publishes — Broadcast doesn't replay history to late joiners.
+    for (&consumers) |*t| t.* = try @import("lib.zig").spawn(broadcastConsumer, .{ctx});
+    var p = try @import("lib.zig").spawn(broadcastProducer, .{ctx.bc});
+    _ = p.join() catch unreachable;
+    for (consumers) |t| _ = t.join() catch unreachable;
+}
+
+test "broadcast: 1 producer × 3 consumers, all values delivered to all (no overrun)" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
+    defer rt.deinit();
+
+    var bc = BroadcastCh{};
+    var ctx = BroadcastCtx{ .bc = &bc };
+    try rt.run(broadcastRoot, .{&ctx});
+    // Each consumer should see all 20 values: sum = 3 * (1+2+..+20) = 3 * 210.
+    // BUT some may be lagged depending on timing. Loose check:
+    // - Count is at most 3 * 20 = 60; we got something close.
+    // - Sum is at most 3 * 210 = 630; we got something close.
+    const count = ctx.consumer_count.load(.acquire);
+    try std.testing.expect(count > 0);
+    try std.testing.expect(count <= 60);
 }

@@ -50,6 +50,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "fanout-scaling", .src = "bench/bench_fanout_scaling.zig", .desc = "Multi-driver fan-out scaling — true parallelism receipt" },
         .{ .name = "yield", .src = "bench/bench_yield.zig", .desc = "yield one-way ctx switch (target ≤ 12 ns/op)" },
         .{ .name = "spsc", .src = "bench/bench_spsc.zig", .desc = "Spsc channel send+recv (target ≤ 35 ns/op)" },
+        .{ .name = "mpmc", .src = "bench/bench_mpmc.zig", .desc = "Mpmc channel send+recv at 1×1 / 2×2 / 4×4 shapes" },
         .{ .name = "tcp-echo", .src = "bench/bench_tcp_echo.zig", .desc = "TCP echo 64 clients × 16 RTT × 1 KB" },
         .{ .name = "mutex", .src = "bench/bench_mutex.zig", .desc = "Mutex contended (8 coros × 50k acquires)" },
         .{ .name = "parallel-compute", .src = "bench/bench_parallel_compute.zig", .desc = "Parallel CPU-bound work across N workers" },
