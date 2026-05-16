@@ -84,13 +84,6 @@ pub inline fn slotSize() usize {
     return RESERVATION_SIZE;
 }
 
-/// Back-compat alias — older callers (runtime, coroutine, benches)
-/// reference `stack.totalSize()` from the pre-arena design where one
-/// allocation == one stack. Same value as `slotSize()` now.
-pub inline fn totalSize() usize {
-    return slotSize();
-}
-
 /// Offset within a slot of the first byte that's ever usable. The
 /// arena's free-list "next" pointer lives at this offset, inside the
 /// body region (which is committed once the slot has been used).

@@ -73,8 +73,8 @@ pub const Coroutine = struct {
     /// import cycle. Cast back to `*Runtime` via @ptrCast/@alignCast
     /// when needed (e.g. `unpark` to push back to the queue).
     runtime: *anyopaque = undefined,
-    /// Base of the (guard + body) mapping returned by `stack.alloc()`.
-    /// SP top is `stack + stack.totalSize()`. The bottom `guardSize()`
+    /// Base of the slot handed out by the runtime's stack arena.
+    /// SP top is `stack + stack.slotSize()`. The bottom `guardSize()`
     /// bytes are PROT_NONE — any access SIGSEGVs.
     stack: stack_mod.StackPtr = undefined,
     /// Pointer to the Frame (comptime-generated).

@@ -304,9 +304,14 @@ pub const Runtime = struct {
         };
         errdefer rt.stack_arena.deinit(cfg.allocator);
         // Initialize each P, then bind each M to its P (1:1 in Phase 1).
+        // Each P's stack pool cap = fair share of the arena across
+        // workers, so asymmetric spawn (one driver, many workers)
+        // can't pin every freed slot in one worker's pool.
+        const fair_share: u32 = @intCast(@max(1, cfg.max_concurrent_stacks / n));
         for (rt.ps, 0..) |*p, i| {
             p.init(i, rt);
             p.arena = &rt.stack_arena;
+            p.stack_pool_cap = fair_share;
         }
         for (rt.ms, 0..) |*m, i| m.init(&rt.ps[i]);
 
@@ -396,7 +401,7 @@ pub const Runtime = struct {
         };
         // SP grows down from the top of the body region. The guard
         // page sits below — overflow walks into PROT_NONE and SIGSEGVs.
-        const stack_top: [*]u8 = stack + stack_mod.totalSize();
+        const stack_top: [*]u8 = stack + stack_mod.slotSize();
         context.initContext(&c.ctx, stack_top, &combined.frame);
 
         combined.task = .{

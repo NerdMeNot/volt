@@ -46,16 +46,12 @@ const Mailbox = @import("worker.zig").Mailbox;
 /// bloating idle workers.
 pub const POOL_CAP: u16 = 64;
 
-/// Soft cap on per-P stack-slot free-list size. Larger = more bursty
-/// spawn workloads stay arena-free; smaller = arena can be smaller
-/// without exhaustion under asymmetric spawn.
-///
-/// 1024 covers the canonical `bench-spawn-hot` shape (single driver,
-/// BATCH=1000, N workers) with one local pull per slot at warm-up
-/// and zero arena traffic at steady state. Over-cap frees push to
-/// the arena, which never `munmap`s — just a spinlock pop/push on
-/// the shared free list.
-pub const STACK_POOL_CAP: u32 = 1024;
+/// Fallback per-P stack-slot cap when no arena is attached (unit
+/// tests that construct bare `P`s). Production sets `stack_pool_cap`
+/// at `Runtime.init` to `arena.n_slots / n_workers` — each P gets a
+/// fair share of the slab. Tests without an arena have no cross-P
+/// rebalance concern so the cap value is immaterial.
+pub const TEST_STACK_POOL_CAP: u32 = std.math.maxInt(u32);
 
 pub const P = struct {
     id: usize,
@@ -93,12 +89,19 @@ pub const P = struct {
     stat_fairness_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stat_unparks_to_inject: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Owner-only LIFO free list of recycled stack slots. Capped at
-    /// `STACK_POOL_CAP` to prevent one P from pinning the arena
+    /// `stack_pool_cap` to prevent one P from pinning the arena
     /// under asymmetric spawn patterns. The intrusive next-pointer
     /// lives at offset `stack.usableOffset()` from the slot's base
     /// (the start of the committed body region).
     stack_pool: ?StackPtr = null,
     stack_pool_count: u32 = 0,
+    /// Fair-share cap = `arena.n_slots / n_workers`, set by
+    /// `Runtime.init`. Above the cap, `freeStack` sheds back to the
+    /// arena instead of growing the local pool — so under asymmetric
+    /// spawn (one driver, N workers) the arena keeps a refill supply
+    /// for the driver instead of every freed slot getting pinned in
+    /// a worker's pool. Tests without an arena get `TEST_STACK_POOL_CAP`.
+    stack_pool_cap: u32 = TEST_STACK_POOL_CAP,
     /// Pointer to the Runtime's slab arena. Per-P pool miss / shutdown
     /// drain go through here. Opaque-typed to avoid an import cycle —
     /// resolved to `*stack_mod.Arena` at use site.
@@ -197,7 +200,7 @@ pub const P = struct {
     /// single pointer write; arena push is a spinlock acquire (rare
     /// after warm-up unless the workload is asymmetric).
     pub fn freeStack(self: *P, base: StackPtr) void {
-        if (self.stack_pool_count >= STACK_POOL_CAP) {
+        if (self.stack_pool_count >= self.stack_pool_cap) {
             if (self.arena) |arena| {
                 arena.free(base);
                 return;
