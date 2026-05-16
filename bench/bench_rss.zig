@@ -88,7 +88,7 @@ pub fn main() !void {
 
     std.debug.print("=== RSS per idle coroutine ===\n", .{});
     std.debug.print("Platform: ReleaseFast, single-worker (workers=1)\n", .{});
-    std.debug.print("Stack size: {d} bytes ({d} KiB) — see volt.STACK_SIZE\n", .{ volt.STACK_SIZE, volt.STACK_SIZE / 1024 });
+    std.debug.print("Stack size: {d} bytes ({d} KiB) — see volt.internal.STACK_SIZE\n", .{ volt.internal.STACK_SIZE, volt.internal.STACK_SIZE / 1024 });
     std.debug.print("\n", .{});
 
     const ns = [_]u32{ 100, 1_000, 5_000, 10_000 };
@@ -99,9 +99,9 @@ pub fn main() !void {
     std.debug.print("\n", .{});
     std.debug.print("Notes:\n", .{});
     std.debug.print("  - macOS reports maxrss in bytes; Linux in KiB. Normalized to bytes here.\n", .{});
-    std.debug.print("  - Per-coro overhead = initial body ({d} KiB) + Coroutine + Frame + Task.\n", .{volt.STACK_SIZE / 1024});
+    std.debug.print("  - Per-coro overhead = initial body ({d} KiB) + Coroutine + Frame + Task.\n", .{volt.internal.STACK_SIZE / 1024});
     std.debug.print("  - Stacks are grow-on-demand: 256 KiB virtual reservation per coro,\n", .{});
-    std.debug.print("    only the top {d} KiB committed at spawn. Deeper recursion mprotects\n", .{volt.STACK_SIZE / 1024});
+    std.debug.print("    only the top {d} KiB committed at spawn. Deeper recursion mprotects\n", .{volt.internal.STACK_SIZE / 1024});
     std.debug.print("    pages on SIGSEGV (signal.zig handler). Idle RSS reported here is\n", .{});
     std.debug.print("    body-only; growable region is PROT_NONE and contributes zero RSS.\n", .{});
 }

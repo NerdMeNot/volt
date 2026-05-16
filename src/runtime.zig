@@ -63,6 +63,17 @@ pub const Config = struct {
     allocator: std.mem.Allocator,
     /// Worker thread count. null = std.Thread.getCpuCount.
     workers: ?usize = null,
+    /// Hard cap on concurrently-live coroutine stacks. The runtime
+    /// pre-reserves `max_concurrent_stacks * 256 KiB` of virtual
+    /// address space at init (PROT_NONE — zero RSS until used) and
+    /// hands slots out from a slab arena. Spawn returns
+    /// `error.ArenaExhausted` once every slot is in use.
+    ///
+    /// The default covers typical interactive workloads and the full
+    /// bench suite. Raise for high-concurrency servers (e.g. tens of
+    /// thousands of HTTP connections); lower to bound virtual address
+    /// usage on tight 32-bit-style budgets.
+    max_concurrent_stacks: usize = stack_mod.DEFAULT_MAX_STACKS,
 };
 
 /// Cooperative yield. Re-queues the current coroutine onto the
@@ -262,6 +273,10 @@ pub const Runtime = struct {
     /// channel block paths, Task.join, etc.). See `src/park.zig`
     /// and `docs/internals/parking-lot.md`.
     parking_lot: park_mod.ParkingLot,
+    /// Slab arena that backs every coroutine stack. One `mmap` at
+    /// `init`, one `munmap` at `deinit`; per-P pools cache freed
+    /// slots so the steady-state hot path is allocation-free.
+    stack_arena: stack_mod.Arena,
     // Diagnostic counters live per-P now (see `P.stat_*`) — they
     // were on Runtime as shared atomics, but every spawn / done /
     // unpark hit the same cache line, costing ~40 % of multi-worker
@@ -285,9 +300,14 @@ pub const Runtime = struct {
             .ps = ps,
             .reactor = try Reactor.init(),
             .parking_lot = park_mod.ParkingLot.init(),
+            .stack_arena = try stack_mod.Arena.init(cfg.allocator, cfg.max_concurrent_stacks),
         };
+        errdefer rt.stack_arena.deinit(cfg.allocator);
         // Initialize each P, then bind each M to its P (1:1 in Phase 1).
-        for (rt.ps, 0..) |*p, i| p.init(i, rt);
+        for (rt.ps, 0..) |*p, i| {
+            p.init(i, rt);
+            p.arena = &rt.stack_arena;
+        }
         for (rt.ms, 0..) |*m, i| m.init(&rt.ps[i]);
 
         // Spawn pthread workers 1..N-1. M[0] is the driver thread
@@ -310,9 +330,11 @@ pub const Runtime = struct {
         for (self.ms[1..]) |*m| m.thread.join();
         for (self.ms) |*m| m.deinit();
         // Pools are quiescent now — every M has stopped dispatching,
-        // so no further spawn/done can touch them. Release whatever
-        // is still cached back to the allocator.
+        // so no further spawn/done can touch them. Drain coroutine
+        // pools back to the allocator and stack pools back to the
+        // arena; the arena's munmap happens after all Ps are done.
         for (self.ps) |*p| p.drainPools(self.allocator);
+        self.stack_arena.deinit(self.allocator);
         self.allocator.free(self.ms);
         self.allocator.free(self.ps);
         self.reactor.deinit();
@@ -351,11 +373,16 @@ pub const Runtime = struct {
             try self.allocator.create(Coroutine);
         errdefer if (owning_p) |p| p.freeCoroutine(c, self.allocator) else self.allocator.destroy(c);
 
+        // Driver-thread spawn (no owning P): pull the slot directly
+        // from the arena. Worker-thread spawn: route through the
+        // owning P's local pool, which falls back to the arena on
+        // miss. Either way, free goes back to the arena (driver) or
+        // the P's local LIFO (worker).
         const stack = if (owning_p) |p|
             try p.allocStack()
         else
-            try stack_mod.alloc();
-        errdefer if (owning_p) |p| p.freeStack(stack) else stack_mod.free(stack);
+            try self.stack_arena.alloc();
+        errdefer if (owning_p) |p| p.freeStack(stack) else self.stack_arena.free(stack);
 
         combined.frame = .{ .args = args, .coro = c };
         c.* = .{

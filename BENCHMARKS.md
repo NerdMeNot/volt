@@ -19,7 +19,9 @@ wrong. When Volt is faster, we treat that as worth investigating
 write barriers — not because we won the design).
 
 All numbers: **Darwin arm64, 11 cores, ReleaseFast, smp_allocator.**
-Date: 2026-05-16. Go reference: 1.26.0 on the same hardware.
+Date: 2026-05-16 (post slab-arena landing). Go reference: 1.26.0 on the
+same hardware. System load avg ~5 during the run — micros are
+load-insensitive; spawn-hot can drift 10–20 % on a quieter host.
 
 Reproduce with `zig build bench-<name>` for Volt or `go run
 bench/go/<name>.go` for the Go side.
@@ -118,8 +120,9 @@ here is a "we win" claim.
 |---|---|---|---|---|
 | yield (one-way ctx switch) | 9 ns | 42 ns | 0.21× | Stackful + no GC write barriers makes this Volt-favoured. |
 | Spsc send+recv (cap=16) | 12 ns | 33 ns | 0.36× | Comptime-specialised channel vs Go's generic chan. |
-| Mutex contended (8×50k) | 14 ns | 81 ns | 0.17× | Volt's contended case spins through the hot lock release; Go also has spin but pays write-barrier costs on the wakers. |
-| TCP echo (64 × 16 RTT × 1 KB) | ~7,000 ns | 9,050 ns | 0.77× | Both runtimes route through OS networking — gap is small. |
+| Mpmc send+recv (1P × 1C) | 54 ns | — | — | Vyukov bounded ring + parking-lot blocking. |
+| Mutex contended (8×50k) | 15 ns | 81 ns | 0.18× | Volt's contended case spins through the hot lock release; Go also has spin but pays write-barrier costs on the wakers. |
+| TCP echo (64 × 16 RTT × 1 KB) | 8,449 ns | 9,050 ns | 0.93× | Both runtimes route through OS networking — gap is small. |
 
 ### Spawn + wait
 
@@ -128,11 +131,11 @@ Notify barrier on Volt's side, `wg.Wait` on Go's side. 10s sustained.
 
 | Workers | Volt | Go | Volt/Go |
 |---|---|---|---|
-| 1 | 106 ns | 137 ns | 0.77× |
-| 2 | 201 | 155 | 1.30× |
-| 4 | 218 | 165 | 1.32× |
-| 8 | 399 | 167 | 2.39× |
-| 11 | 490 | 172 | **2.84×** |
+| 1 | 101 ns | 136 ns | 0.74× |
+| 2 | 138 | 159 | 0.87× |
+| 4 | 161 | 204 | 0.79× |
+| 8 | 389 | 182 | 2.14× |
+| 11 | 575 | 213 | **2.70×** |
 
 Volt's single-worker fast path is sub-Go, then the gap widens with
 worker count. This is a synthetic spawn-heavy shape where adding
@@ -148,9 +151,9 @@ N drivers, N workers, each driver does BATCH=100 + `wg.Wait`, 4s.
 
 | Workers | Volt | Go | Volt/Go |
 |---|---|---|---|
-| 1 | 73 | 107 | 0.68× |
-| 4 | 89 | 92 | 0.97× |
-| 11 | 117 | 106 | 1.10× |
+| 1 | 63 | 108 | 0.58× |
+| 4 | 77 | 89 | 0.86× |
+| 11 | 117 | 107 | 1.10× |
 
 Within ~10% of Go across the curve. This is the receipt that says
 work-stealing is working as intended.

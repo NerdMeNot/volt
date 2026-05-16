@@ -75,13 +75,13 @@ them. See `BENCHMARKS.md` for full methodology + receipts.
 | Workload | Volt | Go | Volt/Go |
 |---|---|---|---|
 | yield (one-way ctx switch) | 9 ns | 42 ns | 0.21× |
-| Mutex contended (8 × 50k) | 14 ns | 81 ns | 0.17× |
+| Mutex contended (8 × 50k) | 15 ns | 81 ns | 0.18× |
 | Spsc send+recv (cap=16) | 12 ns | 33 ns | 0.36× |
-| TCP echo (64 × 16 RTT × 1 KB) | ~7,000 ns | 9,050 ns | 0.77× |
-| spawn+wait workers=1 | 106 ns | 137 ns | 0.77× |
-| fan-out scaling workers=11 | 117 ns | 106 ns | 1.10× |
-| parallel-compute (8 workers, CPU-bound) | 6.6× speedup | — | near-ideal |
-| spawn+wait workers=11 (synthetic) | 490 ns | 172 ns | 2.84× |
+| TCP echo (64 × 16 RTT × 1 KB) | 8,449 ns | 9,050 ns | 0.93× |
+| spawn+wait workers=1 | 101 ns | 136 ns | 0.74× |
+| fan-out scaling workers=11 | 117 ns | 107 ns | 1.10× |
+| parallel-compute (8 workers, CPU-bound) | 5.8× speedup | — | near-ideal |
+| spawn+wait workers=11 (synthetic) | 575 ns | 213 ns | 2.70× |
 
 Single-worker and real-work multi-worker land near or below the Go
 reference. The 2.84× on workers=11 is a synthetic spawn-heavy
@@ -101,7 +101,8 @@ the coordination cost. On any shape with actual parallel work
 | Windows | Not yet — IOCP backend planned |
 | Cancellation | Not implemented — earlier design retired, re-landing planned |
 | File I/O / DNS / TLS | Not yet — these belong in libraries on top of Volt, not in core |
-| Mutex throughput | Parking-lot + spin loop redesign on 2026-05-16 — contended-Mutex bench now 14 ns/op, ~5.8× faster than Go's 81 ns |
+| Mutex throughput | Parking-lot + spin loop redesign on 2026-05-16 — contended-Mutex bench now 15 ns/op, ~5.4× faster than Go's 81 ns |
+| Stack allocation | Slab-arena redesign on 2026-05-16 — one `mmap` at runtime init, lazy per-slot `mprotect`, per-P pool overflows to arena. Removed the VM-lock cliff that the prior pool-of-64 design hit at BATCH > 64. |
 
 The honest case for using Volt today: you want a stackful coroutine substrate for Zig on Darwin arm64, you want the synchronous-shape ergonomics, you can live with the multi-worker spawn-heavy gap to Go, and you can wait for the Linux/Windows backends.
 

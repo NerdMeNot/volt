@@ -14,8 +14,18 @@
 //!   local-queue overflow. Owner P pops in dispatch; sibling Ps can
 //!   pop during stealing.
 //! - `dispatch_count` — fairness counter (see `runtime.zig`).
-//! - `coro_pool` / `stack_pool` — owner-only LIFO free lists for
-//!   recycled Coroutine structs and stacks. See `POOL_CAP`.
+//! - `coro_pool` — owner-only LIFO free list for recycled Coroutine
+//!   structs. Capped at `POOL_CAP`; overflow goes back to the
+//!   allocator.
+//! - `stack_pool` — owner-only LIFO free list for recycled stack
+//!   slots. Capped at `STACK_POOL_CAP`. Slot memory lives in
+//!   `Runtime`'s slab arena; freeing a slot pushes onto the local
+//!   list when there's room, otherwise pushes to the arena's free
+//!   list (cheap — no `munmap`). Cap prevents one P from pinning
+//!   the entire arena under asymmetric spawn patterns (e.g.
+//!   single-driver-fan-out): the spawning P drains arena, worker
+//!   Ps free locally, arena empties, driver fails. Cap forces
+//!   workers to shed excess back to arena so the cycle balances.
 //!
 //! See `docs/internals/scheduler-mn.md` for the full design.
 
@@ -30,11 +40,22 @@ pub const StackPtr = stack_mod.StackPtr;
 
 const Mailbox = @import("worker.zig").Mailbox;
 
-/// Soft cap on per-P free-list size. Matches Go's `gFree` local cache
-/// shape. Larger caches hold more reusable structures but pin RSS;
-/// 64 covers typical spawn-bursts (most ping/pong + scatter/gather
-/// fan-outs are well under this) without bloating idle workers.
+/// Soft cap on per-P Coroutine free-list size. Matches Go's `gFree`
+/// local cache shape. Larger caches hold more reusable structures but
+/// pin allocator memory; 64 covers typical spawn-bursts without
+/// bloating idle workers.
 pub const POOL_CAP: u16 = 64;
+
+/// Soft cap on per-P stack-slot free-list size. Larger = more bursty
+/// spawn workloads stay arena-free; smaller = arena can be smaller
+/// without exhaustion under asymmetric spawn.
+///
+/// 1024 covers the canonical `bench-spawn-hot` shape (single driver,
+/// BATCH=1000, N workers) with one local pull per slot at warm-up
+/// and zero arena traffic at steady state. Over-cap frees push to
+/// the arena, which never `munmap`s — just a spinlock pop/push on
+/// the shared free list.
+pub const STACK_POOL_CAP: u32 = 1024;
 
 pub const P = struct {
     id: usize,
@@ -71,17 +92,17 @@ pub const P = struct {
     stat_done: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stat_fairness_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stat_unparks_to_inject: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// Owner-only LIFO free list of recycled (guard + body) stacks.
-    /// The intrusive next-pointer lives at offset `stack.usableOffset()`
-    /// from the entry's base, because the bottom page is PROT_NONE
-    /// (writing to it would SIGSEGV).
-    ///
-    /// Pool entries are mmap'd by `stack.alloc()` and never munmap'd
-    /// on the hot path — only at `drainPools()` time. This is the
-    /// whole point of the design: keep `mprotect` off the per-spawn
-    /// path (it serializes on the VM lock — see phase-4-postmortem).
+    /// Owner-only LIFO free list of recycled stack slots. Capped at
+    /// `STACK_POOL_CAP` to prevent one P from pinning the arena
+    /// under asymmetric spawn patterns. The intrusive next-pointer
+    /// lives at offset `stack.usableOffset()` from the slot's base
+    /// (the start of the committed body region).
     stack_pool: ?StackPtr = null,
-    stack_pool_count: u16 = 0,
+    stack_pool_count: u32 = 0,
+    /// Pointer to the Runtime's slab arena. Per-P pool miss / shutdown
+    /// drain go through here. Opaque-typed to avoid an import cycle —
+    /// resolved to `*stack_mod.Arena` at use site.
+    arena: ?*stack_mod.Arena = null,
 
     pub fn init(self: *P, id: usize, runtime: *anyopaque) void {
         self.* = .{
@@ -155,29 +176,32 @@ pub const P = struct {
         self.coro_pool_count += 1;
     }
 
-    /// Owner-only: take a recycled (guard + body) stack from the
-    /// pool, or `mmap` a fresh one. Returns the full slice; SP top
-    /// is `slice.ptr + slice.len` (top of body).
+    /// Owner-only: take a recycled stack slot from the local pool,
+    /// or pull one from the arena. Returns `error.ArenaExhausted` if
+    /// the local pool is empty and the arena is fully allocated.
     pub fn allocStack(self: *P) !StackPtr {
         if (self.stack_pool) |base| {
-            // Next-pointer lives at offset `usableOffset()` from base
-            // — the bottom page is PROT_NONE so we can't store
-            // metadata there.
+            // Next-pointer lives at offset `usableOffset()` — start
+            // of the committed body region.
             const next_loc: *?StackPtr = @ptrCast(@alignCast(base + stack_mod.usableOffset()));
             self.stack_pool = next_loc.*;
             self.stack_pool_count -= 1;
             return base;
         }
-        return try stack_mod.alloc();
+        const arena = self.arena orelse return error.ArenaExhausted;
+        return arena.alloc();
     }
 
-    /// Owner-only: return a stack to the pool. Pool-cap eviction
-    /// `munmap`s the entry — that hits the VM lock, but only fires
-    /// when an unusually deep spawn-burst overflows the cap.
+    /// Owner-only: return a stack slot to the local LIFO pool, or
+    /// shed to the arena if the local cap is hit. Local push is a
+    /// single pointer write; arena push is a spinlock acquire (rare
+    /// after warm-up unless the workload is asymmetric).
     pub fn freeStack(self: *P, base: StackPtr) void {
-        if (self.stack_pool_count >= POOL_CAP) {
-            stack_mod.free(base[0..stack_mod.totalSize()]);
-            return;
+        if (self.stack_pool_count >= STACK_POOL_CAP) {
+            if (self.arena) |arena| {
+                arena.free(base);
+                return;
+            }
         }
         const next_loc: *?StackPtr = @ptrCast(@alignCast(base + stack_mod.usableOffset()));
         next_loc.* = self.stack_pool;
@@ -185,19 +209,27 @@ pub const P = struct {
         self.stack_pool_count += 1;
     }
 
-    /// Release every entry held in the pools. Called from
-    /// `Runtime.deinit` after all Ms have stopped.
+    /// Release every entry held in the local pools. Coroutine structs
+    /// go back to the allocator; stack slots go back to the arena
+    /// (the arena owns the slab — actual `munmap` happens in
+    /// `Arena.deinit`). Called from `Runtime.deinit` after all Ms
+    /// have stopped.
     pub fn drainPools(self: *P, allocator: std.mem.Allocator) void {
         while (self.coro_pool) |c| {
             self.coro_pool = c.next;
             allocator.destroy(c);
         }
         self.coro_pool_count = 0;
-        const total = stack_mod.totalSize();
-        while (self.stack_pool) |base| {
-            const next_loc: *?StackPtr = @ptrCast(@alignCast(base + stack_mod.usableOffset()));
-            self.stack_pool = next_loc.*;
-            stack_mod.free(base[0..total]);
+        if (self.arena) |arena| {
+            while (self.stack_pool) |base| {
+                const next_loc: *?StackPtr = @ptrCast(@alignCast(base + stack_mod.usableOffset()));
+                self.stack_pool = next_loc.*;
+                arena.free(base);
+            }
+        } else {
+            // No arena attached — only happens in unit tests that
+            // construct a bare P. Stack pool should be empty here.
+            std.debug.assert(self.stack_pool == null);
         }
         self.stack_pool_count = 0;
     }
@@ -268,6 +300,10 @@ test "P.stack_pool: alloc/free round-trip recycles the same memory" {
     var p: P = undefined;
     p.init(0, undefined);
     const a = std.testing.allocator;
+    var arena = try stack_mod.Arena.init(a, 4);
+    defer arena.deinit(a);
+    p.arena = &arena;
+
     const s1 = try p.allocStack();
     p.freeStack(s1);
     const s2 = try p.allocStack();

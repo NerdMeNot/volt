@@ -24,15 +24,25 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// Maximum number of stacks the SIGSEGV handler can recognize. With
-/// per-P pools sized at 64 and N workers in tens, this leaves headroom.
-pub const MAX_REGIONS: usize = 16 * 1024;
+/// Maximum number of registered regions the SIGSEGV handler can
+/// recognize. With one entry per Runtime arena and a small handful of
+/// Runtime instances per process, 64 is plenty of headroom.
+pub const MAX_REGIONS: usize = 64;
 
-/// A single registered stack region. `base == 0` means the slot is
-/// free. `size` is the reservation length (guard + growable + body).
+/// A single registered region. `base == 0` means the slot is free.
+///
+/// Two shapes:
+///   * `slot_size == 0`: a single-stack region. `size` is the full
+///     reservation length; the very bottom page is the guard. Used
+///     by direct `stack.alloc()` callers (tests).
+///   * `slot_size > 0`: an arena. `size` is the full slab length
+///     (`n_slots * slot_size`). On a fault, the handler computes
+///     `(fault - base) % slot_size` to find the per-slot offset,
+///     then decides guard vs. growable.
 const Region = struct {
     base: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     size: usize = 0,
+    slot_size: usize = 0,
     /// Page size at the time of registration — captured so the
     /// signal handler can decide what the guard page is without
     /// re-querying.
@@ -129,12 +139,19 @@ fn handler(sig: c_int, info: *SigInfo, ctx: ?*anyopaque) callconv(.c) void {
         const base = regions[i].base.load(.acquire);
         if (base == 0) continue;
         const size = regions[i].size;
+        const slot_size = regions[i].slot_size;
         const ps = regions[i].page_size;
         if (fault_addr < base or fault_addr >= base + size) continue;
 
-        // In-region. Is it the guard page (the bottom-most page)?
-        // If so, this is a real overflow — chain.
-        if (fault_addr < base + ps) break;
+        // Slot offset: 0 for single-stack regions, modulo for arenas.
+        const slot_offset = if (slot_size == 0)
+            fault_addr - base
+        else
+            (fault_addr - base) % slot_size;
+
+        // Bottom-most page of the slot is the guard — real overflow,
+        // chain to the default handler.
+        if (slot_offset < ps) break;
 
         // Otherwise: grow. mprotect the page containing fault_addr
         // to PROT_RW. Page-align downward.
@@ -176,20 +193,29 @@ pub fn ensureInstalled() void {
     _ = sigaction_fn(SIGBUS, &act, &prev_bus);
 }
 
-/// Register a stack region with the handler. Called by `stack.alloc()`
-/// after the mmap succeeds. `size` is the full reservation length.
-///
-/// On failure (registry full) returns `error.RegistryFull` — the
-/// caller should fall back to giving up grow-on-demand for this
-/// stack (it'll still SIGSEGV cleanly on overflow because the entire
-/// pre-body region is PROT_NONE).
+/// Register a single-stack region with the handler. `size` is the
+/// full reservation length; the bottom page is treated as the guard.
 pub fn register(base: usize, size: usize) error{RegistryFull}!void {
+    return registerInternal(base, size, 0);
+}
+
+/// Register an arena range with the handler. `total_size` covers the
+/// whole slab; `slot_size` is the per-slot stride so the handler can
+/// compute `(fault - base) % slot_size` to locate the guard page.
+pub fn registerArena(base: usize, total_size: usize, slot_size: usize) error{RegistryFull}!void {
+    std.debug.assert(slot_size > 0);
+    std.debug.assert(total_size % slot_size == 0);
+    return registerInternal(base, total_size, slot_size);
+}
+
+fn registerInternal(base: usize, size: usize, slot_size: usize) error{RegistryFull}!void {
     const ps = std.heap.pageSize();
     var i: usize = 0;
     while (i < MAX_REGIONS) : (i += 1) {
         // Claim a free slot by CAS-ing the atomic base from 0 → base.
         if (regions[i].base.cmpxchgStrong(0, base, .acq_rel, .monotonic) == null) {
             regions[i].size = size;
+            regions[i].slot_size = slot_size;
             regions[i].page_size = ps;
             return;
         }
@@ -204,6 +230,8 @@ pub fn unregister(base: usize) void {
     while (i < MAX_REGIONS) : (i += 1) {
         if (regions[i].base.load(.acquire) == base) {
             regions[i].base.store(0, .release);
+            regions[i].slot_size = 0;
+            regions[i].size = 0;
             return;
         }
     }

@@ -66,14 +66,14 @@ methodology + receipts.
 | Workload | Volt | Go | Volt/Go |
 |---|---|---|---|
 | yield (one-way ctx switch) | 9 ns | 42 ns | 0.21× |
-| Mutex contended (8 × 50k) | 14 ns | 81 ns | 0.17× |
+| Mutex contended (8 × 50k) | 15 ns | 81 ns | 0.18× |
 | Spsc send+recv (cap=16) | 12 ns | 33 ns | 0.36× |
-| TCP echo (64 × 16 RTT × 1 KB) | ~7,000 ns | 9,050 ns | 0.77× |
-| spawn+join workers=1 | 106 ns | 137 ns | 0.77× |
-| fan-out scaling workers=11 | 117 ns | 106 ns | 1.10× |
-| parallel-compute (8 workers) | 6.62× speedup | — | near-ideal |
+| TCP echo (64 × 16 RTT × 1 KB) | 8,449 ns | 9,050 ns | 0.93× |
+| spawn+join workers=1 | 101 ns | 136 ns | 0.74× |
+| fan-out scaling workers=11 | 117 ns | 107 ns | 1.10× |
+| parallel-compute (8 workers) | 5.8× speedup | — | near-ideal |
 | stress (mixed, 45 s) | ~840 M ops | — | green |
-| spawn+join workers=11 (synthetic) | 490 ns | 172 ns | 2.84× |
+| spawn+join workers=11 (synthetic) | 575 ns | 213 ns | 2.70× |
 
 The single workers=11 outlier is a synthetic spawn-heavy shape (one
 driver feeding 11 workers trivial tasks) where adding workers can
@@ -85,7 +85,10 @@ investigation.
 
 Every architectural change runs the full bench suite green before
 merge. Phase 4 was reverted on 2026-05-15 because it skipped this and
-shipped a SIGSEGV in `bench-spawn-hot`. See
+shipped a SIGSEGV in `bench-spawn-hot`. The 2026-05-16 stack guard-page
+landing also skipped this — it regressed `bench-spawn-hot` ~30× via a
+POOL_CAP=64 cliff under BATCH=1000 spawn-bursts; root-caused and fixed
+later that day with the slab-arena rewrite. See
 `docs/internals/phase-4-postmortem.md`.
 
 Required bench suite for any landing that touches the scheduler,
