@@ -77,8 +77,10 @@ export default [
 			{ label: 'The kqueue reactor', slug: 'architecture/reactor' },
 			{ label: 'The context switch', slug: 'architecture/context-switch' },
 			{ label: 'Memory model', slug: 'architecture/memory-model' },
-			{ label: 'Vyukov MPMC', slug: 'architecture/vyukov-mpmc' },
-			{ label: 'Semaphore (FIFO)', slug: 'architecture/semaphore-algorithm' },
+			{ label: 'Cancellation internals', slug: 'architecture/cancellation-internals' },
+			{ label: 'Channels internals', slug: 'architecture/channels-internals' },
+			{ label: 'Vyukov MPMC (algorithm)', slug: 'architecture/vyukov-mpmc' },
+			{ label: 'Semaphore (FIFO algorithm)', slug: 'architecture/semaphore-algorithm' },
 		],
 	},
 	{
