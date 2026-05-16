@@ -1,4 +1,17 @@
-/** Shared sidebar config — used by astro.config.mjs and scripts/snapshot.mjs. */
+/** Shared sidebar config — used by astro.config.mjs and scripts/snapshot.mjs.
+ *
+ * Diátaxis-aligned IA (https://diataxis.fr/):
+ *   Getting Started  → tutorials   (learning-oriented)
+ *   API Reference    → reference   (information-oriented)
+ *   Recipes          → how-to      (task-oriented, copy-pasteable)
+ *   Guides           → how-to      (strategy-oriented)
+ *   Architecture     → explanation (understanding-oriented)
+ *   Performance      → explanation (receipts + postmortems)
+ *   Appendix         → reference   (comparisons, glossary, roadmap)
+ *
+ * URLs are preserved across the 2026-05-16 reorganisation via redirects
+ * in astro.config.mjs — never break an inbound link.
+ */
 export default [
 	{ label: 'Introduction', slug: 'index' },
 	{
@@ -11,7 +24,7 @@ export default [
 		],
 	},
 	{
-		label: 'Usage',
+		label: 'API Reference',
 		items: [
 			{ label: 'The Runtime', slug: 'usage/runtime' },
 			{ label: 'Spawning', slug: 'usage/spawning' },
@@ -20,14 +33,10 @@ export default [
 			{ label: 'Sync Primitives', slug: 'usage/sync' },
 			{ label: 'Time', slug: 'usage/time' },
 			{ label: 'Networking', slug: 'usage/networking' },
-			{ label: 'Signals & Shutdown', slug: 'usage/signals-shutdown' },
-			{ label: 'Subprocess Management', slug: 'usage/process' },
-			{ label: 'Filesystem', slug: 'usage/filesystem' },
-			{ label: 'Observability', slug: 'usage/observability' },
 		],
 	},
 	{
-		label: 'Cookbook',
+		label: 'Recipes',
 		items: [
 			{ label: 'Overview', slug: 'cookbook' },
 			{ label: 'TCP Echo Server', slug: 'cookbook/echo-server' },
@@ -51,25 +60,27 @@ export default [
 		],
 	},
 	{
-		label: 'Design',
+		label: 'Architecture',
 		items: [
-			{ label: 'Stackless vs Stackful', slug: 'design/stackless-vs-stackful' },
+			{ label: 'Overview', slug: 'architecture' },
+			{ label: 'Stackful by design', slug: 'architecture/stackful-design' },
+			{ label: 'The M:N scheduler', slug: 'architecture/mn-scheduler' },
+			{ label: 'Work stealing', slug: 'architecture/work-stealing' },
+			{ label: 'Chase-Lev deque', slug: 'architecture/chase-lev-deque' },
+			{ label: 'The parking lot', slug: 'architecture/parking-lot' },
+			{ label: 'The Parker', slug: 'architecture/parker' },
+			{ label: 'Direct handoff', slug: 'architecture/direct-handoff' },
+			{ label: 'Memory model', slug: 'architecture/memory-model' },
+			{ label: 'Vyukov MPMC', slug: 'architecture/vyukov-mpmc' },
+			{ label: 'Semaphore (FIFO)', slug: 'architecture/semaphore-algorithm' },
 		],
 	},
 	{
-		label: 'Algorithms',
+		label: 'Performance',
 		items: [
-			{ label: 'Work Stealing', slug: 'algorithms/work-stealing' },
-			{ label: 'Chase-Lev Deque', slug: 'algorithms/chase-lev-deque' },
-			{ label: 'Vyukov MPMC Queue', slug: 'algorithms/vyukov-mpmc' },
-			{ label: 'Semaphore (FIFO)', slug: 'algorithms/semaphore-algorithm' },
-			{ label: 'Park', slug: 'algorithms/park' },
-		],
-	},
-	{
-		label: 'Internals',
-		items: [
-			{ label: 'Architecture', slug: 'internals/architecture' },
+			{ label: 'Overview', slug: 'performance' },
+			{ label: 'Multi-worker profile', slug: 'performance/multi-worker-profile' },
+			{ label: 'Phase 4 postmortem', slug: 'performance/phase-4-postmortem' },
 		],
 	},
 	{
@@ -78,6 +89,13 @@ export default [
 			{ label: 'Running Tests', slug: 'testing/running-tests' },
 			{ label: 'Benchmarking', slug: 'testing/benchmarking' },
 			{ label: 'Writing Async Tests', slug: 'testing/writing-async-tests' },
+		],
+	},
+	{
+		label: 'Appendix',
+		items: [
+			{ label: 'Overview', slug: 'appendix' },
+			{ label: 'Roadmap', slug: 'appendix/roadmap' },
 		],
 	},
 ];

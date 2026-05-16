@@ -104,9 +104,9 @@ described above), no measurable change. That's the expected behavior.
 
 ## See also
 
-- `docs/internals/multi-worker-profile.md` — broader scheduler
+- `docs/src/content/docs/performance/multi-worker-profile.md` — broader scheduler
   investigation; direct handoff is finding #3 in that doc.
-- `docs/internals/parking-lot.md` — the parking-lot path the
+- `docs/src/content/docs/architecture/parking-lot.md` — the parking-lot path the
   fast path skips.
-- `docs/internals/scheduler-mn.md` — the M:N scheduler design that
+- `docs/src/content/docs/architecture/mn-scheduler.md` — the M:N scheduler design that
   determines what "current P's lifo slot" means.

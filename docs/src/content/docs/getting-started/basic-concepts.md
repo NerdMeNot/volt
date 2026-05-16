@@ -174,5 +174,5 @@ sparingly.
   programs.
 - [Glossary](/getting-started/glossary/) — terms used throughout the
   docs and source.
-- [Stackless vs Stackful](/design/stackless-vs-stackful/) — why
+- [Stackless vs Stackful](/architecture/stackful-design/) — why
   Volt picked stackful and what the tradeoff actually buys you.

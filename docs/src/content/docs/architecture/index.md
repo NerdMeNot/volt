@@ -144,7 +144,7 @@ or any blocking primitive:
    loop right after the previous swap-in.
 3. The worker's `.park` branch in `dispatch` does a final CAS
    RUNNING → PARKED on `c.park_state` to close a register-then-park
-   race (see `docs/internals/parking-lot.md`).
+   race (see `docs/src/content/docs/architecture/parking-lot.md`).
 
 When the wake fires, the primitive's "release" / "send" / "task done"
 path calls `parkingLot.unparkOne(addr)` → pops the waiter from the

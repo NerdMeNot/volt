@@ -25,6 +25,34 @@ const versionPlugins = versionsConfig.history.length > 0
 // https://astro.build/config
 export default defineConfig({
 	site: 'https://volt.nerdmenot.in',
+	// Preserve URLs across the 2026-05-16 IA reorganisation. Old paths
+	// (algorithms/, design/, internals/) → new locations under
+	// architecture/ and performance/. Out-of-scope pages (filesystem,
+	// process, signals-shutdown, observability) redirect to the
+	// roadmap which explains what lives outside Volt core.
+	redirects: {
+		// internals/ → architecture/ + performance/
+		'/internals/architecture': '/architecture',
+		'/internals/scheduler-mn': '/architecture/mn-scheduler',
+		'/internals/parking-lot': '/architecture/parking-lot',
+		'/internals/memory-model': '/architecture/memory-model',
+		'/internals/direct-handoff-design': '/architecture/direct-handoff',
+		'/internals/multi-worker-profile': '/performance/multi-worker-profile',
+		'/internals/phase-4-postmortem': '/performance/phase-4-postmortem',
+		// algorithms/ → architecture/
+		'/algorithms/work-stealing': '/architecture/work-stealing',
+		'/algorithms/chase-lev-deque': '/architecture/chase-lev-deque',
+		'/algorithms/vyukov-mpmc': '/architecture/vyukov-mpmc',
+		'/algorithms/semaphore-algorithm': '/architecture/semaphore-algorithm',
+		'/algorithms/park': '/architecture/parker',
+		// design/ → architecture/
+		'/design/stackless-vs-stackful': '/architecture/stackful-design',
+		// Out-of-scope (deleted) → roadmap explains where each lives now
+		'/usage/filesystem': '/appendix/roadmap',
+		'/usage/process': '/appendix/roadmap',
+		'/usage/signals-shutdown': '/appendix/roadmap',
+		'/usage/observability': '/appendix/roadmap',
+	},
 	vite: {
 		plugins: [tailwindcss()],
 	},

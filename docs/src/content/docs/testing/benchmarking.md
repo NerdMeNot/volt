@@ -100,7 +100,7 @@ A few caveats for interpreting numbers:
 
 A common ask: "is this faster than Tokio?" The answer depends on
 the workload — Volt is built on different tradeoffs (stackful
-vs stackless, see [Stackless vs Stackful](/design/stackless-vs-stackful/))
+vs stackless, see [Stackless vs Stackful](/architecture/stackful-design/))
 so direct comparisons can mislead.
 
 The honest take:

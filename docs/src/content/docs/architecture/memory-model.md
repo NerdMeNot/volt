@@ -452,7 +452,7 @@ that skip atomics. Single-worker is a configuration, not a code path.
   Tightening to `.monotonic` requires a happens-before proof recorded
   in this document.
 * Linux/Windows specifics — the model is platform-agnostic. Platform
-  notes go in `docs/src/content/docs/internals/platform-*.md`.
+  notes go in `docs/src/content/docs/architecture/platform-*.md`.
 * The reactor's kqueue / epoll / io_uring memory semantics — those
   follow the OS contracts, documented in `reactor_kqueue.zig` etc.
 
