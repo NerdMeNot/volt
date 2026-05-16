@@ -1,170 +1,195 @@
 ---
-title: Running Tests
-description: zig build test, what the test suite covers, and how to interpret failures.
+title: Running tests
+description: zig build test, what the test suite covers, how to interpret failures, and how to write tests against the runtime.
 ---
 
 ```sh
 zig build test
 ```
 
-Runs the full test suite — about 200 tests covering the
-scheduler, every primitive, every channel, and the end-to-end
-integration paths. On Apple Silicon it takes about 7 seconds.
+Runs the full Volt test suite — ~47 tests covering the scheduler,
+every primitive, every channel shape, and end-to-end integration
+paths. On Darwin arm64 it takes a few seconds.
 
-```
-Build Summary: 3/3 steps succeeded; 208/209 tests passed (1 skipped)
-test success
-+- run test 208 pass, 1 skip (209 total) 8s MaxRSS:880M
-   +- compile test Debug native success 2s MaxRSS:390M
-```
-
-The 1 skipped test is a deliberate platform-conditional — typically
-a `if (native_os == .windows) return error.SkipZigTest;` line for
-something not yet ported.
+The pre-commit hook does **not** run tests — it type-checks via
+`zig build-lib`. CI runs the real tests on every push. The
+trade-off: faster pre-commit (no `zig test` IPC hang on loaded
+hosts), authoritative coverage in CI. See
+[Contributing](/appendix/contributing/) for the hook setup.
 
 ## What's covered
 
-The suite runs against the actual stackful runtime — every test
-goes through `volt.run(.{ .allocator = std.testing.allocator },
-test_root, .{})`. So you're testing the dispatch loop, the
-reactor, and the primitive together, not in isolation.
+The suite runs against the actual stackful runtime. Every test
+goes through `Runtime.init` → `rt.run(...)` → `rt.deinit()` — so
+you're testing the dispatch loop, the reactor, and the primitive
+together, not in isolation.
 
 Coverage by area:
 
 | Area | Tests |
 |---|---|
-| Bootstrap (`volt.run`, spawn/launch) | ~15 |
-| Multi-worker scheduling (work-stealing, injection) | ~8 |
-| I/O (TCP loopback echo, pipe read/write across cores) | ~10 |
-| Channels (Channel, Oneshot, Watch, Broadcast, select) | ~50 |
-| Sync (Mutex, RwLock, Semaphore, Notify, Barrier, OnceCell) | ~40 |
-| Structured concurrency (Scope, JoinSet, CancellationToken) | ~15 |
-| Time (sleep, withTimeout, Interval) | ~20 |
-| Stack overflow recovery | ~5 |
-| Stress / fuzz harnesses | ~10 |
-| Address parsing | ~4 |
-| Process / signal / fs | ~10 |
+| Bootstrap (Runtime.init/run/deinit, spawn) | several |
+| Multi-worker scheduling (work-stealing, mailbox) | several |
+| Parking lot + Parker | several |
+| Channels (Spsc, Mpmc, Oneshot, Watch, Broadcast) | many |
+| Sync (Mutex, Notify, Semaphore) | several |
+| Cancellation (Cancel + scope + cancel-aware variants) | several |
+| Slab arena (alloc / free / mprotect, exhaustion) | several |
+| Stack growth via SIGSEGV | a few |
+| TCP loopback echo | a few |
+| Memory model invariants | inline asserts |
 
-Each primitive has unit tests AND a multi-worker stress test
-(spawns N coroutines, hammers the primitive, asserts an
-invariant). The stress tests are what surface concurrency bugs.
+The exact count grows as new primitives land. Run `zig build
+test` to see the current total.
 
-## Stress tests
+Each primitive has unit tests + at least one multi-worker
+exercise. The 45-second `zig build stress` test is a longer-form
+gate that hammers spawn-join / Mutex / Spsc concurrently — see
+[Benchmarking](/testing/benchmarking/).
 
-Some tests run for measurable wall-clock time — multi-worker
-mutexes, channel hangs that took weeks to find before they were
-fixed. The defaults are tuned so the suite finishes in seconds;
-you can crank up the iteration count locally:
+## Allocator choice
 
-```sh
-zig build test -Dstress=200          # if such an option were exposed
-```
+Tests use one of two allocators:
 
-(Not currently a build option — the iteration counts are constants
-in the test files. Edit the constant and rebuild if you need to
-hammer something harder.)
+- **`std.heap.smp_allocator`** — thread-safe. Use for multi-worker
+  tests. No leak detection.
+- **`std.testing.allocator`** — leak-detecting (`GeneralPurpose
+  Allocator{.safety = true}`). Use for single-worker tests.
+  **Not thread-safe** on all paths (the stack-trace-capture
+  hash map for double-free detection is process-global). Tests
+  that use it under multi-worker crash with `EXC_BAD_ACCESS`.
 
-## Cross-compile
-
-Volt's CI matrix runs `zig build-lib` for six target triples:
-
-```sh
-zig build-lib src/lib.zig -target x86_64-linux-gnu     -lc -fno-emit-bin
-zig build-lib src/lib.zig -target aarch64-linux-gnu    -lc -fno-emit-bin
-zig build-lib src/lib.zig -target x86_64-windows-gnu   -lc -fno-emit-bin
-zig build-lib src/lib.zig -target aarch64-windows-gnu  -lc -fno-emit-bin
-zig build-lib src/lib.zig -target x86_64-macos         -lc -fno-emit-bin
-zig build-lib src/lib.zig -target aarch64-macos        -lc -fno-emit-bin
-```
-
-All six should exit `0`. If you're on Apple Silicon, you can run
-the actual test build for the arm64 Linux target (compiles +
-links + cannot-execute on a non-Linux host):
-
-```sh
-zig build test -Dtarget=aarch64-linux-gnu
-```
-
-Build Summary will say `1/3 steps succeeded (1 failed)` — the
-failed step is the run, which can't execute Linux binaries on
-Darwin. The compile step (the one that matters) is green.
-
-## Determinism mode
-
-For test traces you want to reproduce exactly:
+Pattern:
 
 ```zig
-test "my deterministic test" {
-    const result = try volt.run(.{
+test "single-worker behaviour with leak detection" {
+    var rt = try volt.Runtime.init(.{
         .allocator = std.testing.allocator,
-        .deterministic = true,
-    }, root, .{});
-    // ...
+        .workers = 1,
+    });
+    defer rt.deinit();
+    try (try rt.run(root, .{}));
+}
+
+test "multi-worker stress" {
+    var rt = try volt.Runtime.init(.{
+        .allocator = std.heap.smp_allocator,
+        // workers defaults to NumCPU
+    });
+    defer rt.deinit();
+    try (try rt.run(root, .{}));
 }
 ```
 
-`deterministic = true` forces single-worker mode and uses a fixed
-RNG seed for steal selection. Same input → same scheduler trace.
-Useful for bisecting flaky tests or reproducing race-window bugs
-from logs.
+The leak gate (`testing.allocator`) is what catches "I added a new
+allocation path and forgot to free." Every new allocation in the
+runtime needs a single-worker test that exercises alloc + free
+via `testing.allocator`.
 
-It's not perfect — the OS thread scheduler still nudges futex
-wakes, the syscall layer can re-order — but it eliminates Volt's
-contributions to non-determinism.
+## Cross-compile sanity
+
+CI compiles `zig build-lib` for Linux targets even though the
+reactor doesn't ship there:
+
+```sh
+zig build-lib src/lib.zig -target x86_64-linux-gnu  -lc -fno-emit-bin
+zig build-lib src/lib.zig -target aarch64-linux-gnu -lc -fno-emit-bin
+```
+
+Both should exit `0`. Catches type errors that would block the
+eventual Linux backend port. Neither produces a working binary —
+kqueue is Darwin-specific.
+
+## Reproducible test runs
+
+For test traces you want to reproduce exactly, set `workers = 1`:
+
+```zig
+test "deterministic single-worker" {
+    var rt = try volt.Runtime.init(.{
+        .allocator = std.testing.allocator,
+        .workers = 1,
+    });
+    defer rt.deinit();
+    try (try rt.run(root, .{}));
+}
+```
+
+Single-worker eliminates work-stealing non-determinism (the
+randomized steal target choice). The OS scheduler still nudges
+syscall timing, so it's not fully deterministic — but it's
+predictable enough for bisecting flaky tests.
+
+Volt does not ship a `Config.deterministic` flag — single-worker
+is the closest you get.
 
 ## Filtering tests
 
-`zig test`'s built-in filtering works:
+Zig's built-in filtering works:
 
 ```sh
-zig build test -- --filter "channel"     # any test with "channel" in name
+zig build test -- --filter "channel"     # tests matching "channel"
+zig build test -- --filter "Mpmc"        # tests matching "Mpmc"
 ```
 
-Useful when you're working on one primitive and don't want to wait
-for the full suite each iteration.
+Useful when iterating on one primitive.
 
 ## Failure interpretation
 
-Volt's failures are usually clear:
-
-- **Panic during dispatch** — a primitive misuse (calling Volt
-  outside `volt.run`, double-park on the same Park, etc.). The
-  panic message says exactly what.
-- **Hang** — a missed wake or a closed channel waiting on a never-
-  arriving close. Run with `--workers 1` to serialize and add
-  `std.log.debug` traces; usually clear within a few iterations.
-- **Memory leak detected by `std.testing.allocator`** — you
-  forgot a `deinit` on a Channel, JoinSet, or the like. Or
-  forgot to `destroyJob` / `destroyTask`. The allocator's report
-  points at the allocation site.
-- **`error.Cancelled`** unexpected — usually a `withTimeout` that
-  fired earlier than you thought.
+| Symptom | Usual cause |
+|---|---|
+| Panic during dispatch | A primitive misuse (calling Volt outside a coroutine, joining a Task twice). The panic message says what. |
+| Hang | A missed wake or a channel that's never closed. Run with `workers = 1` + `std.log.debug` traces; usually clear within a few iterations. |
+| Memory leak detected by `testing.allocator` | A missing `deinit` on Watch/Broadcast, or a Task never joined. The allocator report points at the allocation site. |
+| `EXC_BAD_ACCESS` in `array_hash_map.ensureTotalCapacity` | Using `testing.allocator` from multi-worker code. Switch to `smp_allocator`. |
+| `error.ArenaExhausted` | Spawned more than `max_concurrent_stacks` coroutines without joining. |
 
 ## Adding tests
 
-Inline tests in source files are automatically picked up by `zig
-build test`. The standard pattern:
+Inline `test "..."` blocks at the bottom of the source file that
+implements the thing being tested. Zig's test discovery (`zig
+build test`) picks them up automatically.
 
 ```zig
-test "channel: SPSC, 1000 messages, sum invariant" {
-    const result = try volt.run(.{
+// in src/channel.zig
+
+test "Spsc: 1000 messages, sum invariant" {
+    var rt = try volt.Runtime.init(.{
         .allocator = std.testing.allocator,
-    }, channelSpscRoot, .{});
-    try std.testing.expectEqual(@as(u64, 499500), result);
+        .workers = 1,
+    });
+    defer rt.deinit();
+    const sum = try (try rt.run(spscSumRoot, .{}));
+    try std.testing.expectEqual(@as(u64, 499500), sum);
 }
 
-fn channelSpscRoot() !u64 {
-    var ch = try volt.channel.Channel(u64).init(std.testing.allocator, 64);
-    defer ch.deinit();
-    // ... use the channel ...
+fn spscSumRoot() !u64 {
+    var ch: Spsc(u64, 16) = .{};
+    // ... producer + consumer ...
     return computed_sum;
 }
 ```
 
-Tests live inline with the code they test. Every primitive's
-source has its own `// ─── Tests ───` section near the bottom.
+Tests near implementation = read alongside the code = harder to
+let them drift. Every `src/*.zig` file has its tests at the
+bottom under a `// ─── Tests ───` comment.
 
-For multi-file integration tests that don't fit cleanly inline,
-there's `src/test/`. See the files there for shape:
-`integration_test.zig`, `multi_worker_test.zig`,
-`channel_integration_test.zig`, `scheduler_fuzz_test.zig`.
+## Diagnostic helpers in tests
+
+`rt.dumpState()` prints scheduler atomics. Call it from a test
+right before an assert if you need to know what the scheduler is
+doing:
+
+```zig
+test "investigate hang" {
+    // ... setup ...
+    if (suspected_hang) rt.dumpState();
+    // ...
+}
+```
+
+## See also
+
+- [Writing async tests](/testing/writing-async-tests/) — patterns for testing coroutine code.
+- [Benchmarking](/testing/benchmarking/) — perf gate, run discipline.
+- [Contributing](/appendix/contributing/) — bench-gate protocol, when to add tests.

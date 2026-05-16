@@ -1,199 +1,216 @@
 ---
-title: Performance Tuning
+title: Performance tuning
 description: Where Volt's overhead lives, what's worth measuring, and the knobs you can turn.
 ---
 
-This guide is for the case where Volt is in your hot path and
-you've decided you need to make it faster. Most programs won't
-need any of it.
+This guide is for when Volt is in your hot path and you've decided
+you need to make it faster. Most programs don't need any of it —
+the defaults are good enough for typical interactive workloads.
 
 ## Measure first
 
-Volt ships `zig build bench`, which runs core benchmarks in
-`ReleaseFast`:
+Run the bench gate from a fresh checkout to establish what
+"normal" looks like on your hardware:
 
 ```sh
-zig build bench
+zig build bench-yield        # ~9 ns/op
+zig build bench-spsc         # ~12 ns/op
+zig build bench-mpmc         # ~54-157 ns/op
+zig build bench-mutex        # ~15 ns/op
+zig build bench-tcp-echo     # ~8,500 ns/RTT
+zig build bench-spawn-hot    # ~100-575 ns/op (workers=1 .. 11)
+zig build bench-rss          # ~16.6 KiB / coroutine at N=10000
 ```
 
-Output is a small table — spawn cost, yield cost, channel SPSC
-throughput, mutex lock/unlock cost on the host. Treat the numbers
-as your **baseline**: if your application's costs are within 2-3×
-of the bench numbers, the runtime isn't the bottleneck — your
-work is.
+Treat these as your **baseline**: if your application's costs are
+within 2-3× of the bench numbers for the matching shape, the
+runtime isn't the bottleneck. Your work is.
 
-If you're well above bench numbers, profile. Volt's source is
-small enough that walking through the dispatch path with a
-profiler usually surfaces the cause.
+If you're well above bench numbers, profile. `samply record` on
+Darwin is the recommended tool; the
+[multi-worker profile](/performance/multi-worker-profile/) doc
+walks through the methodology with real-data examples.
 
-## The knobs
-
-### Worker count
+## The knobs (Config)
 
 ```zig
-try volt.run(.{ .allocator = a, .workers = 4 }, root, .{});
+pub const Config = struct {
+    allocator: std.mem.Allocator,    // required
+    workers: ?usize = null,          // null → getCpuCount()
+    max_concurrent_stacks: usize = 16 * 1024,
+};
 ```
 
-Default is `getCpuCount()`. Tune up or down based on:
+### `workers`
 
-- **CPU-bound workloads**: workers = physical cores. Hyperthreads
-  rarely help with stackful coroutines because the dispatch
-  overhead doesn't parallelize well across SMT.
-- **I/O-bound workloads**: workers = somewhere between 1 and
-  CPU count. More workers = more reactor-claim contention; fewer
-  workers = fewer steal targets.
-- **Latency-sensitive**: workers = CPU count, plus `pin_workers
-  = true` to keep each worker on its own core.
+Default is `getCpuCount()` (with a floor of 1). Tune based on
+workload:
 
-For most workloads, the default is fine. Tuning matters mainly when
-you've measured a clear bottleneck.
+- **CPU-bound**: `workers = physical_cores`. Hyperthreads rarely
+  help with stackful coroutines because dispatch overhead
+  doesn't parallelise across SMT.
+- **I/O-bound**: `workers = getCpuCount()` is usually fine.
+  Fewer workers leaves cores idle if many coroutines are runnable
+  at once; more workers mean more reactor-claim contention.
+- **Latency-sensitive single-purpose**: `workers = 1` eliminates
+  cross-worker coordination entirely. Use for serial pipelines
+  that don't benefit from parallelism.
 
-### Worker pinning
+For most workloads, the default is correct. Tune only when
+you've measured a clear bottleneck and have a hypothesis about
+which direction.
 
-```zig
-try volt.run(.{ .allocator = a, .pin_workers = true }, root, .{});
-```
+### `max_concurrent_stacks`
 
-Linux only. Pins worker `i` to CPU `i % cpu_count` via
-`pthread_setaffinity_np`. Reduces cross-core cache traffic for
-hot data; increases tail latency if a high-priority task arrives
-on a busy worker (no migration possible).
+Default 16384. Sizes the slab arena: `n_slots × 256 KiB` of
+virtual address space reserved at runtime init. Slots have zero
+RSS until they're allocated; raising this is cheap on 64-bit
+hosts.
 
-Pin if your workload has clearly hot per-coroutine data and
-near-zero load imbalance. Don't pin if you have bursty traffic
-where load imbalance is the bigger problem.
+Raise if:
 
-### Stack size
+- You expect tens of thousands of concurrent connections / coros.
+- `volt.spawn` is returning `error.ArenaExhausted`.
 
-Volt commits 1 page (4-16 KiB) up front per coroutine and grows in
-place to 8 MiB on guard-page faults. The cap is a compile-time
-constant (`default_reserved` in `src/coroutine/stack.zig`). If
-you're handling truly recursive workloads (regex backtracking,
-recursive-descent parsers) and hitting `error.StackOverflow`,
-raise it.
+Lower if:
 
-For most workloads, the 1-page initial commit is what you want —
-zero physical memory until the coroutine actually uses stack.
+- You want a hard cap on memory footprint (back-pressure: spawn
+  fails when arena is full, instead of growing without bound).
+- You're on a tight virtual-address budget (rare on 64-bit).
 
-## What's actually expensive
+## What Volt does NOT have
 
-In rough order, biggest first:
+Some knobs that exist in other runtimes don't exist here:
 
-1. **`mmap` / `mprotect` syscalls on coroutine spawn.** Per spawn
-   we reserve 8 MiB virtual address space + commit 1 page +
-   protect a guard page. That's 2-3 syscalls per spawn. The slab
-   pool eliminates this for steady-state workloads (recycles
-   stacks across spawns), but the first N spawns of the runtime
-   pay the syscall cost.
+- **`pin_workers`**: no built-in CPU pinning. Wire
+  `pthread_setaffinity_np` directly from your code if needed.
+- **`deterministic`**: no built-in deterministic mode. Run
+  `workers = 1` for reproducible test traces; full determinism
+  also requires controlling the OS scheduler (sched_setaffinity
+  + nice + RT priority) — out of Volt's scope.
+- **`reactor_backend`**: kqueue is the only shipping backend;
+  there's nothing to switch to. Linux backends are roadmapped.
 
-   *Mitigation*: pre-warm the pool by spawning + finishing N
-   coroutines before your hot path. Subsequent spawns are
-   essentially free.
+## What's expensive (rough cost ordering)
 
-2. **Context switches.** ~10-15 ns on Apple Silicon for the
-   assembly switch. Plus park/unpark bookkeeping (a few atomic
-   ops). The dominant cost in a "ping-pong between two
+1. **`mprotect` syscalls on slot first-use.** Each slot's top
+   page is mprotect'd RW the first time it's allocated. After
+   warmup, the slot stays committed; no further mprotect for
+   that slot. Cost: ~1 µs per syscall, fires at most `n_slots`
+   times over the runtime's life.
+
+   *Mitigation*: warm the arena by spawning + completing N
+   coroutines at startup. After that, the steady-state spawn
+   path is allocation-only with zero syscalls.
+
+2. **Context switches.** ~9 ns/op for the bare swap on arm64
+   (`bench-yield`). Plus a few atomic ops for park-state
+   transitions. The dominant cost in a "ping-pong between two
    coroutines" benchmark.
 
-   *Mitigation*: batch work. If you have an iteration that does
-   1 ns of compute and then yields, you're paying 10ns+ of
-   overhead per item. Restructure to do hundreds of items per
-   suspend.
+   *Mitigation*: batch work. If your loop does 1 ns of compute
+   then yields, you're paying 9 ns+ of overhead per item.
+   Restructure to do hundreds of items per suspend.
 
-3. **Mutex contention under high core counts.** Volt's Mutex is
-   FIFO-fair; on a 64-core machine with all 64 contending, the
-   waiter-list overhead dominates. Std's `std.Thread.Mutex` is
-   fair-ish via parking_lot internals; for small uncontended
-   sections it can be faster.
+3. **Mutex contention under high core counts.** Volt's contended
+   path goes through the parking lot — a sharded mutex per
+   bucket. Under heavy contention on the same address, all
+   contenders converge on one bucket, and the bucket's pthread
+   mutex serializes them. Still 15 ns/op under bench-mutex's 8x
+   contention; scales sublinearly past that.
 
    *Mitigation*: shard. Per-core counters with a periodic
    aggregator. Per-key locks instead of one global lock. The
-   classic "shard your hash table" pattern.
+   classic "shard your hash map" pattern.
 
-4. **Channel ring contention.** `Channel(T)` is a Vyukov MPMC
-   ring; its fast path is a single CAS, but contention on the
-   tail counter under heavy multi-producer load shows up.
+4. **Mpmc ring contention.** Vyukov's MPMC is wait-free under
+   non-pathological load, but `enqueue_pos` is a single counter
+   that all producers CAS-bump. Under heavy multi-producer load
+   it's the contention point.
 
    *Mitigation*: shard channels. N producers each writing to
-   their own channel that one consumer multiplexes is faster
-   than N producers contending on one channel.
+   their own Spsc that one consumer multiplexes is faster than
+   N producers contending on one Mpmc.
 
-5. **Reactor poll dispatch.** Every wake event causes a
-   single-poller-claim dance: try to claim, poll, dispatch. With
-   thousands of events per second this is fine; with millions
-   you start seeing the claim contention on the bitmap.
+5. **Cross-P stealing on idle workers.** Workers without local
+   work randomly choose a sibling P and try to steal. The CAS-
+   based steal is wait-free, but the search can be wasted work
+   if no one has anything stealable.
 
-   *Mitigation*: io_uring's batched submission helps if your I/O
-   is on Linux and you can flip the reactor backend (currently a
-   one-line edit in `reactor.zig` until the runtime
-   `Config.reactor_backend` ships).
+   *Mitigation*: rarely worth tuning. If steal contention shows
+   up high in a profile, the underlying issue is usually load
+   imbalance — fix the work shape, not the scheduler.
 
-## Measuring per-operation cost
+## Stack size
 
-Wrap a hot path with `volt.tracing.span`:
+Volt commits 16 KiB (1 Darwin page) per slot at first use, growing
+in 16 KiB increments via SIGSEGV. Total reservation per slot is
+256 KiB. The body and reservation sizes are compile-time
+constants in `src/stack.zig`.
 
-```zig
-const result = try volt.tracing.span(.{
-    .name = "process_request",
-}, struct {
-    fn body() !Response { ... }
-}.body);
-```
+If you're hitting deep recursion that overflows the 256 KiB
+reservation:
 
-The default sink emits OTel-shaped JSON Lines to stderr with
-nanosecond start/end timestamps. Pipe to a collector for
-aggregation, or set a custom sink:
+- Refactor to remove the recursion (iterative or trampoline-style).
+- Raise `RESERVATION_SIZE` in `src/stack.zig` for the whole
+  runtime (no per-coroutine override today).
 
-```zig
-fn mySink(e: volt.tracing.Event) void { /* aggregate */ }
-volt.tracing.setSink(&mySink);
-```
+For most workloads, the 16 KiB initial commit is correct — zero
+physical memory until the coroutine actually uses stack.
 
-For lower-level "what are workers doing" questions:
+## Diagnostics in production
 
 ```zig
-const m = try volt.observability.metrics(allocator, rt);
-defer m.deinit(allocator);
-for (m.workers) |w| {
-    std.log.debug("w{d}: pushed={d} stolen={d} parked={d} ctx_sw={d}", .{
-        w.id, w.pushes, w.steals, w.parks, w.context_switches,
-    });
-}
+rt.dumpState();
 ```
 
-High `parks` count means workers are idle a lot — your work
-isn't keeping them busy. High `steals` means good load
-distribution. High `context_switches` per second is normal under
-I/O load; it's only a problem if it's coming with high yields
-from CPU code that should be batching.
+Writes to stderr: parked-workers bitmap, num_searching count,
+reactor poller flag, pending reactor events, per-P stat counters
+(spawned / done / fairness hits / cross-thread unparks).
 
-## Snapshot the live runtime
+Safe to call from any thread. Useful for "what is the runtime
+doing right now" investigations during hangs.
 
-```zig
-const snaps = try volt.observability.snapshot(alloc, rt);
-defer alloc.free(snaps);
+```sh
+samply record -- zig-out/bin/my-app
 ```
 
-Each `TaskSnapshot` has the task's name, spawn site, current
-state, and accumulated CPU time. Useful in production for "what
-are my long-running tasks doing right now" — pipe to your
-operational dashboard.
+`samply` works well on Darwin. The architecture chapter has
+real examples of profiles in [Multi-worker
+profile](/performance/multi-worker-profile/).
 
 ## When the runtime *isn't* the bottleneck
 
 Most performance problems aren't Volt's. Common ones:
 
-- **Allocator pressure**. `std.heap.DebugAllocator` is for
-  development; use `std.heap.smp_allocator` or arena-per-request
-  in production.
+- **Allocator pressure**. `std.testing.allocator` is for tests;
+  use `std.heap.smp_allocator` (the recommended default) or
+  arena-per-request in production. Volt does not provide a
+  bespoke allocator — that's `std`'s job.
 - **Logging in the hot path**. `std.debug.print` synchronously
   formats and writes; in a request handler that's measurable
-  overhead.
-- **Heavy computation on the worker thread**. Move it to
-  `volt.spawnBlocking`.
-- **JSON parsing per request**. Use stack-allocated parser state
-  + reuse buffers across requests.
+  overhead. Buffer and flush async.
+- **Heavy computation on a worker thread**. Move it to a real
+  OS thread via `std.Thread.spawn` + a Mpmc bridge (see
+  [Offloading CPU work](/cookbook/work-offload/)).
+- **Mutex held across a suspension**. See
+  [Common pitfalls](/guides/common-pitfalls/) — the lock
+  serialises unrelated coroutines.
 
-Profile, don't guess. Volt's source is ~10K lines and readable —
-if you see Volt's code dominating a profile, file an issue with
+Profile, don't guess. Volt's source is ~5 KLoC and readable — if
+you see Volt's own code dominating a profile, file an issue with
 the trace; we want to know.
+
+## Phase-landing protocol applies to user code too
+
+If you measure a change of 20% on a key bench, you've done
+something real. If it moves by less, it's noise — discard. The
+bench gate's discipline (5-run medians, fixed system load) is the
+right discipline for your own perf work.
+
+## See also
+
+- [Benchmarks](/performance/benchmarks/) — methodology and baselines.
+- [Multi-worker profile](/performance/multi-worker-profile/) — profiling receipts.
+- [Slab arena postmortem](/performance/slab-arena-postmortem/) — what a 30× regression looked like.
+- [Architecture: M:N scheduler](/architecture/mn-scheduler/) — where the cycles go.

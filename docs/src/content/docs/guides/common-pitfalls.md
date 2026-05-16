@@ -1,72 +1,82 @@
 ---
-title: Common Pitfalls
+title: Common pitfalls
 description: The mistakes that bite every Volt developer at least once. Read before shipping.
 ---
 
 These are the failure modes that catch people. The runtime panics
 loudly for most of them — it'd rather give you a clear error than
-silently corrupt state — but understanding *why* they panic helps
-you fix them faster.
+silently corrupt state — but understanding *why* helps you fix
+them faster.
 
-## Calling Volt code outside `volt.run`
+## Calling Volt code outside `Runtime.run`
 
 ```zig
 pub fn main() !void {
-    try volt.sleep(volt.Duration.fromSecs(1));   // PANIC
+    volt.sleep(1 * std.time.ns_per_s);   // PANIC
 }
 ```
 
 Every Volt-suspending call panics if it can't find a current
-runtime in TLS. The error message tells you exactly what happened:
+coroutine in TLS. The error is some variant of:
 
 ```
-thread panic: volt.sleep called outside a runtime
+thread panic: not in a coroutine
 ```
 
-Fix: wrap your entry point in `volt.run`:
+Fix: wrap your entry point in `Runtime.run`:
 
 ```zig
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    try volt.run(.{ .allocator = gpa.allocator() }, app, .{});
+    var rt = try volt.Runtime.init(.{ .allocator = std.heap.smp_allocator });
+    defer rt.deinit();
+    try (try rt.run(app, .{}));
 }
 fn app() !void {
-    try volt.sleep(volt.Duration.fromSecs(1));
+    volt.sleep(1 * std.time.ns_per_s);
 }
 ```
 
-This applies to library code too. If you write a library that uses
-Volt internally, your library's users have to call `volt.run`
-themselves — there's no way to hide it.
+This applies to library code too. A function that uses `volt.spawn`
+or `volt.sleep` only works inside a coroutine; document the
+constraint at the function level.
 
-## Forgetting `destroyJob` / `destroyTask`
-
-```zig
-const j = try volt.launch(work, .{});
-try j.join();
-// ← Job handle leaks!
-```
-
-The `*Job` handle is heap-allocated. The runtime owns the
-coroutine; *you* own the handle. Always pair `launch` / `spawn`
-with `destroyJob` / `destroyTask`:
+## Forgetting to join a Task
 
 ```zig
-const j = try volt.launch(work, .{});
-defer volt.destroyJob(j);
-try j.join();
+const t = try volt.spawn(work, .{});
+// ← never joined: Task struct leaks
 ```
 
-Better: use `volt.scope` and never see a Job handle at all:
+`volt.spawn` returns `*Task(T)` — heap-allocated. `t.join()`
+parks until the coroutine completes **and frees the Task
+struct**. If you don't join, the Task struct leaks.
+
+For one child:
+
+```zig
+const t = try volt.spawn(work, .{});
+_ = t.join();
+```
+
+For multiple, the structured pattern is `volt.scope` + explicit
+joins inside:
 
 ```zig
 try volt.scope(struct {
-    fn body(s: *volt.Scope) !void {
-        try s.spawn(work, .{});
+    fn body(c: *volt.Cancel) anyerror!void {
+        _ = c;
+        const a = try volt.spawn(workA, .{});
+        const b = try volt.spawn(workB, .{});
+        _ = a.join();
+        _ = b.join();
     }
 }.body);
 ```
+
+Volt does not ship a "detach" primitive. Fire-and-forget patterns
+genuinely leak Tasks; bound the leak by scoping the spawns
+inside a scope that joins them, or by capping concurrent spawns
+with a Semaphore.
 
 ## Holding a Mutex across a suspension
 
@@ -95,24 +105,32 @@ If you genuinely need to hold the lock across the suspension
 (e.g., guarded enqueue with notify), that's a Notify pattern, not
 a Mutex pattern.
 
-## Spawning instead of scoping
+## Calling `Task.join` from outside a coroutine
 
 ```zig
-fn parent() !void {
-    _ = try volt.launch(child, .{});   // ← outlives parent
-    return;
+pub fn main() !void {
+    var rt = try volt.Runtime.init(.{ .allocator = a });
+    defer rt.deinit();
+    const t = try rt.spawn(work, .{});
+    _ = t.join();   // PANIC — not in a coroutine
 }
 ```
 
-`volt.launch` returns a `*Job`. If you don't keep it and join it,
-the child outlives the parent — you've created a fire-and-forget
-that may still be running when the parent's caller assumes it's
-done. Resources the child references can be freed underneath it.
+`Task.join` parks on the parking lot, which only works inside a
+coroutine. `Runtime.run` does its internal join from inside its
+own context — that's the only way to bridge.
 
-For static-N children: use `volt.scope`. For dynamic-N: use
-`volt.JoinSet`. Reach for `volt.launch` only when the child
-genuinely needs to outlive the parent (e.g., per-connection
-handlers in a TCP server).
+```zig
+pub fn main() !void {
+    var rt = try volt.Runtime.init(.{ .allocator = a });
+    defer rt.deinit();
+    try (try rt.run(work, .{}));   // run handles the bridge
+}
+```
+
+If you need to coordinate from outside the runtime, use a
+`std.Thread.Mutex` + `std.Thread.Condition`-style pattern in the
+non-coroutine code, with a coroutine doing the final notify.
 
 ## Using `std.Thread.sleep` inside a coroutine
 
@@ -129,42 +147,46 @@ make progress.
 Use `volt.sleep`:
 
 ```zig
-try volt.sleep(volt.Duration.fromSecs(1));
+volt.sleep(1 * std.time.ns_per_s);
 ```
 
-Same applies to any blocking call in `std.posix.*` or `std.Thread.*`
-— if it blocks, it blocks a worker. Either swap to a Volt-aware
-equivalent or wrap the call in `volt.spawnBlocking`.
+Same applies to any blocking syscall on a Volt-registered fd —
+if it blocks, it blocks a worker. Either swap to a Volt-aware
+equivalent (`volt.net.TcpStream.read` instead of
+`std.posix.read`) or bridge via `std.Thread.spawn` + a Mpmc
+channel (see [Offloading CPU work](/cookbook/work-offload/)).
 
-## Calling `std.posix.read` / `write` directly on a registered fd
+## Calling `std.posix.read` / `write` directly on a Volt-managed fd
 
 ```zig
 const conn = try listener.accept();
-const n = try std.posix.read(conn.fd, &buf);   // ← BAD; bypasses reactor
+const n = try std.posix.system.read(conn.fd, &buf);   // BAD; bypasses reactor
 ```
 
 `TcpStream.read` does the non-blocking read + reactor wait dance.
-Calling `std.posix.read` directly returns `EWOULDBLOCK` on the
+Calling the raw syscall directly returns `EAGAIN` on the
 non-blocking fd — your code would have to do the wait itself.
-Use `conn.read(&buf)` instead.
+Use `conn.read(&buf)`.
 
-## Mutating `args` after `volt.launch`
+## Mutating `args` after `volt.spawn`
 
 ```zig
 var args = MyArgs{ .x = 1 };
-const j = try volt.launch(handler, .{&args});
-args.x = 2;   // ← did the handler observe x=1 or x=2?
-try j.join();
+const t = try volt.spawn(handler, .{&args});
+args.x = 2;   // ← does the handler observe x=1 or x=2?
+_ = t.join();
 ```
 
-`volt.launch` and `volt.spawn` copy the args tuple by value into
-the coroutine's stack. Pointer arguments are copied too — the
-*pointer* is captured, but it still points at the caller's
-mutable storage. So the example above is racy: the handler sees
-whatever `args.x` happens to be when it reads.
+`volt.spawn` copies the args tuple by value into the coroutine's
+Frame. Pointer arguments are copied as pointers — the *pointer*
+is captured, but it still points at the caller's mutable storage.
+So the example above is racy: the handler reads whatever
+`args.x` happens to be at read time.
 
 If you need a snapshot: copy `args.x` into a local before passing
-the pointer, or pass the value directly (not via pointer).
+the pointer, or pass the value directly (not via pointer). For
+larger structs, copy by value into the args tuple itself —
+`volt.spawn(handler, .{args})` (no `&`) copies the struct.
 
 ## Sending to a closed channel
 
@@ -173,99 +195,127 @@ ch.close();
 try ch.send(42);   // returns error.Closed
 ```
 
-Not actually a bug per se — `error.Closed` is a normal return
-value. But programs sometimes treat `error.Closed` as fatal when
-it's actually expected (e.g., the receiver finished early). The
-right pattern:
+Not a bug per se — `error.Closed` is a normal return value. But
+programs sometimes treat `error.Closed` as fatal when it's
+expected (e.g., the receiver finished early). The right pattern
+on send paths that might race with close:
 
 ```zig
 ch.send(42) catch |err| switch (err) {
     error.Closed => return,    // receiver gone; we're done
-    error.Cancelled => return,
 };
 ```
 
-## Multi-Volt-runtime mistakes
+`Oneshot.send` similarly returns `error.Closed` on second send
+or after close. The `catch {}` idiom is the common form for
+race-style fan-out.
+
+## Multi-Runtime mistakes
 
 ```zig
-try volt.run(.{ .allocator = a }, outer, .{});
+var rt = try volt.Runtime.init(...);
+try (try rt.run(outer, .{}));
 
 fn outer() !void {
-    try volt.run(.{ .allocator = a }, inner, .{});   // ← PANIC
+    var rt2 = try volt.Runtime.init(...);   // creates a second Runtime
+    try (try rt2.run(inner, .{}));          // ← may panic or deadlock
 }
 ```
 
-You can't nest `volt.run`. The runtime uses TLS to track current
-coroutine / worker / runtime; the inner `volt.run` would clobber
-the outer's TLS. If you need multiple "Volt-like" islands, run
-them in separate processes.
+Nesting `Runtime.run` calls within the same thread doesn't work —
+the threadlocal current-coroutine pointer is shared between
+runtimes; the inner runtime can't tell which coroutine is "live"
+on the M[0] that's already inside `outer`'s dispatch.
+
+If you need multiple runtimes, run them on **different OS
+threads** (each thread becomes its own `M[0]` for its runtime).
+For the typical use case (one process = one runtime), just don't
+nest.
 
 ## Spawning from a non-coroutine thread
 
 ```zig
 const t = std.Thread.spawn(.{}, struct {
     fn run() void {
-        _ = volt.launch(work, .{});   // PANIC
+        _ = volt.spawn(work, .{});   // PANIC — not in a coroutine
     }
-}.run, .{});
+}.run, .{}) catch unreachable;
 ```
 
-`volt.launch` requires a current runtime in TLS, which only exists
-on coroutines and Volt workers. If you need to send work into Volt
-from outside (e.g., from a callback in another runtime), use a
-`Channel(T).trySend` (lock-free, callable anywhere) and have a
-Volt coroutine consume from it.
+`volt.spawn` requires a current coroutine in TLS — only exists on
+Volt workers. From a non-coroutine thread, use `rt.spawn(...)`
+which takes a `*Runtime` handle and routes directly through the
+slab arena (no per-P pool fast path):
 
-## Forgetting to deinit a Channel / Broadcast / JoinSet
+```zig
+const t = std.Thread.spawn(.{}, struct {
+    fn run(rt: *volt.Runtime) void {
+        _ = rt.spawn(work, .{}) catch unreachable;
+    }
+}.run, .{rt_ptr}) catch unreachable;
+```
+
+`rt.spawn` is the cross-thread injection door. Use sparingly.
+
+## Forgetting to deinit a Watch / Broadcast / channel
 
 ```zig
 fn root() !void {
-    var ch = try volt.channel.Channel(u32).init(alloc, 64);
-    // ... use ch ...
-    // ← never deinit'd; ring buffer + waiter list leak
+    var b = volt.Broadcast(Event, 64).init();
+    // ... use b ...
+    // ← never deinit'd; per-receiver waiter lists leak
 }
 ```
 
 Always:
 
 ```zig
-var ch = try volt.channel.Channel(u32).init(alloc, 64);
-defer ch.deinit();
+var b = volt.Broadcast(Event, 64).init();
+defer b.deinit();
 ```
 
-Same for `Broadcast`, `JoinSet`, `Watch`, `Mutex` — though the
-last three are zero-allocation, so their `deinit` is a no-op or
-defensive assertion (Watch).
+Same for `Watch`. `Spsc` and `Mpmc` and `Oneshot` are
+zero-allocation (their `.{}` init form has no allocation to
+clean up), but the convention is to call `deinit` anyway — future
+versions might add bookkeeping.
 
-## Cancelling without joining
+## Cancelling without ensuring children observe
 
 ```zig
-j.cancel();
-volt.destroyJob(j);   // ← coroutine may still be running!
+c.fire();
+// ← children may still be running; firing Cancel doesn't wait
 ```
 
-`cancel()` sets a flag and unparks the coroutine. The coroutine
-hasn't finished — it's about to wake up and observe the cancel.
-Destroying its handle now (and its underlying Coroutine) leads to
-use-after-free.
+`Cancel.fire()` flips the flag and unparks every coroutine
+parked on a cancel-aware op with the Cancel. But:
 
-Always:
+1. Children that aren't parked yet (running CPU, between syscalls)
+   won't observe the cancel until they hit the next cancel-aware
+   op or `checkpoint`.
+2. Children parked on **non-cancel-aware** ops (`volt.sleep`,
+   any I/O) don't wake from Cancel at all.
+
+The typical pattern: fire the Cancel, then join each child to
+wait for unwind:
 
 ```zig
-j.cancel();
-_ = j.join() catch {};
-volt.destroyJob(j);
+c.fire();
+_ = t1.join();
+_ = t2.join();
 ```
 
-## Concurrent Job/Task on the same join_park
+If children might be stuck on a non-cancel-aware op, you have to
+break them out another way (e.g., close their fd).
 
-The Park inside a coroutine's `join_park` is single-waiter. If two
-different coroutines both `j.join()` the same Job concurrently,
-the second panics with `concurrent waiter on Park`.
+## Concurrent Task.join on the same Task
 
-Fix: only one coroutine should `join` a given Job. If you need
-multiple consumers to wait for completion, use a `Notify` or
-`Oneshot` instead.
+The Task's `done` flag has at most one parked waiter slot. If two
+coroutines both `t.join()` on the same Task, behaviour is
+undefined — likely a panic, possibly a missed wake.
+
+Fix: a given Task is joined by exactly one coroutine. If you
+need fan-out of "task is done", have the task signal a `Notify`
+that multiple coroutines can `wait` on.
 
 ## Long-running CPU loops without yield
 
@@ -280,26 +330,43 @@ fn cpuLoop() void {
 
 This blocks the worker indefinitely. Other coroutines on that
 worker never run. Cancellation can never propagate (no suspension
-point to surface `error.Cancelled`).
+point to observe a Cancel at).
 
 Fixes:
 
-- Add `try volt.yield();` periodically — gives other coroutines a
-  chance and acts as a cancellation point.
-- Move the work to `volt.spawnBlocking` — runs on a dedicated
-  pool thread, doesn't tie up a worker.
+- Add `volt.yield()` periodically — gives other coroutines a
+  chance.
+- Add `try c.checkpoint()` periodically when a `*Cancel` is
+  threaded through — makes the loop cancel-aware.
+- Move the work to a separate OS thread via `std.Thread.spawn`
+  and bridge with a `Mpmc` channel — see [Offloading CPU
+  work](/cookbook/work-offload/).
 
-## Using `volt.io.read(fd, buf)` instead of `stream.read(buf)`
+## Assuming `volt.sleep` is cancel-aware
 
 ```zig
-const n = try volt.io.lowlevel.read(conn.fd, &buf);
+volt.sleep(60 * std.time.ns_per_s);
+try c.checkpoint();   // checked AFTER the 60s sleep
 ```
 
-This works but it's the wrong layer. `lowlevel` is for FFI and
-custom-fd integrations; `TcpStream.read` is what application code
-should use. The difference is documentation more than behavior —
-new readers of your code will be confused why you're reaching
-through to `.fd`.
+`volt.sleep` runs to completion regardless of `Cancel.fire()`.
+Today there's no cancel-aware sleep variant. If a watchdog fires
+a Cancel during the sleep, the sleeping coroutine won't observe
+it until after wake.
+
+Workaround: race the sleep against the Cancel via a Notify, or
+use a shorter sleep + checkpoint loop:
+
+```zig
+var elapsed_ns: u64 = 0;
+while (elapsed_ns < 60 * std.time.ns_per_s) {
+    try c.checkpoint();
+    volt.sleep(100 * std.time.ns_per_ms);
+    elapsed_ns += 100 * std.time.ns_per_ms;
+}
+```
+
+Coarser; cancellation observed within 100 ms of fire.
 
 ## "It works in tests but hangs in production"
 
@@ -307,18 +374,29 @@ Almost always one of:
 
 - A `Mutex` deadlock you didn't trip in single-threaded tests
   because two coroutines never raced on the same lock.
-- A `Channel` that's never closed; receivers park forever.
-- A `Job.join()` on something that errored out before the join
-  could see it (rare; usually a misuse of structured concurrency).
+- A channel that's never closed; receivers park forever.
+- A `Task.join` on a Task whose coroutine errored out in a way
+  the joiner doesn't observe — typically a misuse of structured
+  concurrency.
 
-Run with `--workers 1 --deterministic` for tests:
+For reproducible test traces, run with `workers = 1`:
 
 ```zig
-try volt.run(.{
-    .allocator = std.testing.allocator,
-    .deterministic = true,
-}, test_root, .{});
+var rt = try volt.Runtime.init(.{
+    .allocator = std.heap.smp_allocator,
+    .workers = 1,
+});
 ```
 
-That makes test traces reproducible. Then add multi-worker stress
-tests separately to surface concurrency-only bugs.
+This makes the scheduler single-threaded. Then add multi-worker
+stress tests separately to surface concurrency-only bugs.
+
+For hang investigation, `rt.dumpState()` prints scheduler atomics
+to stderr — useful when you can attach a debugger and call it.
+
+## See also
+
+- [Common pitfalls](/guides/common-pitfalls/) — this page.
+- [Error handling](/guides/error-handling/) — the error vocabulary across primitives.
+- [Performance tuning](/guides/performance-tuning/) — the perf-side mistakes.
+- [Architecture: memory model](/architecture/memory-model/) — what the runtime's atomics actually mean.

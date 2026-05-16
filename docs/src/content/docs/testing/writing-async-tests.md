@@ -1,56 +1,82 @@
 ---
-title: Writing Async Tests
-description: Patterns for testing coroutines — keeping tests fast, deterministic, and meaningful.
+title: Writing async tests
+description: Patterns for testing coroutine code — keeping tests fast, deterministic, and meaningful.
 ---
 
-Testing async code in Volt is "test it like you'd test a synchronous
-function" — because Volt-shape code looks synchronous. The wrapper
-around every test:
+Testing async code in Volt is "test it like you'd test a
+synchronous function" — because Volt-shape code looks
+synchronous. The wrapper around every test:
 
 ```zig
 test "my test" {
-    const result = try volt.run(.{
+    var rt = try volt.Runtime.init(.{
         .allocator = std.testing.allocator,
-    }, testRoot, .{});
+        .workers = 1,                  // single-worker for leak detection
+    });
+    defer rt.deinit();
+    const result = try (try rt.run(testRoot, .{}));
     try std.testing.expectEqual(expected, result);
 }
 
 fn testRoot() !ResultType {
-    // your async-shaped test code
+    // your coroutine code
 }
 ```
 
-That's it. `volt.run` bootstraps the runtime; `testRoot` runs;
-`std.testing.allocator` catches leaks.
+That's it. `Runtime.init` + `rt.run` bootstraps the runtime;
+`testRoot` runs as the root coroutine; `std.testing.allocator`
+catches leaks at `deinit`.
+
+## Allocator choice
+
+Volt has two test-friendly allocators:
+
+| Allocator | Use for | Why |
+|---|---|---|
+| `std.testing.allocator` | Single-worker tests (`workers = 1`) | Leak detection; the canonical default |
+| `std.heap.smp_allocator` | Multi-worker tests | Thread-safe; `testing.allocator` is NOT thread-safe on all paths |
+
+`std.testing.allocator` is `GeneralPurposeAllocator{.safety =
+true}`. Its stack-trace capture for double-free detection uses a
+process-global hash map that isn't safe under contention. Tests
+that use it under multi-worker crash with `EXC_BAD_ACCESS` in
+`array_hash_map.ensureTotalCapacityContext`.
+
+The pattern: **single-worker for leak gates, multi-worker for
+concurrency exercises.**
 
 ## Basic patterns
 
 ### Test a primitive's happy path
 
 ```zig
-test "channel: send + recv round-trip" {
-    const v = try volt.run(.{
+test "Spsc: send + recv round-trip" {
+    var rt = try volt.Runtime.init(.{
         .allocator = std.testing.allocator,
-    }, channelRoundtrip, .{});
+        .workers = 1,
+    });
+    defer rt.deinit();
+    const v = try (try rt.run(spscRoundtrip, .{}));
     try std.testing.expectEqual(@as(u32, 42), v);
 }
 
-fn channelRoundtrip() !u32 {
-    var ch = try volt.channel.Channel(u32).init(std.testing.allocator, 4);
-    defer ch.deinit();
+fn spscRoundtrip() !u32 {
+    var ch: volt.Spsc(u32, 4) = .{};
 
-    const sender = try volt.launch(struct {
-        fn body(c: *volt.channel.Channel(u32)) !void {
+    const sender = try volt.spawn(struct {
+        fn body(c: *volt.Spsc(u32, 4)) !void {
             try c.send(42);
         }
     }.body, .{&ch});
-    defer volt.destroyJob(sender);
 
     const v = try ch.recv();
-    try sender.join();
+    _ = sender.join();
     return v;
 }
 ```
+
+Note: `sender.join()` is required — it frees the Task struct. The
+leak detector catches missing joins.
 
 ### Multi-worker stress
 
@@ -58,23 +84,29 @@ For concurrency bugs that only surface across cores:
 
 ```zig
 test "mutex stress: 8 coros × 200 increments == 1600" {
-    const result = try volt.run(.{
-        .allocator = std.testing.allocator,
-    }, mutexStressRoot, .{ @as(u32, 8), @as(u32, 200) });
+    var rt = try volt.Runtime.init(.{
+        .allocator = std.heap.smp_allocator,    // multi-worker → smp
+        // workers defaults to NumCPU
+    });
+    defer rt.deinit();
+    const result = try (try rt.run(mutexStress, .{}));
     try std.testing.expectEqual(@as(u64, 1600), result);
 }
 
-fn mutexStressRoot(workers: u32, iters: u32) !u64 {
-    var mu: volt.sync.Mutex = .{};
+fn mutexStress() !u64 {
+    var mu = volt.Mutex.init();
+    defer mu.deinit();
     var counter: u64 = 0;
 
-    const alloc = std.testing.allocator;
-    const jobs = try alloc.alloc(*volt.Job, workers);
-    defer alloc.free(jobs);
+    const workers: u32 = 8;
+    const iters: u32 = 200;
 
-    for (jobs) |*j| {
-        j.* = try volt.launch(struct {
-            fn body(mu_: *volt.sync.Mutex, c: *u64, n: u32) void {
+    const tasks = try std.heap.smp_allocator.alloc(*volt.Task(void), workers);
+    defer std.heap.smp_allocator.free(tasks);
+
+    for (tasks) |*t| {
+        t.* = try volt.spawn(struct {
+            fn body(mu_: *volt.Mutex, c: *u64, n: u32) void {
                 var i: u32 = 0;
                 while (i < n) : (i += 1) {
                     mu_.lock();
@@ -84,45 +116,48 @@ fn mutexStressRoot(workers: u32, iters: u32) !u64 {
             }
         }.body, .{ &mu, &counter, iters });
     }
-    defer for (jobs) |j| volt.destroyJob(j);
-    for (jobs) |j| try j.join();
+    for (tasks) |t| t.join();
     return counter;
 }
 ```
 
-The default worker count is `getCpuCount()` so this actually
-exercises multi-worker scheduling. To force single-worker for
-deterministic comparison:
-
-```zig
-const result = try volt.run(.{
-    .allocator = std.testing.allocator,
-    .deterministic = true,   // single worker, fixed RNG
-}, mutexStressRoot, .{ ... });
-```
+`getCpuCount()` workers contending on one Mutex; the assertion
+catches any non-atomic increment.
 
 ### Asserting cancellation
 
 ```zig
-test "withTimeout: cancels long-running task" {
-    const result = volt.run(.{
-        .allocator = std.testing.allocator,
-    }, timeoutRoot, .{});
-    try std.testing.expectError(error.Timeout, result);
+test "cancel-aware recv wakes on Cancel.fire" {
+    var rt = try volt.Runtime.init(.{
+        .allocator = std.heap.smp_allocator,
+    });
+    defer rt.deinit();
+    try std.testing.expectError(error.Cancelled, try rt.run(cancelTest, .{}));
 }
 
-fn timeoutRoot() !u32 {
-    return try volt.withTimeout(volt.Duration.fromMillis(50), longTask, .{});
-}
+fn cancelTest() !void {
+    var c = volt.Cancel.init(volt.runtime());
+    defer c.deinit();
+    var ch: volt.Spsc(u32, 4) = .{};
 
-fn longTask() !u32 {
-    try volt.sleep(volt.Duration.fromSecs(60));
-    return 0;
+    // Spawn a coroutine that fires the Cancel after a delay.
+    const firer = try volt.spawn(struct {
+        fn body(cancel: *volt.Cancel) void {
+            volt.sleep(20 * std.time.ns_per_ms);
+            cancel.fire();
+        }
+    }.body, .{&c});
+
+    // Block on cancel-aware recv; should wake with error.Cancelled.
+    _ = try ch.recvCancel(&c);
+
+    firer.join();
 }
 ```
 
-`expectError` matches against the error union; `error.Timeout`
-fires before `volt.sleep` completes.
+The cancel-aware recv parks on the channel. The firer eventually
+calls `Cancel.fire`, which wakes the parked recv via the parking
+lot, which observes the Cancel flag, returns `error.Cancelled`.
 
 ## Patterns to avoid
 
@@ -130,32 +165,29 @@ fires before `volt.sleep` completes.
 
 ```zig
 // BAD:
-const j = try volt.launch(produce, .{ &ch });
+const t = try volt.spawn(produce, .{&ch});
 std.Thread.sleep(100 * std.time.ns_per_ms);   // hope produce ran by now
 const v = try ch.recv();
 ```
 
 `std.Thread.sleep` blocks a Volt worker. The test will pass on
 fast machines and flake on slow ones. Use `volt.sleep` if you
-need a delay, or restructure to use `Notify` / `Barrier` for
-proper synchronization.
+need a delay, or restructure to use `Notify` for proper
+synchronisation.
 
-### Don't `expectEqual` non-deterministic state
+### Don't `expectEqual` non-atomic shared state
 
 ```zig
 // BAD:
 fn shouldBeFour() !u32 {
     var counts: [4]u32 = .{ 0, 0, 0, 0 };
-    // 4 coroutines each increment counts[i]
+    // 4 coroutines each increment counts[i] (non-atomic)
+    // ... join them ...
     return counts[0] + counts[1] + counts[2] + counts[3];
-}
-test "broken" {
-    const v = try volt.run(.{...}, shouldBeFour, .{});
-    try std.testing.expectEqual(@as(u32, 4), v);   // works, but hides race
 }
 ```
 
-If `counts[i]++` isn't atomic and synchronization between the
+If `counts[i]++` isn't atomic and synchronisation between the
 producers and the read isn't explicit, the test passes by luck.
 Better:
 
@@ -164,8 +196,8 @@ fn shouldBeFour() !u32 {
     var counts: [4]std.atomic.Value(u32) = .{
         .{ .raw = 0 }, .{ .raw = 0 }, .{ .raw = 0 }, .{ .raw = 0 }
     };
-    // 4 coroutines each fetchAdd(1, .monotonic)
-    // ... join them ...
+    // 4 coroutines each fetchAdd(1, .acq_rel)
+    // ... join them (the joins establish happens-before)...
     var sum: u32 = 0;
     for (&counts) |*c| sum += c.load(.acquire);
     return sum;
@@ -175,13 +207,34 @@ fn shouldBeFour() !u32 {
 The atomic store + acquire-load ordering makes the read
 correctness explicit.
 
-### Don't test exact context-switch counts
+### Don't test exact scheduling
 
 The work-stealing scheduler is deliberately non-deterministic
-about *which* worker runs *which* coroutine. Tests that assert
-"this coroutine ran on worker 0" will flake. Test invariants
-(values, ordering relations, counts) — not scheduling
-implementation details.
+about which worker runs which coroutine. Tests that assert "this
+coroutine ran on worker 0" will flake. Test invariants (values,
+ordering relations, counts) — not scheduling implementation
+details.
+
+### Don't forget to join
+
+```zig
+// BAD:
+test "missing join" {
+    var rt = try volt.Runtime.init(.{ ... });
+    defer rt.deinit();
+    try (try rt.run(struct {
+        fn b() !void {
+            _ = try volt.spawn(work, .{});   // never joined
+        }
+    }.b, .{}));
+}
+// → testing.allocator reports a leak (the Task struct)
+```
+
+Every `volt.spawn` returns a `*Task(T)` that needs joining. If you
+genuinely want fire-and-forget for a test, accept the leak by
+using `smp_allocator` (no leak detection) — but a join is
+almost always correct.
 
 ## Leak detection
 
@@ -193,69 +246,81 @@ implementation details.
 
 If this fires:
 
-1. Look for missing `deinit` on a Channel/Broadcast/JoinSet.
-2. Look for missing `destroyJob` / `destroyTask`.
-3. If neither, run with `--summary all` to see the allocation
-   site in the trace.
+1. Look for missing `deinit` on `Watch`, `Broadcast`, or any
+   sync primitive you `init`'d.
+2. Look for missing `Task.join()`.
+3. Look for missing `Cancel.deinit()` (and missing
+   `Cancel.fire()` if the Cancel had registered waiters — leaks
+   are flagged by the assertion in `Cancel.deinit`).
+4. If none, the runtime might have a leak. File an issue.
 
-Volt-internal allocations should always be freed before
-`volt.run` returns. Per-coroutine stacks go back to the slab
-pool, which the runtime drains on teardown. If you're seeing
-leaks attributed to `coroutine/stack.zig` etc., file an issue —
-that's a runtime bug, not a test bug.
+Volt-internal allocations are released by `Runtime.deinit`. Per-
+coroutine stacks return to the slab arena; the arena's mmap is
+released as part of `deinit`. If you're seeing leaks attributed
+to `runtime.zig` / `stack.zig` / etc., that's a runtime bug, not
+a test bug.
 
-## Layered tests
-
-For testing a library you've built on top of Volt:
+## Layered tests (testing a library on top of Volt)
 
 ```zig
 test "my library: end-to-end" {
-    const result = try volt.run(.{
+    var rt = try volt.Runtime.init(.{
         .allocator = std.testing.allocator,
-    }, struct {
-        fn body() !u32 {
+        .workers = 1,
+    });
+    defer rt.deinit();
+    try (try rt.run(struct {
+        fn body() !void {
             var lib = try MyLib.init(std.testing.allocator);
             defer lib.deinit();
 
-            return try lib.doTheThing();
+            const result = try lib.doTheThing();
+            try std.testing.expectEqual(@as(u32, 42), result);
         }
-    }.body, .{});
-    try std.testing.expectEqual(@as(u32, 42), result);
+    }.body, .{}));
 }
 ```
 
-Your library wraps Volt-aware code; the test wraps your library
-in `volt.run`. Standard onion.
+The library wraps Volt-aware code; the test wraps the library in
+`rt.run`. Standard onion.
 
 ## Inline vs separate test files
 
 Volt's convention:
 
-- **Per-primitive unit tests**: inline in the source file
-  (`src/sync/Mutex.zig` etc.). The standard `// ─── Tests ───`
-  section at the bottom.
-- **Cross-file integration tests**: in `src/test/` (e.g.,
-  `multi_worker_test.zig`, `channel_integration_test.zig`).
+- **Per-primitive unit tests**: inline at the bottom of the
+  source file (`src/sync.zig`, `src/channel.zig`, etc.). The
+  standard `// ─── Tests ───` section.
+- **Cross-cutting integration tests**: in `src/lib.zig`'s root
+  test block, or in dedicated files if they grow large.
 
 Inline tests are easier to keep in sync with the code they test.
-Cross-file integration tests are for behaviors that span
-multiple primitives.
+Cross-file integration tests are for behaviours that span
+multiple primitives or files.
 
 ## Reproducing flaky tests
 
 If a test sometimes hangs or fails in CI:
 
-1. Reproduce locally with `deterministic = true`. If it now
-   reproduces, you have a deterministic-mode failure that's
-   easy to debug.
-2. If it only fails under multi-worker, run it in a tight loop:
+1. **Reproduce locally with `workers = 1`.** If it now
+   reproduces, you have a deterministic-mode failure that's easy
+   to debug.
+2. **If it only fails under multi-worker**, run it in a tight
+   loop:
 
    ```sh
-   for i in $(seq 200); do zig build test --filter "your test" || break; done
+   for i in $(seq 200); do zig build test -- --filter "your test" || break; done
    ```
 
    200 iterations is usually enough to catch a 1% flake.
-3. Add `std.log.debug` traces on the suspected critical path,
-   re-run.
-4. If it's a runtime bug (panic, hang in dispatch loop, memory
-   error), file an issue with the trace.
+3. **Add `std.log.debug` traces** on the suspected critical
+   path; re-run.
+4. **If it's a runtime panic / hang / EXC_BAD_ACCESS**, that's a
+   runtime bug. File an issue with the trace; include
+   `rt.dumpState()` output if you can attach a debugger.
+
+## See also
+
+- [Running tests](/testing/running-tests/) — `zig build test`, allocator choices, failure interpretation.
+- [Benchmarking](/testing/benchmarking/) — perf gate alongside the test gate.
+- [Common pitfalls](/guides/common-pitfalls/) — the bugs to write tests against.
