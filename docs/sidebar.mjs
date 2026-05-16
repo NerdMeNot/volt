@@ -18,8 +18,10 @@ export default [
 		label: 'Getting Started',
 		items: [
 			{ label: 'Installation', slug: 'getting-started/installation' },
-			{ label: 'Quick Start', slug: 'getting-started/quick-start' },
-			{ label: 'Basic Concepts', slug: 'getting-started/basic-concepts' },
+			{ label: 'Your first program', slug: 'getting-started/first-program' },
+			{ label: 'Spawning and joining', slug: 'getting-started/spawn-join' },
+			{ label: 'Talk to the network', slug: 'getting-started/io-tutorial' },
+			{ label: 'Basic concepts', slug: 'getting-started/basic-concepts' },
 			{ label: 'Glossary', slug: 'getting-started/glossary' },
 		],
 	},

@@ -1,37 +1,36 @@
 ---
 title: Volt
-description: Stackful coroutine runtime for Zig. No async/await. Code reads like blocking I/O; the runtime suspends at every wait point.
+description: Stackful coroutine runtime for Zig. No async/await — code reads like blocking I/O while the runtime suspends at every wait point.
 ---
 
 import { Card, CardGrid } from '@astrojs/starlight/components';
 
 **Volt is a stackful coroutine runtime for Zig.** Code reads like
-blocking I/O — there is no `async`/`await`, no Future state machines,
-no `.poll()`, no manual `Pin` dance. Each task owns a growable
-virtual stack; the runtime suspends at every I/O / channel / sleep /
-sync wait point and resumes you on whichever worker the reactor wakes
-first.
+blocking I/O. There is no `async`/`await`, no `Future` state machine,
+no `.poll()`, no manual `Pin`. Each task owns a growable virtual stack;
+the runtime suspends at every I/O, channel, sleep, or sync wait point
+and resumes on whichever worker the reactor wakes first.
 
 ```zig
 const std = @import("std");
 const volt = @import("volt");
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    try volt.run(.{ .allocator = gpa.allocator() }, serve, .{});
+    var rt = try volt.Runtime.init(.{ .allocator = std.heap.smp_allocator });
+    defer rt.deinit();
+    try (try rt.run(echoServer, .{}));
 }
 
-fn serve() !void {
-    var listener = try volt.io.TcpListener.bind(volt.io.Address.any4(8080));
+fn echoServer() !void {
+    var listener = try volt.net.TcpListener.bind(.any4(8080));
     defer listener.close();
     while (true) {
         const conn = try listener.accept();
-        _ = try volt.launch(echo, .{conn});
+        _ = try volt.spawn(echoOne, .{conn});
     }
 }
 
-fn echo(conn: volt.io.TcpStream) void {
+fn echoOne(conn: volt.net.TcpStream) void {
     var s = conn;
     defer s.close();
     var buf: [4096]u8 = undefined;
@@ -43,67 +42,105 @@ fn echo(conn: volt.io.TcpStream) void {
 }
 ```
 
-That's the whole shape. `s.read(&buf)` suspends the coroutine when
-the socket isn't ready and resumes it when the reactor delivers
+That's the whole shape. `s.read(&buf)` suspends the coroutine when the
+socket isn't ready and resumes it when the kqueue reactor delivers
 readiness — possibly on a different worker thread.
 
 ## Highlights
 
 <CardGrid>
   <Card title="Stackful, not stackless" icon="rocket">
-    1 page committed up-front, grows in place via guard-page faults
-    to 8 MiB. Pointers to stack-locals stay valid across suspension;
-    no compiler stackmaps required.
+    16 KiB committed up-front per coroutine, growable on demand
+    via SIGSEGV-handled guard pages. Pointers to stack-locals stay
+    valid across suspension. No function coloring, no `Pin`,
+    no compiler stackmaps.
   </Card>
   <Card title="Multi-worker work-stealing" icon="puzzle">
-    Per-worker Chase-Lev deque, LIFO slot, global injection queue.
-    Default workers = `getCpuCount()`. Cross-thread wakes go through
-    the injection queue.
+    Per-worker Chase-Lev deque (256 slots), single-slot LIFO cache
+    for spawn-chain locality, per-P MPMC mailbox for cross-thread
+    pushes. Default workers = `getCpuCount()`. Same code path for
+    single-threaded and multi-threaded.
   </Card>
-  <Card title="Park-based primitives" icon="setting">
-    Mutex, RwLock, Semaphore, Notify, Barrier, OnceCell, Channel,
-    Oneshot, Watch, Broadcast, select, Scope, JoinSet,
-    CancellationToken — all built on a single `Park` substrate.
-    Zero allocation per wait.
+  <Card title="One wait/wake substrate" icon="setting">
+    Mutex, Notify, Semaphore, every channel block path, and
+    `Task.join` all route through a single sharded parking lot.
+    Zero allocation per wait; validator-under-lock closes the
+    register-then-park race for free.
   </Card>
-  <Card title="Cancellable from anywhere" icon="warning">
-    Cancelling a task wakes it from any park (sleep / I/O / channel /
-    sync) and surfaces `error.Cancelled`. Timeouts propagate through
-    uncooperative blocking calls.
+  <Card title="Cancellation by data" icon="warning">
+    `*Cancel` is a value you thread through code Go-style. Fire
+    from anywhere — every cancel-aware blocking op (`recvCancel`,
+    `lockCancel`, …) wakes with `error.Cancelled`. `volt.scope`
+    ties the Cancel lifetime to a lexical block.
   </Card>
 </CardGrid>
 
 ## Status
 
-Volt is at v1.0.0 against Zig 0.16.0. Tag format is
-`vX.Y.Z-zigA.B.C` so the Zig version is always explicit.
+This is **v1.0.0-zig0.16.0**, tagged for Zig 0.16. The runtime works
+for what it claims — see the [bench gate](/performance/) — but
+several pieces are still in flight.
 
-| Target                  | Backend  | Status                                  |
-|-------------------------|----------|-----------------------------------------|
-| macOS arm64 / x86\_64   | kqueue   | runtime + CI                            |
-| Linux x86\_64 / arm64   | epoll    | runtime + CI                            |
-| Linux x86\_64           | io_uring | parallel backend; cross-compile CI      |
-| Windows x86\_64 / arm64 | IOCP     | cross-compile CI; runtime port pending  |
+| Target | Status |
+|---|---|
+| Darwin arm64 (kqueue) | **Working** — primary dev platform |
+| Linux x86_64 / arm64 (epoll or io_uring) | Not yet — backend planned |
+| Windows (IOCP) | Not yet — backend planned |
+| x86_64 context switch | Not yet — arm64 only today |
+| Cancellation | **Shipping** — `Cancel`, cancel-aware variants, `scope` |
+| File I/O / DNS / TLS / HTTP | Out of core — lives in [downstream libraries](/appendix/roadmap/) |
 
-See [Installation](/getting-started/installation/) to get going,
-[Quick Start](/getting-started/quick-start/) for the minimal program,
-or jump to [Basic Concepts](/getting-started/basic-concepts/) to
-understand the model.
+The honest case for using Volt today: you want a stackful coroutine
+substrate for Zig on Darwin arm64, you want the synchronous-shape
+ergonomics, and you can wait for the Linux/Windows backends.
 
 ## Why stackful
 
-The honest tradeoff: stackful coroutines pay ~4-16 KiB resident per
-coroutine for "code looks synchronous, no function coloring, no
-manual state machines." Stackless futures pay ~256-512 bytes per
-coroutine for "every async function has a different type, the
-language needs `async`/`await`, lifetimes follow the state machine."
+The tradeoff: stackful pays ~16 KiB resident per task for "code
+looks synchronous." Stackless pays ~hundreds of bytes per task for
+"every async function has a different type and the language needs
+`async`/`await`."
 
-Zig has no `async`/`await` keyword and (by maintainer statement)
-won't add one again. That removes stackless's main ergonomic
-argument in this language. For workloads that genuinely need 1M+
-concurrent waiters with tiny per-task state, stackless is still the
-right tool. For everything else — HTTP servers, pipelines, CLIs,
-system tools, service meshes — stackful's ergonomics dominate.
+Zig has no `async`/`await` keyword and won't add one (by maintainer
+statement). That removes stackless's main ergonomic argument in this
+language. Stackful gives Zig users the synchronous-shape API that
+Tokio gives Rust users — without compiling Tokio.
 
-For more on the design, see [Stackless vs
-Stackful](/architecture/stackful-design/).
+For workloads that genuinely need 1M+ concurrent waiters with tiny
+per-task state, stackless is still the right tool. For everything
+else — HTTP servers, pipelines, CLIs, network proxies — stackful's
+ergonomics dominate. See [Stackful by
+design](/architecture/stackful-design/) for the long version.
+
+## Performance — Go as scale reference
+
+Go has been optimised over 15+ years; expecting Volt to beat it
+everywhere would be naive. The comparison below exists to know
+we're in a sensible range — when Volt is faster it's usually
+because Go pays a cost we don't (GC write barriers, function
+colouring), not because we out-engineered them. Full receipts in
+[Benchmarks](/performance/).
+
+| Workload | Volt | Go | Volt/Go |
+|---|---|---|---|
+| yield (one-way ctx switch) | 9 ns | 42 ns | 0.21× |
+| Mutex contended (8 × 50k) | 15 ns | 81 ns | 0.18× |
+| Spsc send+recv (cap=16) | 12 ns | 33 ns | 0.36× |
+| TCP echo (64 × 16 RTT × 1 KB) | 8,449 ns | 9,050 ns | 0.93× |
+| spawn+wait workers=1 | 101 ns | 136 ns | 0.74× |
+| fan-out workers=11 | 117 ns | 107 ns | 1.10× |
+| spawn+wait workers=11 (synthetic) | 575 ns | 213 ns | 2.70× |
+
+The single workers=11 outlier is a synthetic spawn-heavy shape
+where adding workers can only hurt — there's no parallel work to
+amortise the coordination cost. Real-work shapes (fan-out, TCP,
+parallel-compute) land at or below the Go reference.
+
+## Next steps
+
+- [Install Volt](/getting-started/installation/) — add the dependency to your build.
+- [Your first program](/getting-started/first-program/) — sleep, print, exit, in 30 seconds.
+- [Spawning and joining](/getting-started/spawn-join/) — spawn a child, join its result.
+- [Talk to the network](/getting-started/io-tutorial/) — TCP echo with the reactor.
+- [Basic concepts](/getting-started/basic-concepts/) — the mental model under the API.
+- [Architecture](/architecture/) — how a stackful M:N runtime is built.

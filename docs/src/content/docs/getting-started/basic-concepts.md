@@ -1,178 +1,211 @@
 ---
-title: Basic Concepts
-description: How Volt's stackful model works — coroutines, the scheduler, the reactor, and what "suspending at a wait point" actually does.
+title: Basic concepts
+description: The mental model under Volt — coroutines, workers, the reactor, the parking lot, the slab arena. Five things; everything else is composition.
 ---
 
-You don't have to know any of this to use Volt — `volt.run` and the
-primitives behave the way `std.Thread.spawn` and `std.Thread.Mutex`
-already trained you to expect. But understanding the model makes
-debugging and performance tuning much easier when you need them.
+You don't strictly need this page to write Volt programs —
+`volt.spawn`, `Task.join`, and the sync primitives behave the way
+your intuition from `std.Thread` already expects. But debugging,
+performance tuning, and reading source code go much faster once you
+have the model.
 
-## The four moving parts
+There are five moving parts. Everything else is built from them.
 
-Volt has exactly four things, and the rest is built from them:
+## 1. The coroutine
 
-- A **coroutine** is a function plus its own stack. `volt.launch(fn,
-  args)` spawns one. The stack is virtual memory: the runtime
-  reserves 8 MiB of address space per coroutine but only commits 1
-  page (4-16 KiB) up front; more pages get committed on demand when
-  the coroutine actually uses more stack.
-- A **worker** is an OS thread that runs coroutines. Volt spawns
-  `getCpuCount()` workers by default. Each owns a Chase-Lev
-  work-stealing deque; idle workers steal from busy ones; a global
-  injection queue handles cross-thread spawns and reactor wakes.
-- The **reactor** is the OS-level readiness source. On Darwin/BSD
-  it's kqueue; on Linux it's epoll (with parallel io_uring); on
-  Windows it's IOCP. When a coroutine waits on I/O, sleep, or a
-  timer, it parks; the reactor wakes it when the kernel signals
-  readiness.
-- A **Park** is the universal "wake me later" primitive. Every
-  blocking primitive in Volt — channels, mutexes, semaphores,
-  notifies, sleeps, I/O waits, joins — is implemented on top of
-  `Park`. Cancelling a coroutine pokes the Park it's currently
-  parked on; that's what makes timeouts propagate.
+A function plus its own stack. `volt.spawn(fn, args)` allocates one
+and returns a typed `*Task(T)` handle.
 
-That's it. Everything else is composition.
+The stack is a **slot in the runtime's slab arena**: a 256 KiB
+virtual reservation per coroutine. Only the top 16 KiB is committed
+RW at first; deeper recursion grows the stack page-by-page via a
+SIGSEGV handler. The bottom page is the guard — overflow there aborts
+the process cleanly with a stack trace instead of corrupting heap.
+
+Idle resident memory per coroutine: ~16 KiB (one body page). Idle
+virtual: 256 KiB per slot. See [The slab arena](/architecture/) for
+the design.
+
+## 2. The worker (M)
+
+An OS thread that runs coroutines. Volt creates `getCpuCount()`
+workers by default. The thread calling `Runtime.run` becomes M[0]
+when `run` enters its dispatch loop.
+
+Each worker owns:
+
+- A **fixed-256 work-stealing queue** (Chase-Lev-style) for runnable coroutines.
+- A **single-slot LIFO cache** for spawn-chain locality — the most
+  recently spawned coroutine sits here so the next dispatch can grab
+  it without queue ops.
+- An **MPMC mailbox** that receives cross-worker pushes
+  (unparks-from-elsewhere, queue overflow).
+- A **Parker** (`__ulock_wait` on Darwin) for when there's nothing
+  to do.
+
+The "P" in the source code (`src/p.zig`) is the scheduler state; the
+"M" (`src/worker.zig`) is the OS thread. In Phase 1 they're bound
+1:1; later phases may detach.
+
+## 3. The reactor
+
+The kqueue interface to the kernel. One reactor per runtime. Single
+poller at a time: any worker can CAS-claim the "I'm polling" flag,
+call `kevent`, dispatch woken coroutines back to worker queues, then
+release the claim.
+
+Coroutines doing I/O (`accept`, `read`, `writeAll`) park here. Sleep
+parks here too — `EVFILT_TIMER` is a kqueue event like any other.
+
+Linux (epoll) and Windows (IOCP) backends are planned; today this
+is Darwin-only.
+
+## 4. The parking lot
+
+A sharded hash map from `*const anyopaque` (the "address you're
+waiting on") to a FIFO list of waiting coroutines. One mechanism
+serves every blocking primitive in Volt — `Mutex.lock`,
+`Notify.wait`, `Spsc.recv`, `Task.join`, channel `send`-on-full,
+the Parker for OS-level waits — all keyed on the address of their
+own state field.
+
+The architectural win: every primitive's waiter list is the same
+data structure with the same race-handling. Adding a new sync
+primitive doesn't introduce new wait/wake bugs — it reuses the
+substrate.
+
+See [The parking lot](/architecture/parking-lot/) for the
+validator-under-lock pattern that closes the register-then-park race
+generically.
+
+## 5. The Cancel
+
+A handle for **data-driven cancellation**. `volt.Cancel` carries an
+atomic flag plus a waiter list. `Cancel.fire()` flips the flag and
+unparks every coroutine that registered with it.
+
+Functions opt in by accepting `*Cancel` as a parameter. Cancel-aware
+blocking ops (`recvCancel`, `lockCancel`, etc.) check the flag under
+their primitive's bucket lock and return `error.Cancelled` if fired.
+
+This is Go's `context.Context` model in shape, with the
+parking-lot integration making cancellation propagate cleanly through
+arbitrary blocking. There's no `?` operator on every call, no
+implicit per-coroutine cancel slot, no global "current task" lookup —
+just a value you thread through.
 
 ## The lifecycle
 
 ```
-volt.run(config, root_fn, args)
-    │
-    ▼
-[Runtime starts: workers + reactor + injection queue + stack pool]
-    │
-    ▼
-[Spawn root coroutine on worker 0]
-    │
-    ├── Coroutine runs synchronously until it suspends
-    │   (calls volt.sleep / channel.recv / Mutex.lock / etc.)
-    │
-    ├── On suspension: save its registers + stack pointer,
-    │   register a "wake reason" with the reactor / waiter list,
-    │   switch back to the worker's scheduler context
-    │
-    ├── Worker picks up the next runnable coroutine
-    │   (LIFO slot → local deque → steal → injection queue → reactor poll)
-    │
-    └── When wake fires: coroutine goes back on a worker's deque,
-        gets dispatched, switches back into its saved context,
-        continues from right after the suspending call.
-    │
-    ▼
-[Root coroutine returns its value or error]
-    │
-    ▼
-[Runtime drains, joins worker threads, deinits the reactor]
+                                 ┌─ deinit (joins workers, frees slab) ─┐
+                                 │                                       │
+   Runtime.init   ─►  rt.run(root) ─►  root runs synchronously
+        │                  │                  │
+        │                  ▼                  │
+        │            [M0 dispatch loop]       │
+        │                  │                  │
+        │                  ▼                  │
+        │            pop coroutine            │
+        │              from queue ────┐       │
+        │                  │          │       │
+        │                  ▼          │       ▼
+        │           context.swap into ── coroutine runs until it
+        │                  ▲                  │
+        │                  │                  │
+        │            context.swap back ── coroutine.pending = .park
+        │                  │                  │
+        │                  ▼                  │
+        │            register waiter, park    │
+        │                  │                  │
+        │                  ▼                  │
+        │            next iter of dispatch   ◄┘
+        │                  │
+        │            (worker steals from peers,
+        │             polls reactor, parks self
+        │             on Parker if nothing to do)
+        │                  │
+        │                  ▼
+        │            unparked by:
+        │              • reactor event
+        │              • another worker's unpark
+        │              • Cancel.fire
+        │                  │
+        │                  ▼
+        │            coroutine back on queue
+        │                  │
+        ▼                  ▼
+   rt.deinit   ◄── root returns its value or error
 ```
-
-You will not see any of this in your code. You see `volt.run(config,
-serve, .{})` and `serve` reads like a synchronous program. The
-runtime does the bookkeeping.
 
 ## Suspension points
 
 Volt only suspends at **explicit suspension points**. They are:
 
-- **I/O**: `TcpStream.read` / `writeAll`, `TcpListener.accept`,
-  filesystem ops, signal listeners, etc.
-- **Time**: `volt.sleep(duration)`, `Interval.tick()`,
-  `volt.withTimeout(...)`.
-- **Channels**: `Channel.send` / `recv` (when full / empty),
-  `Oneshot.recv`, `Watch.changed`, `Broadcast.recv`.
-- **Sync primitives**: `Mutex.lock`, `RwLock.lockShared` /
-  `lockExclusive`, `Semaphore.acquire`, `Notify.wait`, `Barrier.wait`.
-- **Joining**: `Job.join`, `Task.join`, `JoinSet.joinNext`.
-- **Explicit yield**: `volt.yield()` — used to give other coroutines
-  a chance and to act as a cancellation check inside CPU-bound loops.
+- **I/O** — `TcpStream.read` / `writeAll` / `connect`, `TcpListener.accept`.
+- **Time** — `volt.sleep(ns)`.
+- **Channels** — `Spsc.send` / `recv` (on full / empty),
+  `Mpmc.send` / `recv`, `Oneshot.recv`, `Watch.changed`,
+  `Broadcast.recv`.
+- **Sync** — `Mutex.lock`, `Semaphore.acquire`, `Notify.wait`.
+- **Join** — `Task.join`.
+- **Explicit yield** — `volt.yield()`.
 
-A function that doesn't call any of these will run to completion
-without releasing its worker thread. If your work is CPU-bound, use
-`volt.spawnBlocking` (off the main worker pool) or sprinkle
-`volt.yield()` calls so cancellation can propagate.
+A function that doesn't call any of these runs to completion without
+releasing its worker thread. CPU-bound loops should sprinkle
+`volt.yield()` so the worker stays cooperative — and so cancellation
+checkpoints work.
 
-## Cancellation
+## Cancellation as data
 
-This is where Volt diverges most visibly from Go. Cancelling a
-coroutine sets a flag *and* unparks whatever it's currently parked
-on:
+Volt's cancellation diverges from Go in the data-flow shape:
 
 ```zig
-const j = try volt.launch(longRunning, .{});
-volt.sleep(volt.Duration.fromMillis(100)) catch {};
-j.cancel();   // wakes longRunning from sleep / I/O / channel — error.Cancelled bubbles
+const c = volt.Cancel.init(volt.runtime());
+defer c.deinit();
+
+const t = try volt.spawn(longRunning, .{&c});
+volt.sleep(100 * std.time.ns_per_ms);
+c.fire();  // wakes longRunning from any cancel-aware blocking op
 ```
 
-There is no `context.Context` to thread through every function and
-no `?` operator on every call. The cancellation propagates *into*
-whatever the task is doing because Park (the suspension primitive)
-is cancellable, and every blocking primitive parks. `volt.withTimeout(dur,
-fn, args)` is a watcher built on this.
+The cancellation flows through whatever cancel-aware blocking call
+`longRunning` is parked on. The waker doesn't need to know what
+`longRunning` is doing.
 
-For a CPU-only loop you have to ask explicitly:
+For pure-CPU work that needs cancellation, call `c.checkpoint() catch
+return` periodically — it's a single atomic load + branch when not
+fired.
 
-```zig
-while (work_remains) {
-    try volt.yield();   // returns error.Cancelled if the task was cancelled
-    // ... CPU work ...
-}
-```
+## Memory ownership
 
-## Memory: who owns what
-
-- **Stacks**: owned by the runtime's stack pool. Slab-recycled on
-  coroutine completion. You don't free them.
-- **Job / Task handles**: heap-allocated by `volt.launch` / `volt.spawn`.
-  *You own the handle.* Call `volt.destroyJob(j)` /
-  `volt.destroyTask(t)` when you're done with it.
-- **Channels, mutexes, etc.**: own whatever they allocate. Call
-  their `deinit` (channels, JoinSet) or just let them go out of
-  scope (Mutex, Semaphore — zero-allocation).
-- **The Runtime**: owned by `volt.run`. Tears down on return.
-
-## Structured concurrency, by default
-
-The simplest Volt program looks like a synchronous program. The
-*next* simplest uses `volt.scope`:
-
-```zig
-try volt.scope(struct {
-    fn body(s: *volt.Scope) !void {
-        try s.spawn(workerA, .{});
-        try s.spawn(workerB, .{});
-        // returning here joins both. If either errored, propagate.
-    }
-}.body);
-```
-
-Scopes are the recommended default for spawning more than one
-coroutine. They're equivalent to Trio's nurseries / Kotlin's
-`coroutineScope`. The guarantee is that **child coroutines cannot
-outlive the scope's body** — when `body` returns, every child has
-either completed or been cancelled-and-joined. You can't leak.
-
-`volt.launch` (no scope) is for fire-and-forget cases where the
-child genuinely needs to outlive the current scope. Reach for it
-sparingly.
+- **Stacks** — owned by `Runtime.stack_arena`. Slot reuse is
+  per-P-pool LIFO; you never free a stack manually.
+- **`Task(T)` handles** — heap-allocated by `volt.spawn`, freed by
+  `t.join()`. Don't use `t` after `join`.
+- **`Cancel`** — caller-owned (stack or heap). `deinit` asserts the
+  waiter list is empty.
+- **Channels / Mutex / etc.** — caller-owned. Channels with internal
+  state (Watch, Broadcast) have explicit `init`/`deinit`; trivial
+  primitives (Mutex) are zero-init structs.
+- **The Runtime** — owned by `main` (or wherever you call
+  `Runtime.init`). `deinit` releases everything.
 
 ## What's NOT here
 
-- **No async/await keyword.** That's the whole point. Code that
-  suspends looks identical to code that doesn't.
-- **No global runtime.** `volt.run` owns the runtime; library code
-  that wants to suspend must be called from inside it. There's no
-  init-on-first-use mode and no nested `volt.run`.
-- **No goroutine-style "spawn and forget by default."** Use
-  `volt.scope`.
-- **No `*Allocator` parameter on every function.** You pass it once
-  to `volt.run` (in the Config); the runtime hands it to
-  primitives that need it.
+- **No `async`/`await` keyword.** That's the design.
+- **No implicit global runtime.** You construct one with
+  `Runtime.init`. Library code that wants to suspend must be called
+  from inside a coroutine on that Runtime; `volt.runtime()` looks it
+  up via the threadlocal current coroutine.
+- **No `spawn-and-detach-implicitly`.** Every `volt.spawn` returns a
+  `*Task(T)` you're expected to join. Fire-and-forget without join
+  leaks the Task struct.
+- **No per-function allocator parameter.** The allocator is in
+  `Runtime.Config`; the runtime hands it to primitives that need it.
 
 ## Where to go next
 
-- [Quick Start](/getting-started/quick-start/) — three runnable
-  programs.
-- [Glossary](/getting-started/glossary/) — terms used throughout the
-  docs and source.
-- [Stackless vs Stackful](/architecture/stackful-design/) — why
-  Volt picked stackful and what the tradeoff actually buys you.
+- [API Reference](/usage/runtime/) — the public surface, type by type.
+- [Recipes](/cookbook/) — concrete patterns built from the five pieces.
+- [Architecture](/architecture/) — how this is actually built inside.
+- [Glossary](/getting-started/glossary/) — terms used throughout.

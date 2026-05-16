@@ -24,17 +24,16 @@ const volt = @import("volt");
 pub fn main() !void {
     var rt = try volt.Runtime.init(.{ .allocator = std.heap.smp_allocator });
     defer rt.deinit();
-    try rt.run(echoServer, .{});
+    try (try rt.run(echoServer, .{}));
 }
 
 fn echoServer() !void {
     var listener = try volt.net.TcpListener.bind(.any4(8080));
     defer listener.close();
-    const rt: *volt.Runtime = @ptrCast(@alignCast(volt.current.require().runtime));
     while (true) {
         const conn = try listener.accept();
         // Fire-and-forget: spawn a task and let it run; no join needed.
-        _ = try rt.spawn(echoOne, .{conn});
+        _ = try volt.spawn(echoOne, .{conn});
     }
 }
 
@@ -54,12 +53,13 @@ That's the whole shape. No `async`, no `await`, no `Future`, no `.poll()`, no ma
 
 ## What's in the box (currently)
 
-- **Stackful coroutines** with a 16 KiB heap-allocated stack per task. mmap-grow stacks with guard pages are planned (see `docs/internals/phase-4-postmortem.md` for the in-progress design).
-- **M:N work-stealing scheduler.** Each OS thread (`M`) is bound to a logical processor (`P`) with its own work-stealing queue, LIFO slot, mailbox, and per-P coroutine/stack pools. The driver thread participates as a worker.
+- **Stackful coroutines** backed by a slab arena. One `mmap` at `Runtime.init` reserves `max_concurrent_stacks × 256 KiB` of virtual address space; per-slot `mprotect` is lazy. 16 KiB committed RSS per active coroutine; stacks grow on demand via the SIGSEGV handler.
+- **M:N work-stealing scheduler.** Each OS thread (`M`) is bound to a per-worker scheduler state (`P`) with its own Chase-Lev work-stealing queue, single-slot LIFO cache, MPMC mailbox, and per-P pools. The driver thread participates as a worker.
 - **Typed `Task(T)` handle** with `join()` returning the spawned function's result.
 - **Direct handoff in `Task.join`** when the joinee is in the same M's lifo slot — skips the park/unpark round trip for the common spawn-then-await pattern (Go's `gopark`/`goready` shape).
-- **Channels** comptime-specialized at the call site — `volt.Spsc(T, cap)` for single-producer/single-consumer, `volt.Mpmc(T, cap)` (Vyukov bounded ring) for the general case. Both block on full/empty via the parking lot.
+- **Channels** comptime-specialized at the call site — `Spsc(T, cap)` (single-producer/single-consumer), `Mpmc(T, cap)` (Vyukov bounded ring), `Oneshot(T)` (1:1 handoff), `Watch(T)` (1:N latest-value, seqlock), `Broadcast(T, cap)` (1:N history-aware). All block via the parking lot.
 - **Sync primitives** — `Mutex`, `Notify`, `Semaphore` — built on a shared parking lot.
+- **Cancellation** — `volt.Cancel` carries an atomic flag + waiter list. Cancel-aware variants (`Mutex.lockCancel`, `Spsc.recvCancel`, etc.) wake with `error.Cancelled` when fired. `volt.scope` ties Cancel lifetime to a lexical block.
 - **kqueue reactor** for Darwin/BSD — non-blocking sockets with single-poller claim. Linux (epoll/io_uring) and Windows (IOCP) backends planned; not currently shipped.
 
 ## Performance — Go as scale reference
@@ -99,10 +99,10 @@ the coordination cost. On any shape with actual parallel work
 | Darwin arm64 kqueue | **Working** — primary dev platform |
 | Linux x86_64 / arm64 | Not yet — epoll backend planned |
 | Windows | Not yet — IOCP backend planned |
-| Cancellation | Not implemented — earlier design retired, re-landing planned |
+| Cancellation | **Shipping** — `Cancel`, cancel-aware variants of every blocking op, `scope` for lexical lifetime |
 | File I/O / DNS / TLS | Not yet — these belong in libraries on top of Volt, not in core |
 | Mutex throughput | Parking-lot + spin loop redesign on 2026-05-16 — contended-Mutex bench now 15 ns/op, ~5.4× faster than Go's 81 ns |
-| Stack allocation | Slab-arena redesign on 2026-05-16 — one `mmap` at runtime init, lazy per-slot `mprotect`, per-P pool overflows to arena. Removed the VM-lock cliff that the prior pool-of-64 design hit at BATCH > 64. |
+| Stack allocation | Slab-arena redesign on 2026-05-16 — one `mmap` at runtime init, lazy per-slot `mprotect`, per-P pool with fair-share cap overflows to arena. Removed the VM-lock cliff that the prior pool-of-64 design hit at BATCH > 64. |
 
 The honest case for using Volt today: you want a stackful coroutine substrate for Zig on Darwin arm64, you want the synchronous-shape ergonomics, you can live with the multi-worker spawn-heavy gap to Go, and you can wait for the Linux/Windows backends.
 
@@ -138,10 +138,17 @@ Volt requires libc.
 // Bootstrap.
 var rt = try volt.Runtime.init(.{ .allocator = a });
 defer rt.deinit();
-const result = try rt.run(myFn, .{ arg1, arg2 });
+// run() returns `!T` where T is your fn's return type. If your fn
+// returns `!U` (an error union), the outer `!` is from run, the
+// inner `!` is yours — hence `try (try ...)`. Tests use this idiom.
+try (try rt.run(myFn, .{ arg1, arg2 }));
 
-// Or with explicit worker count:
-var rt = try volt.Runtime.init(.{ .allocator = a, .workers = 4 });
+// Or with explicit worker count and arena size:
+var rt = try volt.Runtime.init(.{
+    .allocator = a,
+    .workers = 4,
+    .max_concurrent_stacks = 4096,
+});
 
 // Spawning (from inside a coroutine):
 const t = try rt.spawn(parse, .{buf});  // *Task(T)

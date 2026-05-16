@@ -5,16 +5,17 @@ description: Add Volt to your Zig project and verify the install with a one-line
 
 ## Requirements
 
-- **Zig 0.16.0**. Volt pins to one Zig minor per release; the version
+- **Zig 0.16.0.** Volt pins to one Zig minor per release; the version
   is part of the tag (`vX.Y.Z-zigA.B.C`).
-- **macOS** (arm64 or x86_64) or **Linux** (x86_64 or arm64). Windows
-  cross-compiles cleanly today; runtime port is pending.
-- **libc**. Volt uses `sigsetjmp` / `siglongjmp` / `mprotect` /
-  `signalfd` directly; the build helper links libc automatically.
+- **Darwin arm64.** Today this is the only platform with a working
+  reactor (kqueue). Linux (epoll / io_uring) and Windows (IOCP) are
+  cross-compile-clean but not runtime-ready — see [Roadmap](/appendix/roadmap/).
+- **libc.** Volt uses `mmap` / `mprotect` / `kqueue` / `__ulock_wait`
+  via `@extern`; the build helper links libc automatically.
 
 ## Add the dependency
 
-In your `build.zig.zon`:
+`build.zig.zon`:
 
 ```zig
 .{
@@ -25,7 +26,7 @@ In your `build.zig.zon`:
     .dependencies = .{
         .volt = .{
             .url = "https://github.com/NerdMeNot/volt/archive/refs/tags/v1.0.0-zig0.16.0.tar.gz",
-            .hash = "...", // run `zig build` once and paste the hash Zig prints
+            // .hash = ... — run `zig build` once and paste the hash Zig prints
         },
     },
 
@@ -33,7 +34,7 @@ In your `build.zig.zon`:
 }
 ```
 
-In your `build.zig`:
+`build.zig`:
 
 ```zig
 const std = @import("std");
@@ -54,9 +55,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe.root_module.addImport("volt", volt_dep.module("volt"));
-    exe.root_module.link_libc = true; // sigsetjmp/mprotect/signalfd
+    exe.root_module.link_libc = true; // mmap / kqueue / __ulock_wait
 
     b.installArtifact(exe);
+
+    const run = b.addRunArtifact(exe);
+    b.step("run", "Run the app").dependOn(&run.step);
 }
 ```
 
@@ -69,13 +73,13 @@ const std = @import("std");
 const volt = @import("volt");
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    try volt.run(.{ .allocator = gpa.allocator() }, hello, .{});
+    var rt = try volt.Runtime.init(.{ .allocator = std.heap.smp_allocator });
+    defer rt.deinit();
+    try (try rt.run(hello, .{}));
 }
 
 fn hello() !void {
-    try volt.sleep(volt.Duration.fromMillis(50));
+    volt.sleep(50 * std.time.ns_per_ms);
     std.debug.print("hello from a coroutine\n", .{});
 }
 ```
@@ -85,9 +89,11 @@ zig build run
 # hello from a coroutine
 ```
 
-If that prints, you're set up. The `volt.sleep(50ms)` call suspended
-the coroutine, the reactor woke it, and it continued. No `async`,
-no callback, no state machine.
+If that prints, you're set up. `volt.sleep` parked the coroutine on
+the kqueue reactor's timer; ~50 ms later the kernel delivered the
+timer event, the reactor woke the coroutine, and it continued. No
+`async`, no callback, no state machine. The whole program is six
+lines of executable code.
 
 ## Building from source
 
@@ -96,29 +102,37 @@ If you're hacking on Volt itself:
 ```sh
 git clone https://github.com/NerdMeNot/volt.git
 cd volt
-zig build              # build the library
-zig build test         # run the test suite (~200+ tests)
-zig build bench        # core benchmarks (ReleaseFast)
-
-zig build run-echo            # cookbook examples
-zig build run-fan-out
-zig build run-work-offload
-zig build run-timeout-retry
+zig build              # build the volt module
+zig build test         # ~47 tests, leak-detecting
+zig build stress       # 45 s multi-primitive stress test
+zig build bench-yield  # one bench at a time — see build.zig for the full list
 ```
 
-## Cross-compile sanity check
-
-Volt's CI matrix runs `zig build-lib` for six target triples on every
-commit. You can do the same locally:
+Pre-commit hook (`zig fmt --check` + `zig build-lib` type-check):
 
 ```sh
-zig build-lib src/lib.zig -target x86_64-linux-gnu     -lc -fno-emit-bin
-zig build-lib src/lib.zig -target aarch64-linux-gnu    -lc -fno-emit-bin
-zig build-lib src/lib.zig -target x86_64-windows-gnu   -lc -fno-emit-bin
-zig build-lib src/lib.zig -target aarch64-windows-gnu  -lc -fno-emit-bin
-zig build-lib src/lib.zig -target x86_64-macos         -lc -fno-emit-bin
-zig build-lib src/lib.zig -target aarch64-macos        -lc -fno-emit-bin
+git config core.hooksPath .githooks
 ```
 
-All six should exit `0`. Windows compiles but does not yet run — see
-the platform-status table in the [introduction](/).
+Tests run in CI on every push; the pre-commit hook is fast (~2 s).
+
+## Cross-compile sanity check (optional)
+
+Volt's CI compiles `zig build-lib` for Linux + Windows targets even
+though the reactor doesn't ship for them yet — this catches type
+errors that would block the eventual port:
+
+```sh
+zig build-lib src/lib.zig -target x86_64-linux-gnu  -lc -fno-emit-bin
+zig build-lib src/lib.zig -target aarch64-linux-gnu -lc -fno-emit-bin
+```
+
+Both should exit `0`. Neither produces a working binary today — the
+kqueue reactor is Darwin-specific.
+
+## Next
+
+- [Your first program](/getting-started/first-program/) — the
+  one-pager walkthrough of what just happened.
+- [Spawning and joining](/getting-started/spawn-join/) — spawn a
+  child coroutine and collect its result.

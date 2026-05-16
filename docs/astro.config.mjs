@@ -52,6 +52,9 @@ export default defineConfig({
 		'/usage/process': '/appendix/roadmap',
 		'/usage/signals-shutdown': '/appendix/roadmap',
 		'/usage/observability': '/appendix/roadmap',
+		// Quick Start subsumed by the new tutorial track (first-program,
+		// spawn-join, io-tutorial). Redirect to the first one.
+		'/getting-started/quick-start': '/getting-started/first-program',
 	},
 	vite: {
 		plugins: [tailwindcss()],
