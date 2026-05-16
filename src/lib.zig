@@ -151,7 +151,7 @@ fn sleepTestRoot(ctx: *SleepCtx) !void {
 }
 
 test "sleep parks for ~10ms via kqueue timer" {
-    var rt = try Runtime.init(.{ .allocator = std.testing.allocator });
+    var rt = try Runtime.init(.{ .allocator = std.heap.smp_allocator });
     defer rt.deinit();
     var ctx = SleepCtx{};
     try (try rt.run(sleepTestRoot, .{&ctx}));

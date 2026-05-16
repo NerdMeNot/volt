@@ -392,7 +392,10 @@ pub const Semaphore = struct {
 // is a special configuration check, not the default test fixture.
 // ─────────────────────────────────────────────────────────────────────
 
-const test_allocator = std.testing.allocator;
+// See note in src/runtime.zig: std.testing.allocator's stack-trace
+// capture corrupts under multi-worker spawn. smp_allocator is the
+// thread-safe choice for runtime-touching tests.
+const test_allocator = std.heap.smp_allocator;
 const Runtime = runtime.Runtime;
 
 // Mutex test — N concurrent coros each incrementing a shared counter.

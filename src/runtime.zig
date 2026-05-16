@@ -715,7 +715,15 @@ fn dispatch(rt: *Runtime, m: *M, c: *Coroutine) void {
 // Tests
 // ─────────────────────────────────────────────────────────────────────
 
-const test_allocator = std.testing.allocator;
+// Tests use the smp_allocator (thread-safe, no stack-trace cache).
+// `std.testing.allocator` is a GeneralPurposeAllocator with stack-trace
+// capture for leak detection — but the trace capture walks
+// `debug.SelfInfo`'s module hash map without synchronization. Under
+// multi-worker spawn, several workers call `allocator.create(Coroutine)`
+// concurrently; the unwinder corrupts the module map and crashes with
+// EXC_BAD_ACCESS. The smp_allocator is fast, thread-safe, and what
+// production workloads use.
+const test_allocator = std.heap.smp_allocator;
 
 fn returnInt(x: u32) u32 {
     return x * 2;

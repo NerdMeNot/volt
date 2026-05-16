@@ -215,7 +215,10 @@ inline fn isAgain(e: c_int) bool {
 // Tests
 // ─────────────────────────────────────────────────────────────────────
 
-const test_allocator = std.testing.allocator;
+// See note in src/runtime.zig: std.testing.allocator's stack-trace
+// capture corrupts under multi-worker spawn. smp_allocator is the
+// thread-safe choice for runtime-touching tests.
+const test_allocator = std.heap.smp_allocator;
 
 fn testListenerLifecycle() !void {
     var listener = try TcpListener.bind(Address.loopback4(0));
