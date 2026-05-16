@@ -457,8 +457,11 @@ pub fn Watch(comptime T: type) type {
             _ = park.unparkAll(currentRt(), &self.version);
         }
 
+        /// Create a receiver. Cursor starts at 0, so a fresh receiver
+        /// sees the current value as "new" on its first `changed()`
+        /// (matches Tokio's watch::channel semantics).
         pub fn receiver(self: *Self) Receiver {
-            return .{ .watch = self, .cursor = self.version.load(.acquire) };
+            return .{ .watch = self, .cursor = 0 };
         }
 
         pub const Receiver = struct {
@@ -466,18 +469,22 @@ pub fn Watch(comptime T: type) type {
             cursor: u64,
 
             /// Park until the watch advances past our cursor. Returns
-            /// `error.Closed` if the watch closes.
+            /// `error.Closed` only after every version up to close has
+            /// been observed (so a closed-but-unseen watch surfaces
+            /// its final value first, then Closed on the next call).
             pub fn changed(self: *Receiver) ChannelError!void {
                 while (true) {
-                    if (self.watch.closed.load(.acquire)) return error.Closed;
                     const v = self.watch.version.load(.acquire);
-                    // Skip the writer-in-progress phase: round down to
-                    // last completed version.
+                    // Round down to the last completed version (writer
+                    // mid-update has odd version).
                     const stable = if (v & 1 == 1) v -% 1 else v;
                     if (stable > self.cursor) {
                         self.cursor = stable;
                         return;
                     }
+                    // No new version. Check close AFTER we've seen the
+                    // latest visible version.
+                    if (self.watch.closed.load(.acquire)) return error.Closed;
                     park.parkOn(&self.watch.version, watchChangedValidator);
                 }
             }
@@ -631,29 +638,56 @@ pub fn Broadcast(comptime T: type, comptime cap: usize) type {
 const test_allocator = std.testing.allocator;
 const Runtime = runtime.Runtime;
 
-const TestCtx = struct {
+const TestCtxCap4 = struct {
     ch: *Spsc(u64, 4),
     sum: u64 = 0,
     n: u64,
 };
 
-fn producer(ctx: *TestCtx) !void {
+const TestCtxCap2 = struct {
+    ch: *Spsc(u64, 2),
+    sum: u64 = 0,
+    n: u64,
+};
+
+fn producer4(ctx: *TestCtxCap4) ChannelError!void {
     var i: u64 = 0;
     while (i < ctx.n) : (i += 1) try ctx.ch.send(i);
     ctx.ch.close();
 }
 
-fn consumer(ctx: *TestCtx) !void {
+fn consumer4(ctx: *TestCtxCap4) ChannelError!void {
     while (true) {
         const v = ctx.ch.recv() catch return;
         ctx.sum +%= v;
     }
 }
 
-fn spscTestRoot(ctx: *TestCtx) !void {
+fn spscTestRoot4(ctx: *TestCtxCap4) !void {
     const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
-    var prod = try rt.spawn(producer, .{ctx});
-    var cons = try rt.spawn(consumer, .{ctx});
+    var prod = try rt.spawn(producer4, .{ctx});
+    var cons = try rt.spawn(consumer4, .{ctx});
+    _ = prod.join() catch unreachable;
+    _ = cons.join() catch unreachable;
+}
+
+fn producer2(ctx: *TestCtxCap2) ChannelError!void {
+    var i: u64 = 0;
+    while (i < ctx.n) : (i += 1) try ctx.ch.send(i);
+    ctx.ch.close();
+}
+
+fn consumer2(ctx: *TestCtxCap2) ChannelError!void {
+    while (true) {
+        const v = ctx.ch.recv() catch return;
+        ctx.sum +%= v;
+    }
+}
+
+fn spscTestRoot2(ctx: *TestCtxCap2) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var prod = try rt.spawn(producer2, .{ctx});
+    var cons = try rt.spawn(consumer2, .{ctx});
     _ = prod.join() catch unreachable;
     _ = cons.join() catch unreachable;
 }
@@ -663,8 +697,8 @@ test "spsc: small unbuffered pipeline (multi-worker default)" {
     defer rt.deinit();
 
     var ch = Spsc(u64, 4){};
-    var ctx = TestCtx{ .ch = &ch, .n = 100 };
-    try rt.run(spscTestRoot, .{&ctx});
+    var ctx = TestCtxCap4{ .ch = &ch, .n = 100 };
+    try (try rt.run(spscTestRoot4, .{&ctx}));
 
     try std.testing.expectEqual(@as(u64, 4950), ctx.sum);
 }
@@ -674,8 +708,8 @@ test "spsc: cap=2 stresses block-on-full, multi-worker" {
     defer rt.deinit();
 
     var ch = Spsc(u64, 2){};
-    var ctx = TestCtx{ .ch = &ch, .n = 1000 };
-    try rt.run(spscTestRoot, .{&ctx});
+    var ctx = TestCtxCap2{ .ch = &ch, .n = 1000 };
+    try (try rt.run(spscTestRoot2, .{&ctx}));
 
     try std.testing.expectEqual(@as(u64, 499500), ctx.sum);
 }
@@ -685,8 +719,8 @@ test "spsc: works at workers=1 (configuration check)" {
     defer rt.deinit();
 
     var ch = Spsc(u64, 4){};
-    var ctx = TestCtx{ .ch = &ch, .n = 1000 };
-    try rt.run(spscTestRoot, .{&ctx});
+    var ctx = TestCtxCap4{ .ch = &ch, .n = 1000 };
+    try (try rt.run(spscTestRoot4, .{&ctx}));
 
     try std.testing.expectEqual(@as(u64, 499500), ctx.sum);
 }
@@ -740,7 +774,7 @@ test "mpmc: 4 producers × 4 consumers, all messages delivered exactly once" {
 
     var ch = MpmcCh{};
     var ctx = MpmcCtx{ .ch = &ch, .n_per_producer = 250 };
-    try rt.run(mpmcRoot4x4, .{&ctx});
+    try (try rt.run(mpmcRoot4x4, .{&ctx}));
 
     const total_msgs = 4 * 250;
     try std.testing.expectEqual(@as(u64, total_msgs), ctx.received.load(.acquire));
@@ -783,7 +817,7 @@ test "mpmc: works at workers=1 (configuration check)" {
 
     var ch = MpmcCh{};
     var ctx = MpmcCtx{ .ch = &ch, .n_per_producer = 50 };
-    try rt.run(mpmcRoot4x4, .{&ctx});
+    try (try rt.run(mpmcRoot4x4, .{&ctx}));
     try std.testing.expectEqual(@as(u64, 4 * 50), ctx.received.load(.acquire));
 }
 
@@ -817,14 +851,20 @@ test "oneshot: single-value handoff between two coros" {
 
     var ch = Oneshot(u64){};
     var ctx = OneshotCtx{ .ch = &ch };
-    try rt.run(oneshotRoot, .{&ctx});
+    try (try rt.run(oneshotRoot, .{&ctx}));
     try std.testing.expectEqual(@as(u64, 0xCAFE), ctx.got);
 }
 
-test "oneshot: second send returns Closed" {
-    var ch = Oneshot(u64){};
+fn oneshotDoubleSendRoot(ch: *Oneshot(u64)) !void {
     try ch.send(1);
     try std.testing.expectError(error.Closed, ch.send(2));
+}
+
+test "oneshot: second send returns Closed" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
+    defer rt.deinit();
+    var ch = Oneshot(u64){};
+    try (try rt.run(oneshotDoubleSendRoot, .{&ch}));
 }
 
 fn oneshotCloseProducer(ch: *Oneshot(u64)) !void {
@@ -850,7 +890,7 @@ test "oneshot: close-without-send surfaces Closed to receiver" {
 
     var ch = Oneshot(u64){};
     var ctx = OneshotCtx{ .ch = &ch };
-    try rt.run(oneshotCloseRoot, .{&ctx});
+    try (try rt.run(oneshotCloseRoot, .{&ctx}));
     try std.testing.expectEqual(@as(u64, 0xDEAD), ctx.got);
 }
 
@@ -893,7 +933,7 @@ test "watch: receiver sees most recent value, exits on close" {
 
     var w = Watch(u64).init(0);
     var ctx = WatchCtx{ .w = &w };
-    try rt.run(watchRoot, .{&ctx});
+    try (try rt.run(watchRoot, .{&ctx}));
     // Last value the producer published was 50. Receiver may have
     // coalesced some intermediate values (that's by design — Watch
     // is latest-only).
@@ -931,11 +971,15 @@ fn broadcastConsumer(ctx: *BroadcastCtx) !void {
 }
 
 fn broadcastRoot(ctx: *BroadcastCtx) !void {
-    var consumers: [3]*@TypeOf(@import("lib.zig").spawn(broadcastConsumer, .{ctx}) catch unreachable) = undefined;
+    const lib = @import("lib.zig");
+    const ConsumerHandle = @TypeOf(try lib.spawn(broadcastConsumer, .{ctx}));
+    var consumers: [3]ConsumerHandle = undefined;
     // Spawn consumers FIRST so their cursors are set before producer
     // publishes — Broadcast doesn't replay history to late joiners.
-    for (&consumers) |*t| t.* = try @import("lib.zig").spawn(broadcastConsumer, .{ctx});
-    var p = try @import("lib.zig").spawn(broadcastProducer, .{ctx.bc});
+    consumers[0] = try lib.spawn(broadcastConsumer, .{ctx});
+    consumers[1] = try lib.spawn(broadcastConsumer, .{ctx});
+    consumers[2] = try lib.spawn(broadcastConsumer, .{ctx});
+    var p = try lib.spawn(broadcastProducer, .{ctx.bc});
     _ = p.join() catch unreachable;
     for (consumers) |t| _ = t.join() catch unreachable;
 }
@@ -946,7 +990,7 @@ test "broadcast: 1 producer × 3 consumers, all values delivered to all (no over
 
     var bc = BroadcastCh{};
     var ctx = BroadcastCtx{ .bc = &bc };
-    try rt.run(broadcastRoot, .{&ctx});
+    try (try rt.run(broadcastRoot, .{&ctx}));
     // Each consumer should see all 20 values: sum = 3 * (1+2+..+20) = 3 * 210.
     // BUT some may be lagged depending on timing. Loose check:
     // - Count is at most 3 * 20 = 60; we got something close.

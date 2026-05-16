@@ -427,7 +427,7 @@ test "Mutex: serializes 16 coros on multi-worker runtime" {
     defer mu.deinit();
     var counter: u64 = 0;
     var ctx = MutexCtx{ .mu = &mu, .counter = &counter, .iters = 1000 };
-    try rt.run(mutexTestRoot, .{&ctx});
+    try (try rt.run(mutexTestRoot, .{&ctx}));
 
     try std.testing.expectEqual(@as(u64, 16 * 1000), counter);
 }
@@ -440,7 +440,7 @@ test "Mutex: works at workers=1 (single-worker configuration)" {
     defer mu.deinit();
     var counter: u64 = 0;
     var ctx = MutexCtx{ .mu = &mu, .counter = &counter, .iters = 1000 };
-    try rt.run(mutexTestRoot, .{&ctx});
+    try (try rt.run(mutexTestRoot, .{&ctx}));
 
     try std.testing.expectEqual(@as(u64, 16 * 1000), counter);
 }
@@ -478,7 +478,7 @@ test "Notify: notifyOne wakes one waiter at a time, multi-worker" {
     defer note.deinit();
     var fired = std.atomic.Value(u32).init(0);
     var ctx = NotifyCtx{ .note = &note, .fired = &fired, .n = 8 };
-    try rt.run(notifyTestRoot, .{&ctx});
+    try (try rt.run(notifyTestRoot, .{&ctx}));
 
     try std.testing.expectEqual(@as(u32, 8), fired.load(.acquire));
 }
@@ -510,7 +510,7 @@ test "Semaphore: 100 coros acquire/release with cap=3, multi-worker" {
     defer sem.deinit();
     var counter = std.atomic.Value(u32).init(0);
     var ctx = SemCtx{ .sem = &sem, .counter = &counter };
-    try rt.run(semTestRoot, .{&ctx});
+    try (try rt.run(semTestRoot, .{&ctx}));
 
     try std.testing.expectEqual(@as(u32, 100), counter.load(.acquire));
     try std.testing.expectEqual(@as(u32, 3), sem.permits.load(.acquire));

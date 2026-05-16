@@ -27,6 +27,10 @@ const context = @import("context_arm64.zig");
 
 const KEV_BATCH: usize = 32;
 
+// Darwin sys/event.h constants for EVFILT_TIMER.
+const EVFILT_TIMER: i16 = -7;
+const NOTE_NSECONDS: u32 = 0x00000004;
+
 pub const Reactor = struct {
     kq: i32 = -1,
     /// In-flight kqueue registrations (one per coroutine parked on
@@ -64,6 +68,28 @@ pub const Reactor = struct {
     /// Park the current coroutine until `fd` is writable.
     pub fn waitWritable(self: *Reactor, fd: i32) void {
         self.waitFd(fd, posix.system.EVFILT.WRITE);
+    }
+
+    /// Park the current coroutine for at least `ns` nanoseconds.
+    /// Single-shot kqueue timer keyed on the coroutine's pointer
+    /// (each coro can have at most one outstanding sleep at a time).
+    /// Kernel timer resolution is bounded below by ~1 µs on Darwin.
+    pub fn waitTimer(self: *Reactor, ns: u64) void {
+        const me = current.require();
+        var kev = std.mem.zeroes(posix.Kevent);
+        kev.ident = @intFromPtr(me);
+        kev.filter = EVFILT_TIMER;
+        kev.flags = posix.system.EV.ADD | posix.system.EV.ONESHOT;
+        kev.fflags = NOTE_NSECONDS;
+        kev.data = @intCast(ns);
+        kev.udata = @intFromPtr(me);
+        var changes = [_]posix.Kevent{kev};
+        var dummy: [1]posix.Kevent = undefined;
+        const n = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
+        if (n < 0) @panic("kevent timer register failed");
+        _ = self.pending.fetchAdd(1, .acq_rel);
+        me.pending = .park;
+        context.swap(&me.ctx, me.main_ctx);
     }
 
     fn waitFd(self: *Reactor, fd: i32, filter: i16) void {

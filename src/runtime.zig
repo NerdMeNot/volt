@@ -754,7 +754,7 @@ test "runtime: 100 coros fanned out across workers" {
     var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 4 });
     defer rt.deinit();
     var counter = std.atomic.Value(u32).init(0);
-    try rt.run(fanOutRoot, .{&counter});
+    try (try rt.run(fanOutRoot, .{&counter}));
     try std.testing.expectEqual(@as(u32, 100), counter.load(.acquire));
 }
 
@@ -778,7 +778,7 @@ test "runtime: two yielding coroutines interleave across workers" {
     var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
     defer rt.deinit();
     var counter = std.atomic.Value(u32).init(0);
-    try rt.run(yieldRoot, .{&counter});
+    try (try rt.run(yieldRoot, .{&counter}));
     try std.testing.expectEqual(@as(u32, 20), counter.load(.acquire));
 }
 
@@ -805,7 +805,7 @@ test "runtime: tryDispatchInline runs target inline and join returns result" {
     var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
     defer rt.deinit();
     var out: u32 = 0;
-    try rt.run(inlineRoot, .{&out});
+    try (try rt.run(inlineRoot, .{&out}));
     try std.testing.expectEqual(@as(u32, 42), out);
 }
 
@@ -828,7 +828,7 @@ test "runtime: tryDispatchInline returns false when target is not in lifo_slot" 
     var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
     defer rt.deinit();
     var out: u32 = 0;
-    try rt.run(inlineMissRoot, .{&out});
+    try (try rt.run(inlineMissRoot, .{&out}));
     try std.testing.expectEqual(@as(u32, 84), out);
 }
 
@@ -853,7 +853,7 @@ test "runtime: tryDispatchInline returns false when target yields, target comple
     var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
     defer rt.deinit();
     var out: u32 = 0;
-    try rt.run(inlineYieldRoot, .{&out});
+    try (try rt.run(inlineYieldRoot, .{&out}));
     try std.testing.expectEqual(@as(u32, 7), out);
 }
 
@@ -904,6 +904,6 @@ test "runtime: tryDispatchInline returns false when target parks, target complet
     var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
     defer rt.deinit();
     var out: u32 = 0;
-    try rt.run(inlineParkRoot, .{&out});
+    try (try rt.run(inlineParkRoot, .{&out}));
     try std.testing.expectEqual(@as(u32, 99), out);
 }

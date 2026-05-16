@@ -227,7 +227,7 @@ fn testListenerLifecycle() !void {
 test "TcpListener: bind + localAddress" {
     var rt = try runtime.Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
     defer rt.deinit();
-    try rt.run(testListenerLifecycle, .{});
+    try (try rt.run(testListenerLifecycle, .{}));
 }
 
 const EchoTestCtx = struct {
@@ -275,7 +275,7 @@ test "TCP echo single client round-trip" {
     defer listener.close();
     var ctx = EchoTestCtx{ .listener = &listener };
     ctx.addr = try listener.localAddress();
-    try rt.run(echoTestRoot, .{&ctx});
+    try (try rt.run(echoTestRoot, .{&ctx}));
 
     try std.testing.expect(ctx.server_done);
     try std.testing.expect(ctx.client_done);
