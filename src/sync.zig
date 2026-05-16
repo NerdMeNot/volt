@@ -65,6 +65,7 @@ const coroutine = @import("coroutine.zig");
 const runtime = @import("runtime.zig");
 const current = @import("current.zig");
 const park = @import("park.zig");
+const cancel_mod = @import("cancel.zig");
 
 // pthread-backed internal mutex. We use pthread's because it has
 // adaptive spin-then-park built-in and it's already a dependency
@@ -213,14 +214,86 @@ pub const Mutex = struct {
     /// still CONTENDED. If unlock dropped it to UNLOCKED in between
     /// our CAS and the parking lot's check, we exit park cleanly
     /// instead of waiting for an unpark that already missed us.
+    ///
+    /// Also checks `current.cancel_in_flight` — if a cancel-aware
+    /// caller fires its `Cancel` between `c.register` and parkOn,
+    /// the cancel.fire's `unparkAll(&state)` doesn't reach us yet
+    /// (we haven't parked), so the validator must catch the race
+    /// itself.
     fn lockValidator(addr: *const anyopaque) bool {
         const sp: *const std.atomic.Value(u32) = @ptrCast(@alignCast(addr));
+        if (current.get()) |me| {
+            if (me.cancel_in_flight) |cp| {
+                const c: *cancel_mod.Cancel = @ptrCast(@alignCast(cp));
+                if (c.isFired()) return false;
+            }
+        }
         return sp.load(.acquire) == CONTENDED;
     }
 
     /// Non-blocking. Returns true if acquired.
     pub fn tryLock(self: *Mutex) bool {
         return self.state.cmpxchgStrong(UNLOCKED, LOCKED, .acquire, .monotonic) == null;
+    }
+
+    /// Cancel-aware lock. Same semantics as `lock` but returns
+    /// `error.Cancelled` if the cancel fires while parked (or
+    /// before entering the wait path). On successful return the
+    /// caller owns the lock; on `Cancelled` the caller does NOT
+    /// hold the lock and should not call `unlock`.
+    pub fn lockCancel(self: *Mutex, c: *cancel_mod.Cancel) cancel_mod.Error!void {
+        if (c.isFired()) return error.Cancelled;
+        // Fast path.
+        if (self.state.cmpxchgStrong(UNLOCKED, LOCKED, .acquire, .monotonic) == null) return;
+        return self.lockCancelSlow(c);
+    }
+
+    fn lockCancelSlow(self: *Mutex, c: *cancel_mod.Cancel) cancel_mod.Error!void {
+        @branchHint(.cold);
+        var spin: u32 = 0;
+        var have_parked: bool = false;
+        while (true) {
+            if (c.isFired()) return error.Cancelled;
+
+            const s = self.state.load(.monotonic);
+
+            if (s == UNLOCKED) {
+                const target: u32 = if (have_parked) CONTENDED else LOCKED;
+                if (self.state.cmpxchgWeak(UNLOCKED, target, .acquire, .monotonic) == null) return;
+                continue;
+            }
+
+            if (s == LOCKED and spin < SPIN_LIMIT) {
+                std.atomic.spinLoopHint();
+                spin += 1;
+                continue;
+            }
+
+            if (s != CONTENDED) {
+                if (self.state.cmpxchgWeak(s, CONTENDED, .monotonic, .monotonic) != null) continue;
+            }
+
+            // Register with the cancel BEFORE parking. If fire races
+            // with our park, the cancel's waiter list ensures fire
+            // calls `unparkAll(&self.state)` and our park returns.
+            var waiter: cancel_mod.Waiter = .{};
+            if (c.register(&waiter, @intFromPtr(&self.state))) {
+                return error.Cancelled;
+            }
+            // Publish the cancel to the validator, which runs under
+            // the parking-lot bucket lock and re-checks it. Without
+            // this, a fire between `register` and `parkOn`'s
+            // bucket-lock acquire would miss us — its `unparkAll`
+            // fires before we're parked.
+            const me = current.require();
+            me.cancel_in_flight = @ptrCast(c);
+            park.parkOn(&self.state, lockValidator);
+            me.cancel_in_flight = null;
+            c.deregister(&waiter);
+            if (c.isFired()) return error.Cancelled;
+            have_parked = true;
+            spin = 0;
+        }
     }
 
     pub fn unlock(self: *Mutex) void {
@@ -433,6 +506,76 @@ test "Mutex: serializes 16 coros on multi-worker runtime" {
     try (try rt.run(mutexTestRoot, .{&ctx}));
 
     try std.testing.expectEqual(@as(u64, 16 * 1000), counter);
+}
+
+// ─── Mutex.lockCancel tests ──────────────────────────────────────────
+
+const LockCancelCtx = struct {
+    mu: *Mutex,
+    c: *cancel_mod.Cancel,
+    got_cancelled: bool = false,
+};
+
+fn lockCancelWaiter(ctx: *LockCancelCtx) !void {
+    // The mutex is already held by the test root. We try to acquire
+    // it; the cancel will fire while we're parked.
+    ctx.mu.lockCancel(ctx.c) catch |err| {
+        if (err == error.Cancelled) ctx.got_cancelled = true;
+        return;
+    };
+    // Unexpected — we acquired despite cancel
+    ctx.mu.unlock();
+}
+
+fn lockCancelRoot(ctx: *LockCancelCtx) !void {
+    // Take the mutex so the spawned waiter blocks.
+    ctx.mu.lock();
+    var waiter = try @import("lib.zig").spawn(lockCancelWaiter, .{ctx});
+    // Yield a few times to ensure the waiter parks.
+    var i: u32 = 0;
+    while (i < 16) : (i += 1) @import("runtime.zig").yield();
+    // Fire the cancel — should wake the parked waiter with Cancelled.
+    ctx.c.fire();
+    _ = waiter.join() catch {};
+    ctx.mu.unlock();
+}
+
+test "Mutex.lockCancel: fires while parked, returns Cancelled" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
+    defer rt.deinit();
+    var mu = Mutex.init();
+    defer mu.deinit();
+    var c = cancel_mod.Cancel.init(rt);
+    defer c.deinit();
+    var ctx = LockCancelCtx{ .mu = &mu, .c = &c };
+    try (try rt.run(lockCancelRoot, .{&ctx}));
+    try std.testing.expect(ctx.got_cancelled);
+}
+
+fn lockCancelPrefiredWaiter(ctx: *LockCancelCtx) !void {
+    ctx.mu.lockCancel(ctx.c) catch |err| {
+        if (err == error.Cancelled) ctx.got_cancelled = true;
+        return;
+    };
+    ctx.mu.unlock();
+}
+
+fn lockCancelPrefiredRoot(ctx: *LockCancelCtx) !void {
+    ctx.c.fire();
+    var waiter = try @import("lib.zig").spawn(lockCancelPrefiredWaiter, .{ctx});
+    _ = waiter.join() catch {};
+}
+
+test "Mutex.lockCancel: pre-fired cancel returns Cancelled immediately" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
+    defer rt.deinit();
+    var mu = Mutex.init();
+    defer mu.deinit();
+    var c = cancel_mod.Cancel.init(rt);
+    defer c.deinit();
+    var ctx = LockCancelCtx{ .mu = &mu, .c = &c };
+    try (try rt.run(lockCancelPrefiredRoot, .{&ctx}));
+    try std.testing.expect(ctx.got_cancelled);
 }
 
 test "Mutex: works at workers=1 (single-worker configuration)" {

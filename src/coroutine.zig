@@ -112,6 +112,18 @@ pub const Coroutine = struct {
     /// at spawn; transitions are owned by `runtime.park` / `runtime.unpark`
     /// / `dispatch` and documented at those sites.
     park_state: std.atomic.Value(u32) = std.atomic.Value(u32).init(ParkState.RUNNING),
+    /// Set by cancel-aware blocking ops (`Mutex.lockCancel`,
+    /// `Spsc.recvCancel`, etc.) immediately before they call
+    /// `park.parkOn`. The op's validator (which runs under the
+    /// parking-lot bucket lock) reads this slot to close the
+    /// register-then-park race: if the cancel fires between
+    /// `c.register` and `parkOn`, the validator sees `fired` and
+    /// bails without parking. Cleared after wake.
+    ///
+    /// Type-erased to avoid the coroutine → cancel → runtime →
+    /// coroutine import cycle. Cast back to `*cancel.Cancel` at
+    /// validator time.
+    cancel_in_flight: ?*anyopaque = null,
 };
 
 // ─────────────────────────────────────────────────────────────────────

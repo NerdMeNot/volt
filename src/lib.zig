@@ -95,6 +95,10 @@ pub const Mutex = sync.Mutex;
 pub const Notify = sync.Notify;
 pub const Semaphore = sync.Semaphore;
 
+/// Go-style cancellation handle. Caller-owned; fire to wake every
+/// cancel-aware blocking op holding `*Cancel`. See `src/cancel.zig`.
+pub const Cancel = @import("cancel.zig").Cancel;
+
 // ─── Internal (not for user code) ────────────────────────────────────
 
 /// Internal-use namespaces. Stable enough that volt's tests + benches
@@ -130,6 +134,7 @@ test {
     _ = @import("stack.zig");
     _ = @import("signal.zig");
     _ = @import("context_arm64.zig");
+    _ = @import("cancel.zig");
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
