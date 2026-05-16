@@ -83,6 +83,29 @@ pub fn sleep(ns: u64) void {
     rt.reactor.waitTimer(ns);
 }
 
+/// Run `body` with a fresh `*Cancel`. If `body` returns an error,
+/// the Cancel fires automatically — every coroutine that was given
+/// `&cancel` and is mid-blocking-op wakes with `error.Cancelled`.
+/// If `body` returns OK, the Cancel does NOT fire (the spawned
+/// children, if any, must have completed already — `scope` does
+/// not auto-await; that's the body's responsibility).
+///
+/// This is the minimum-viable "structured concurrency" primitive
+/// for v1: it ties cancel lifetime to a lexical scope so errors
+/// propagate without manual `defer cancel.fire()` boilerplate.
+/// Auto-await of child tasks is library territory and may land in
+/// a v1.x extension.
+///
+/// Must be called from inside a coroutine (needs `runtime()`).
+pub fn scope(comptime body: anytype) anyerror!void {
+    var c = Cancel.init(runtime());
+    defer c.deinit();
+    body(&c) catch |e| {
+        c.fire();
+        return e;
+    };
+}
+
 // ─── Channel & sync convenience re-exports ───────────────────────────
 
 pub const Spsc = channel.Spsc;
@@ -162,4 +185,49 @@ test "sleep parks for ~10ms via kqueue timer" {
     try (try rt.run(sleepTestRoot, .{&ctx}));
     try std.testing.expect(ctx.slept_ns >= 9 * std.time.ns_per_ms);
     try std.testing.expect(ctx.slept_ns < 100 * std.time.ns_per_ms);
+}
+
+// ─── scope tests ─────────────────────────────────────────────────────
+
+fn scopeOkBody(c: *Cancel) anyerror!void {
+    _ = c;
+}
+
+fn scopeErrBody(c: *Cancel) anyerror!void {
+    _ = c;
+    return error.Boom;
+}
+
+// Records whether the cancel was fired post-body. Exposed via a
+// global slot because the body fn only sees *Cancel, no user ctx.
+var test_scope_seen_fired: bool = false;
+
+fn scopeFireRecordingBody(c: *Cancel) anyerror!void {
+    // Snapshot pre-error: cancel should NOT be fired yet.
+    if (c.isFired()) test_scope_seen_fired = true;
+    return error.Boom;
+}
+
+fn scopeRoot(_: *void) !void {
+    // (1) ok body → scope returns OK
+    try scope(scopeOkBody);
+
+    // (2) error body → scope propagates the error
+    const r = scope(scopeErrBody);
+    try std.testing.expectError(error.Boom, r);
+
+    // (3) cancel only fires AFTER the body returns the error, not
+    //     during. The body samples `c.isFired()` and sets a flag
+    //     if pre-mature firing occurred.
+    test_scope_seen_fired = false;
+    const r2 = scope(scopeFireRecordingBody);
+    try std.testing.expectError(error.Boom, r2);
+    try std.testing.expect(!test_scope_seen_fired);
+}
+
+test "scope: ok body returns OK; error body propagates error" {
+    var rt = try Runtime.init(.{ .allocator = std.heap.smp_allocator });
+    defer rt.deinit();
+    var dummy: void = {};
+    try (try rt.run(scopeRoot, .{&dummy}));
 }
