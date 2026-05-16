@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const posix = std.posix;
-const reactor_mod = @import("reactor_kqueue.zig");
+const reactor_mod = @import("reactor.zig");
 const runtime = @import("runtime.zig");
 const current = @import("current.zig");
 
@@ -41,16 +41,9 @@ inline fn errnoVal() c_int {
     return c_error().*;
 }
 
-const F_GETFL: c_int = 3;
-const F_SETFL: c_int = 4;
-const O_NONBLOCK: c_int = 4;
-extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
-
-fn setNonblock(fd: c_int) !void {
-    const flags = fcntl(fd, F_GETFL, @as(c_int, 0));
-    if (flags < 0) return error.FcntlGetFailed;
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return error.FcntlSetFailed;
-}
+// Note: `setNonblock` lives in `reactor.zig` (re-exported from each
+// platform's backend). The duplicate that used to live here was
+// consolidated as part of the L1 reactor refactor.
 
 pub const Address = struct {
     /// IPv4 host bytes in host order (192.168.1.1 → {192,168,1,1}).
@@ -129,7 +122,7 @@ pub const TcpListener = struct {
         const sa = addr.toSockaddr();
         if (c_bind(fd, &sa, @sizeOf(sockaddr_in)) < 0) return error.BindFailed;
         if (c_listen(fd, 128) < 0) return error.ListenFailed;
-        try setNonblock(fd);
+        try reactor_mod.setNonblock(@intCast(fd));
         return .{ .fd = @intCast(fd) };
     }
 
@@ -151,7 +144,7 @@ pub const TcpListener = struct {
         while (true) {
             const new_fd = c_accept(@intCast(self.fd), null, null);
             if (new_fd >= 0) {
-                try setNonblock(new_fd);
+                try reactor_mod.setNonblock(@intCast(new_fd));
                 return .{ .fd = @intCast(new_fd) };
             }
             if (!isAgain(errnoVal())) return error.AcceptFailed;
@@ -167,7 +160,7 @@ pub const TcpStream = struct {
         const fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (fd < 0) return error.SocketCreateFailed;
         errdefer _ = c_close(fd);
-        try setNonblock(fd);
+        try reactor_mod.setNonblock(@intCast(fd));
 
         const sa = addr.toSockaddr();
         if (c_connect(fd, &sa, @sizeOf(sockaddr_in)) < 0) {

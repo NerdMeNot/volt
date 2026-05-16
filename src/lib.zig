@@ -132,7 +132,7 @@ pub const internal = struct {
     pub const PendingKind = @import("coroutine.zig").PendingKind;
     pub const Frame = @import("runtime.zig").Frame;
     pub const STACK_SIZE = @import("runtime.zig").STACK_SIZE;
-    pub const reactor = @import("reactor_kqueue.zig");
+    pub const reactor = @import("reactor.zig");
     pub const context = @import("context_arm64.zig");
     pub const park = @import("runtime.zig").park;
     pub const unpark = @import("runtime.zig").unpark;
@@ -149,7 +149,7 @@ test {
     _ = @import("sync.zig");
     _ = @import("net.zig");
     _ = @import("park.zig");
-    _ = @import("reactor_kqueue.zig");
+    _ = @import("reactor.zig");
     _ = @import("work_steal_queue.zig");
     _ = @import("p.zig");
     _ = @import("worker.zig");
