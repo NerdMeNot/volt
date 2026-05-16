@@ -1,231 +1,212 @@
 ---
 title: Channels
-description: Channel, Oneshot, Watch, Broadcast, and select — message passing primitives in Volt.
+description: Spsc, Mpmc, Oneshot, Watch, Broadcast — five comptime-specialised channel shapes for the patterns you actually need.
 ---
 
-Volt has four channel types and a `select`. They share a unified
-error vocabulary — `error.Closed` and `error.Cancelled` — so a
-single `catch` can cover the whole family.
+Volt has five channel types. They share a unified error vocabulary
+(`error.Closed`, `error.Cancelled` via the cancel-aware variants)
+and all route their block-on-full / block-on-empty paths through
+the parking lot.
 
-| Type | Pattern | Allocates | Use case |
+| Type | Pattern | Backpressure | Use case |
 |---|---|---|---|
-| `Channel(T)` | MPMC bounded queue | yes (init) | Work queues, pipelines with backpressure |
-| `Oneshot(T)` | 1:1, single value | no | Hand a single result from producer to consumer |
-| `Watch(T)` | 1:N, latest value | no | Config hot-reload, current-state propagation |
-| `Broadcast(T)` | 1:N, history-aware | yes (init) | Pub/sub fan-out, event streams |
+| `Spsc(T, cap)` | 1 producer, 1 consumer, bounded | yes | Pipeline stages; fastest channel |
+| `Mpmc(T, cap)` | N producers, M consumers, bounded | yes | Work queues, fan-out, fan-in |
+| `Oneshot(T)` | 1 producer, 1 consumer, single value | n/a | Result handoff, races, futures |
+| `Watch(T)` | 1 producer, N consumers, latest value | no (drops intermediate) | Config hot-reload, current state |
+| `Broadcast(T, cap)` | 1 producer, N consumers, history-aware | no (slow rx → Lagged) | Pub/sub, event streams |
 
-```
-Channel(T):  many → ring buffer → many
-   P1 ──┐                      ┌── C1
-   P2 ──┼──[ A B C D E . . ]──┼── C2     bounded; full → backpressure
-   P3 ──┘  cap-sized ring     └── C3
+Capacity (`cap`) is **comptime**. `Spsc(T, 16)` and `Spsc(T, 32)` are
+distinct types; the compiler specialises ring sizes at the call site.
 
-Oneshot(T):  single → slot → single
-   P  ──── [   v   ] ──── C                 once; second send → Closed
+## Spsc(T, cap) — single-producer / single-consumer
 
-Watch(T):  single → latest-value cell → many independent receivers
-                  ┌── R1 (cursor=v3)
-   P ── [v3] ─────┼── R2 (cursor=v2)        each rx polls rx.changed()
-                  └── R3 (cursor=v3)         missed values → silent skip
-
-Broadcast(T):  single → ring buffer → many independent receivers
-                            ┌── R1 (cursor=4)
-   P ── [3 4 5 6 7 8 9 10] ─┼── R2 (cursor=8)   slow rx → .lagged(N) tag
-        cap-sized ring      └── R3 (cursor=10)  no producer backpressure
-```
-
-## Channel(T) — bounded MPMC
+The fastest channel. One pair of pointers (head / tail) on separate
+cache lines, comptime-specialised modulo. 12 ns/op on the bench
+(see [Performance](/performance/)).
 
 ```zig
-var ch = try volt.channel.Channel(u32).init(allocator, 64);
-defer ch.deinit();
+var ch: volt.Spsc(u64, 16) = .{};
 
-// Producer (any coroutine):
-try ch.send(7);                 // suspends if full; error.Closed | Cancelled
+// Producer:
+try ch.send(7);              // suspends if full; error.Closed if closed
+// Consumer:
+const v = try ch.recv();     // suspends if empty; error.Closed if closed
 
-// Consumer (any coroutine):
-const v = try ch.recv();        // suspends if empty; error.Closed | Cancelled
+// Cancel-aware variants:
+try ch.sendCancel(7, &c);    // CancelError = error{Closed, Cancelled}
+const v2 = try ch.recvCancel(&c);
 
-// Close — wakes all waiters:
+// Close — wakes both ends:
 ch.close();
 ```
 
-Capacity is rounded up to the next power of two with a floor of 2.
-The implementation is a Vyukov MPMC ring with a closed-bit packed
-into the tail counter; the fast path is one CAS.
+The single-producer / single-consumer contract is enforced by you,
+not the type. Concurrent `send` from two coroutines is undefined
+behaviour; same for concurrent `recv`. If you need many-to-many,
+use `Mpmc`.
 
-### Non-blocking variants
+Initialization is zero (`= .{}`); no `init`/`deinit` needed.
 
-```zig
-switch (ch.trySend(value)) {
-    .sent => {},
-    .full => { /* backpressure — drop, retry, ... */ },
-    .closed => {},
-}
+## Mpmc(T, cap) — multi-producer / multi-consumer
 
-switch (ch.tryRecv()) {
-    .value => |v| handle(v),
-    .empty => {},
-    .closed => return,
-}
-```
-
-`trySend` / `tryRecv` are lock-free and callable from any thread.
-The blocking `send` / `recv` variants are coroutine-only.
-
-### When to use Channel
-
-- Producer/consumer pipelines (fixed-buffer backpressure).
-- Job queues where workers pull units of work.
-- Anywhere the queue depth itself is the load-shedding signal.
-
-## Oneshot(T) — single hand-off
+Vyukov bounded MPMC ring with per-cell sequence counters. Each
+cell carries a `seq` that producers / consumers advance via CAS;
+producers see "full" when `cell.seq < pos` (one lap behind),
+consumers see "empty" when `cell.seq < pos + 1`.
 
 ```zig
-var os = volt.channel.Oneshot(Result){};
+var ch = volt.Mpmc(u64, 64).init();
+defer ch.deinit();
 
-// Sender:
-try os.send(.{ .ok = 42 });    // first send wins; subsequent → error.Closed
+// Any coroutine, any thread:
+try ch.send(value);
+const v = try ch.recv();
 
-// Receiver:
-const r = try os.recv();        // suspends; returns value or error.Closed
+// Non-blocking variants:
+ch.trySend(value) catch |e| switch (e) {
+    error.Full => { /* backpressure */ },
+    error.Closed => return,
+};
+const v2 = ch.tryRecv() catch |e| switch (e) {
+    error.Empty => continue,
+    error.Closed => return,
+};
+
+ch.close();   // wakes all parked senders + receivers with error.Closed
 ```
 
-Zero allocation. Useful for:
+Use Mpmc for:
 
-- "Eventual result" patterns — one task hands a value back to its
-  parent.
-- Race-style fan-out (`select`/`scope` first-wins).
-- Building higher-level futures.
+- Work queues (M producers enqueueing units, N workers consuming).
+- Fan-in (N producers → 1 consumer with throughput limits).
+- Any channel scenario where Spsc's 1:1 contract is too restrictive.
 
-If you call `send` twice or `send` after `close`, the second call
-returns `error.Closed` — the channel is "closed" from the
-second-sender's perspective once the first send wins.
+About 5× slower than Spsc per op due to the CAS-based producer /
+consumer paths, but still under 150 ns at 4P × 4C. Cancel-aware
+variants (`sendCancel`, `recvCancel`) follow the same pattern.
+
+## Oneshot(T) — single-value handoff
+
+```zig
+var os: volt.Oneshot(Result) = .{};
+
+// One sender, one receiver:
+try os.send(.{ .value = 42 });    // error.Closed if already sent or closed
+const r = try os.recv();          // parks until send or close
+```
+
+Zero allocation. The value lives in the Oneshot struct itself.
+
+Used for:
+
+- Result handoff: spawn a child, hand it a `*Oneshot`, child sends
+  its result, parent receives.
+- Race-style patterns: N children share one Oneshot, first to send
+  wins, others see `error.Closed` on their attempt.
+- Building higher-level futures / promises.
+
+`send` is single-shot; second call returns `error.Closed`.
+`recv` blocks; cancel-aware variant `recvCancel(&c)` returns
+`error.Cancelled` when the held Cancel fires.
 
 ## Watch(T) — latest-value broadcast
 
+1 producer, N consumers. Producer never blocks; consumers see the
+**latest** published value, missing intermediate values silently.
+Built on a seqlock so readers don't block writers.
+
 ```zig
-var w = volt.channel.Watch(Config).init(initial_cfg);
+var w = volt.Watch(Config).init(initial_config);
 defer w.deinit();
 
-// Producer:
-w.send(new_cfg);           // overwrites; doesn't queue
+// Producer (any coroutine):
+w.send(new_config);    // overwrites; never blocks; wakes all parked receivers
 
-// Each consumer holds its own Receiver:
-var rx = w.subscribe();
+// Each consumer:
+var rx = w.receiver();
 while (true) {
-    try rx.changed();           // suspend until value updates
-    const cfg = rx.current();   // snapshot copy
+    try rx.changed();           // park until version > my cursor
+    const cfg = rx.borrow();    // current latest (seqlock-spin on mid-write)
     applyConfig(cfg);
 }
 ```
 
-Receiver methods:
+Watch is the right tool for "value changes periodically and
+consumers always want the latest" — typical config-hot-reload
+shape. Slow consumers see fewer intermediate values; they never
+backpressure producers.
 
-| Method | Returns |
-|---|---|
-| `current()` | Snapshot copy of the latest value |
-| `hasChanged()` | True iff version > seen_version |
-| `markSeen()` | Update seen_version without waiting |
-| `changed()` | Suspend until version advances; `error.Closed` / `error.Cancelled` |
+`w.close()` wakes every parked `changed()` call with
+`error.Closed`. Subsequent `changed()` returns `error.Closed`
+immediately.
 
-Watch is the right tool when you have a value that changes
-periodically and consumers always want the latest — not history.
-Slow consumers don't backpressure producers; they just see fewer
-intermediate values.
+## Broadcast(T, cap) — history-aware fan-out
 
-Closing a Watch wakes all parked `changed()` calls with
-`error.Closed`.
-
-## Broadcast(T) — fan-out with history
+1 producer, N consumers, bounded ring. Each receiver has its own
+cursor; slow receivers get `error.Lagged` when they fall too far
+behind, and their cursor jumps forward.
 
 ```zig
-var b = try volt.channel.Broadcast(Event).init(allocator, 128);
+var b = volt.Broadcast(Event, 128).init();
 defer b.deinit();
 
 // Producer:
-try b.send(event);         // error.Closed if closed
+b.send(event);     // never blocks (overwrites if all receivers behind)
 
-// Each consumer subscribes:
-var rx = b.subscribe();
+// Each consumer:
+var rx = b.receiver();
 while (true) {
-    switch (try rx.recv()) {
-        .value => |v| handle(v),
-        .lagged => |n| std.log.warn("dropped {} events", .{n}),
-        .closed => return,
-    }
+    const event = rx.recv() catch |e| switch (e) {
+        error.Closed => break,
+        error.Lagged => continue,    // cursor advanced; missed N events
+    };
+    handle(event);
 }
 ```
 
-Capacity is the maximum lag tolerance. If a receiver falls more
-than `capacity` messages behind, the next `recv` returns
-`.lagged(N)` with `N` = number of dropped messages, and the
-receiver's cursor jumps to the oldest available message. Slow
-consumers don't backpressure producers.
+Use when:
 
-The error path on `recv` is just `error.Cancelled` — `closed` is a
-tagged-union return because consumers usually want to distinguish
-"channel closed cleanly" from "I was cancelled."
+- You want every consumer to see every event (within their lag
+  budget).
+- Slow consumers should not block the producer (different from
+  Mpmc, which blocks the producer when full).
+- Lost events on overrun are tolerable — and detectable via
+  `error.Lagged`.
 
-## select — wait on the first ready
-
-```zig
-switch (try volt.select(.{
-    .msg = volt.channel.OnRecv(u32){ .ch = &cmd_ch },
-    .quit = volt.channel.OnRecv(void){ .ch = &shutdown_ch },
-    .timeout = volt.channel.OnRecv(void){ .ch = &timeout_ch },
-})) {
-    .msg => |v| try handle(v),
-    .quit => return,
-    .timeout => continue,
-}
-```
-
-The result is a tagged union with one variant per branch (named
-after the branch's field name). `OnRecv(T)` is currently the only
-branch type; `OnSend` and `OnTimeout` are planned.
-
-Up to 16 branches. The implementation spawns one forwarder
-coroutine per branch and races them; the first to receive a value
-sends it into a Oneshot, main parks on that Oneshot, losers are
-cancelled. Cancellable parks make the cleanup prompt.
-
-### Lossy on simultaneous publish
-
-If two branches publish at exactly the same instant and both
-forwarders consume their values before main wakes and cancels them,
-**one of those values is lost** — the loser's value was consumed
-from its channel but never delivered to main. For most workloads
-this is fine; if you can't tolerate lost values, use a `Channel(T)`
-with manual multiplexing instead.
-
-A lossless `select` with two-phase claim-before-consume is planned
-once the model checker validates the interleavings.
+The capacity is the lag tolerance. A consumer that falls more than
+`cap` events behind the producer gets `error.Lagged` on its next
+`recv`; the cursor jumps to the oldest available message.
 
 ## Closing semantics
 
-| Channel | `close()` effect |
+| Channel | `close()` |
 |---|---|
-| `Channel(T)` | Wakes all parked senders + receivers with `error.Closed` |
-| `Oneshot(T)` | Wakes parked receiver with `error.Closed`; subsequent sends fail |
-| `Watch(T)` | Wakes all parked `changed()` calls with `error.Closed` |
-| `Broadcast(T)` | All subsequent `recv()` return `.closed` (tagged-union, not error) |
+| `Spsc` | Wakes both ends with `error.Closed`. Subsequent send/recv return `error.Closed`. |
+| `Mpmc` | Wakes all parked senders/receivers with `error.Closed`. |
+| `Oneshot` | Wakes parked receiver with `error.Closed`. Subsequent sends fail. |
+| `Watch` | Wakes parked `changed()` with `error.Closed`. |
+| `Broadcast` | All subsequent `recv` return `error.Closed`. |
 
-Once closed, a channel cannot be reopened. Subsequent `send` calls
-return `error.Closed` (or `.closed` for `Channel.trySend`).
+Once closed, channels stay closed — no reopen.
 
 ## Picking the right channel
 
-- One value, one consumer? `Oneshot`.
-- Many producers and/or consumers, backpressure desired? `Channel`.
-- Slow consumers OK to miss intermediate values, all want latest?
-  `Watch`.
-- Slow consumers should see history but not block producers?
-  `Broadcast`.
+| You have… | Use |
+|---|---|
+| Producer-consumer pipeline, exactly 1:1 | `Spsc` |
+| Work queue, M producers, N workers | `Mpmc` |
+| One result, one consumer | `Oneshot` |
+| Periodic value, consumers want latest | `Watch` |
+| Event stream, slow consumers OK to lag | `Broadcast` |
+| "Many consumers, every consumer sees every event, no drops, no producer block" | **Not a single channel** — fan out one Mpmc per consumer with a forwarder, or a per-consumer Spsc. |
 
-If you find yourself wanting "all messages, no drops, multiple
-consumers" — that's not a single channel. It's a fan-out of N
-independent `Channel`s, one per consumer, and a producer that
-sends to all of them. Volt does not provide a "lossless broadcast"
-type because the right structure depends on what you want to do
-when one consumer falls behind.
+The absence of a generic "lossless broadcast" is intentional: the
+right structure depends on what you want when one consumer falls
+behind. Volt doesn't pick for you.
+
+## See also
+
+- [Channels internals](/architecture/) — Vyukov MPMC, seqlock for Watch, ring with cursors for Broadcast.
+- [Cookbook: pub/sub](/cookbook/pub-sub/) — Broadcast in a real pattern.
+- [Cookbook: config hot-reload](/cookbook/config-hot-reload/) — Watch in a real pattern.

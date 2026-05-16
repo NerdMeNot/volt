@@ -1,184 +1,220 @@
 ---
 title: Networking
-description: TcpListener, TcpStream, Address — coroutine-aware TCP I/O.
+description: TcpListener, TcpStream, Address — TCP/IPv4 with non-blocking sockets parked on the kqueue reactor. That's the network surface today.
 ---
 
-Volt's networking surface is intentionally small for v1.0: TCP
-sockets and an `Address` type. UDP and Unix sockets are planned;
-TLS is out of scope (build it on top of `TcpStream`).
+Volt ships **TCP/IPv4 on Darwin**. That's the network surface:
+`volt.net.TcpListener`, `volt.net.TcpStream`, `volt.net.Address`.
+UDP, IPv6, Unix sockets, DNS resolution, TLS — all live in
+downstream libraries by design (see [Roadmap](/appendix/roadmap/)).
 
-## Address
+The whole API is non-blocking under the hood; sockets are
+`O_NONBLOCK`, and `EAGAIN` yields to the reactor.
 
-`std.net.Address`-aligned constructors. Pick the form that matches
-how you have the address.
+## `volt.net.Address`
 
 ```zig
-// Explicit octets:
-const a = volt.io.Address.initIp4(.{ 127, 0, 0, 1 }, 8080);
-const a6 = volt.io.Address.initIp6(.{0} ** 16, 8080);
-
-// Common defaults:
-const lo = volt.io.Address.loopback4(8080);   // 127.0.0.1
-const lo6 = volt.io.Address.loopback6(8080);  // ::1
-const any = volt.io.Address.any4(8080);       // 0.0.0.0 — listen on every interface
-const any6 = volt.io.Address.any6(8080);      // ::
-
-// String parsing:
-const a = try volt.io.Address.parseIp4("192.168.1.50", 8080);
-const a = try volt.io.Address.parse("127.0.0.1:8080");
-const a = try volt.io.Address.parse("[::1]:9090");
-
-// Inspection:
-a.family();       // posix.AF.INET | AF.INET6
-a.getPort();      // u16, native byte order
-a.osSockLen();    // for bind/connect/accept
+pub const Address = struct {
+    pub fn loopback4(port: u16) Address { ... }                          // 127.0.0.1:port
+    pub fn any4(port: u16) Address { ... }                                // 0.0.0.0:port
+    pub fn parse4(host: []const u8, port: u16) error{InvalidAddress}!Address { ... }
+};
 ```
 
-`parse` recognizes `host:port` for IPv4 and `[host]:port` for IPv6.
-Currently the IPv6 string parser only handles `::1` and `::`;
-full IPv6 text parsing is planned. For non-trivial IPv6 use
-`initIp6` directly.
-
-## TcpListener
+Constructors are explicit about IPv4 (`*4` suffix) so adding IPv6
+later doesn't require renaming. `parse4` accepts dotted-quad
+("192.168.1.10"); anything else returns `error.InvalidAddress`.
 
 ```zig
-var listener = try volt.io.TcpListener.bind(volt.io.Address.any4(8080));
+const a = volt.net.Address.loopback4(8080);
+const b = volt.net.Address.any4(8080);
+const c = try volt.net.Address.parse4("192.168.1.10", 5432);
+```
+
+## `volt.net.TcpListener`
+
+```zig
+var listener = try volt.net.TcpListener.bind(.any4(8080));
 defer listener.close();
 
 while (true) {
-    const conn = try listener.accept();   // suspends; reactor wakes us
-    _ = try volt.launch(handle, .{conn});
+    const conn = try listener.accept();
+    _ = try volt.spawn(handle, .{conn});
 }
 ```
 
-`bind(addr)`:
+`bind(addr)` returns a TcpListener with the socket bound, listening
+(`backlog = 128`), `SO_REUSEADDR` set, and `O_NONBLOCK` on. The
+underlying fd is owned by the TcpListener; `close()` releases it.
 
-- Creates a non-blocking socket.
-- Sets `SO_REUSEADDR`.
-- Binds to `addr`.
-- Listens with default backlog.
-
-Returns a `TcpListener` you must `close()` (or let the runtime tear
-down at shutdown).
-
-`accept()` suspends the calling coroutine on the listener fd until
-the kernel says a connection is ready, then returns a
-`TcpStream`. The new stream is also non-blocking and registered
-with the reactor.
+`accept()` parks the coroutine on kqueue `EVFILT_READ` until the
+kernel says "incoming connection ready", then `accept4()`s it and
+returns a `TcpStream`. The returned stream is also `O_NONBLOCK`.
 
 ```zig
-const local: volt.io.Address = try listener.localAddress();
-// Useful when you bound port=0 (kernel-assigned port).
+const addr = try listener.localAddress();
 ```
 
-## TcpStream
+`localAddress` returns the actual bound address. Useful when you
+bound to port 0 (let the kernel pick) and want to print the port
+to your client.
+
+## `volt.net.TcpStream`
 
 ```zig
-fn handle(conn: volt.io.TcpStream) void {
+pub const TcpStream = struct {
+    pub fn connect(addr: Address) !TcpStream { ... }
+    pub fn close(self: *TcpStream) void { ... }
+    pub fn read(self: *TcpStream, buf: []u8) !usize { ... }
+    pub fn readFull(self: *TcpStream, buf: []u8) !usize { ... }
+    pub fn write(self: *TcpStream, buf: []const u8) !usize { ... }
+    pub fn writeAll(self: *TcpStream, buf: []const u8) !void { ... }
+};
+```
+
+### `connect(addr)`
+
+Opens an `O_NONBLOCK` socket, issues `connect()`, and parks on
+`EVFILT_WRITE` until the handshake completes. Returns a connected
+`TcpStream`.
+
+```zig
+var s = try volt.net.TcpStream.connect(.loopback4(8080));
+defer s.close();
+```
+
+### `read(buf)`
+
+```zig
+var buf: [4096]u8 = undefined;
+const n = try s.read(&buf);
+if (n == 0) {
+    // peer closed
+} else {
+    process(buf[0..n]);
+}
+```
+
+Reads up to `buf.len` bytes. Returns the count. Parks on
+`EVFILT_READ` until data is buffered. `n == 0` means peer closed
+the connection cleanly.
+
+### `readFull(buf)`
+
+Reads until `buf` is full or peer closes. Returns the number of
+bytes actually read (will be `buf.len` on success, less on EOF).
+Saves a loop around `read`.
+
+### `write(buf)` / `writeAll(buf)`
+
+```zig
+try s.writeAll(message);
+```
+
+`write` returns how many bytes were sent in one syscall (may be
+short if the kernel buffer is full). `writeAll` loops until every
+byte is sent, parking on `EVFILT_WRITE` between iterations.
+
+### Error vocabulary
+
+| Error | When |
+|---|---|
+| `error.BindFailed` | bind() syscall returned -1 |
+| `error.ListenFailed` | listen() syscall returned -1 |
+| `error.AcceptFailed` | accept4() returned an error other than EAGAIN |
+| `error.ConnectFailed` | connect() failed; kernel returned an error after handshake |
+| `error.SocketCreateFailed` | socket() returned -1 |
+| `error.FcntlGetFailed` / `error.FcntlSetFailed` | O_NONBLOCK probe / set failed |
+| `error.GetSockNameFailed` | localAddress query failed |
+
+No `error.Closed` from network ops — TCP doesn't distinguish "this
+end closed" from "this end is at EOF". Use `n == 0` from `read` as
+the EOF signal.
+
+## Full echo server
+
+```zig
+const std = @import("std");
+const volt = @import("volt");
+
+pub fn main() !void {
+    var rt = try volt.Runtime.init(.{ .allocator = std.heap.smp_allocator });
+    defer rt.deinit();
+    try (try rt.run(serve, .{}));
+}
+
+fn serve() !void {
+    var listener = try volt.net.TcpListener.bind(.any4(8080));
+    defer listener.close();
+    while (true) {
+        const conn = try listener.accept();
+        _ = try volt.spawn(echoOne, .{conn});
+    }
+}
+
+fn echoOne(conn: volt.net.TcpStream) void {
     var s = conn;
     defer s.close();
-
     var buf: [4096]u8 = undefined;
     while (true) {
         const n = s.read(&buf) catch return;
-        if (n == 0) return;                       // peer closed
+        if (n == 0) return;
         s.writeAll(buf[0..n]) catch return;
     }
 }
 ```
 
-`TcpStream` methods (all suspend on `WouldBlock`):
-
-| Method | Description |
-|---|---|
-| `read(&buf) !usize` | Read up to `buf.len` bytes; returns 0 on peer close |
-| `write(buf) !usize` | Write up to `buf.len` bytes; returns count actually written |
-| `writeAll(buf) !void` | Write the entire buffer, looping over partial writes |
-| `close()` | Close the fd; remove from reactor |
-
-Every read/write registers a wait on the reactor when the kernel
-returns `EWOULDBLOCK`. The reactor wakes the coroutine when the
-kernel signals readiness; the loop retries the syscall.
-
-### Connecting
-
-```zig
-var stream = try volt.io.TcpStream.connect(volt.io.Address.parse("127.0.0.1:8080") catch unreachable);
-defer stream.close();
-try stream.writeAll("ping");
-```
-
-`connect(addr)` does a non-blocking `connect()`, suspends on
-writability if the kernel returned `EINPROGRESS`, then checks
-`SO_ERROR` to surface connection failures. Returns the connected
-stream.
-
-## Cancellation through I/O
-
-Cancelling a coroutine parked on `read` / `accept` / `connect`
-unparks it; the next syscall returns `error.Cancelled`. This is
-how `volt.withTimeout` cancels a hung connection:
-
-```zig
-const data = volt.withTimeout(
-    volt.Duration.fromSecs(5),
-    readAll,
-    .{&stream},
-) catch |err| switch (err) {
-    error.Timeout => return error.ConnectionTimedOut,
-    else => return err,
-};
-```
-
-You don't need a deadline socket option or per-syscall timeout.
-
-## Server pattern with graceful shutdown
-
-```zig
-fn serve() !void {
-    var listener = try volt.io.TcpListener.bind(volt.io.Address.any4(8080));
-    defer listener.close();
-
-    var shutdown = try volt.signal.shutdown();
-    defer shutdown.deinit();
-
-    while (true) {
-        // Non-blocking shutdown check.
-        if (shutdown.handler.read()) |_| return else |_| {}
-
-        const conn = listener.accept() catch |err| switch (err) {
-            error.Cancelled => return,
-            else => return err,
-        };
-        _ = try volt.launch(handle, .{conn});
-    }
-}
-```
-
-For a more elegant shutdown that uses `volt.select`, see the
-[graceful drain cookbook](/cookbook/graceful-drain/).
+One coroutine per connection, 16 KiB committed RSS per connection,
+N workers cycling through the reactor's wake queue. Works the same
+on workers=1 and workers=`getCpuCount()`.
 
 ## What's NOT here
 
-- **TLS / SSL** — build on top of `TcpStream`. A `volt-tls` crate
-  is planned.
-- **DNS resolution** — would block the worker. Use
-  `volt.spawnBlocking` with `getaddrinfo` if you need it. A
-  proper async DNS resolver is planned.
-- **HTTP** — Volt is a runtime, not a framework. `volt-http` is a
-  separate library.
-- **UDP / Unix sockets** — planned, not yet shipped.
+Out of scope for Volt core — these live in downstream libraries:
 
-## Low-level access
+- **UDP** — different syscall surface; no fan-out from one fd to N
+  reading coroutines without buffering.
+- **IPv6** — `Address.any6` / `loopback6` / `parse6` will land
+  with the wider net library.
+- **Unix domain sockets** — same shape as TCP but different
+  syscall.
+- **DNS resolution** — async DNS is its own substantial design
+  (cancellable name lookups, EDNS, caching).
+- **TLS** — needs C interop (BoringSSL / rustls / OpenSSL), opt-in
+  via a `volt-tls` extension.
+- **HTTP** — too large for runtime core.
 
-If you need to register a non-TCP fd with the reactor (custom
-syscalls, FFI), `volt.io.lowlevel.*` exposes the building blocks:
+See [Roadmap](/appendix/roadmap/) for what lives where.
+
+## Cancellation
+
+`accept` / `read` / `writeAll` aren't cancel-aware at the API level
+today. To cancel an in-flight I/O op, fire a Cancel that some
+other coroutine observes, and have it `close()` the stream — the
+in-flight parked op will wake with an error from the kernel (the
+fd is closed under it). This is the workaround until cancel-aware
+I/O variants land.
 
 ```zig
-try volt.io.lowlevel.setNonblock(my_fd);
-try volt.io.lowlevel.waitReadable(my_fd);
-const n = try volt.io.lowlevel.read(my_fd, &buf);
+fn handleWithCancel(conn: volt.net.TcpStream, c: *volt.Cancel) void {
+    var s = conn;
+    defer s.close();
+    // Spawn a watcher that closes s when c fires:
+    _ = volt.spawn(struct {
+        fn watch(stream: *volt.net.TcpStream, cancel: *volt.Cancel) void {
+            // ... wait on cancel via a notify ...
+            stream.close();
+        }
+    }.watch, .{ &s, c }) catch {};
+    // ... use s.read / s.writeAll normally ...
+}
 ```
 
-Most application code shouldn't touch these; they're for
-integration and library authors.
+Cancel-aware I/O (`readCancel`, `writeAllCancel`, `acceptCancel`)
+is on the roadmap; for now, the close-the-fd pattern works.
+
+## See also
+
+- [The kqueue reactor](/architecture/) — how parking on `EVFILT_READ` actually works.
+- [Recipes: TCP echo server](/cookbook/echo-server/) — production-shape echo with graceful shutdown.
+- [Recipes: connection pool](/cookbook/connection-pool/) — sharing a pool of TcpStreams across coroutines.

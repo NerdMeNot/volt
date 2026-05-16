@@ -1,194 +1,154 @@
 ---
 title: Time
-description: sleep, withTimeout, Interval, Duration, Instant — handling time inside coroutines.
+description: volt.sleep parks the coroutine on the kqueue timer. volt.yield re-queues immediately. That's the time surface.
 ---
 
-Volt's time API has two layers:
-
-- **Value types** (`volt.Duration`, `volt.Instant`) — model-agnostic
-  measurements. Usable anywhere, including outside the runtime.
-- **Coroutine-aware operations** (`volt.sleep`, `volt.withTimeout`,
-  `volt.Interval`) — suspend the calling coroutine until a deadline.
-
-## Duration and Instant
+Volt's time surface is intentionally minimal. Two functions:
 
 ```zig
-const d = volt.Duration.fromMillis(50);          // 50ms
-const d2 = volt.Duration.fromSecs(2);             // 2 seconds
-const total = d.add(d2);                          // 2.05s
-
-const start = volt.Instant.now();
-// ... do work ...
-const elapsed = start.elapsed();
-std.debug.print("took {} ms\n", .{ elapsed.asMillis() });
+volt.sleep(ns: u64);   // park for ≥ns nanoseconds via the reactor's timer
+volt.yield();           // re-queue to the worker's tail; FIFO
 ```
 
-| Method | What it returns |
-|---|---|
-| `Duration.fromNanos(n)` / `fromMicros` / `fromMillis` / `fromSecs` / `fromMins` / `fromHours` / `fromDays` | construct a Duration |
-| `d.asNanos()` / `asMillis()` / `asSecs()` / etc. | extract |
-| `d.add(other)` / `sub(other)` / `mul(n)` / `div(n)` | arithmetic |
-| `Instant.now()` | current monotonic timestamp |
-| `inst.elapsed()` | Duration since the instant |
-| `inst.add(d)` / `sub(d)` | Instant arithmetic |
-| `inst.isBefore(other)` / `isAfter(other)` | comparison |
+That's it. No `Interval`, no `Duration`, no `withTimeout`, no
+`now()`. Higher-level timer patterns compose from `sleep` + a
+spawned watchdog (see below).
 
-Internally, `Instant` reads `clock_gettime(CLOCK_MONOTONIC)` on
-POSIX or `QueryPerformanceCounter` on Windows. Monotonic — never
-goes backwards across NTP adjustments.
-
-## sleep
+## `volt.sleep(ns: u64)`
 
 ```zig
-try volt.sleep(volt.Duration.fromMillis(50));
+volt.sleep(50 * std.time.ns_per_ms);    // sleep 50 ms
+volt.sleep(2 * std.time.ns_per_s);      // sleep 2 s
 ```
 
-Suspends the calling coroutine for at least the given duration. The
-reactor wakes it via a kqueue `EVFILT_TIMER` (Darwin), epoll
-`timerfd` (Linux), io_uring `TIMEOUT` (when using io_uring), or
-`CreateTimerQueueTimer` (Windows).
+Registers an `EVFILT_TIMER` event with the kqueue reactor, with
+the current coroutine as `udata`, then parks. When the kernel
+delivers the timer event, the reactor unparks the coroutine — it
+ends up on a worker's queue and resumes.
 
-`sleep` is cancellable — a cancelled coroutine surfaces
-`error.Cancelled` from sleep immediately. This is how
-`volt.withTimeout` works.
+Argument is nanoseconds (`u64`). Use `std.time.ns_per_{ms,s,min}`
+constants for clarity. Kernel timer resolution on Darwin arm64 is
+bounded below by ~1 µs; shorter requested sleeps round up.
 
-## withTimeout — race work against a deadline
+**`sleep` does not block the worker thread.** The coroutine parks
+on the reactor; the worker runs other coroutines. This is what
+makes "sleep 50ms on every connection" scale — `getCpuCount()`
+workers cover thousands of concurrent sleepers.
 
-```zig
-const result = volt.withTimeout(
-    volt.Duration.fromSecs(2),
-    fetchUser,
-    .{user_id},
-);
-
-const user = result catch |err| switch (err) {
-    error.Timeout => return defaultUser(),
-    else => return err,
-};
-```
-
-`volt.withTimeout(duration, fn, args)`:
-
-1. Spawns `fn(args)` as a child coroutine.
-2. Spawns a watcher that sleeps for `duration`.
-3. Whichever finishes first wins; the other is cancelled.
-4. Returns the user fn's value, or `error.Timeout` if the deadline
-   fired first.
-
-The implementation parks the parent on a Park that can be woken by
-either the child completing or the timer firing. Cancellation is
-prompt because Park is cancellable through any nested wait point —
-even uncooperative blocking calls.
-
-### Composing timeouts
-
-`withTimeout` composes naturally:
+**`sleep` is not cancel-aware** at the API level. To cancel a
+sleep, you'd need a separate watchdog pattern:
 
 ```zig
-fn fetchAllWithTimeout() !void {
-    try volt.withTimeout(volt.Duration.fromSecs(5), fetchAll, .{});
-}
-fn fetchAll() !void {
-    try volt.withTimeout(volt.Duration.fromSecs(2), fetchOne, .{"user"});
-    try volt.withTimeout(volt.Duration.fromSecs(2), fetchOne, .{"posts"});
+fn sleepCancellable(ns: u64, c: *volt.Cancel) error{Cancelled}!void {
+    // Race the sleep against the Cancel via Notify.
+    var done = volt.Notify.init();
+    defer done.deinit();
+
+    _ = try volt.spawn(struct {
+        fn t(n: u64, d: *volt.Notify) void {
+            volt.sleep(n);
+            d.notifyOne();
+        }
+    }.t, .{ ns, &done });
+
+    // ... wait on whichever fires first via parking-lot multiplexing ...
 }
 ```
 
-The outer 5-second timeout cancels everything inside if the total
-runs over. Each inner call has its own 2-second budget. The cancels
-nest correctly because Park-cancel propagates uniformly through any
-suspension.
+A first-class cancel-aware `sleep` may land later. For now,
+`sleep` itself runs to completion; cancellation of the surrounding
+work has to happen at the next cancel-aware blocking op.
 
-## Interval — repeating timer
-
-```zig
-var tick = volt.Interval.start(volt.Duration.fromSecs(1));
-
-while (running) {
-    try tick.tick();          // suspend until next interval
-    try emitMetrics();
-}
-```
-
-`Interval.start(period)` creates an interval that fires immediately
-on the first tick, then every `period` after that. Use
-`Interval.startAfter(period)` if you want the first tick to delay
-by `period`.
+## `volt.yield()`
 
 ```zig
-tick.setMissedTickPolicy(.skip);   // default: catch up (burst)
+volt.yield();
 ```
 
-Missed-tick policies (when the consumer is slower than the period):
+Re-queues the current coroutine to its worker's queue **tail**.
+Other queued coroutines on this worker run first; this coroutine
+resumes on the next pop. FIFO, not LIFO — yields don't bounce
+through the LIFO slot.
 
-- **`.burst`** (default) — fire as many times as needed to catch up.
-- **`.skip`** — drop missed ticks; next tick is at the next aligned
-  boundary.
-- **`.delay`** — reset the schedule; next tick is `period` from now.
+Use cases:
 
-Pick by what you want when the consumer falls behind: `burst` for
-metrics where every tick must record, `skip` for periodic
-heartbeats where you only care about cadence going forward.
+- **CPU-bound loop cooperation.** A loop with no other suspension
+  points can use `yield()` periodically so sibling coroutines on
+  the same worker make progress:
 
-## Patterns
+  ```zig
+  fn cpuLoop(n: u64) u64 {
+      var sum: u64 = 0;
+      var i: u64 = 0;
+      while (i < n) : (i += 1) {
+          if (i % 10_000 == 0) volt.yield();
+          sum +%= heavy(i);
+      }
+      return sum;
+  }
+  ```
 
-### Periodic flush with shutdown
+- **Cancellation checkpoint.** With a `*Cancel`, combine yield
+  with checkpoint to make cancellation propagate:
 
-```zig
-fn flusher(quit: *volt.sync.Notify) !void {
-    var tick = volt.Interval.start(volt.Duration.fromMillis(100));
-    while (true) {
-        // Race tick against shutdown signal.
-        // (Not using volt.select here because Notify isn't a Channel —
-        //  use a small dedicated select wrapper or an explicit check.)
-        try tick.tick();
-        if (quitFlag.load(.acquire)) return;
-        try flushBuffer();
-    }
-}
-```
+  ```zig
+  while (...) {
+      try c.checkpoint();    // error.Cancelled if fired
+      volt.yield();          // let other coros (incl. the canceller) make progress
+      // ... CPU work ...
+  }
+  ```
 
-### Bounded retry with backoff
+For I/O-bound code, you don't need `yield` — the next `read` /
+`recv` / `accept` already parks the coroutine.
 
-```zig
-fn withRetry(comptime f: anytype, args: anytype) !@TypeOf(@call(.auto, f, args)) {
-    var attempt: u32 = 0;
-    while (attempt < max_attempts) : (attempt += 1) {
-        const r = volt.withTimeout(
-            volt.Duration.fromMillis(100 << attempt),  // 100ms, 200ms, 400ms, ...
-            f,
-            args,
-        );
-        return r catch |err| switch (err) {
-            error.Timeout => continue,
-            else => return err,
-        };
-    }
-    return error.GaveUp;
-}
-```
+## What about `Instant` / `Duration` / `Interval` / `withTimeout`?
 
-### Deadline propagation
+Not yet in Volt core. The patterns they'd encode are library
+territory or trivially built from `sleep` + spawn + channels:
 
-For request-scoped deadlines that propagate naturally without being
-threaded through args, wrap the entire request in a single
-`withTimeout`:
+- **Timeout on an op:** spawn a watchdog that sleeps then fires
+  a Cancel; pass that Cancel to the op's cancel-aware variant.
 
-```zig
-fn handleRequest(conn: TcpStream) !Response {
-    return volt.withTimeout(volt.Duration.fromSecs(30), serve, .{conn});
-}
-```
+  ```zig
+  fn withTimeout(ns: u64, comptime body: anytype) !void {
+      try volt.scope(struct {
+          fn b(c: *volt.Cancel) anyerror!void {
+              _ = try volt.spawn(struct {
+                  fn watchdog(n: u64, ctx_c: *volt.Cancel) void {
+                      volt.sleep(n);
+                      ctx_c.fire();
+                  }
+              }.watchdog, .{ ns, c });
+              try body(c);
+          }
+      }.b);
+  }
+  ```
 
-If anything inside `serve` takes longer than 30 seconds total, the
-whole call surfaces `error.Timeout` and every coroutine spawned
-within it is cancelled.
+  Then `try withTimeout(1 * std.time.ns_per_s, doWorkWithCancel);`
+  cancels `doWorkWithCancel` if it takes more than 1 second.
 
-## What about high-resolution timers?
+- **Periodic tick:** loop with `volt.sleep` at the bottom. Drift
+  correction (sleep until the next deadline rather than for a
+  duration) is straightforward with `std.time.nanoTimestamp()`.
 
-The default reactor timers have ~ms granularity (and worse on busy
-systems). For nanosecond-precise work, use `Instant.now()` + a
-spin loop or `volt.yield()` — but be aware that the worker thread
-isn't guaranteed to wake at exactly the requested instant on a
-loaded system. If you need hard-real-time guarantees, you're in OS
-RT scheduling territory and Volt isn't the right tool.
+A polished `volt.timer` module may land in a future release. For
+now, the recipe approach keeps Volt core small and lets users
+compose what they actually need.
+
+## Reactor and timers
+
+Internally, every `sleep` is a kqueue `EVFILT_TIMER` registration.
+The reactor's single-poller-claim ensures one worker at a time
+calls `kevent`. Timer delivery scales to thousands of concurrent
+sleepers without per-timer thread overhead — the kernel's heap
+does the work, the runtime just dispatches.
+
+See [The kqueue reactor](/architecture/) for the design.
+
+## See also
+
+- [Structured Concurrency](/usage/structured-concurrency/) — Cancel + watchdog patterns for timeouts.
+- [Cookbook: timeout with retry](/cookbook/timeout-retry/) — concrete example using the watchdog pattern.
+- [Cookbook: graceful drain](/cookbook/graceful-drain/) — shutdown via sleep + Cancel.

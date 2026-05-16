@@ -1,245 +1,154 @@
 ---
-title: Sync Primitives
-description: Mutex, RwLock, Semaphore, Notify, Barrier, OnceCell — the locks and signals under volt.sync.*.
+title: Sync primitives
+description: Mutex, Notify, Semaphore — three primitives that cover most coroutine-level synchronization. All three sit on the parking lot.
 ---
 
-All sync primitives in `volt.sync.*` are zero-allocation, built on
-the single `Park` substrate, and cancellable from any park (cancel
-propagates into `error.Cancelled` at the next suspension point).
+Three sync primitives. All three are built on the parking lot;
+none of them carry their own waiter queue. The reason they're
+small surfaces is the parking lot does the work — see [The parking
+lot](/architecture/parking-lot/) for the substrate.
 
-## Mutex — fair FIFO
+## `volt.Mutex`
 
 ```zig
-var mu: volt.sync.Mutex = .{};
+var mu = volt.Mutex.init();
+defer mu.deinit();
 
-mu.lock();
+mu.lock();                       // parks on contention
 defer mu.unlock();
-// critical section
+// ... critical section ...
 ```
 
-Or non-blocking:
+Standard mutual exclusion. State machine is `UNLOCKED ↔ LOCKED ↔
+CONTENDED`:
+
+- Uncontended `lock`: single CAS UNLOCKED → LOCKED.
+- Contended `lock`: spin briefly, then CAS to CONTENDED and park on
+  `&self.state`.
+- `unlock` LOCKED: single CAS to UNLOCKED.
+- `unlock` CONTENDED: CAS to UNLOCKED, then unparkOne on
+  `&self.state`.
+
+The contended path also handles a race-case where the spinning
+slow-path's CAS-to-CONTENDED and the unlock's CAS-to-UNLOCKED
+interleave; the slow-path detects the race via the swap-CONTENDED
+return value and takes ownership inline. The race is the reason
+unlock's fast path doesn't take an inner mutex.
 
 ```zig
+// Non-blocking:
 if (mu.tryLock()) {
     defer mu.unlock();
-    // critical section
-} else {
-    // contended; do something else
-}
-```
-
-Fair FIFO waiter list — the longest-waiting coroutine is the first
-to acquire the lock when the holder unlocks. This prevents
-starvation under contention but does mean lock acquisition is
-roughly the cost of one Park per contended call.
-
-### Pattern: hold across suspension
-
-You can hold a Mutex across a suspending call, but only do it
-intentionally:
-
-```zig
-mu.lock();
-defer mu.unlock();
-const v = try ch.recv();   // suspends WHILE HOLDING the lock!
-```
-
-This is sometimes correct (you genuinely need the lock held while
-you're waiting on a channel), but usually a bug. The pattern that
-usually wants:
-
-```zig
-const v = try ch.recv();
-mu.lock();
-defer mu.unlock();
-applyValue(v);
-```
-
-## RwLock — reader-writer, writer-priority
-
-```zig
-var rw: volt.sync.RwLock = .{};
-
-// Many readers, none excluded:
-rw.lockShared();
-defer rw.unlockShared();
-const v = state.someField;
-
-// One writer, all readers excluded:
-rw.lockExclusive();
-defer rw.unlockExclusive();
-state.someField = newValue;
-```
-
-`tryLockShared` / `tryLockExclusive` return `bool` for non-blocking
-attempts.
-
-Implementation note: the RwLock is built on a `Semaphore` with
-writer-priority — when a writer is waiting, no new readers are
-admitted. This prevents the classic "writer never gets a chance"
-starvation pattern under heavy read load.
-
-Use `RwLock` when:
-
-- Reads are far more frequent than writes (>10:1 ratio is the rough
-  rule).
-- The critical section is large enough that the bookkeeping cost is
-  amortized.
-
-For small critical sections (a few field reads), a plain `Mutex` is
-typically faster — RwLock's bookkeeping costs more than a contended
-Mutex acquire.
-
-## Semaphore — counting permits
-
-```zig
-var sem = volt.sync.Semaphore.init(8);   // 8 permits
-
-sem.acquire(1);
-defer sem.release(1);
-// ... work bounded to 8 concurrent ...
-```
-
-Common patterns:
-
-- **Connection pool**: `Semaphore.init(pool_size)`; each connection
-  acquire/release pair gates pool checkout.
-- **Rate limiter**: `Semaphore.init(burst)`; a separate timer
-  releases `rate` permits per interval.
-- **Bounded concurrency**: `Semaphore.init(max_concurrent)` around
-  any expensive operation.
-
-Non-blocking and multi-permit forms:
-
-```zig
-if (sem.tryAcquire(2)) {
-    defer sem.release(2);
-    // ...
+    // ... critical section ...
 }
 
-const n: u32 = sem.available();   // permits currently free (snapshot)
+// Cancel-aware:
+try mu.lockCancel(&cancel);    // error.Cancelled if Cancel fires
 ```
 
-The waiter list is FIFO and respects the requested-N: if the head
-waiter wants 4 permits and only 3 are available, no smaller waiter
-behind it gets to skip ahead. This is the parking_lot fairness
-contract.
+Contended-Mutex bench: 15 ns/op (Volt) vs 81 ns/op (Go). The 5.4×
+gap is mostly Go paying for write-barriers on parked goroutine
+pointers; we don't have GC, so we don't pay.
 
-## Notify — condition variable
+## `volt.Notify`
 
 ```zig
-var n: volt.sync.Notify = .{};
+var n = volt.Notify.init();
+defer n.deinit();
 
-// Producer:
-producePayload();
-n.notifyOne();   // wake one waiter, if any
+// One coroutine waits:
+n.wait();        // consumes one permit, or parks until notifyOne
 
-// Consumer:
-try n.wait();    // suspend until notify; error.Cancelled if cancelled
+// Any coroutine wakes:
+n.notifyOne();   // wakes one waiter, or stores one permit
+n.notifyAll();   // wakes all waiters
 ```
 
-`notifyAll()` wakes every parked waiter at once. `notifyOne()` is
-the typical choice for single-consumer-per-event patterns.
+A "permit + parker" primitive. Internal state is a small counter:
 
-Notify handles the notify-before-wait race correctly: if `notifyOne`
-fires before the consumer parks, the next `wait` returns
-immediately. Internally that's a single counter increment +
-condition check.
+- `notifyOne` increments the permit counter (saturating at 1) or
+  wakes a parked waiter.
+- `wait` decrements the permit (returning immediately) or parks.
 
-Notify does NOT have a Mutex baked in (unlike `std.Thread.Condition`).
-That's deliberate — Volt's coroutine model means you can express
-"wait, holding mutex" by just locking the mutex *after* `wait()`
-returns. The pattern:
+Permits don't accumulate beyond 1 — `notifyOne` called 5 times
+when no one is waiting stores 1 permit, not 5. This matches the
+"signal once, wait once" pattern. For counting semantics, use
+`Semaphore`.
+
+`notifyAll` wakes every parked waiter (without consuming permits).
+
+Notify is the building block for one-shot waits (done flags,
+barriers, condition variables). The runtime itself uses Notify
+patterns in `Task.join`'s parking primitive.
+
+## `volt.Semaphore`
 
 ```zig
-// Producer:
-mu.lock();
-buffer.push(item);
-mu.unlock();
-n.notifyOne();
+var sem = volt.Semaphore.init(8);    // 8 permits available
+defer sem.deinit();
 
-// Consumer:
-try n.wait();
-mu.lock();
-const item = buffer.pop();
-mu.unlock();
+sem.acquire();                       // parks if 0 permits
+defer sem.release();
+// ... do work that requires a permit ...
 ```
 
-If you need the cond-var semantic where wait+unlock+relock is
-atomic with the wait, that's a Volt-shape that doesn't exist —
-because Volt doesn't have the spurious-wakeup problem
-condition-variables exist to solve. Park doesn't spuriously wake.
+A counting semaphore. `init(N)` starts with N permits.
 
-## Barrier — N-task sync point
+- `acquire` decrements (parks if 0).
+- `release` increments and unparks one waiter (if any).
+- `tryAcquire()` returns false instead of parking.
+
+Use cases:
+
+- **Concurrency limits.** Cap N coroutines running a thing at
+  once: `sem = Semaphore.init(8)`, every worker `acquire`s before
+  starting, `release`s after finishing.
+- **Resource pools.** N database connections in a pool, semaphore
+  with N permits, each `acquire` waits for an available
+  connection.
+- **Rate limiters (with sleep).** Token bucket: refill task
+  periodically releases permits.
+
+Direct-handoff release: when `release` finds a parked waiter, it
+unparks via direct handoff (the waiter's Task is dispatched
+inline on the releaser's worker via the LIFO slot). Cuts the
+park/unpark round trip — same optimization as `Task.join`.
+
+## What's NOT here
+
+Volt does not provide:
+
+- **RwLock / RWMutex.** Add as a library on top if you need it;
+  the underlying parking lot makes a reader-writer state machine
+  trivial. Not core because most workloads can use `Mutex` with
+  short critical sections and not measurably suffer.
+- **Condition variables.** Use `Notify` + a separate mutex if you
+  want explicit signal/wait. The combination isn't packaged into
+  one type because the parking lot already gives you the wait part
+  for free.
+- **Barrier.** Use a `Semaphore` initialised to 0, plus N
+  `release` calls.
+- **OnceCell / Once.** Library territory; the runtime doesn't need
+  it.
+
+## Cancellation
+
+Every blocking sync op has a cancel-aware variant:
 
 ```zig
-var b = volt.sync.Barrier.init(4);
-
-// Each of 4 coroutines:
-switch (b.wait()) {
-    .leader => {
-        // exactly one of the 4 sees this per round
-    },
-    .follower => {},
-}
+try mu.lockCancel(&cancel);
 ```
 
-`Barrier.wait()` blocks until N coroutines have called it. The
-last to arrive is the leader; the rest are followers. The barrier
-auto-resets for the next round.
+Same shape as channel cancel-aware ops — register a Cancel waiter
+under the bucket lock atomically with checking the primitive
+state. See [Structured Concurrency](/usage/structured-concurrency/).
 
-Use when:
+Cancel-aware `Notify` and `Semaphore` variants exist for
+completeness; if you have a `*Cancel` in scope, prefer them over
+the non-Cancel forms.
 
-- N parallel pipelines need to sync at a checkpoint between phases.
-- One special coroutine should do "leader" work (e.g., aggregate
-  partial results) while siblings wait.
+## See also
 
-`Barrier.wait` is non-cancellable: once you've entered the sync
-point, breaking out via cancel would desynchronize peers, so cancel
-returns the cancelled coroutine as `.follower` rather than
-unwinding it.
-
-## OnceCell(T) — lazy one-time init
-
-```zig
-var cell = volt.sync.OnceCell([]const u8){};
-
-// Cheap repeated check:
-if (cell.get()) |v| return v;
-
-// First-call-wins init:
-const v = try cell.getOrInit(allocator, struct {
-    fn init(a: std.mem.Allocator) ![]const u8 {
-        return try loadConfig(a);
-    }
-}.init);
-```
-
-`get()` returns `?T` — the snapshot if initialized, else `null`.
-`getOrInit(alloc, init_fn)` runs `init_fn(alloc)` exactly once
-across all callers and returns the result; concurrent callers
-serialize on the init.
-
-Use for:
-
-- Lazy expensive global config / connection / cache.
-- Constants computed at first use.
-
-The internal state is `empty / initializing / initialized` — three
-states, single CAS for transitions. No allocator needed unless your
-init function uses one.
-
-## Picking a primitive
-
-| You want… | Use |
-|---|---|
-| Exclusive access to a struct | `Mutex` |
-| Many readers, infrequent writer | `RwLock` |
-| Bounded concurrency | `Semaphore` |
-| Wake one waiter on event | `Notify` |
-| N tasks to meet at a checkpoint | `Barrier` |
-| Lazy one-time init | `OnceCell(T)` |
-
-If you find yourself reaching for two of these for the same value,
-consider whether a `Channel(T)` would be cleaner — passing values
-between coroutines often beats locking shared mutable state.
+- [The parking lot](/architecture/parking-lot/) — wait/wake substrate that all three use.
+- [Structured Concurrency](/usage/structured-concurrency/) — cancel-aware patterns.
+- [Choosing a primitive](/guides/choosing-primitive/) — decision tree across sync + channels.

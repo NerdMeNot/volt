@@ -1,215 +1,187 @@
 ---
 title: Spawning
-description: launch, spawn, spawnBlocking — when to use which, and how Job and Task differ.
+description: volt.spawn returns a typed handle. Task(T).join() parks until completion and returns the result. Direct handoff makes the common case zero-overhead.
 ---
 
-Volt has three flavors of "go run this concurrently." Pick by what
-the function returns and where it should run:
+Volt has one spawn primitive: `volt.spawn(fn, args)`. It allocates
+a coroutine, pushes it for the current worker to dispatch, and
+returns a typed `*Task(T)` handle. `t.join()` parks the caller
+until the coroutine completes and returns its result.
 
-| You want… | Use | Returns |
-|---|---|---|
-| Fire-and-forget on a worker | `volt.launch(fn, args)` | `*Job` |
-| Value-returning on a worker | `volt.spawn(fn, args)` | `*Task(T)` |
-| Synchronous code on a thread pool | `volt.spawnBlocking(fn, args)` | `T` (parks caller) |
+There is no fire-and-forget primitive. Every spawn returns a Task
+you're expected to join (or let `volt.scope` join for you).
 
-## launch — fire-and-forget
-
-Returns `*Job` — a handle that lets you cancel and join the
-coroutine but doesn't carry a typed return value:
+## The shape
 
 ```zig
-const j = try volt.launch(handler, .{conn});
-defer volt.destroyJob(j);
-
-// later, if you need to:
-j.cancel();
-try j.join();
-```
-
-`Job.join()` returns `error.Cancelled`, `error.StackOverflow`, or
-void.
-
-Use `launch` when you don't care about the return value — TCP
-connection handlers, periodic background work, fan-out workers
-writing into shared state.
-
-## spawn — typed value
-
-Returns `*Task(T)` — same handle plus a typed `join()`:
-
-```zig
-var t = try volt.spawn(parseRequest, .{buf});
-defer volt.destroyTask(t);
-
-const req = try t.join();   // returns the user fn's value or error
-```
-
-`Task(T).join()` returns the user fn's value, or its error union
-type unioned with `error{Cancelled, StackOverflow}`.
-
-Use `spawn` when you need the result. The extra cost over `launch`
-is one heap-allocated result slot.
-
-## spawnBlocking — synchronous code on a thread pool
-
-```zig
-const hash = try volt.spawnBlocking(sha256, .{data});
-```
-
-This is *not* the same shape as `launch`/`spawn`. `spawnBlocking`:
-
-- Submits `sha256(data)` to a separate **blocking thread pool**
-  (lazily created on first call; idle workers expire after 10s).
-- **Parks the calling coroutine** until the work finishes.
-- Returns the value (or error) directly. There is no Job/Task
-  handle; the parked coroutine resumes when the pool thread
-  finishes.
-
-Use `spawnBlocking` for:
-
-- CPU-heavy work (hashing, parsing, compression).
-- Sync C library calls that block (most third-party libs).
-- File I/O on platforms without io_uring (Volt's `volt.fs` already
-  uses the blocking pool internally).
-
-Don't use `spawnBlocking` for:
-
-- Microsecond work — submitting to the pool costs more than the work.
-- Already-async code — just `volt.spawn` it instead.
-
-To run multiple blocking calls **concurrently**, spawn one Volt
-coroutine per call:
-
-```zig
-fn worker(sink: *Sink, idx: usize, data: []const u8) !void {
-    sink.out[idx] = try volt.spawnBlocking(sha256, .{data});
+fn parentFn() !void {
+    const t = try volt.spawn(childFn, .{ arg1, arg2 });
+    // t : *volt.Task(return_type_of_childFn)
+    const result = t.join();
+    // result : return_type_of_childFn
 }
 
-const j1 = try volt.launch(worker, .{ &sink, 0, blob1 });
-const j2 = try volt.launch(worker, .{ &sink, 1, blob2 });
-defer volt.destroyJob(j1);
-defer volt.destroyJob(j2);
-try j1.join();
-try j2.join();
+fn childFn(x: u64, y: u64) u64 {
+    return x + y;
+}
 ```
 
-Each `spawnBlocking` call only parks its own coroutine; concurrent
-coroutines park independently and the blocking pool services them
-in parallel.
+`T` in `*Task(T)` is inferred from `childFn`'s return type. If
+`childFn` returns `!u64`, `t.join()` returns `!u64`. If `void`,
+`t.join()` returns `void`.
 
-## Job and Task — the handle API
+## `volt.spawn` vs `Runtime.spawn`
 
-Lifecycle of a Job from your code's perspective:
+Two entry points, same allocation path:
 
-```
-   volt.launch(fn, args)
-            │
-            ▼
-       ┌─────────┐    cancel      ┌────────────┐
-       │ running │ ─────────────► │ cancelled  │
-       └────┬────┘                 └────────────┘
-            │                            │
-   fn returns│                           │ join surfaces
-            │                            │ error.Cancelled
-            ▼                            │
-     ┌────────────┐                       │
-     │ completed  │ ───── join ──────────►│
-     └────┬───────┘   surfaces value     │
-          │                              │
-   stack ovf            ┌────────────┐  │
-   detected by ────────►│ overflowed │──┤
-   SIGSEGV handler      └────────────┘  │
-                                         ▼
-                                   ┌──────────────┐
-                                   │ destroyJob() │
-                                   └──────────────┘
-                                   you free the handle
-```
+| Call | Must be inside coro? | Pool path |
+|---|---|---|
+| `volt.spawn(fn, args)` | yes | Current P's local pool → arena fallback |
+| `rt.spawn(fn, args)` | no | Slab arena directly |
 
-Both share the same surface for cancellation and state queries:
+`volt.spawn` is the canonical API. `rt.spawn` exists for the rare
+case of injecting work from a non-coroutine thread holding a
+`*Runtime`. Inside a coroutine, always use `volt.spawn` — the local
+pool is one pointer load on the hot path.
+
+## `Task(T).join()`
 
 ```zig
-const j = try volt.launch(work, .{ctx});
-
-j.cancel();             // wake whatever the coroutine is parked on; cancel_flag = true
-j.isActive();           // true while running or parked
-j.isCompleted();        // true once .done
-j.isCancelled();        // true if cancel was observed and propagated
-j.isOverflowed();       // true if stack overflow caught by SIGSEGV handler
-
-j.state();              // single-shot enum: .running | .completed | .cancelled | .overflowed
-
-j.setName("name");                  // surfaces in observability snapshots
-j.setSpawnSite(@src());             // " " " "
-
-try j.join();           // park caller until done; returns Cancelled/StackOverflow/void
+const result = t.join();
 ```
 
-`Task(T)` adds a typed `join() T` (well, `(E||RunErr)!T`) and
-mirrors all the predicates and setters.
+Behaviour:
 
-## Lifetime: who owns what
+- If the spawned coroutine has completed already (`done` flag set),
+  `join` reads the result and returns immediately.
+- Otherwise, `join` parks the caller on `&t.done` via the parking
+  lot. The coroutine's dispatch `.done` branch unparks the join
+  waiter atomically with setting `done`.
+- After reading the result, `join` frees the `Task` struct (and
+  the `Frame` closure beneath it).
 
-The Job/Task handle is **heap-allocated** and **owned by you**.
-Always pair `launch`/`spawn` with `destroyJob`/`destroyTask`. The
-cleanest pattern:
+**`join` consumes the Task.** Don't use `t` after calling
+`t.join()`. Calling `join` twice is undefined behaviour.
+
+**`join` from outside a coroutine panics** while the spawned task
+is still running. This is the rule: every blocking op on the
+parking lot requires a current coroutine. The exception is the
+bootstrap path — `Runtime.run` does its internal join from inside
+its own context, so users never write `join` from `main` directly.
+
+## Direct handoff
+
+The common case is `spawn` followed immediately by `join`:
 
 ```zig
-const j = try volt.launch(work, .{});
-defer volt.destroyJob(j);
-try j.join();   // or j.cancel() + j.join()
+const t = try volt.spawn(work, .{});
+const result = t.join();
 ```
 
-The coroutine itself (the stack, the `Coroutine` struct) is owned
-by the runtime. The handle holds a pointer; the runtime reaps the
-coroutine on its own schedule once `.done`. You free the handle;
-the runtime frees the coroutine.
+Without optimization, that's: spawn → push to LIFO slot → park
+caller → worker pulls from LIFO slot → run child → child completes
+→ unpark caller → caller resumes. Round trip through the parking
+lot, two context switches.
 
-## When NOT to use these directly
+Volt's `Task.join` detects this pattern via `tryRemoveLifo` + a
+single CAS: if the child is still in this M's LIFO slot, claim it
+back, dispatch it inline on the caller's stack, and return its
+result. Zero park, zero unpark, zero round trip.
 
-If you're spawning more than one task in a region and want them to
-all complete before the region exits, use `volt.scope` (structured
-concurrency) instead. It owns the join-on-exit guarantee for you:
+If the child got stolen between spawn and join, the CAS fails and
+`join` falls through to the normal park-on-done path. No
+correctness impact, just a 4-13% measured win on workloads that
+hit the inline path. See [Direct handoff](/architecture/direct-handoff/)
+for the design.
+
+## Errors
+
+`volt.spawn` itself can fail:
+
+| Error | When |
+|---|---|
+| `error.OutOfMemory` | Allocator failed allocating the Frame+Task combined struct or the Coroutine struct. |
+| `error.ArenaExhausted` | Slab arena has no free slots — `max_concurrent_stacks` reached. Raise the config. |
+
+`Task.join`'s return type is whatever `user_fn` returns, with no
+runtime-level errors injected. If the spawned function panics
+mid-execution, the worker panics (process aborts) — Volt does not
+intercept panics.
+
+## Multiple children
+
+For more than one child, you have two patterns:
+
+### Explicit pairwise join
 
 ```zig
-try volt.scope(struct {
-    fn body(s: *volt.Scope) !void {
-        try s.spawn(workerA, .{});
-        try s.spawn(workerB, .{});
-        // when this returns, both workers have joined.
-    }
-}.body);
+fn fetchBoth() !struct { a: []u8, b: []u8 } {
+    const ta = try volt.spawn(fetch, .{ "https://a.example.com" });
+    const tb = try volt.spawn(fetch, .{ "https://b.example.com" });
+    return .{ .a = try ta.join(), .b = try tb.join() };
+}
 ```
 
-See [Structured Concurrency](/usage/structured-concurrency/) for
-when `scope` is the right choice (almost always).
+You own each Task; you join each one. Simple and explicit. Right
+choice when N is small and known.
 
-## Spawning across threads
-
-`launch` and `spawn` work the same regardless of which worker they
-run on. You can call them from inside any coroutine; the runtime
-finds a worker for the new task (typically the LIFO slot of the
-calling worker, falling back to the local deque). Cross-thread
-spawn from a non-coroutine context (e.g., a signal handler) is
-**not** supported — those paths assume a current coroutine. To
-publish work from outside the runtime, use a `Channel(T)` whose
-sender side is `trySend` (lock-free, callable from anywhere) and
-whose receiver runs inside a coroutine.
-
-## yield
+### `volt.scope` for error-driven cleanup
 
 ```zig
-try volt.yield();
+fn fetchBoth() !void {
+    try volt.scope(struct {
+        fn body(c: *volt.Cancel) anyerror!void {
+            const ta = try volt.spawn(fetchCancel, .{ "https://a", c });
+            const tb = try volt.spawn(fetchCancel, .{ "https://b", c });
+            _ = try ta.join();
+            _ = try tb.join();
+        }
+    }.body);
+}
 ```
 
-Voluntarily release the worker to other coroutines. Returns
-`error.Cancelled` if the calling coroutine was cancelled. Useful in
-two cases:
+If `fetchA` errors before `fetchB` returns, the explicit pattern
+above won't cancel `fetchB` — you'll wait for it to finish on its
+own. `volt.scope` gives you "if either child errors, fire the
+Cancel so the other observes it via cancel-aware blocking ops." See
+[Structured Concurrency](/usage/structured-concurrency/).
 
-- A CPU-bound loop with no other suspension points needs an
-  explicit cancellation check.
-- Manually balancing fairness — you've held the worker for a while
-  and want to give siblings a chance.
+## Fire-and-forget?
 
-For most code, you don't need `yield` — the next I/O / channel /
-sleep call already releases the worker.
+Volt does not have a detach primitive. You always get back a Task.
+The closest pattern:
+
+```zig
+_ = try volt.spawn(backgroundWork, .{});
+```
+
+This still allocates the Task and leaks it (the Task struct is
+freed only by `join`). For long-running runtimes where you spawn
+once and never want the handle back, the leak is bounded by the
+spawn rate. For high-rate spawns, use `scope` so the Tasks get
+freed when the scope returns.
+
+## Cooperative yield
+
+```zig
+volt.yield();
+```
+
+Re-queue the current coroutine to the worker's queue tail (FIFO,
+not LIFO slot). The dispatch loop runs every other queued
+coroutine first, then comes back. Use cases:
+
+- A CPU-bound loop that should let sibling coroutines on the same
+  worker make progress.
+- A cancellation checkpoint when combined with `*Cancel` —
+  `c.checkpoint() catch return; volt.yield();` is the canonical "I'm
+  about to do more work; let cancellation propagate first" idiom.
+
+For I/O-bound code, you don't need `yield` — the next blocking
+call already releases the worker.
+
+## See also
+
+- [Structured Concurrency](/usage/structured-concurrency/) — `volt.scope` and `Cancel`.
+- [Direct handoff](/architecture/direct-handoff/) — why spawn-then-join is zero-overhead.
+- [The Runtime](/usage/runtime/) — `Runtime.spawn` for cross-thread injection.
