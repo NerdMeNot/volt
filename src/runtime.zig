@@ -74,6 +74,11 @@ pub const Config = struct {
     /// thousands of HTTP connections); lower to bound virtual address
     /// usage on tight 32-bit-style budgets.
     max_concurrent_stacks: usize = stack_mod.DEFAULT_MAX_STACKS,
+    /// **Linux only.** Chooses between epoll and io_uring backends.
+    /// `.auto` probes for io_uring at init and falls back to epoll
+    /// on older kernels (< 5.10) or sysctl-disabled environments.
+    /// Ignored on Darwin (always kqueue) and Windows (always IOCP).
+    io_backend: reactor_mod.IoBackend = .auto,
 };
 
 /// Cooperative yield. Re-queues the current coroutine onto the
@@ -294,11 +299,24 @@ pub const Runtime = struct {
         const ps = try cfg.allocator.alloc(P, n);
         errdefer cfg.allocator.free(ps);
 
+        // Reactor init: on Linux, the io_backend config selects
+        // between epoll and io_uring (tagged union dispatch in
+        // reactor_linux.zig). On other platforms `io_backend` is
+        // accepted but ignored — kqueue or IOCP is fixed.
+        const reactor_inst = if (@import("builtin").os.tag == .linux)
+            switch (cfg.io_backend) {
+                .auto => try Reactor.init(),
+                .epoll => try Reactor.initBackend(.epoll),
+                .io_uring => try Reactor.initBackend(.io_uring),
+            }
+        else
+            try Reactor.init();
+
         rt.* = .{
             .allocator = cfg.allocator,
             .ms = ms,
             .ps = ps,
-            .reactor = try Reactor.init(),
+            .reactor = reactor_inst,
             .parking_lot = park_mod.ParkingLot.init(),
             .stack_arena = try stack_mod.Arena.init(cfg.allocator, cfg.max_concurrent_stacks),
         };

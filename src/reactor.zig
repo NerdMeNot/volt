@@ -24,12 +24,17 @@ const builtin = @import("builtin");
 
 const backend = switch (builtin.os.tag) {
     .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly => @import("reactor_kqueue.zig"),
-    .linux => @import("reactor_epoll.zig"),
+    .linux => @import("reactor_linux.zig"), // tagged-union dispatch for epoll/io_uring
     .windows => @import("reactor_iocp.zig"),
     else => @compileError("Volt: no reactor backend for this platform — see src/reactor.zig"),
 };
 
 pub const Reactor = backend.Reactor;
+
+/// Linux-only — `Runtime.Config.io_backend` selects between
+/// `.epoll` and `.io_uring`; on other platforms the Config field
+/// is accepted but ignored. Public for `runtime.zig`'s use.
+pub const IoBackend = enum { auto, epoll, io_uring };
 
 // I/O helpers — same shape across platforms; impls live in each
 // backend file because errno / EAGAIN / fcntl details differ.
