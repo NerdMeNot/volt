@@ -33,6 +33,7 @@ const coroutine = @import("coroutine.zig");
 const runtime = @import("runtime.zig");
 const current = @import("current.zig");
 const park = @import("park.zig");
+const cancel_mod = @import("cancel.zig");
 
 pub const ChannelError = error{Closed};
 
@@ -40,6 +41,20 @@ const CACHE_LINE: usize = 128;
 
 inline fn currentRt() *runtime.Runtime {
     return @ptrCast(@alignCast(current.require().runtime));
+}
+
+/// True if the running coroutine has a cancel attached and it has
+/// fired. Channel validators call this under the parking-lot bucket
+/// lock to close the register-then-park race for `*Cancel`-aware
+/// sends / recvs (same pattern as `Mutex.lockCancel`).
+inline fn currentCancelFired() bool {
+    if (current.get()) |me| {
+        if (me.cancel_in_flight) |cp| {
+            const c: *cancel_mod.Cancel = @ptrCast(@alignCast(cp));
+            return c.isFired();
+        }
+    }
+    return false;
 }
 
 pub fn Spsc(comptime T: type, comptime cap: usize) type {
@@ -63,10 +78,11 @@ pub fn Spsc(comptime T: type, comptime cap: usize) type {
         closed: std.atomic.Value(bool) align(CACHE_LINE) = std.atomic.Value(bool).init(false),
 
         /// Validator for producer parked on full channel: keep
-        /// parking if (still full) AND (not closed). Runs UNDER the
-        /// parking-lot bucket lock — atomic with the consumer's
-        /// state change.
+        /// parking if (still full) AND (not closed) AND (cancel not
+        /// fired). Runs UNDER the parking-lot bucket lock — atomic
+        /// with the consumer's state change.
         fn fullValidator(addr: *const anyopaque) bool {
+            if (currentCancelFired()) return false;
             const tail_ptr: *align(CACHE_LINE) const std.atomic.Value(u64) =
                 @ptrCast(@alignCast(addr));
             const self: *const Self = @fieldParentPtr("tail", tail_ptr);
@@ -77,8 +93,10 @@ pub fn Spsc(comptime T: type, comptime cap: usize) type {
         }
 
         /// Validator for consumer parked on empty channel: keep
-        /// parking if (still empty) AND (not closed).
+        /// parking if (still empty) AND (not closed) AND (cancel not
+        /// fired).
         fn emptyValidator(addr: *const anyopaque) bool {
+            if (currentCancelFired()) return false;
             const head_ptr: *align(CACHE_LINE) const std.atomic.Value(u64) =
                 @ptrCast(@alignCast(addr));
             const self: *const Self = @fieldParentPtr("head", head_ptr);
@@ -136,6 +154,65 @@ pub fn Spsc(comptime T: type, comptime cap: usize) type {
             const rt = currentRt();
             _ = park.unparkOne(rt, &self.head);
             _ = park.unparkOne(rt, &self.tail);
+        }
+
+        pub const CancelError = ChannelError || cancel_mod.Error;
+
+        /// Cancel-aware send. Returns `error.Cancelled` if `c` fires
+        /// before or during the wait. On `Cancelled`, the value is
+        /// NOT delivered.
+        pub fn sendCancel(self: *Self, v: T, c: *cancel_mod.Cancel) CancelError!void {
+            while (true) {
+                if (c.isFired()) return error.Cancelled;
+                if (self.closed.load(.acquire)) return error.Closed;
+                const h = self.head.load(.monotonic);
+                const t = self.tail.load(.acquire);
+                if (h - t < cap) {
+                    self.ring[h & MASK] = v;
+                    self.head.store(h + 1, .release);
+                    _ = park.unparkOne(currentRt(), &self.head);
+                    return;
+                }
+                // Full — register on cancel, then park.
+                var waiter: cancel_mod.Waiter = .{};
+                if (c.register(&waiter, @intFromPtr(&self.tail))) {
+                    return error.Cancelled;
+                }
+                const me = current.require();
+                me.cancel_in_flight = @ptrCast(c);
+                park.parkOn(&self.tail, fullValidator);
+                me.cancel_in_flight = null;
+                c.deregister(&waiter);
+                if (c.isFired()) return error.Cancelled;
+            }
+        }
+
+        /// Cancel-aware recv. Returns `error.Cancelled` if `c` fires
+        /// before or during the wait.
+        pub fn recvCancel(self: *Self, c: *cancel_mod.Cancel) CancelError!T {
+            while (true) {
+                if (c.isFired()) return error.Cancelled;
+                const t = self.tail.load(.monotonic);
+                const h = self.head.load(.acquire);
+                if (h != t) {
+                    const v = self.ring[t & MASK];
+                    self.tail.store(t + 1, .release);
+                    _ = park.unparkOne(currentRt(), &self.tail);
+                    return v;
+                }
+                if (self.closed.load(.acquire)) return error.Closed;
+                // Empty — register on cancel, then park.
+                var waiter: cancel_mod.Waiter = .{};
+                if (c.register(&waiter, @intFromPtr(&self.head))) {
+                    return error.Cancelled;
+                }
+                const me = current.require();
+                me.cancel_in_flight = @ptrCast(c);
+                park.parkOn(&self.head, emptyValidator);
+                me.cancel_in_flight = null;
+                c.deregister(&waiter);
+                if (c.isFired()) return error.Cancelled;
+            }
         }
     };
 }
@@ -257,8 +334,10 @@ pub fn Mpmc(comptime T: type, comptime cap: usize) type {
 
         /// Validator for a producer parked on `enqueue_pos`. Re-runs
         /// `trySend`-equivalent observation under the bucket lock:
-        /// keep parking if (still full) AND (not closed).
+        /// keep parking if (still full) AND (not closed) AND (cancel
+        /// not fired).
         fn fullValidator(addr: *const anyopaque) bool {
+            if (currentCancelFired()) return false;
             const enq_ptr: *align(CACHE_LINE) const std.atomic.Value(u64) =
                 @ptrCast(@alignCast(addr));
             const self: *const Self = @fieldParentPtr("enqueue_pos", enq_ptr);
@@ -273,8 +352,10 @@ pub fn Mpmc(comptime T: type, comptime cap: usize) type {
         }
 
         /// Validator for a consumer parked on `dequeue_pos`. Keep
-        /// parking if (still empty) AND (not closed).
+        /// parking if (still empty) AND (not closed) AND (cancel not
+        /// fired).
         fn emptyValidator(addr: *const anyopaque) bool {
+            if (currentCancelFired()) return false;
             const deq_ptr: *align(CACHE_LINE) const std.atomic.Value(u64) =
                 @ptrCast(@alignCast(addr));
             const self: *const Self = @fieldParentPtr("dequeue_pos", deq_ptr);
@@ -330,6 +411,60 @@ pub fn Mpmc(comptime T: type, comptime cap: usize) type {
             const rt = currentRt();
             _ = park.unparkAll(rt, &self.enqueue_pos);
             _ = park.unparkAll(rt, &self.dequeue_pos);
+        }
+
+        pub const CancelError = ChannelError || cancel_mod.Error;
+
+        /// Cancel-aware send. Returns `error.Cancelled` if `c` fires
+        /// before or during the wait.
+        pub fn sendCancel(self: *Self, v: T, c: *cancel_mod.Cancel) CancelError!void {
+            while (true) {
+                if (c.isFired()) return error.Cancelled;
+                self.trySend(v) catch |e| switch (e) {
+                    error.Closed => return error.Closed,
+                    error.Full => {
+                        var waiter: cancel_mod.Waiter = .{};
+                        if (c.register(&waiter, @intFromPtr(&self.enqueue_pos))) {
+                            return error.Cancelled;
+                        }
+                        const me = current.require();
+                        me.cancel_in_flight = @ptrCast(c);
+                        park.parkOn(&self.enqueue_pos, fullValidator);
+                        me.cancel_in_flight = null;
+                        c.deregister(&waiter);
+                        if (c.isFired()) return error.Cancelled;
+                        continue;
+                    },
+                };
+                _ = park.unparkOne(currentRt(), &self.dequeue_pos);
+                return;
+            }
+        }
+
+        /// Cancel-aware recv. Returns `error.Cancelled` if `c` fires
+        /// before or during the wait.
+        pub fn recvCancel(self: *Self, c: *cancel_mod.Cancel) CancelError!T {
+            while (true) {
+                if (c.isFired()) return error.Cancelled;
+                if (self.tryRecv()) |v| {
+                    _ = park.unparkOne(currentRt(), &self.enqueue_pos);
+                    return v;
+                } else |e| switch (e) {
+                    error.Closed => return error.Closed,
+                    error.Empty => {
+                        var waiter: cancel_mod.Waiter = .{};
+                        if (c.register(&waiter, @intFromPtr(&self.dequeue_pos))) {
+                            return error.Cancelled;
+                        }
+                        const me = current.require();
+                        me.cancel_in_flight = @ptrCast(c);
+                        park.parkOn(&self.dequeue_pos, emptyValidator);
+                        me.cancel_in_flight = null;
+                        c.deregister(&waiter);
+                        if (c.isFired()) return error.Cancelled;
+                    },
+                }
+            }
         }
     };
 }
@@ -410,8 +545,39 @@ pub fn Oneshot(comptime T: type) type {
         }
 
         fn oneshotRecvValidator(addr: *const anyopaque) bool {
+            if (currentCancelFired()) return false;
             const sp: *const std.atomic.Value(u32) = @ptrCast(@alignCast(addr));
             return sp.load(.acquire) == EMPTY;
+        }
+
+        pub const CancelError = ChannelError || cancel_mod.Error;
+
+        /// Cancel-aware recv. Returns `error.Cancelled` if `c` fires
+        /// while waiting for the value.
+        pub fn recvCancel(self: *Self, c: *cancel_mod.Cancel) CancelError!T {
+            while (true) {
+                if (c.isFired()) return error.Cancelled;
+                const s = self.state.load(.acquire);
+                switch (s) {
+                    FULL => {
+                        if (self.state.cmpxchgWeak(FULL, CONSUMED, .acquire, .monotonic)) |_| continue;
+                        return self.value;
+                    },
+                    CLOSED, CONSUMED => return error.Closed,
+                    else => {
+                        var waiter: cancel_mod.Waiter = .{};
+                        if (c.register(&waiter, @intFromPtr(&self.state))) {
+                            return error.Cancelled;
+                        }
+                        const me = current.require();
+                        me.cancel_in_flight = @ptrCast(c);
+                        park.parkOn(&self.state, oneshotRecvValidator);
+                        me.cancel_in_flight = null;
+                        c.deregister(&waiter);
+                        if (c.isFired()) return error.Cancelled;
+                    },
+                }
+            }
         }
     };
 }
@@ -822,6 +988,109 @@ test "mpmc: works at workers=1 (configuration check)" {
     var ctx = MpmcCtx{ .ch = &ch, .n_per_producer = 50 };
     try (try rt.run(mpmcRoot4x4, .{&ctx}));
     try std.testing.expectEqual(@as(u64, 4 * 50), ctx.received.load(.acquire));
+}
+
+// ─── Cancel-aware channel tests ──────────────────────────────────────
+
+const CancelCh = Spsc(u64, 4);
+const SpscCancelCtx = struct {
+    ch: *CancelCh,
+    c: *cancel_mod.Cancel,
+    got_cancelled: bool = false,
+};
+
+fn spscRecvCancelWaiter(ctx: *SpscCancelCtx) !void {
+    _ = ctx.ch.recvCancel(ctx.c) catch |e| {
+        if (e == error.Cancelled) ctx.got_cancelled = true;
+        return;
+    };
+}
+
+fn spscRecvCancelRoot(ctx: *SpscCancelCtx) !void {
+    const lib = @import("lib.zig");
+    var waiter = try lib.spawn(spscRecvCancelWaiter, .{ctx});
+    // Yield a few times so the waiter parks on the empty channel.
+    var i: u32 = 0;
+    while (i < 16) : (i += 1) lib.yield();
+    ctx.c.fire();
+    _ = waiter.join() catch {};
+}
+
+test "spsc.recvCancel: cancel fires while parked on empty" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
+    defer rt.deinit();
+    var ch = CancelCh{};
+    var c = cancel_mod.Cancel.init(rt);
+    defer c.deinit();
+    var ctx = SpscCancelCtx{ .ch = &ch, .c = &c };
+    try (try rt.run(spscRecvCancelRoot, .{&ctx}));
+    try std.testing.expect(ctx.got_cancelled);
+}
+
+const MpmcCancelCtx = struct {
+    ch: *MpmcCh,
+    c: *cancel_mod.Cancel,
+    got_cancelled: bool = false,
+};
+
+fn mpmcRecvCancelWaiter(ctx: *MpmcCancelCtx) !void {
+    _ = ctx.ch.recvCancel(ctx.c) catch |e| {
+        if (e == error.Cancelled) ctx.got_cancelled = true;
+        return;
+    };
+}
+
+fn mpmcRecvCancelRoot(ctx: *MpmcCancelCtx) !void {
+    const lib = @import("lib.zig");
+    var waiter = try lib.spawn(mpmcRecvCancelWaiter, .{ctx});
+    var i: u32 = 0;
+    while (i < 16) : (i += 1) lib.yield();
+    ctx.c.fire();
+    _ = waiter.join() catch {};
+}
+
+test "mpmc.recvCancel: cancel fires while parked on empty" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
+    defer rt.deinit();
+    var ch = MpmcCh{};
+    var c = cancel_mod.Cancel.init(rt);
+    defer c.deinit();
+    var ctx = MpmcCancelCtx{ .ch = &ch, .c = &c };
+    try (try rt.run(mpmcRecvCancelRoot, .{&ctx}));
+    try std.testing.expect(ctx.got_cancelled);
+}
+
+const OneshotCancelCtx = struct {
+    ch: *Oneshot(u64),
+    c: *cancel_mod.Cancel,
+    got_cancelled: bool = false,
+};
+
+fn oneshotRecvCancelWaiter(ctx: *OneshotCancelCtx) !void {
+    _ = ctx.ch.recvCancel(ctx.c) catch |e| {
+        if (e == error.Cancelled) ctx.got_cancelled = true;
+        return;
+    };
+}
+
+fn oneshotRecvCancelRoot(ctx: *OneshotCancelCtx) !void {
+    const lib = @import("lib.zig");
+    var waiter = try lib.spawn(oneshotRecvCancelWaiter, .{ctx});
+    var i: u32 = 0;
+    while (i < 16) : (i += 1) lib.yield();
+    ctx.c.fire();
+    _ = waiter.join() catch {};
+}
+
+test "oneshot.recvCancel: cancel fires while waiting for value" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
+    defer rt.deinit();
+    var ch = Oneshot(u64){};
+    var c = cancel_mod.Cancel.init(rt);
+    defer c.deinit();
+    var ctx = OneshotCancelCtx{ .ch = &ch, .c = &c };
+    try (try rt.run(oneshotRecvCancelRoot, .{&ctx}));
+    try std.testing.expect(ctx.got_cancelled);
 }
 
 // ─── Oneshot tests ───────────────────────────────────────────────────
