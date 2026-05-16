@@ -8,6 +8,15 @@ reference points: Tokio (Rust) and Go's runtime. The table isn't
 prescriptive about "which is best" — it's about helping readers
 find the equivalent shape they already know.
 
+For narrative-form migration walkthroughs (mental-model shifts,
+side-by-side code, gotchas), see:
+
+- [Coming from Go](/migrating/from-go/)
+- [Coming from Tokio (Rust)](/migrating/from-tokio/)
+- [Coming from Node.js](/migrating/from-nodejs/)
+
+This page is the dense reference table they cross-link to.
+
 ## Concept mapping
 
 | Concept | Volt | Tokio (Rust) | Go |

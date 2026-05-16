@@ -62,6 +62,15 @@ export default [
 		],
 	},
 	{
+		label: 'Migrating to Volt',
+		items: [
+			{ label: 'Overview', slug: 'migrating' },
+			{ label: 'From Go', slug: 'migrating/from-go' },
+			{ label: 'From Tokio (Rust)', slug: 'migrating/from-tokio' },
+			{ label: 'From Node.js', slug: 'migrating/from-nodejs' },
+		],
+	},
+	{
 		label: 'Architecture',
 		items: [
 			{ label: 'Overview', slug: 'architecture' },
