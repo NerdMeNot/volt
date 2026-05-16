@@ -39,7 +39,7 @@ const DriverCtx = struct {
 };
 
 fn driverCoro(ctx: *DriverCtx) void {
-    const rt: *volt.Runtime = @ptrCast(@alignCast(volt.current.require().runtime));
+    const rt = volt.runtime();
     const tasks = rt.allocator.alloc(*volt.Task(void), ctx.batch) catch @panic("driver alloc");
     defer rt.allocator.free(tasks);
 
@@ -61,7 +61,7 @@ const RootCtx = struct {
 };
 
 fn benchRoot(rctx: *RootCtx) !void {
-    const rt: *volt.Runtime = @ptrCast(@alignCast(volt.current.require().runtime));
+    const rt = volt.runtime();
     var dctx = DriverCtx{ .batch = rctx.batch, .deadline_ns = rctx.deadline_ns };
 
     const drivers = try rt.allocator.alloc(*volt.Task(void), rctx.drivers);

@@ -50,7 +50,7 @@ const RootCtx = struct {
 };
 
 fn root(ctx: *RootCtx) !void {
-    const rt: *volt.Runtime = @ptrCast(@alignCast(volt.current.require().runtime));
+    const rt = volt.runtime();
     const ctxs = try rt.allocator.alloc(TaskCtx, N_TASKS);
     defer rt.allocator.free(ctxs);
     const tasks = try rt.allocator.alloc(*volt.Task(void), N_TASKS);

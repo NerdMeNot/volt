@@ -72,7 +72,7 @@ fn watchdog(ctx: *Ctx, rt: *volt.Runtime) void {
 fn nopFn() void {}
 
 fn phaseSpawnJoin(ctx: *Ctx) !void {
-    const rt: *volt.Runtime = @ptrCast(@alignCast(volt.current.require().runtime));
+    const rt = volt.runtime();
     const BATCH: u32 = 200;
     const tasks = try rt.allocator.alloc(*volt.Task(void), BATCH);
     defer rt.allocator.free(tasks);
@@ -109,7 +109,7 @@ fn mutexWorker(mctx: *MutexCtx) void {
 }
 
 fn phaseMutex(ctx: *Ctx) !void {
-    const rt: *volt.Runtime = @ptrCast(@alignCast(volt.current.require().runtime));
+    const rt = volt.runtime();
     var mu = volt.Mutex.init();
     defer mu.deinit();
     var counter: u64 = 0;
@@ -156,7 +156,7 @@ fn chanConsumer(cctx: *ChanCtx) !void {
 }
 
 fn phaseChannel(ctx: *Ctx) !void {
-    const rt: *volt.Runtime = @ptrCast(@alignCast(volt.current.require().runtime));
+    const rt = volt.runtime();
     var ch = volt.Spsc(u64, 32){};
     var cctx = ChanCtx{
         .ch = &ch,
@@ -215,7 +215,7 @@ fn notifyNotifier(nctx: *NotifyCtx) void {
 }
 
 fn phaseNotify(ctx: *Ctx) !void {
-    const rt: *volt.Runtime = @ptrCast(@alignCast(volt.current.require().runtime));
+    const rt = volt.runtime();
     var note = volt.Notify.init();
     defer note.deinit();
 

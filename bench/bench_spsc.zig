@@ -40,7 +40,7 @@ fn consumer(ctx: *BenchCtx) !void {
 }
 
 fn benchRoot(ctx: *BenchCtx) !void {
-    const rt: *volt.Runtime = @ptrCast(@alignCast(volt.current.require().runtime));
+    const rt = volt.runtime();
     const start = nanosNow();
     var prod = try rt.spawn(producer, .{ctx});
     var cons = try rt.spawn(consumer, .{ctx});

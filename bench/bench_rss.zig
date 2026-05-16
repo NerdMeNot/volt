@@ -36,7 +36,7 @@ fn maxRssBytes() u64 {
 }
 
 fn benchRoot(n: u32) !void {
-    const rt: *volt.Runtime = @ptrCast(@alignCast(volt.current.require().runtime));
+    const rt = volt.runtime();
     var note = volt.Notify.init();
     defer note.deinit();
     var ctx = Ctx{ .note = &note };

@@ -69,7 +69,7 @@ fn watchdog(ctx: *Ctx, rt: *volt.Runtime) void {
 }
 
 fn benchRoot(ctx: *Ctx) !void {
-    const rt: *volt.Runtime = @ptrCast(@alignCast(volt.current.require().runtime));
+    const rt = volt.runtime();
     const tasks = try rt.allocator.alloc(*volt.Task(void), ctx.batch);
     defer rt.allocator.free(tasks);
 

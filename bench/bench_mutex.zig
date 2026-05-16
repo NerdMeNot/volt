@@ -35,7 +35,7 @@ const BenchCtx = struct {
 };
 
 fn benchRoot(ctx: *BenchCtx) !void {
-    const rt: *volt.Runtime = @ptrCast(@alignCast(volt.current.require().runtime));
+    const rt = volt.runtime();
     const tasks = try rt.allocator.alloc(*volt.Task(void), ctx.workers);
     defer rt.allocator.free(tasks);
     const start = nanosNow();

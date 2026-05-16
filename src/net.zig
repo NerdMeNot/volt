@@ -58,12 +58,35 @@ pub const Address = struct {
     /// Port in host order.
     port: u16,
 
-    pub fn loopback(port: u16) Address {
+    /// IPv4 loopback (127.0.0.1) at the given port. Use port 0 to
+    /// let the kernel pick (see `TcpListener.localAddress`).
+    pub fn loopback4(port: u16) Address {
         return .{ .host = .{ 127, 0, 0, 1 }, .port = port };
     }
 
-    pub fn any(port: u16) Address {
+    /// IPv4 "any" (0.0.0.0) — listen on every interface.
+    pub fn any4(port: u16) Address {
         return .{ .host = .{ 0, 0, 0, 0 }, .port = port };
+    }
+
+    /// Parse a dotted-quad IPv4 string (`"192.168.1.1"`). Returns
+    /// `error.InvalidAddress` on malformed input. No DNS — that's
+    /// library territory.
+    pub fn parse4(host: []const u8, port: u16) error{InvalidAddress}!Address {
+        var bytes: [4]u8 = undefined;
+        var i: usize = 0;
+        var start: usize = 0;
+        for (host, 0..) |ch, idx| {
+            if (ch == '.') {
+                if (i >= 4 or idx == start) return error.InvalidAddress;
+                bytes[i] = std.fmt.parseInt(u8, host[start..idx], 10) catch return error.InvalidAddress;
+                i += 1;
+                start = idx + 1;
+            }
+        }
+        if (i != 3 or start >= host.len) return error.InvalidAddress;
+        bytes[3] = std.fmt.parseInt(u8, host[start..], 10) catch return error.InvalidAddress;
+        return .{ .host = bytes, .port = port };
     }
 
     fn toSockaddr(self: Address) sockaddr_in {
@@ -92,7 +115,9 @@ pub const Address = struct {
 pub const TcpListener = struct {
     fd: i32,
 
-    pub fn bindAddress(addr: Address) !TcpListener {
+    /// Bind a TCP listener at `addr`. Sets SO_REUSEADDR so repeated
+    /// runs don't EADDRINUSE; non-blocking from the start.
+    pub fn bind(addr: Address) !TcpListener {
         const fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (fd < 0) return error.SocketCreateFailed;
         errdefer _ = c_close(fd);
@@ -193,7 +218,7 @@ inline fn isAgain(e: c_int) bool {
 const test_allocator = std.testing.allocator;
 
 fn testListenerLifecycle() !void {
-    var listener = try TcpListener.bindAddress(Address.loopback(0));
+    var listener = try TcpListener.bind(Address.loopback4(0));
     defer listener.close();
     const addr = try listener.localAddress();
     if (addr.port == 0) return error.BadPort;
@@ -246,7 +271,7 @@ test "TCP echo single client round-trip" {
     var rt = try runtime.Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
     defer rt.deinit();
 
-    var listener = try TcpListener.bindAddress(Address.loopback(0));
+    var listener = try TcpListener.bind(Address.loopback4(0));
     defer listener.close();
     var ctx = EchoTestCtx{ .listener = &listener };
     ctx.addr = try listener.localAddress();

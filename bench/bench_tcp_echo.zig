@@ -68,7 +68,7 @@ const RootCtx = struct {
 };
 
 fn root(ctx: *RootCtx) !void {
-    var listener = try volt.net.TcpListener.bindAddress(volt.net.Address.loopback(0));
+    var listener = try volt.net.TcpListener.bind(volt.net.Address.loopback4(0));
     defer listener.close();
     const addr = try listener.localAddress();
 
