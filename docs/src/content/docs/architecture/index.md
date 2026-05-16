@@ -1,295 +1,254 @@
 ---
 title: Architecture
-description: How Volt fits together — Runtime, Worker, Reactor, Coroutine, Park, and how a typical wake travels through the system.
+description: How Volt is built. The five components, how a coroutine moves through them, and where to read next depending on what you want to learn.
 ---
 
-:::caution
-**Partially stale (2026-05-15).** Path references and some
-implementation details (cancellation, EventSource, 8 MiB stacks)
-predate the flattening + parking-lot migration that produced the
-current tree. The high-level shape (Runtime owns workers,
-work-stealing, reactor, suspend/resume via context switch) is still
-correct. Authoritative source for specifics: read the actual
-`src/*.zig` files. Path map below reflects the current tree;
-conceptual details flagged inline.
-:::
+This chapter is a mini-textbook on how a modern stackful M:N
+coroutine runtime is built. It's organised top-down: this page
+gives you the system shape; each subpage takes one component and
+goes deep.
 
-This is the system map. If you're trying to understand a stack
-trace, debug a missed wake, or contribute to the runtime, start
-here.
+You can read top-to-bottom or jump in. Each page has a "Further
+reading" footer pointing at adjacent topics.
 
-## The shape
+## The system, in one diagram
 
 ```
-            ┌────────────────────────────────────────────────────────────┐
-            │                       volt.run(...)                        │
-            │            (owns Runtime; tears down on return)            │
-            └────────────────────────────────────────────────────────────┘
-                                       │
-            ┌──────────────────────────▼──────────────────────────┐
-            │                      Runtime                         │
-            │   workers[] · reactor · injection · stack_pool       │
-            │   shutdown_flag · parked_workers bitmap              │
-            └──────────────────────────┬──────────────────────────┘
-                                       │
-   ┌───────────────────────────────────┼───────────────────────────────────┐
-   │                                   │                                   │
-   ▼                                   ▼                                   ▼
-┌─────┐  steal       ┌─────┐  inject  ┌──────────┐  poll        ┌──────────┐
-│ W0  │ ◄──────────► │ W1  │ ────►    │Injection │              │ Reactor  │
-│LIFO │              │LIFO │          │  queue   │              │ (kqueue/ │
-│deque│              │deque│          └──────────┘              │  epoll/  │
-└─────┘              └─────┘                                    │   IOCP)  │
-                                                                └──────────┘
-                                                                      ▲
-                                                                      │ park / wake
-                                                                      │
-                                                                ┌──────────┐
-                                                                │Coroutine │
-                                                                │ stack +  │
-                                                                │ context  │
-                                                                │ + Park   │
-                                                                └──────────┘
+                              ┌─────────────────────────────┐
+                              │     volt.Runtime            │
+                              │                             │
+                              │  ms: []M       (OS threads) │
+                              │  ps: []P       (per-worker  │
+                              │                 sched state)│
+                              │  reactor       (kqueue)     │
+                              │  parking_lot   (sharded     │
+                              │                 wait/wake)  │
+                              │  stack_arena   (slab,       │
+                              │                 lazy        │
+                              │                 mprotect)   │
+                              └─────────────────────────────┘
+                                         │
+   ┌─────────────────────────────────────┼─────────────────────────────────────┐
+   │                                     │                                     │
+   ▼                                     ▼                                     ▼
+
+┌──────────────────────┐        ┌──────────────────────┐         ┌──────────────────────┐
+│      M[0]            │        │      M[1]            │   ...   │      M[N-1]          │
+│   (driver thread)    │        │   (pthread worker)   │         │   (pthread worker)   │
+│                      │        │                      │         │                      │
+│  Parker              │        │  Parker              │         │  Parker              │
+│  ▲                   │        │  ▲                   │         │  ▲                   │
+│  │                   │        │  │                   │         │  │                   │
+│  P[0]                │        │  P[1]                │         │  P[N-1]              │
+│   ├─ WSQ (256 fixed) │        │   ├─ WSQ (256 fixed) │         │   ├─ WSQ (256 fixed) │
+│   ├─ LIFO slot       │        │   ├─ LIFO slot       │         │   ├─ LIFO slot       │
+│   ├─ Mailbox (MPMC)  │        │   ├─ Mailbox (MPMC)  │         │   ├─ Mailbox (MPMC)  │
+│   ├─ coro pool       │        │   ├─ coro pool       │         │   ├─ coro pool       │
+│   └─ stack pool      │        │   └─ stack pool      │         │   └─ stack pool      │
+│                      │        │                      │         │                      │
+└──────────────────────┘        └──────────────────────┘         └──────────────────────┘
+   │                              │                                 │
+   │                              │                                 │
+   │  ┌──────────────────────────┘                                 │
+   │  │  (work stealing across P's WSQs)                            │
+   │  ▼                                                             │
+   │  ┌────────────────────────────────────────────────────────┐    │
+   │  │                  Coroutine                              │    │
+   │  │   stack: → slot in stack_arena (256 KiB virtual,        │    │
+   │  │                                 16 KiB committed)       │    │
+   │  │   ctx:   saved registers (AAPCS64 wide-save)            │    │
+   │  │   pending: yield / park / done                          │    │
+   │  │   park_state: atomic (RUNNING / NOTIFIED / PARKED)      │    │
+   │  └────────────────────────────────────────────────────────┘    │
+   │                                                                 │
+   │                                                                 │
+   └─────────────────────────────────────────────────────────────────┘
 ```
 
-Five things, the rest is composition:
+## The five components
 
-- **Runtime** (`src/runtime.zig`) — Owns everything. Created by
-  `volt.run`. Holds the worker array, the reactor, the global
-  injection queue, the stack pool, the parked-workers bitmap, and
-  the shutdown flag.
-- **M (Worker)** (`src/worker.zig`) — An OS thread. Bound 1:1 to a P.
-- **P (Processor)** (`src/p.zig`) — Owns the scheduler state: a fixed
-  256-slot lock-free work-stealing queue, a single-slot LIFO cache,
-  an MPMC mailbox (for cross-P pushes), and per-P Coroutine + stack
-  pools. Each P has an ID and a bit in the runtime's `parked_workers`
-  bitmap. The M:N split lets a future Phase 5 detach M from P during
-  blocking syscalls.
-- **Reactor** (`src/reactor_kqueue.zig` only currently; Linux/Windows
-  backends planned) — The OS-level readiness source. One per runtime,
-  with single-poller-claim (only one M calls `reactor.poll()` at a
-  time).
-- **Mailbox** (per-P, in `src/worker.zig`) — A lock-free MPMC Treiber
-  stack. Cross-P pushes target a specific P's mailbox; reduces
-  cache-line contention vs a single global injection queue.
-- **Coroutine** (`src/coroutine.zig`) — A function plus a stack plus
-  saved registers (`Context`). No cancellation/`current_park` field
-  in current build — that's tracked work for later.
+These are the actual moving parts. Everything else is built from
+them.
 
-## Spawning a coroutine
+### 1. The M:N scheduler
 
-`rt.spawn(fn, args)` — see `src/runtime.zig` `Runtime.spawn`:
+Volt has **M OS threads** running **N coroutines** where N can be
+orders of magnitude larger than M. Each thread (`M` in source) is
+bound 1:1 to a per-worker scheduler state (`P` in source) — the M
+holds the thread, the P holds the runnable-coroutine queues. The
+M's dispatch loop pops from its P's queues, runs the coroutine
+until it suspends, repeats.
 
-1. Comptime-specialize a `Combined { frame: F, task: Task(T) }`
-   struct for this (fn, args, return) tuple. Frame is at offset 0
-   so voltCoroEntry's `*x19 = run_fn` cast still works.
-2. Allocate the Combined (one allocator call).
-3. Pop a Coroutine struct from the current P's pool (or
-   `allocator.create` on miss).
-4. Pop a 16 KiB stack from the current P's pool (or `alignedAlloc`
-   on miss).
-5. Initialize Frame + Coroutine + saved-context. The context's
-   `lr = voltCoroEntry`, `sp = stack_top`, `x19 = &combined.frame`.
-6. Initialize the Task half of Combined with `frame_destroy =
-   &Combined.destroy` so Task.join eventually frees the whole
-   combined allocation.
-7. Push the Coroutine onto the current P's `lifo_slot` (with the
-   evicted prior, if any, landing on the local WSQ).
-8. `wakeOneParked` — wakes a sibling M if `num_searching == 0`.
-9. Return `&combined.task`.
+[Read more →](/architecture/mn-scheduler/)
 
-For spawns from outside a worker context (e.g. pre-`run()` setup),
-the Combined goes to `ps[0].mailbox`.
+### 2. Work stealing
 
-## Dispatching: the worker loop
+When a P's local queue is empty, the M doesn't go to sleep
+immediately. It tries to **steal** coroutines from sibling P's. A
+fixed-size 256-slot deque per P, Chase-Lev-style: owner FIFO-pops
+from the bottom, thieves CAS-pop from the top.
 
-```
-loop {
-    1. Have a coroutine ready in the LIFO slot? swap-into it.
-    2. Pop the local deque (LIFO for owner, FIFO for thieves).
-       Got one? swap-into it.
-    3. Drain a small burst from the injection queue. Got any?
-       Push to local deque, retry from step 1.
-    4. Try to steal from another worker's deque (random victim).
-       Got one? swap-into it.
-    5. Try to claim the reactor. If we own the claim:
-       reactor.poll(timeout) → wakes deliver coroutines onto our
-       deque. Release the claim; retry from step 1.
-    6. Park: set our bit in parked_workers, condvar-wait.
-}
-```
+Plus a single-slot **LIFO cache** in front of the queue — the most
+recently spawned coroutine sits here for spawn-chain locality, so
+the immediate joiner can grab it back with a single CAS (this is
+the [direct handoff](/architecture/direct-handoff/) optimization).
 
-The "swap-into" step is the assembly context switch
-(`voltCtxSwap` in `src/context_arm64.zig` — x86_64 backend planned).
-It saves the worker's callee-saved registers (14 wide-save GPR +
-NEON pairs), loads the coroutine's callee-saved registers, and
-`ret`s into whatever address was at the top of the coroutine's
-saved `lr` — either a normal return-point (if resuming) or
-`voltCoroEntry` → trampoline (if first-dispatch).
+Plus a per-P **MPMC mailbox** for cross-thread pushes (unparks
+from a different M, queue overflow). One Vyukov ring per P;
+producers and consumers can be any thread.
 
-## Suspending: the coroutine side
+[Read more →](/architecture/work-stealing/)
 
-When a coroutine calls `Mutex.lock` (and the mutex is held),
-`Spsc.recv` (on empty), `Task.join` (and the task isn't done yet),
-or any blocking primitive:
+### 3. The parking lot
 
-1. The primitive enqueues the coroutine on its **parking lot** bucket
-   (or, in the case of `sync.WaitQueue`, on its own waiter list —
-   tracked for migration in #168). The bucket lock is held only across
-   the few-pointer enqueue.
-2. The primitive calls `runtime.park()` which sets
-   `c.pending = .park`, then `context.swap(&c.ctx, c.main_ctx)`. This
-   saves the coroutine's registers into `c.ctx`, loads the worker's
-   registers from `c.main_ctx`, and `ret`s into the worker's dispatch
-   loop right after the previous swap-in.
-3. The worker's `.park` branch in `dispatch` does a final CAS
-   RUNNING → PARKED on `c.park_state` to close a register-then-park
-   race (see `docs/src/content/docs/architecture/parking-lot.md`).
+When a coroutine blocks — on a Mutex, channel, sleep, join —
+it parks. The parking lot is a **sharded hash map from address
+to FIFO waiter list**. Every blocking primitive in Volt is built
+on `parkOn(addr, validator)`; the address is some atomic field
+in the primitive's state.
 
-When the wake fires, the primitive's "release" / "send" / "task done"
-path calls `parkingLot.unparkOne(addr)` → pops the waiter from the
-bucket and calls `runtime.unpark(coro)`. That pushes the coro back
-onto a P's mailbox and `wakeOneParked`s. On next dispatch, the
-coroutine swap-ins, returns from `runtime.park()`, and continues
-from right after the suspension call.
+The validator hook is the load-bearing detail: it lets the parking
+lot re-check arbitrary state under the bucket lock, atomically
+with queueing the waiter. This closes the register-then-park race
+that bedevils ad-hoc wait/wake implementations.
 
-## Cancellation propagation
+[Read more →](/architecture/parking-lot/)
 
-Not implemented in the current build. The pre-stackful tree had a
-`Coroutine.cancel` + `current_park` design; that was retired with the
-flattening and not yet re-built. Re-landing it is on the roadmap but
-unscoped.
+### 4. The kqueue reactor
 
-## I/O wake path
+I/O ops and timers park on the reactor instead of the parking lot.
+One kqueue per Runtime. Single-poller-claim: one M at a time CASes
+the "I'm polling" flag, calls `kevent`, and unparks coroutines back
+to worker queues. The other workers run regular work in parallel.
 
-A typical TCP read (see `src/net.zig` + `src/reactor_kqueue.zig`):
+Events register with `EV_ONESHOT` and `udata = *Coroutine` — when
+the kernel delivers, we know exactly which coroutine to wake.
 
-```
-coroutine: stream.read(&buf)
-    │  syscall → EWOULDBLOCK
-    │  reactor.registerWait(fd, .readable)
-    │  runtime.park()   ─── coroutine suspends here, swap to m.main_ctx
-    ▼
-    [worker dispatches other work]
-    [some worker's findWork loop calls reactor.poll() — single-poller-claim]
-    [kqueue delivers EVFILT_READ for fd]
-    [reactor dispatches the waiting coro to a P's mailbox + wakeOneParked]
-    │
-    ▼
-    [worker pops coro from mailbox, dispatch swaps in]
-    │  runtime.park() returns
-    │  caller retries the read syscall → succeeds
-    │  return n bytes
-    └──► caller continues
+[Read more →](/architecture/reactor/)
+
+### 5. The slab arena
+
+Coroutine stacks come from a **single mmap reservation** at
+runtime init. N slots of 256 KiB virtual each, lazy-mprotect on
+first use. Per-P pools cache freed slots for cache locality;
+arena is the backing store for cross-P balancing.
+
+The arena replaced a per-spawn `mmap` design that hit a 30× cliff
+when batch size exceeded the cache cap. The
+[postmortem](/performance/slab-arena-postmortem/) is the receipt.
+
+[Read more →](/architecture/slab-arena/)
+
+## A coroutine's journey
+
+To make the five components concrete, here's what happens when
+you call `volt.spawn(fn, .{})` from inside a running coroutine:
+
+```mermaid
+sequenceDiagram
+    participant Caller as Caller coroutine
+    participant Spawn as volt.spawn
+    participant Arena as Slab arena
+    participant Pool as P's pools
+    participant LIFO as P's LIFO slot
+    participant Disp as P's dispatch loop
+    participant Child as Child coroutine
+
+    Caller->>Spawn: spawn(fn, args)
+    Spawn->>Pool: allocCoroutine (Coroutine struct)
+    Spawn->>Pool: allocStack (StackPtr)
+    alt local pool hit
+        Pool-->>Spawn: pop existing slot
+    else local pool miss
+        Pool->>Arena: arena.alloc()
+        Arena-->>Pool: pop slot index
+        Pool-->>Spawn: slot pointer
+    end
+    Spawn->>Spawn: initContext (trampoline + SP + frame ptr)
+    Spawn->>LIFO: pushLifo(coro)
+    Spawn-->>Caller: *Task(T)
+
+    Note over Caller: Caller continues; may call .join() next
+
+    Disp->>LIFO: popLocal (LIFO slot wins)
+    LIFO-->>Disp: child coroutine
+    Disp->>Child: context.swap into child's stack
+    Child->>Child: runs user fn via trampoline
+    Child->>Child: hits end / blocks / yields
+    Child->>Disp: context.swap back
+    Disp->>Disp: branch on pending (done / yield / park)
 ```
 
-The "lands back on a P's mailbox" step might be on a *different*
-worker than the one the coroutine was last on. That's fine —
-coroutines are not pinned to workers. Anything that was on the
-coroutine's stack still works because the stack memory hasn't moved.
+If the caller does `.join()` immediately after spawn — the common
+case — the [direct-handoff path](/architecture/direct-handoff/)
+catches this: `join` claims the child back from the LIFO slot via
+a single CAS, dispatches it inline, returns its result. Zero
+park, zero unpark, zero queue ops.
 
-## Coroutine completion
+If the caller goes off and does other work first, the child gets
+stolen by another M (or run by this M on a later dispatch tick),
+and `join` later parks on the child's done flag via the parking
+lot.
 
-When a coroutine returns from its top-level function:
+## How to read the rest of this chapter
 
-1. The trampoline writes the result into Frame's result slot.
-2. Sets `coroutine.pending = .done` and swaps back to `c.main_ctx`.
-3. Worker's `dispatch` sees `.done`:
-   - Signals `task.done` (via `parkingLot.unparkOne(&done)`).
-   - For tasks without a `Task` handle, calls `frame_destroy`.
-   - Returns Coroutine + stack to the current P's pools.
+**If you want the high-level model:**
+1. [Stackful by design](/architecture/stackful-design/) — why no async/await.
+2. [The M:N scheduler](/architecture/mn-scheduler/) — Ms, Ps, dispatch.
+3. [Work stealing](/architecture/work-stealing/) — the queue design.
 
-Per-P pools cap at 64 (Coroutine struct) / unbounded (stack — see
-`p.zig` for current sizing). Pool hits avoid an allocator round-trip
-per spawn — the steady-state allocation cost is dominated by the
-`Combined{Frame,Task}` create.
+**If you want the wait/wake substrate:**
+4. [The parking lot](/architecture/parking-lot/) — universal wait/wake.
+5. [The Parker](/architecture/parker/) — OS-level park (`__ulock_wait` / futex).
+6. [Direct handoff](/architecture/direct-handoff/) — the spawn-then-join optimization.
 
-## Worker waking
+**If you want memory + correctness:**
+7. [The slab arena](/architecture/slab-arena/) — stack allocation without VM-lock cliffs.
+8. [Stack growth on demand](/architecture/stack-growth/) — guard pages + SIGSEGV.
+9. [The kqueue reactor](/architecture/reactor/) — non-blocking I/O.
+10. [The context switch](/architecture/context-switch/) — AAPCS64 wide-save asm.
+11. [Memory model](/architecture/memory-model/) — atomic orderings per region.
 
-Idle Ms don't poll. They block in `Parker.park()` with their bit
-set in `Runtime.parked_workers` (a u64 bitmap — caps `MAX_WORKERS`
-at 64).
+**If you want the algorithm-level deep-dives:**
+12. [Cancellation internals](/architecture/cancellation-internals/) — Cancel + parking-lot integration.
+13. [Channels internals](/architecture/channels-internals/) — Spsc/Mpmc/Oneshot/Watch/Broadcast layouts.
+14. [Chase-Lev deque](/architecture/chase-lev-deque/) — the WSQ algorithm in isolation.
+15. [Vyukov MPMC](/architecture/vyukov-mpmc/) — the bounded MPMC ring algorithm.
+16. [Semaphore (FIFO)](/architecture/semaphore-algorithm/) — the fair-queueing semaphore.
 
-When a coroutine becomes runnable while a sibling M is parked,
-the runtime:
+## Design principles
 
-1. Pushes onto a P's lifo_slot or local queue (spawn) / mailbox
-   (cross-P unpark).
-2. Calls `wakeOneParked()`:
-   - Anti-herd: if `num_searching > 0`, return immediately (a
-     searching M will find the work on its next loop).
-   - Otherwise: CAS-clear one bit in `parked_workers`, call that
-     M's `parker.unpark()`.
-3. The woken M re-enters its dispatch loop.
+These show up across every page. They're not invented for Volt —
+they're the conventions you'd find in Tokio's design docs, Go's
+runtime source, the `parking_lot` crate's README, and the Linux
+kernel's lockdep notes. Volt borrows; the value-add is the
+integration.
 
-## Parker (lost-wake-free)
+1. **Correctness first; port well-known algorithms.** Tokio's WSQ.
+   Chase-Lev. Vyukov MPMC. `parking_lot`'s validator. Go's
+   `gopark`/`goready` direct-handoff. We don't invent new algorithms
+   in performance-critical paths; we port the ones that have been
+   model-checked, fuzzed, or deployed at scale.
+2. **Atomic ops need ordering justification.** Every `.acquire` /
+   `.release` / `.acq_rel` should be paired against a matching
+   read or write in the [memory-model](/architecture/memory-model/)
+   doc. If the ordering is `.monotonic`, the comment says why
+   it's safe.
+3. **No raw pointers across yield points.** A coroutine can resume
+   on a different worker thread. Anything threadlocal-cached must
+   be re-read after every potential yield.
+4. **Stackful means stack contents preserved across suspension.**
+   Heap pointers stashed on a coroutine's stack live as long as
+   the coroutine. This is what makes the synchronous-shape API
+   possible — Pin-free, lifetime-free.
+5. **Explicit allocators.** Zig idiom. One allocator in
+   `Runtime.Config`; the runtime hands it to primitives that need
+   it. No global allocator. No fallback to libc malloc.
 
-`src/parker.zig` — a single-atomic state machine over `u32`:
-`EMPTY` (0) | `NOTIFIED` (1) | `WAITING` (2). The slow-path block
-uses `__ulock_wait` on Darwin / `futex` on Linux (no
-`std.Thread.Condition` — those were removed in Zig 0.16).
+## A note on staleness
 
-Two transitions matter:
-
-- `park()`: cmpxchg `NOTIFIED → EMPTY` (fast path); if that fails,
-  cmpxchg `EMPTY → WAITING` and block on `futexWait` until
-  `unpark` writes a non-WAITING value.
-- `unpark()`: `swap(NOTIFIED)`; if the prior value was `WAITING`,
-  call `futexWake`.
-
-The seq_cst swap in `unpark` + the seq_cst cmpxchg in `park` (step
-EMPTY → WAITING) linearize through one modification order. Two
-relative orders, both safe:
-
-- park.cmpxchg first → state is WAITING → unpark's swap sees
-  WAITING → futexWake → park returns from futexWait.
-- unpark.swap first → state is NOTIFIED → park.cmpxchg fails →
-  park returns immediately (no syscall).
-
-Earlier versions had a 30 s park watchdog as defense-in-depth;
-the current Parker doesn't. If a wake is lost (memory-ordering
-bug), the symptom is a hang in `Runtime.deinit` at the `m.thread.join`
-loop. The stress test exercises this nightly under cross-thread
-churn.
-
-## Shutdown protocol
-
-`Runtime.deinit`:
-
-```text
-1. shutdown.store(true, .release)
-2. for m in ms[1..]: m.parker.unpark()
-3. for m in ms[1..]: m.thread.join()
-4. for m in ms: m.deinit()
-5. for p in ps: p.drainPools(allocator, STACK_SIZE)
-6. allocator.free ms, ps; reactor.deinit; parking_lot.deinit
-7. allocator.destroy(self)
-```
-
-Every M's dispatch loop checks `shutdown` after each find-work
-miss. With the parker unparked in step 2, even Ms blocked in
-`futexWait` wake up, observe shutdown, and exit. Step 3 then
-returns immediately for all spawned Ms.
-
-## File map
-
-| Concept | Source |
-|---|---|
-| Runtime + Config | `src/runtime.zig` |
-| M (worker thread) + Mailbox | `src/worker.zig` |
-| P (processor/scheduler unit) + per-P pools | `src/p.zig` |
-| Work-stealing queue (Chase-Lev-style, fixed 256) | `src/work_steal_queue.zig` |
-| Parker (__ulock / futex) | `src/parker.zig` |
-| Parking lot (sync wait queues) | `src/park.zig` |
-| TLS current coroutine | `src/current.zig` |
-| Coroutine struct + Frame factory | `src/coroutine.zig` |
-| Context switch (asm) | `src/context_arm64.zig` (x86_64 planned) |
-| Task(T) typed handle | `src/task.zig` |
-| Spsc(T, cap) channel | `src/channel.zig` |
-| Mutex/Notify/Semaphore | `src/sync.zig` |
-| kqueue reactor (Darwin) | `src/reactor_kqueue.zig` |
-| TCP listener/stream | `src/net.zig` |
-| Public surface | `src/lib.zig` |
-
-The runtime is roughly 5K lines of source (down from ~10K in
-v0.x). If you can read it, you can modify it.
+The doc tree is kept honest: every page links to specific source
+files and line numbers where the implementation lives. If a page
+diverges from `src/`, the source is authoritative — file an issue
+or send a PR. The pages are intended to read forever; the source
+is the ground truth.
