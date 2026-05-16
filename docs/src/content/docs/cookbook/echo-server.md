@@ -1,6 +1,6 @@
 ---
 title: TCP Echo Server
-description: A complete TCP echo server with one coroutine per connection and graceful Ctrl-C shutdown.
+description: A complete TCP echo server with one coroutine per connection and bounded concurrency via Semaphore.
 ---
 
 The full thing, then explanation:
@@ -10,34 +10,23 @@ const std = @import("std");
 const volt = @import("volt");
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    try volt.run(.{ .allocator = gpa.allocator() }, serve, .{});
+    var rt = try volt.Runtime.init(.{ .allocator = std.heap.smp_allocator });
+    defer rt.deinit();
+    try (try rt.run(serve, .{}));
 }
 
 fn serve() !void {
-    var listener = try volt.io.TcpListener.bind(volt.io.Address.any4(8080));
+    var listener = try volt.net.TcpListener.bind(.any4(8080));
     defer listener.close();
-    std.debug.print("echo server listening on :8080 (Ctrl+C to stop)\n", .{});
-
-    var shutdown = try volt.signal.shutdown();
-    defer shutdown.deinit();
+    std.debug.print("echo server listening on :8080\n", .{});
 
     while (true) {
-        if (shutdown.handler.read()) |_| {
-            std.debug.print("\nshutdown signal received; draining\n", .{});
-            return;
-        } else |_| {}
-
-        const conn = listener.accept() catch |err| switch (err) {
-            error.Cancelled => return,
-            else => return err,
-        };
-        _ = try volt.launch(handle, .{conn});
+        const conn = try listener.accept();
+        _ = try volt.spawn(handle, .{conn});
     }
 }
 
-fn handle(conn: volt.io.TcpStream) void {
+fn handle(conn: volt.net.TcpStream) void {
     var s = conn;
     defer s.close();
     var buf: [4096]u8 = undefined;
@@ -52,7 +41,7 @@ fn handle(conn: volt.io.TcpStream) void {
 Test it:
 
 ```sh
-zig build run-echo                            # runs from examples/echo_server.zig
+zig build run                                # runs the program
 echo "hello volt" | nc 127.0.0.1 8080         # in another terminal
 # → hello volt
 ```
@@ -62,86 +51,81 @@ echo "hello volt" | nc 127.0.0.1 8080         # in another terminal
 ### Bootstrap
 
 ```zig
-try volt.run(.{ .allocator = gpa.allocator() }, serve, .{});
+var rt = try volt.Runtime.init(.{ .allocator = std.heap.smp_allocator });
+defer rt.deinit();
+try (try rt.run(serve, .{}));
 ```
 
-One call. The runtime owns the worker pool, the reactor, the
-injection queue, and the per-task stacks. When `serve` returns
-(either normally or via error), the runtime tears down.
+Two calls. The runtime owns the worker pool, the reactor, the
+parking lot, the slab arena. The driver thread becomes M[0] when
+`rt.run` enters its dispatch loop and joins the worker pool. When
+`serve` returns (normally or via error), `rt.run` returns; the
+deferred `rt.deinit` tears everything down.
+
+The double `try` is because `rt.run(fn, args)` returns
+`!user_fn_return_type` — runtime errors on the outside, your fn's
+errors on the inside. `serve` returns `!void`, so `rt.run` returns
+`!!void`. The inner `try` strips the outer; `main` propagates the
+inner.
 
 ### Bind + listen
 
 ```zig
-var listener = try volt.io.TcpListener.bind(volt.io.Address.any4(8080));
+var listener = try volt.net.TcpListener.bind(.any4(8080));
 defer listener.close();
 ```
 
-`any4(8080)` is `0.0.0.0:8080` — listen on every interface. Use
-`loopback4(8080)` if you only want local connections, or
-`parse("192.168.1.50:8080")` for a specific interface.
+`.any4(8080)` is `0.0.0.0:8080` — listen on every interface. Use
+`.loopback4(8080)` for local-only, or `Address.parse4("192.168.1.50", 8080)`
+for a specific interface.
 
-`bind` does the full setup: non-blocking socket, `SO_REUSEADDR`,
-bind, listen with default backlog. Errors return on the spot.
-
-### Shutdown listener
-
-```zig
-var shutdown = try volt.signal.shutdown();
-defer shutdown.deinit();
-```
-
-`shutdown()` watches `SIGINT` + `SIGTERM`. The handler exposes a
-non-blocking `.read()` that returns `error.WouldBlock` when no
-signal has fired and a SignalSet when one has. We poll it at the
-top of every accept iteration.
+`bind` does the full setup: `socket()`, `setsockopt(SO_REUSEADDR)`,
+`bind()`, `listen()` with backlog=128, set `O_NONBLOCK`. Errors
+return on the spot.
 
 ### Accept loop
 
 ```zig
 while (true) {
-    if (shutdown.handler.read()) |_| return else |_| {}
-
-    const conn = listener.accept() catch |err| switch (err) {
-        error.Cancelled => return,
-        else => return err,
-    };
-    _ = try volt.launch(handle, .{conn});
+    const conn = try listener.accept();
+    _ = try volt.spawn(handle, .{conn});
 }
 ```
 
-`listener.accept()` suspends the calling coroutine on the listener
-fd. The reactor wakes it when the kernel says a connection is
-ready. We then spawn one coroutine per connection — `volt.launch`
-returns a `*Job` that we deliberately discard with `_ =`; the
-runtime will reap the coroutine on its own when it finishes.
+`listener.accept()` parks the calling coroutine on kqueue's
+`EVFILT_READ` for the listener fd. The reactor wakes it when the
+kernel says a connection is ready, and `accept` returns the new
+`TcpStream`.
 
-The `error.Cancelled` arm handles the case where the runtime is
-shutting down — the listener wait gets cancelled and `accept`
-surfaces it.
+We spawn one coroutine per connection. `volt.spawn` returns a
+`*Task(void)` (since `handle` returns void); we discard it with
+`_ =`. The Task struct leaks per connection — fine if the
+connection rate is bounded; see the "bounded concurrency"
+variant below for the fix.
 
 ### Per-connection handler
 
 ```zig
-fn handle(conn: volt.io.TcpStream) void {
+fn handle(conn: volt.net.TcpStream) void {
     var s = conn;
     defer s.close();
     var buf: [4096]u8 = undefined;
     while (true) {
         const n = s.read(&buf) catch return;
-        if (n == 0) return;                         // peer closed
+        if (n == 0) return;
         s.writeAll(buf[0..n]) catch return;
     }
 }
 ```
 
-`s.read` and `s.writeAll` both suspend on `EWOULDBLOCK`, get woken
-by the reactor when ready, retry the syscall. The handler reads
-like a synchronous program.
+`s.read` and `s.writeAll` both park on the reactor (`EVFILT_READ` /
+`EVFILT_WRITE`) when the syscall returns `EAGAIN`. Both retry the
+syscall after the wake. The handler reads as straight-line
+synchronous code.
 
-`return` on any error or peer-close exits the loop, the `defer
-s.close()` runs, and the coroutine completes. The runtime's
-`Done.subscribe` recycles its stack into the slab pool and frees
-the `Coroutine` struct.
+`return` on any error or peer-close exits the loop; the deferred
+`s.close()` runs; the coroutine completes. The runtime's `.done`
+branch frees the coroutine + stack via the per-P pools.
 
 ## Variants
 
@@ -150,81 +134,96 @@ the `Coroutine` struct.
 Use a Semaphore to bound concurrency:
 
 ```zig
-var sem = volt.sync.Semaphore.init(1000);
+fn serveBounded() !void {
+    var listener = try volt.net.TcpListener.bind(.any4(8080));
+    defer listener.close();
 
-while (true) {
-    sem.acquire(1);
-    const conn = try listener.accept();
-    _ = try volt.launch(handleWithSem, .{ conn, &sem });
+    var sem = volt.Semaphore.init(1000);
+    defer sem.deinit();
+
+    while (true) {
+        sem.acquire();                            // parks if full
+        const conn = try listener.accept();
+        _ = try volt.spawn(handleWithSem, .{ conn, &sem });
+    }
 }
 
-fn handleWithSem(conn: volt.io.TcpStream, sem: *volt.sync.Semaphore) void {
-    defer sem.release(1);
+fn handleWithSem(conn: volt.net.TcpStream, sem: *volt.Semaphore) void {
+    defer sem.release();
     handle(conn);
 }
 ```
 
 Now the server accepts at most 1000 active connections. Beyond
-that, `sem.acquire(1)` parks the accept loop until a handler
+that, `sem.acquire()` parks the accept loop until a handler
 finishes.
 
-### Drain (don't kill) on shutdown
+### Drain on shutdown via Cancel
 
-If you want active handlers to **finish their current request**
-before the program exits, wrap spawning in a `volt.scope`:
+If you want the server to stop accepting new connections but
+finish active ones, build a Cancel that fires on shutdown and
+have the accept loop close the listener:
 
 ```zig
-fn serve() !void {
-    var listener = try volt.io.TcpListener.bind(volt.io.Address.any4(8080));
+fn serveDrain() !void {
+    var rt_runtime = volt.runtime();
+
+    var c = volt.Cancel.init(rt_runtime);
+    defer c.deinit();
+
+    var listener = try volt.net.TcpListener.bind(.any4(8080));
+    // Note: defer close fires AFTER the scope below, on shutdown path
     defer listener.close();
 
-    try volt.scope(struct {
-        fn body(s: *volt.Scope) !void {
-            var shutdown = try volt.signal.shutdown();
-            defer shutdown.deinit();
-
-            while (true) {
-                if (shutdown.handler.read()) |_| return else |_| {}
-                const conn = listener.accept() catch |err| switch (err) {
-                    error.Cancelled => return,
-                    else => return err,
-                };
-                try s.spawn(handle, .{conn});
-            }
+    // Spawn a watcher that closes the listener fd on cancel.
+    // Closing the fd causes any in-flight accept() to return an
+    // error, breaking the accept loop.
+    _ = try volt.spawn(struct {
+        fn watch(cancel: *volt.Cancel, l: *volt.net.TcpListener) void {
+            // (Wait for cancel — uses a Notify wired to fire.)
+            // For brevity, sketch only:
+            // ... wait until cancel.isFired() ...
+            l.close();
         }
-    }.body);
-    // After this returns: every handler has finished.
+    }.watch, .{ &c, &listener });
+
+    // Run the accept loop until the listener errors:
+    while (true) {
+        const conn = listener.accept() catch break;
+        _ = try volt.spawn(handle, .{conn});
+    }
+
+    // Existing handlers continue running until they hit EOF / error
+    // on their own sockets.
 }
 ```
 
-The scope joins every spawned handler before returning. New
-connections aren't accepted (the loop has exited); existing ones
-finish their work.
+(Wiring `Cancel` to wake the watcher cleanly needs a `Notify` or a
+`Mpmc` since `Cancel` itself doesn't park-and-wake on demand.
+The graceful-drain recipe shows the full shape.)
 
-### Read deadlines
-
-Wrap `handle` in a per-connection timeout:
+### Reading from a specific interface
 
 ```zig
-fn handle(conn: volt.io.TcpStream) void {
-    volt.withTimeout(volt.Duration.fromSecs(60), handleInner, .{conn}) catch {};
-}
-
-fn handleInner(conn: volt.io.TcpStream) !void {
-    var s = conn;
-    defer s.close();
-    // ... blocking handler ...
-}
+const addr = try volt.net.Address.parse4("192.168.1.50", 8080);
+var listener = try volt.net.TcpListener.bind(addr);
 ```
 
-If the connection hangs idle for 60s, the timeout fires; cancel
-propagates through `s.read` (Park-cancellable through any wait
-point); `handle` exits cleanly.
+`parse4(host, port)` takes the host and port separately; returns
+`error.InvalidAddress` on a bad host string.
 
-## Source
+## What's NOT here
 
-[`examples/echo_server.zig`](https://github.com/NerdMeNot/volt/blob/main/examples/echo_server.zig) in the repo.
+- **Ctrl-C handling.** Volt's signal handler is internal
+  (SIGSEGV-only). Wire `std.posix.sigaction` directly if you need
+  graceful Ctrl-C; trigger `c.fire()` from the signal handler.
+- **Per-connection deadlines.** No `withTimeout` primitive ships
+  today; the [Timeout with Retry](/cookbook/timeout-retry/) recipe
+  shows the scope+watchdog pattern.
 
-```sh
-zig build run-echo
-```
+## See also
+
+- [Networking](/usage/networking/) — TcpListener / TcpStream / Address API.
+- [Structured Concurrency](/usage/structured-concurrency/) — Cancel + scope.
+- [Connection Pool](/cookbook/connection-pool/) — the inverse pattern.
+- [Graceful drain](/cookbook/graceful-drain/) — full drain-on-shutdown shape.

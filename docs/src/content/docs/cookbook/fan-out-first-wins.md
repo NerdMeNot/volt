@@ -1,11 +1,11 @@
 ---
 title: Fan Out, Take First Answer
-description: Race N backends, return whichever responds first, cancel the losers cleanly.
+description: Race N tasks, return whichever finishes first, fire a Cancel so the losers wake out of any blocking op cleanly.
 ---
 
 A common pattern in distributed systems: query N replicas, return
-the fastest answer, abandon the rest. Volt's `Scope` + `Oneshot`
-make this clean.
+the fastest answer, abandon the rest. Volt's `scope` + `Oneshot` +
+`Cancel` make this clean.
 
 ## The pattern
 
@@ -16,39 +16,50 @@ const volt = @import("volt");
 const Result = struct { backend: u32, value: u32 };
 
 const Ctx = struct {
-    winner: *volt.channel.Oneshot(Result),
+    winner: *volt.Oneshot(Result),
+    cancel: *volt.Cancel,
 };
 
 fn backend(ctx: *Ctx, id: u32, latency_ms: u32) void {
-    volt.sleep(volt.Duration.fromMillis(latency_ms)) catch return;
+    // Parking on sleep is *not* cancel-aware today, so we do a
+    // best-effort check before and after. A future cancel-aware
+    // sleep variant would make this trivial.
+    if (ctx.cancel.isFired()) return;
+    volt.sleep(@as(u64, latency_ms) * std.time.ns_per_ms);
+    if (ctx.cancel.isFired()) return;
     _ = ctx.winner.send(.{ .backend = id, .value = id * 100 }) catch {};
 }
 
-fn race(scope: *volt.Scope) !void {
-    const ctx = race_ctx.?;
-    try scope.spawn(backend, .{ ctx, @as(u32, 1), @as(u32, 80)  });
-    try scope.spawn(backend, .{ ctx, @as(u32, 2), @as(u32, 30)  });
-    try scope.spawn(backend, .{ ctx, @as(u32, 3), @as(u32, 120) });
-
-    const winner = try ctx.winner.recv();
-    std.debug.print("winner: backend {d} → {d}\n", .{ winner.backend, winner.value });
-    ctx.winner.close();
-}
-
-threadlocal var race_ctx: ?*Ctx = null;
-
 fn root() !void {
-    var os = volt.channel.Oneshot(Result){};
-    var ctx = Ctx{ .winner = &os };
-    race_ctx = &ctx;
-    defer race_ctx = null;
-    try volt.scope(race);
+    var os: volt.Oneshot(Result) = .{};
+
+    try volt.scope(struct {
+        fn body(c: *volt.Cancel) anyerror!void {
+            var ctx = Ctx{ .winner = &os, .cancel = c };
+
+            const t1 = try volt.spawn(backend, .{ &ctx, @as(u32, 1), @as(u32, 80)  });
+            const t2 = try volt.spawn(backend, .{ &ctx, @as(u32, 2), @as(u32, 30)  });
+            const t3 = try volt.spawn(backend, .{ &ctx, @as(u32, 3), @as(u32, 120) });
+
+            const winner = try os.recv();
+            std.debug.print("winner: backend {d} -> {d}\n", .{
+                winner.backend, winner.value,
+            });
+
+            // Cancel the rest, then join.
+            c.fire();
+            os.close();
+            t1.join();
+            t2.join();
+            t3.join();
+        }
+    }.body);
 }
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    try volt.run(.{ .allocator = gpa.allocator() }, root, .{});
+    var rt = try volt.Runtime.init(.{ .allocator = std.heap.smp_allocator });
+    defer rt.deinit();
+    try (try rt.run(root, .{}));
 }
 ```
 
@@ -56,60 +67,41 @@ pub fn main() !void {
 
 **The Oneshot is the race resolver.** All three backends call
 `ctx.winner.send`. The first call wins; the second and third get
-`error.Closed` and silently discard. So whichever backend finishes
-first is the only one whose value lands in the Oneshot.
+`error.Closed` (swallowed by the `catch {}`). So whichever backend
+finishes first is the only one whose value lands in the Oneshot.
 
-**The scope owns lifetime.** When `race` returns, `volt.scope`
-joins the remaining backends. They're either parked on
-`volt.sleep` (if they hadn't woken yet) or finished their `send`
-call (if they raced and lost). Either way, the scope cleans them
-up — Park is cancellable, so `volt.sleep` surfaces
-`error.Cancelled` when the scope cancels them.
+**The Cancel is the loser-cleanup signal.** When the winner has
+been received, the body calls `c.fire()`. Any cancel-aware
+blocking op on a backend coroutine would wake with
+`error.Cancelled`. The `isFired()` checkpoint in `backend` handles
+the case where the sleep hasn't fired yet — backends bail without
+trying to `send`.
 
-**`ctx.winner.close()` after winning** wakes any backend that's
-still blocked trying to send (none here, but the close is good
-hygiene; with a buffered channel the close would matter for
-preventing waste).
+**The scope owns lifetime.** When `body` returns OK, the spawned
+Tasks have all been joined; when `body` errors, `scope` fires the
+Cancel before propagating. Either way, no leaked coroutines.
 
-## Threadlocal? Really?
-
-The example uses `threadlocal var race_ctx: ?*Ctx = null` to give
-the scope-body access to the context without changing its
-signature. That's a workaround for Zig's lack of closures —
-`volt.scope(body)` takes a function, not a closure, so the body
-can't capture surrounding scope.
-
-In production code you'd thread the context through more cleanly:
-
-```zig
-fn race(scope: *volt.Scope, ctx: *Ctx) !void {
-    try scope.spawn(backend, .{ ctx, ... });
-    // ...
-}
-
-// And use a wrapper:
-try volt.scope(struct {
-    fn body(s: *volt.Scope) !void {
-        try race(s, &ctx);
-    }
-}.body);
-```
-
-The threadlocal version is fine for examples; the explicit-arg
-version is fine for real code.
+**Joining each Task** is necessary because `volt.spawn` returns
+`*Task(T)` which you're responsible for freeing via `join`. The
+joins here happen after `c.fire()` so they're effectively waiting
+for clean shutdown of the losers.
 
 ## Variant: race a real network call
 
 Replace `volt.sleep` with an actual call:
 
 ```zig
-fn fetchFromBackend(ctx: *Ctx, id: u32, addr: volt.io.Address) void {
-    const stream = volt.io.TcpStream.connect(addr) catch return;
+fn fetchFromBackend(ctx: *Ctx, id: u32, addr: volt.net.Address) void {
+    if (ctx.cancel.isFired()) return;
+    const stream = volt.net.TcpStream.connect(addr) catch return;
     defer { var s = stream; s.close(); }
 
-    var buf: [4096]u8 = undefined;
+    if (ctx.cancel.isFired()) return;
     var s = stream;
     s.writeAll("GET / HTTP/1.0\r\n\r\n") catch return;
+
+    if (ctx.cancel.isFired()) return;
+    var buf: [4096]u8 = undefined;
     const n = s.read(&buf) catch return;
 
     _ = ctx.winner.send(.{
@@ -119,43 +111,46 @@ fn fetchFromBackend(ctx: *Ctx, id: u32, addr: volt.io.Address) void {
 }
 ```
 
-Same shape. `connect` / `writeAll` / `read` all suspend on the
-reactor; cancelling them on scope-exit unblocks them with
-`error.Cancelled` and the function returns.
+Same shape. `connect` / `writeAll` / `read` all park on the
+reactor; closing the TcpStream from the body coroutine would break
+them out (the reactor fault path returns an error). A first-class
+cancel-aware I/O variant would make the `isFired()` checks
+unnecessary.
 
-## Variant: take the first N answers, not just one
+## Variant: take the first N answers
 
-Use a `Channel(T)` instead of a `Oneshot(T)`, and read N times
+Use a `Mpmc(T, cap)` instead of a `Oneshot(T)`, and read N times
 before closing:
 
 ```zig
-fn race(scope: *volt.Scope) !void {
-    var ch = try volt.channel.Channel(Result).init(allocator, 8);
-    defer ch.deinit();
+fn raceN(n_winners: usize) !void {
+    try volt.scope(struct {
+        fn body(c: *volt.Cancel) anyerror!void {
+            var ch = volt.Mpmc(Result, 8).init();
+            defer ch.deinit();
 
-    try scope.spawn(backend, .{ ... });
-    try scope.spawn(backend, .{ ... });
-    try scope.spawn(backend, .{ ... });
-    try scope.spawn(backend, .{ ... });
-    try scope.spawn(backend, .{ ... });
+            const t1 = try volt.spawn(backendCh, .{ &ch, c, @as(u32, 1) });
+            // ... t2, t3, t4, t5 ...
 
-    var got: u32 = 0;
-    while (got < 3) {
-        const r = try ch.recv();
-        std.debug.print("answer {d}: backend {d}\n", .{ got, r.backend });
-        got += 1;
-    }
-    ch.close();   // wakes remaining backends still blocked on send
+            var got: usize = 0;
+            while (got < n_winners) : (got += 1) {
+                const r = try ch.recv();
+                std.debug.print("answer {d}: backend {d}\n", .{ got, r.backend });
+            }
+
+            c.fire();
+            ch.close();
+            _ = t1.join();
+            // ... join the rest ...
+        }
+    }.body);
 }
 ```
 
-We accept 3 of 5 answers and let the other 2 see `error.Closed` on
-their `send` call. Scope joins all 5.
+We accept N of M answers and fire the Cancel for the others.
 
-## Source
+## See also
 
-[`examples/fan_out.zig`](https://github.com/NerdMeNot/volt/blob/main/examples/fan_out.zig) in the repo.
-
-```sh
-zig build run-fan-out
-```
+- [Structured Concurrency](/usage/structured-concurrency/) — Cancel + scope semantics.
+- [Channels](/usage/channels/) — Oneshot and Mpmc.
+- [Connection Pool](/cookbook/connection-pool/) — when "first wins" is for connection acquisition.
