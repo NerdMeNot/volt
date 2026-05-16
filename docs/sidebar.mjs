@@ -87,8 +87,10 @@ export default [
 		label: 'Performance',
 		items: [
 			{ label: 'Overview', slug: 'performance' },
+			{ label: 'Benchmarks', slug: 'performance/benchmarks' },
 			{ label: 'Multi-worker profile', slug: 'performance/multi-worker-profile' },
 			{ label: 'Phase 4 postmortem', slug: 'performance/phase-4-postmortem' },
+			{ label: 'Slab arena postmortem', slug: 'performance/slab-arena-postmortem' },
 		],
 	},
 	{
@@ -104,6 +106,9 @@ export default [
 		items: [
 			{ label: 'Overview', slug: 'appendix' },
 			{ label: 'Roadmap', slug: 'appendix/roadmap' },
+			{ label: 'Tokio + Go comparison', slug: 'appendix/tokio-go-comparison' },
+			{ label: 'Zig 0.16 notes', slug: 'appendix/zig-016-notes' },
+			{ label: 'Contributing', slug: 'appendix/contributing' },
 		],
 	},
 ];
