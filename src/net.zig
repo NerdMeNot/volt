@@ -5,6 +5,7 @@
 //! synchronous; suspend points are transparent.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const reactor_mod = @import("reactor.zig");
 const runtime = @import("runtime.zig");
@@ -13,9 +14,37 @@ const current = @import("current.zig");
 const AF_INET: c_int = 2;
 const SOCK_STREAM: c_int = 1;
 const IPPROTO_TCP: c_int = 6;
-const SOL_SOCKET: c_int = 0xFFFF; // Darwin
-const SO_REUSEADDR: c_int = 0x0004;
-const EINPROGRESS_DARWIN: c_int = 36;
+
+// Platform-specific socket constants. Darwin and Linux disagree on
+// SOL_SOCKET / EINPROGRESS / EAGAIN values; the switches resolve at
+// comptime so each target sees one canonical value.
+const SOL_SOCKET: c_int = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos => 0xFFFF,
+    .linux, .freebsd, .openbsd, .netbsd, .dragonfly => 1,
+    .windows => 0xFFFF, // WinSock SOL_SOCKET
+    else => @compileError("SOL_SOCKET not defined for this OS"),
+};
+const SO_REUSEADDR: c_int = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos => 0x0004,
+    .linux => 2,
+    .freebsd, .openbsd, .netbsd, .dragonfly => 0x0004,
+    .windows => 0x0004,
+    else => @compileError("SO_REUSEADDR not defined for this OS"),
+};
+const EINPROGRESS: c_int = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos => 36,
+    .linux => 115,
+    .freebsd, .openbsd, .netbsd, .dragonfly => 36,
+    .windows => 10036, // WSAEINPROGRESS
+    else => @compileError("EINPROGRESS not defined for this OS"),
+};
+const EAGAIN: c_int = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos => 35,
+    .linux => 11,
+    .freebsd, .openbsd, .netbsd, .dragonfly => 35,
+    .windows => 10035, // WSAEWOULDBLOCK
+    else => @compileError("EAGAIN not defined for this OS"),
+};
 
 const sockaddr_in = extern struct {
     len: u8 = @sizeOf(sockaddr_in),
@@ -147,7 +176,7 @@ pub const TcpListener = struct {
                 try reactor_mod.setNonblock(@intCast(new_fd));
                 return .{ .fd = @intCast(new_fd) };
             }
-            if (!isAgain(errnoVal())) return error.AcceptFailed;
+            if (errnoVal() != EAGAIN) return error.AcceptFailed;
             rt.reactor.waitReadable(self.fd);
         }
     }
@@ -165,7 +194,7 @@ pub const TcpStream = struct {
         const sa = addr.toSockaddr();
         if (c_connect(fd, &sa, @sizeOf(sockaddr_in)) < 0) {
             const e = errnoVal();
-            if (e != EINPROGRESS_DARWIN) return error.ConnectFailed;
+            if (e != EINPROGRESS) return error.ConnectFailed;
             // Wait for writable = connect completed.
             const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
             rt.reactor.waitWritable(fd);
@@ -198,11 +227,9 @@ pub const TcpStream = struct {
     }
 };
 
-const EAGAIN_DARWIN: c_int = 35;
-const EAGAIN_LINUX: c_int = 11;
-inline fn isAgain(e: c_int) bool {
-    return e == EAGAIN_DARWIN or e == EAGAIN_LINUX;
-}
+// Note: the `EAGAIN` constant is defined at the top of this file
+// via a `builtin.os.tag` switch. `isAgain` is no longer needed —
+// callers compare against the platform-specific `EAGAIN` directly.
 
 // ─────────────────────────────────────────────────────────────────────
 // Tests
