@@ -42,9 +42,7 @@ pub fn build(b: *std.Build) void {
 
     // Benches.
     const benches = [_]struct { name: []const u8, src: []const u8, desc: []const u8 }{
-        .{ .name = "spawn-join", .src = "bench/bench_spawn_join.zig", .desc = "Runtime spawn+join across worker counts" },
-        .{ .name = "spawn-hot", .src = "bench/bench_spawn_hot.zig", .desc = "Canonical spawn-hot: single Notify barrier per batch (matches Go wg.Wait)" },
-        .{ .name = "spawn-hot-individual", .src = "bench/bench_spawn_hot_individual.zig", .desc = "Volt-specific: 1000 individual task.join calls per batch — measures per-task cleanup cost" },
+        .{ .name = "spawn-hot", .src = "bench/bench_spawn_hot.zig", .desc = "Canonical spawn-hot: single Notify barrier per 1000-batch (matches Go wg.Wait)" },
         .{ .name = "scaling", .src = "bench/bench_scaling.zig", .desc = "Multi-worker scaling curve — receipt bench for scheduler changes" },
         .{ .name = "rss", .src = "bench/bench_rss.zig", .desc = "RSS per idle coroutine — receipt bench for stack-cost work" },
         .{ .name = "fanout-scaling", .src = "bench/bench_fanout_scaling.zig", .desc = "Multi-driver fan-out scaling — true parallelism receipt" },

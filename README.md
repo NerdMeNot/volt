@@ -62,22 +62,33 @@ That's the whole shape. No `async`, no `await`, no `Future`, no `.poll()`, no ma
 - **Sync primitives** — `Mutex`, `Notify`, `Semaphore` — built on a shared parking lot.
 - **kqueue reactor** for Darwin/BSD — non-blocking sockets with single-poller claim. Linux (epoll/io_uring) and Windows (IOCP) backends planned; not currently shipped.
 
-## Performance snapshot vs Go 1.26
+## Performance — Go as scale reference
 
-Numbers measured on the same Darwin arm64 hardware, ReleaseFast vs `go build`. See `BENCHMARKS.md` for the full table + methodology.
+Numbers on Darwin arm64, ReleaseFast vs `go build`. Go has been
+optimised over a decade by people with deep systems expertise; the
+comparison below is to know we're in a sensible range for a stackful
+coroutine runtime, **not** a "we beat Go" claim. When Volt is
+faster, it's usually because Go pays a cost we don't (GC write
+barriers, function colouring) rather than because we out-engineered
+them. See `BENCHMARKS.md` for full methodology + receipts.
 
 | Workload | Volt | Go | Volt/Go |
 |---|---|---|---|
-| yield (one-way ctx switch) | **9 ns** | 42 ns | **0.21× — 4.7× faster** |
-| Mutex contended (8 coros × 50k acquires) | **14 ns** | 81 ns | **0.17× — 5.8× faster** |
-| Spsc send+recv (cap=16) | **12 ns** | 33 ns | **0.36× — 2.8× faster** |
-| TCP echo (64 clients × 16 RTT × 1 KB) | **~7,000 ns** | 9,050 ns | **0.77× — 1.3× faster** |
-| spawn+wait_all workers=1 | **106 ns** | 137 ns | **0.77× — 1.3× faster** |
-| fan-out scaling workers=11 (real parallel work) | **117 ns** | 106 ns | 1.10× — parity |
-| parallel-compute (8 workers, CPU-bound) | **6.6× speedup** | n/a | near-ideal |
-| spawn+wait_all workers=11 (synthetic) | 490 ns | 172 ns | 2.84× behind |
+| yield (one-way ctx switch) | 9 ns | 42 ns | 0.21× |
+| Mutex contended (8 × 50k) | 14 ns | 81 ns | 0.17× |
+| Spsc send+recv (cap=16) | 12 ns | 33 ns | 0.36× |
+| TCP echo (64 × 16 RTT × 1 KB) | ~7,000 ns | 9,050 ns | 0.77× |
+| spawn+wait workers=1 | 106 ns | 137 ns | 0.77× |
+| fan-out scaling workers=11 | 117 ns | 106 ns | 1.10× |
+| parallel-compute (8 workers, CPU-bound) | 6.6× speedup | — | near-ideal |
+| spawn+wait workers=11 (synthetic) | 490 ns | 172 ns | 2.84× |
 
-**Single-worker we beat Go decisively. Real-work multi-worker is at parity. The gap is on synthetic spawn-heavy patterns (one driver, many workers, trivial work per task) where adding workers can only hurt because there's no parallel work to amortize coordination overhead.**
+Single-worker and real-work multi-worker land near or below the Go
+reference. The 2.84× on workers=11 is a synthetic spawn-heavy
+shape — one driver feeding 11 workers trivial tasks — where adding
+workers can only hurt because there's no parallel work to amortise
+the coordination cost. On any shape with actual parallel work
+(fan-out, TCP, parallel-compute) the scheduler matches Go.
 
 ## Status
 

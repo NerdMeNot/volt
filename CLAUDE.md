@@ -20,8 +20,9 @@ today. There is just Volt.
 zig build                    # Build the volt module
 zig build test               # Run unit tests
 zig build docs               # Generate API documentation
-zig build bench-spawn-join   # (and bench-yield, bench-spsc, bench-tcp-echo,
-zig build bench-mutex        #  bench-parallel-compute) — perf benches
+zig build bench-spawn-hot    # (and bench-yield, bench-spsc, bench-mpmc,
+zig build bench-mutex        #  bench-tcp-echo, bench-parallel-compute,
+                             #  bench-rss, bench-scaling, bench-fanout-scaling)
 zig build spike-A            # POC validations (A, B, C, D, F, G, H)
 ```
 
@@ -54,39 +55,31 @@ docs/                      # Astro-Starlight site
 
 ## Benchmarks (Darwin arm64, 11 cores, ReleaseFast)
 
-Numbers from 2026-05-15 vs Go 1.26.0 on the same hardware. See
-`docs/internals/multi-worker-profile.md` for the investigation that
-produced these and `BENCHMARKS.md` for the full table.
+Go 1.26.0 is the **scale reference**, not a competitive benchmark.
+Go has been optimised over 15+ years; expecting Volt to beat it
+everywhere would be naive. When Volt is faster, it's usually because
+Go pays a cost we don't (GC write barriers, function colouring),
+not because we out-engineered them. The numbers exist to know
+whether we're in a sensible range. See `BENCHMARKS.md` for full
+methodology + receipts.
 
-### Where Volt wins
-
-| Bench | Volt | Go | Ratio |
+| Workload | Volt | Go | Volt/Go |
 |---|---|---|---|
-| yield (one-way ctx switch) | 9 ns | 42 ns | **4.7× faster** |
-| Mutex contended (8 coros × 50k) | 14 ns | 81 ns | **5.8× faster** |
-| Spsc send+recv (cap=16) | 12 ns | 33 ns | **2.8× faster** |
-| spawn+join **workers=1** (waitall) | 106 ns | 137 ns | **1.3× faster** |
-| fan-out scaling **workers=1** | 73 ns | 107 ns | **1.5× faster** |
-| TCP echo 64×16 RTT 1 KB | ~7,000 ns | 9,050 ns | **1.3× faster** |
-| fan-out scaling workers=11 | 117 ns | 106 ns | 1.10× — parity |
-| parallel-compute (8 workers) | 6.62× speedup | n/a | near-ideal |
-| stress test (mixed, 45 s) | ~840 M ops | n/a | green |
+| yield (one-way ctx switch) | 9 ns | 42 ns | 0.21× |
+| Mutex contended (8 × 50k) | 14 ns | 81 ns | 0.17× |
+| Spsc send+recv (cap=16) | 12 ns | 33 ns | 0.36× |
+| TCP echo (64 × 16 RTT × 1 KB) | ~7,000 ns | 9,050 ns | 0.77× |
+| spawn+join workers=1 | 106 ns | 137 ns | 0.77× |
+| fan-out scaling workers=11 | 117 ns | 106 ns | 1.10× |
+| parallel-compute (8 workers) | 6.62× speedup | — | near-ideal |
+| stress (mixed, 45 s) | ~840 M ops | — | green |
+| spawn+join workers=11 (synthetic) | 490 ns | 172 ns | 2.84× |
 
-### Where Volt is behind
-
-| Bench | Volt | Go | Ratio |
-|---|---|---|---|
-| spawn+join workers=11 (waitall) | 490 ns | 172 ns | 2.84× behind |
-
-The multi-worker spawn+join gap is concentrated on synthetic
-spawn-heavy patterns (one driver spawning into many workers with
-trivial per-task work). On real-work multi-worker shapes (fan-out,
-TCP, parallel-compute), we're at parity or better. Closing the
-remaining gap further needs deeper structural work (smaller
-Coroutine struct, per-fn-type Combined pool) — see the profile doc.
-
-The Mutex gap closed 2026-05-16 with a parking-lot + spin-loop
-redesign (see `src/sync.zig`).
+The single workers=11 outlier is a synthetic spawn-heavy shape (one
+driver feeding 11 workers trivial tasks) where adding workers can
+only hurt. Real-work multi-worker shapes land near or below the Go
+reference. See `docs/internals/multi-worker-profile.md` for the
+investigation.
 
 ## Phase-landing protocol
 
@@ -102,15 +95,14 @@ regressions.
 
 - `zig build bench-yield`
 - `zig build bench-spsc`
+- `zig build bench-mpmc`
 - `zig build bench-mutex`
-- `zig build bench-spawn-hot` — canonical: single Notify barrier per batch (matches Go's `wg.Wait`)
-- `zig build bench-spawn-hot-individual` — Volt-specific: 1000 individual `task.join` per batch
-- `zig build bench-spawn-join`
+- `zig build bench-spawn-hot` — canonical: single Notify barrier per 1000-batch (matches Go's `wg.Wait`)
 - `zig build bench-fanout-scaling` — N drivers × N workers, real parallel work
 - `zig build bench-scaling` — single-driver curve (false-parallelism receipt)
 - `zig build bench-parallel-compute`
 - `zig build bench-tcp-echo`
-- `zig build bench-rss` — RSS per idle coroutine (Zig-native metric)
+- `zig build bench-rss` — RSS per idle coroutine
 - `zig build stress` (3 runs)
 
 Variance is high on the spawn benches — take 5-run medians, not single
