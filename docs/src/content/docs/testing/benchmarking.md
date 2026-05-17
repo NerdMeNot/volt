@@ -122,10 +122,23 @@ Target: 6.6×+ at 8 workers on an 11-core host. Near-ideal.
 
 64 clients × 16 RTT × 1 KB. End-to-end TCP echo, both client
 and server running on the same Runtime. Routes through the
-kqueue reactor for every read/write.
+reactor for every read/write.
 
 ~8,500 ns/RTT (Volt) vs ~9,050 ns/RTT (Go). Both runtimes pay
 the OS networking syscall cost; gap is small.
+
+### `bench-reactor-throughput`
+
+Single connection, 1-byte payload, one worker, tight ping-pong.
+The register / park / kernel-deliver / unpark / dispatch cycle
+dominates (no payload-copy or concurrency masking). Useful as a
+"did the backend pull its weight" cross-platform receipt — kqueue
+/ epoll / io_uring / IOCP numbers should track within ~2× of each
+other on similarly-clocked hardware; outliers point at a backend
+bug.
+
+~10 µs/wake on Darwin arm64. Linux / Windows baselines added as
+those platforms get real CI runs.
 
 ### `bench-rss`
 

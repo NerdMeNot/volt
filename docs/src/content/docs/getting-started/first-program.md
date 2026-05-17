@@ -41,9 +41,10 @@ This single call:
 2. **Spawns `getCpuCount() - 1` worker threads**, each with its own
    work-stealing deque, mailbox, and parker. The thread you're on
    (the one running `main`) becomes worker `M[0]` when `run` enters.
-3. **Initialises the kqueue reactor**, the sharded parking lot, the
-   per-worker coroutine pool. Installs the SIGSEGV handler that
-   grows stacks on demand.
+3. **Initialises the reactor** (kqueue / epoll / io_uring / IOCP,
+   picked at comptime), the sharded parking lot, the per-worker
+   coroutine pool. Installs the SIGSEGV handler that grows stacks
+   on demand.
 
 Default config is reasonable for most apps. `Config` only requires
 `allocator`; `workers` defaults to `NumCPU`, `max_concurrent_stacks`
@@ -76,8 +77,10 @@ volt.sleep(50 * std.time.ns_per_ms);
 
 `sleep` does not block the worker thread. It:
 
-1. Registers an `EVFILT_TIMER` event with the kqueue reactor, with
-   the current coroutine as `udata`.
+1. Registers a timer with the reactor (`EVFILT_TIMER` on Darwin
+   kqueue, `timerfd` on epoll, `IORING_OP_TIMEOUT` on io_uring,
+   `CreateThreadpoolTimer` on Windows IOCP) with the current
+   coroutine as the wake identity.
 2. Marks the coroutine `pending = .park` and calls `context.swap`
    back to the worker's dispatch loop. The worker can now run
    something else; the coroutine's stack is paused, registers saved.

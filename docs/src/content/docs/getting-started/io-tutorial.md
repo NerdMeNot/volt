@@ -120,10 +120,14 @@ and only the active top page is committed (16 KiB RSS each).
 ```
 
 One worker at a time claims "reactor poller" via a single CAS; it
-polls `kevent`, dispatches woken coroutines back to a worker
-queue, then releases the claim. The other workers do regular
-work-stealing in parallel. See [The kqueue reactor](/architecture/)
-for the design.
+calls the backend's harvest syscall (`kevent` on Darwin, `epoll_wait`
+on Linux epoll, `io_uring_enter` on io_uring,
+`GetQueuedCompletionStatusEx` on Windows IOCP), dispatches woken
+coroutines back to a worker queue, then releases the claim. The
+other workers do regular work-stealing in parallel. See
+[The reactor](/architecture/reactor/) for the design and
+[its backends](/architecture/reactor-backends/) for what each
+platform actually does.
 
 ## Cancellation across I/O
 

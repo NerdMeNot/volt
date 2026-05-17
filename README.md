@@ -49,7 +49,7 @@ fn echoOne(conn: volt.net.TcpStream) void {
 }
 ```
 
-That's the whole shape. No `async`, no `await`, no `Future`, no `.poll()`, no manual state machines. The `s.read(&buf)` call suspends the coroutine when the socket isn't ready and resumes it when the kqueue/epoll reactor delivers readiness — possibly on a different worker thread.
+That's the whole shape. No `async`, no `await`, no `Future`, no `.poll()`, no manual state machines. The `s.read(&buf)` call suspends the coroutine when the socket isn't ready and resumes it when the reactor (kqueue / epoll / io_uring / IOCP, depending on platform) delivers readiness — possibly on a different worker thread.
 
 ## What's in the box (currently)
 
@@ -60,7 +60,7 @@ That's the whole shape. No `async`, no `await`, no `Future`, no `.poll()`, no ma
 - **Channels** comptime-specialized at the call site — `Spsc(T, cap)` (single-producer/single-consumer), `Mpmc(T, cap)` (Vyukov bounded ring), `Oneshot(T)` (1:1 handoff), `Watch(T)` (1:N latest-value, seqlock), `Broadcast(T, cap)` (1:N history-aware). All block via the parking lot.
 - **Sync primitives** — `Mutex`, `Notify`, `Semaphore` — built on a shared parking lot.
 - **Cancellation** — `volt.Cancel` carries an atomic flag + waiter list. Cancel-aware variants (`Mutex.lockCancel`, `Spsc.recvCancel`, etc.) wake with `error.Cancelled` when fired. `volt.scope` ties Cancel lifetime to a lexical block.
-- **kqueue reactor** for Darwin/BSD — non-blocking sockets with single-poller claim. Linux (epoll/io_uring) and Windows (IOCP) backends planned; not currently shipped.
+- **Reactor with four backend implementations** behind one interface — kqueue (Darwin/BSD), epoll (Linux), io_uring (Linux ≥ 5.10, poll mode), IOCP (Windows, polyfilled as readiness via zero-byte `WSARecv`/`WSASend`). Single-poller claim, one-shot registrations, `*Coroutine` as the wake identity. Darwin is the primary dev platform; Linux backends cross-compile and run their unit tests; Windows cross-compiles, runtime validation pending.
 
 ## Performance — Go as scale reference
 
@@ -96,15 +96,17 @@ the coordination cost. On any shape with actual parallel work
 
 | | Status |
 |---|---|
-| Darwin arm64 kqueue | **Working** — primary dev platform |
-| Linux x86_64 / arm64 | Not yet — epoll backend planned |
-| Windows | Not yet — IOCP backend planned |
+| Darwin arm64 kqueue | **Working** — primary dev platform; full bench suite + 45 s stress green |
+| Linux arm64 epoll | **Working** — cross-compile + epoll-specific tests green; runtime CI pass pending |
+| Linux arm64 io_uring (poll mode) | **Working** — `Runtime.Config.io_backend = .io_uring`, kernel ≥ 5.10 |
+| Windows arm64 IOCP (readiness polyfill) | **Cross-compiles cleanly** — implementation via zero-byte `WSARecv`/`WSASend`; runtime validation deferred to a Windows VM/CI pass |
+| x86_64 (Linux + Windows) | **Cross-compile only** — needs an x86_64 context switch (#149); ARM64 ctx switch is the only one shipping today |
 | Cancellation | **Shipping** — `Cancel`, cancel-aware variants of every blocking op, `scope` for lexical lifetime |
 | File I/O / DNS / TLS | Not yet — these belong in libraries on top of Volt, not in core |
 | Mutex throughput | Parking-lot + spin loop redesign on 2026-05-16 — contended-Mutex bench now 15 ns/op, ~5.4× faster than Go's 81 ns |
 | Stack allocation | Slab-arena redesign on 2026-05-16 — one `mmap` at runtime init, lazy per-slot `mprotect`, per-P pool with fair-share cap overflows to arena. Removed the VM-lock cliff that the prior pool-of-64 design hit at BATCH > 64. |
 
-The honest case for using Volt today: you want a stackful coroutine substrate for Zig on Darwin arm64, you want the synchronous-shape ergonomics, you can live with the multi-worker spawn-heavy gap to Go, and you can wait for the Linux/Windows backends.
+The honest case for using Volt today: you want a stackful coroutine substrate for Zig on ARM64, you want the synchronous-shape ergonomics, you can live with the multi-worker spawn-heavy gap to Go, and you're OK being an early user on Linux (epoll + io_uring backends are written but not yet CI-validated) or willing to wait on Windows (cross-compiles cleanly; runtime validation pass pending).
 
 ## Install
 
@@ -167,7 +169,7 @@ var ch = volt.Spsc(u32, 16){};
 try ch.send(7);
 const v = try ch.recv();
 
-// Networking (TCP only, kqueue/Darwin).
+// Networking — TCP across kqueue / epoll / io_uring / IOCP.
 var listener = try volt.net.TcpListener.bind(.any4(8080));
 const conn = try listener.accept();
 const n = try conn.read(&buf);
@@ -183,10 +185,11 @@ zig build              # build the volt module
 zig build test         # run the unit test suite (30+ tests, leak-detecting)
 zig build stress       # 45 s mixed-primitive stress test
 zig build bench-rss    # per-coro RSS
-zig build bench-spawn-hot       # canonical multi-worker (Go-shaped)
-zig build bench-fanout-scaling  # multi-driver real-parallelism scaling
+zig build bench-spawn-hot          # canonical multi-worker (Go-shaped)
+zig build bench-fanout-scaling     # multi-driver real-parallelism scaling
 zig build bench-mutex
 zig build bench-tcp-echo
+zig build bench-reactor-throughput # tight register/wake loop — cross-platform receipt
 # ...see build.zig for the full list
 ```
 

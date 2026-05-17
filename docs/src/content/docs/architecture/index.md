@@ -20,7 +20,10 @@ reading" footer pointing at adjacent topics.
                               │  ms: []M       (OS threads) │
                               │  ps: []P       (per-worker  │
                               │                 sched state)│
-                              │  reactor       (kqueue)     │
+                              │  reactor       (kqueue /    │
+       │                 epoll /     │
+       │                 io_uring /  │
+       │                 IOCP)       │
                               │  parking_lot   (sharded     │
                               │                 wait/wake)  │
                               │  stack_arena   (slab,       │
@@ -114,17 +117,22 @@ that bedevils ad-hoc wait/wake implementations.
 
 [Read more →](/architecture/parking-lot/)
 
-### 4. The kqueue reactor
+### 4. The reactor
 
 I/O ops and timers park on the reactor instead of the parking lot.
-One kqueue per Runtime. Single-poller-claim: one M at a time CASes
-the "I'm polling" flag, calls `kevent`, and unparks coroutines back
-to worker queues. The other workers run regular work in parallel.
+One reactor per Runtime. Single-poller-claim: one M at a time CASes
+the "I'm polling" flag, calls the backend's harvest syscall, and
+unparks coroutines back to worker queues. The other workers run
+regular work in parallel.
 
-Events register with `EV_ONESHOT` and `udata = *Coroutine` — when
-the kernel delivers, we know exactly which coroutine to wake.
+Registrations are one-shot and carry the coroutine pointer as
+their wake identity — when the kernel delivers the event, we know
+exactly which coroutine to wake. Four backends front the same
+interface: kqueue (Darwin/BSD), epoll and io_uring (Linux),
+IOCP (Windows, polyfilled as readiness via zero-byte WSARecv).
 
-[Read more →](/architecture/reactor/)
+[Read more →](/architecture/reactor/) — and
+[the per-platform deep-dive](/architecture/reactor-backends/).
 
 ### 5. The slab arena
 
@@ -205,7 +213,7 @@ lot.
 **If you want memory + correctness:**
 7. [The slab arena](/architecture/slab-arena/) — stack allocation without VM-lock cliffs.
 8. [Stack growth on demand](/architecture/stack-growth/) — guard pages + SIGSEGV.
-9. [The kqueue reactor](/architecture/reactor/) — non-blocking I/O.
+9. [The reactor](/architecture/reactor/) and [its backends](/architecture/reactor-backends/) — non-blocking I/O on kqueue / epoll / io_uring / IOCP.
 10. [The context switch](/architecture/context-switch/) — AAPCS64 wide-save asm.
 11. [Memory model](/architecture/memory-model/) — atomic orderings per region.
 

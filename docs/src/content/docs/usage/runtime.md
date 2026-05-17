@@ -72,7 +72,9 @@ var rt = try volt.Runtime.init(.{ .allocator = a });
 In order:
 
 1. Allocates `n_workers` `M` structs and `n_workers` `P` structs.
-2. Initialises the kqueue reactor (one fd per Runtime).
+2. Initialises the reactor (one per Runtime; backend is platform-
+    selected at comptime — kqueue on Darwin, epoll or io_uring on
+    Linux, IOCP on Windows).
 3. Initialises the sharded parking lot (16 buckets, each with its
     own pthread mutex + waiter list).
 4. Constructs the slab arena: `mmap` of
@@ -88,8 +90,8 @@ In order:
 
 Failure modes: `error.OutOfMemory` (allocator), `error.MmapFailed`
 (arena), `error.TooManyWorkers` (workers > MAX_WORKERS = 64),
-`error.ReactorInitFailed` (kqueue), `error.SystemResources` (pthread
-spawn).
+`error.ReactorInitFailed` (per-platform: kqueue / epoll / io_uring /
+IOCP), `error.SystemResources` (pthread spawn).
 
 ### `Runtime.run(user_fn, args)`
 

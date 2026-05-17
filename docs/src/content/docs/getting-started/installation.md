@@ -7,11 +7,16 @@ description: Add Volt to your Zig project and verify the install with a one-line
 
 - **Zig 0.16.0.** Volt pins to one Zig minor per release; the version
   is part of the tag (`vX.Y.Z-zigA.B.C`).
-- **Darwin arm64.** Today this is the only platform with a working
-  reactor (kqueue). Linux (epoll / io_uring) and Windows (IOCP) are
-  cross-compile-clean but not runtime-ready — see [Roadmap](/appendix/roadmap/).
-- **libc.** Volt uses `mmap` / `mprotect` / `kqueue` / `__ulock_wait`
-  via `@extern`; the build helper links libc automatically.
+- **ARM64.** The context switch is ARM64-only today (x86_64 is
+  cross-compile-clean but tracked by #149). Within ARM64: Darwin
+  (kqueue) is the primary dev platform with the full bench suite
+  green; Linux (epoll + io_uring) cross-compiles and passes its
+  unit tests but CI on a Linux runner hasn't landed yet; Windows
+  (IOCP, polyfilled as readiness) cross-compiles and runtime
+  validation is pending a Windows-machine pass. See [Roadmap](/appendix/roadmap/).
+- **libc.** Volt uses `mmap` / `mprotect` / the per-platform
+  reactor syscalls / `__ulock_wait` / `futex` via `@extern`; the
+  build helper links libc automatically.
 
 ## Add the dependency
 
@@ -90,10 +95,11 @@ zig build run
 ```
 
 If that prints, you're set up. `volt.sleep` parked the coroutine on
-the kqueue reactor's timer; ~50 ms later the kernel delivered the
-timer event, the reactor woke the coroutine, and it continued. No
-`async`, no callback, no state machine. The whole program is six
-lines of executable code.
+the reactor's timer (`EVFILT_TIMER` on Darwin; `timerfd` on epoll;
+`IORING_OP_TIMEOUT` on io_uring; thread-pool timer on IOCP); ~50 ms
+later the kernel delivered the timer event, the reactor woke the
+coroutine, and it continued. No `async`, no callback, no state
+machine. The whole program is six lines of executable code.
 
 ## Building from source
 
@@ -118,17 +124,20 @@ Tests run in CI on every push; the pre-commit hook is fast (~2 s).
 
 ## Cross-compile sanity check (optional)
 
-Volt's CI compiles `zig build-lib` for Linux + Windows targets even
-though the reactor doesn't ship for them yet — this catches type
-errors that would block the eventual port:
+Volt's CI compiles `zig build-lib` for Linux + Windows targets to
+catch type errors that would block runtime portability:
 
 ```sh
-zig build-lib src/lib.zig -target x86_64-linux-gnu  -lc -fno-emit-bin
-zig build-lib src/lib.zig -target aarch64-linux-gnu -lc -fno-emit-bin
+zig build-lib src/lib.zig -target aarch64-linux-gnu   -lc -fno-emit-bin
+zig build-lib src/lib.zig -target x86_64-linux-gnu    -lc -fno-emit-bin
+zig build-lib src/lib.zig -target aarch64-windows-gnu -lc -fno-emit-bin
+zig build-lib src/lib.zig -target x86_64-windows-gnu  -lc -fno-emit-bin
 ```
 
-Both should exit `0`. Neither produces a working binary today — the
-kqueue reactor is Darwin-specific.
+All four should exit `0`. The Linux and Windows reactor backends are
+real implementations (not stubs); the aarch64 targets will produce
+working binaries once paired with a Linux/Windows runtime CI pass.
+x86_64 needs an x86_64 context switch first (tracked by #149).
 
 ## Next
 

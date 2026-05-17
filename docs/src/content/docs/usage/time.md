@@ -21,8 +21,10 @@ volt.sleep(50 * std.time.ns_per_ms);    // sleep 50 ms
 volt.sleep(2 * std.time.ns_per_s);      // sleep 2 s
 ```
 
-Registers an `EVFILT_TIMER` event with the kqueue reactor, with
-the current coroutine as `udata`, then parks. When the kernel
+Registers a timer with the reactor (`EVFILT_TIMER` on Darwin
+kqueue; `timerfd` on epoll; `IORING_OP_TIMEOUT` on io_uring;
+`CreateThreadpoolTimer` on Windows IOCP), with the current
+coroutine as the wake identity, then parks. When the kernel
 delivers the timer event, the reactor unparks the coroutine — it
 ends up on a worker's queue and resumes.
 
@@ -139,13 +141,18 @@ compose what they actually need.
 
 ## Reactor and timers
 
-Internally, every `sleep` is a kqueue `EVFILT_TIMER` registration.
-The reactor's single-poller-claim ensures one worker at a time
-calls `kevent`. Timer delivery scales to thousands of concurrent
-sleepers without per-timer thread overhead — the kernel's heap
-does the work, the runtime just dispatches.
+Internally, every `sleep` is a reactor timer registration. The
+per-platform mechanism differs — `EVFILT_TIMER` on Darwin kqueue,
+`timerfd` registered into epoll on Linux, `IORING_OP_TIMEOUT` on
+io_uring, `CreateThreadpoolTimer` on Windows IOCP — but the
+contract is identical: the kernel's timer heap holds the
+registration, the reactor's single-poller-claim ensures one
+worker at a time harvests, and timer delivery scales to thousands
+of concurrent sleepers without per-timer thread overhead.
 
-See [The kqueue reactor](/architecture/) for the design.
+See [The reactor](/architecture/reactor/) for the design and
+[its backends](/architecture/reactor-backends/) for the per-platform
+syscall walkthroughs.
 
 ## See also
 

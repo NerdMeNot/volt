@@ -43,8 +43,9 @@ fn echoOne(conn: volt.net.TcpStream) void {
 ```
 
 That's the whole shape. `s.read(&buf)` suspends the coroutine when the
-socket isn't ready and resumes it when the kqueue reactor delivers
-readiness — possibly on a different worker thread.
+socket isn't ready and resumes it when the reactor (kqueue / epoll /
+io_uring / IOCP, depending on platform) delivers readiness — possibly
+on a different worker thread.
 
 ## Highlights
 
@@ -83,16 +84,19 @@ several pieces are still in flight.
 
 | Target | Status |
 |---|---|
-| Darwin arm64 (kqueue) | **Working** — primary dev platform |
-| Linux x86_64 / arm64 (epoll or io_uring) | Not yet — backend planned |
-| Windows (IOCP) | Not yet — backend planned |
-| x86_64 context switch | Not yet — arm64 only today |
+| Darwin arm64 (kqueue) | **Working** — primary dev platform; full bench suite green |
+| Linux arm64 (epoll) | **Working** — cross-compile + epoll-specific tests green; runtime CI pass pending |
+| Linux arm64 (io_uring, poll mode) | **Working** — kernel ≥ 5.10 via `Runtime.Config.io_backend = .io_uring` |
+| Windows arm64 (IOCP, readiness polyfill) | **Cross-compiles cleanly** — runtime validation deferred to a Windows VM/CI pass |
+| x86_64 (Linux + Windows) | Cross-compile only — needs an x86_64 ctx switch (#149) |
 | Cancellation | **Shipping** — `Cancel`, cancel-aware variants, `scope` |
 | File I/O / DNS / TLS / HTTP | Out of core — lives in [downstream libraries](/appendix/roadmap/) |
 
 The honest case for using Volt today: you want a stackful coroutine
-substrate for Zig on Darwin arm64, you want the synchronous-shape
-ergonomics, and you can wait for the Linux/Windows backends.
+substrate for Zig on ARM64, you want the synchronous-shape
+ergonomics, and you're OK being an early user on Linux (the epoll
+and io_uring backends are written but not yet CI-validated) or
+willing to wait for the Windows runtime pass.
 
 ## Why stackful
 

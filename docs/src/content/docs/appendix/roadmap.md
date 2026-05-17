@@ -9,12 +9,13 @@ still in flight.
 
 ## In-flight
 
-| | Status |
+| Platform | Status |
 |---|---|
-| Darwin arm64 (kqueue) | **Working** — primary dev platform |
-| Linux x86_64 / arm64 (epoll or io_uring) | Not yet — backend planned |
-| Windows (IOCP) | Not yet — backend planned |
-| x86_64 context switch | Not yet — only arm64 today |
+| Darwin arm64 (kqueue) | **Working** — primary dev platform; full bench suite + 45 s stress green |
+| Linux arm64 (epoll) | **Working** — cross-compile + epoll-specific tests green; runtime CI pass pending |
+| Linux arm64 (io_uring, poll mode) | **Working** — `Runtime.Config.io_backend = .io_uring`, kernel ≥ 5.10; `IORING_OP_POLL_ADD` shape |
+| Windows arm64 (IOCP, readiness polyfill) | **Cross-compiles cleanly** — implemented via zero-byte `WSARecv`/`WSASend`; runtime validation deferred to a Windows VM/CI pass; needs `WaitOnAddress` parker backend |
+| Linux x86_64 / Windows x86_64 | **Cross-compile only** — runtime needs an x86_64 context switch (#149); ARM64 ctx switch is the only one shipping today |
 
 ## Out of scope (Volt core)
 

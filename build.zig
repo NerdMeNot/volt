@@ -52,6 +52,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "tcp-echo", .src = "bench/bench_tcp_echo.zig", .desc = "TCP echo 64 clients × 16 RTT × 1 KB" },
         .{ .name = "mutex", .src = "bench/bench_mutex.zig", .desc = "Mutex contended (8 coros × 50k acquires)" },
         .{ .name = "parallel-compute", .src = "bench/bench_parallel_compute.zig", .desc = "Parallel CPU-bound work across N workers" },
+        .{ .name = "reactor-throughput", .src = "bench/bench_reactor_throughput.zig", .desc = "Reactor wakes/s — single connection, 1-byte payload, 1 worker (cross-platform receipt)" },
     };
     for (benches) |bench| {
         const mod = b.createModule(.{

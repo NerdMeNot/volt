@@ -1,12 +1,13 @@
 ---
 title: Networking
-description: TcpListener, TcpStream, Address — TCP/IPv4 with non-blocking sockets parked on the kqueue reactor. That's the network surface today.
+description: TcpListener, TcpStream, Address — TCP/IPv4 with non-blocking sockets parked on the reactor (kqueue / epoll / io_uring / IOCP). That's the network surface today.
 ---
 
-Volt ships **TCP/IPv4 on Darwin**. That's the network surface:
-`volt.net.TcpListener`, `volt.net.TcpStream`, `volt.net.Address`.
-UDP, IPv6, Unix sockets, DNS resolution, TLS — all live in
-downstream libraries by design (see [Roadmap](/appendix/roadmap/)).
+Volt ships **TCP/IPv4** across every reactor backend (kqueue on
+Darwin, epoll and io_uring on Linux, IOCP on Windows). That's the
+network surface: `volt.net.TcpListener`, `volt.net.TcpStream`,
+`volt.net.Address`. UDP, IPv6, Unix sockets, DNS resolution, TLS —
+all live in downstream libraries by design (see [Roadmap](/appendix/roadmap/)).
 
 The whole API is non-blocking under the hood; sockets are
 `O_NONBLOCK`, and `EAGAIN` yields to the reactor.
@@ -215,6 +216,7 @@ is on the roadmap; for now, the close-the-fd pattern works.
 
 ## See also
 
-- [The kqueue reactor](/architecture/) — how parking on `EVFILT_READ` actually works.
+- [The reactor](/architecture/reactor/) — how parking on read-readiness actually works (kqueue / epoll / io_uring / IOCP).
+- [The reactor backends](/architecture/reactor-backends/) — per-platform syscall walkthroughs.
 - [Recipes: TCP echo server](/cookbook/echo-server/) — production-shape echo with graceful shutdown.
 - [Recipes: connection pool](/cookbook/connection-pool/) — sharing a pool of TcpStreams across coroutines.
