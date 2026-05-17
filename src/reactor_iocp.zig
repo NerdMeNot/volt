@@ -60,7 +60,7 @@ const builtin = @import("builtin");
 const coroutine = @import("coroutine.zig");
 const runtime = @import("runtime.zig");
 const current = @import("current.zig");
-const context = @import("context_arm64.zig");
+const context = @import("context.zig");
 
 const win = std.os.windows;
 const ws2_32 = win.ws2_32;

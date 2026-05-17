@@ -23,7 +23,7 @@ const posix = std.posix;
 const coroutine = @import("coroutine.zig");
 const runtime = @import("runtime.zig");
 const current = @import("current.zig");
-const context = @import("context_arm64.zig");
+const context = @import("context.zig");
 
 const KEV_BATCH: usize = 32;
 

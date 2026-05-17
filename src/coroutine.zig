@@ -17,7 +17,7 @@
 //! swap-back to decide whether to re-queue, leave parked, or free.
 
 const std = @import("std");
-const context = @import("context_arm64.zig");
+const context = @import("context.zig");
 const stack_mod = @import("stack.zig");
 
 /// User functions passed to `spawn` get monomorphized into a Frame

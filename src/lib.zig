@@ -133,7 +133,7 @@ pub const internal = struct {
     pub const Frame = @import("runtime.zig").Frame;
     pub const STACK_SIZE = @import("runtime.zig").STACK_SIZE;
     pub const reactor = @import("reactor.zig");
-    pub const context = @import("context_arm64.zig");
+    pub const context = @import("context.zig");
     pub const park = @import("runtime.zig").park;
     pub const unpark = @import("runtime.zig").unpark;
     pub const tryDispatchInline = @import("runtime.zig").tryDispatchInline;
@@ -156,7 +156,7 @@ test {
     _ = @import("parker.zig");
     _ = @import("stack.zig");
     _ = @import("signal.zig");
-    _ = @import("context_arm64.zig");
+    _ = @import("context.zig");
     _ = @import("cancel.zig");
 }
 

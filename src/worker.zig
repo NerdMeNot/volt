@@ -17,7 +17,7 @@
 const std = @import("std");
 const coroutine = @import("coroutine.zig");
 const parker_mod = @import("parker.zig");
-const context = @import("context_arm64.zig");
+const context = @import("context.zig");
 const p_mod = @import("p.zig");
 
 pub const Coroutine = coroutine.Coroutine;

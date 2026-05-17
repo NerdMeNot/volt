@@ -46,7 +46,7 @@ const builtin = @import("builtin");
 const coroutine = @import("coroutine.zig");
 const runtime = @import("runtime.zig");
 const current = @import("current.zig");
-const context = @import("context_arm64.zig");
+const context = @import("context.zig");
 
 const linux = std.os.linux;
 const CQE_BATCH: usize = 32;

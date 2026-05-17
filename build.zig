@@ -9,6 +9,24 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // The x86_64 context switch ships as a separate `.S` file —
+    // Zig 0.16 comptime `asm()` blocks don't reliably emit global
+    // symbols on x86_64-linux ELF (works on aarch64), so we link
+    // an assembly source via `addAssemblyFile`. ARM64 uses module-
+    // level inline asm in `src/context_arm64.zig` and needs no
+    // build-system wiring. Windows x64 will land its own `.S`
+    // file in L6b.
+    const link_x86_64_ctx = struct {
+        fn apply(mod: *std.Build.Module, builder: *std.Build, t: std.Build.ResolvedTarget) void {
+            if (t.result.cpu.arch != .x86_64) return;
+            // L6a: System V x86-64 (Linux + macOS-Intel + BSDs).
+            //      Win64 lands in L6b alongside `context_x86_64_win.S`.
+            if (t.result.os.tag != .windows) {
+                mod.addAssemblyFile(builder.path("src/context_x86_64_sysv.S"));
+            }
+        }
+    }.apply;
+
     // Public module.
     const volt_mod = b.addModule("volt", .{
         .root_source_file = b.path("src/lib.zig"),
@@ -16,6 +34,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     volt_mod.link_libc = true;
+    link_x86_64_ctx(volt_mod, b, target);
 
     // Unit tests.
     const test_mod = b.createModule(.{
@@ -24,6 +43,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_mod.link_libc = true;
+    link_x86_64_ctx(test_mod, b, target);
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(unit_tests).step);
 
@@ -33,6 +53,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    link_x86_64_ctx(docs_mod, b, target);
     const docs_obj = b.addObject(.{ .name = "volt-docs", .root_module = docs_mod });
     b.step("docs", "Generate API documentation").dependOn(&b.addInstallDirectory(.{
         .source_dir = docs_obj.getEmittedDocs(),

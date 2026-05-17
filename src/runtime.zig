@@ -34,7 +34,7 @@
 //!     P's local queue is repeatedly fed by yields.
 
 const std = @import("std");
-const context = @import("context_arm64.zig");
+const context = @import("context.zig");
 const coroutine = @import("coroutine.zig");
 const task_mod = @import("task.zig");
 const current = @import("current.zig");
