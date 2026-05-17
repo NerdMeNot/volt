@@ -48,7 +48,11 @@
 //! preserved.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const signal = @import("signal.zig");
+
+const is_windows = builtin.os.tag == .windows;
+const win = std.os.windows;
 
 /// Opaque base pointer for a slot. Page-aligned by construction (the
 /// arena's `mmap` returns a page-aligned base and slot size is a
@@ -91,9 +95,13 @@ pub inline fn usableOffset() usize {
     return slotSize() - BODY_SIZE;
 }
 
-// libc bindings — `std.posix.{mmap,munmap,mprotect}` were removed in
-// Zig 0.16.
-const mmap_fn = @extern(
+// Platform syscall bindings. On POSIX (Darwin / Linux / BSD) we use
+// libc `mmap` / `munmap` / `mprotect` via `@extern` — `std.posix`
+// dropped the medium-level wrappers in Zig 0.16. On Windows we use
+// `VirtualAlloc` / `VirtualFree` / `VirtualProtect` from kernel32;
+// these are declared in their own block below the POSIX ones.
+
+const mmap_fn = if (is_windows) {} else @extern(
     *const fn (
         addr: ?*anyopaque,
         len: usize,
@@ -105,12 +113,12 @@ const mmap_fn = @extern(
     .{ .name = "mmap" },
 );
 
-const munmap_fn = @extern(
+const munmap_fn = if (is_windows) {} else @extern(
     *const fn (addr: *anyopaque, len: usize) callconv(.c) c_int,
     .{ .name = "munmap" },
 );
 
-const mprotect_fn = @extern(
+const mprotect_fn = if (is_windows) {} else @extern(
     *const fn (addr: *anyopaque, len: usize, prot: c_int) callconv(.c) c_int,
     .{ .name = "mprotect" },
 );
@@ -125,11 +133,66 @@ const MAP_ANON: c_int = switch (@import("builtin").os.tag) {
 };
 const MAP_FAILED: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
 
+// ── Windows VM bindings ──────────────────────────────────────────────
+//
+// `VirtualAlloc(NULL, size, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE)`
+// reserves and commits a slab in one syscall — what the L5b "full-
+// commit" stack arena needs. Per-slot guard pages are installed via
+// `VirtualProtect(slot_base, page_size, PAGE_NOACCESS, &old)` in a
+// startup loop. `VirtualFree(base, 0, MEM_RELEASE)` releases the
+// whole reservation at deinit. `size = 0` is mandatory with
+// MEM_RELEASE (Windows reads the original reservation length from
+// its bookkeeping).
+//
+// L5c will replace MEM_RESERVE|MEM_COMMIT with just MEM_RESERVE and
+// commit per-page in the VEH on access — restoring POSIX-style
+// lazy-grow semantics.
+
+const MEM_COMMIT: win.DWORD = 0x1000;
+const MEM_RESERVE: win.DWORD = 0x2000;
+const MEM_RELEASE: win.DWORD = 0x8000;
+const PAGE_NOACCESS: win.DWORD = 0x01;
+const PAGE_READWRITE: win.DWORD = 0x04;
+
+extern "kernel32" fn VirtualAlloc(
+    lpAddress: ?*anyopaque,
+    dwSize: usize,
+    flAllocationType: win.DWORD,
+    flProtect: win.DWORD,
+) callconv(.winapi) ?*anyopaque;
+
+extern "kernel32" fn VirtualFree(
+    lpAddress: *anyopaque,
+    dwSize: usize,
+    dwFreeType: win.DWORD,
+) callconv(.winapi) win.BOOL;
+
+extern "kernel32" fn VirtualProtect(
+    lpAddress: *anyopaque,
+    dwSize: usize,
+    flNewProtect: win.DWORD,
+    lpflOldProtect: *win.DWORD,
+) callconv(.winapi) win.BOOL;
+
 pub const Error = error{
     MmapFailed,
     MprotectFailed,
     ArenaExhausted,
 };
+
+/// Release a slab reservation made by either `mmap` (POSIX) or
+/// `VirtualAlloc(MEM_RESERVE|MEM_COMMIT)` (Windows). Used by both
+/// `Arena.init`'s rollback paths and `Arena.deinit`. The size
+/// argument is ignored on Windows — `VirtualFree(.., MEM_RELEASE)`
+/// requires `dwSize == 0` and reads the original reservation length
+/// from the kernel's bookkeeping.
+inline fn releaseReservation(base: StackPtr, total: usize) void {
+    if (comptime is_windows) {
+        _ = VirtualFree(@ptrCast(base), 0, MEM_RELEASE);
+    } else {
+        _ = munmap_fn(@ptrCast(base), total);
+    }
+}
 
 /// Slab arena of fixed-size coroutine stack slots.
 ///
@@ -177,15 +240,39 @@ pub const Arena = struct {
 
         const slot_size = slotSize();
         const total = n_slots * slot_size;
-        const ret = mmap_fn(null, total, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (ret == MAP_FAILED or ret == null) return error.MmapFailed;
-        const base: StackPtr = @ptrCast(@alignCast(ret.?));
 
+        // Reserve the slab. Two platform shapes — see the bindings
+        // block above for why Windows does eager-commit.
+        const base: StackPtr = if (comptime is_windows) blk: {
+            // MEM_RESERVE|MEM_COMMIT in a single call — full slab is
+            // RW. Per-slot guards installed in the loop below.
+            const p = VirtualAlloc(null, total, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (p == null) return error.MmapFailed;
+            const b: StackPtr = @ptrCast(@alignCast(p.?));
+            // Install the per-slot guard page (bottom page of each
+            // slot). One VirtualProtect per slot — bounded at
+            // construction, paid once.
+            const ps = std.heap.pageSize();
+            var s: usize = 0;
+            while (s < n_slots) : (s += 1) {
+                var old: win.DWORD = 0;
+                const guard_ptr: *anyopaque = @ptrCast(b + s * slot_size);
+                if (VirtualProtect(guard_ptr, ps, PAGE_NOACCESS, &old) == win.BOOL.FALSE) {
+                    _ = VirtualFree(p.?, 0, MEM_RELEASE);
+                    return error.MprotectFailed;
+                }
+            }
+            break :blk b;
+        } else blk: {
+            const ret = mmap_fn(null, total, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (ret == MAP_FAILED or ret == null) return error.MmapFailed;
+            break :blk @as(StackPtr, @ptrCast(@alignCast(ret.?)));
+        };
         // Free-index stack: initialise full, ordered so pop yields
         // index 0 first (lowest VA — irrelevant to perf, helpful for
         // tests that want predictable layouts).
         const free_indices = allocator.alloc(u32, n_slots) catch {
-            _ = munmap_fn(ret.?, total);
+            releaseReservation(base, total);
             return error.MmapFailed;
         };
         var i: usize = 0;
@@ -195,17 +282,20 @@ pub const Arena = struct {
 
         const committed = allocator.alloc(u8, (n_slots + 7) / 8) catch {
             allocator.free(free_indices);
-            _ = munmap_fn(ret.?, total);
+            releaseReservation(base, total);
             return error.MmapFailed;
         };
         @memset(committed, 0);
 
         // Single arena registration with the SIGSEGV handler. Handler
-        // computes per-slot offset on fault.
+        // computes per-slot offset on fault. On Windows this is a
+        // no-op (signal.zig short-circuits) — the registration is
+        // dead weight there but uniform shape across platforms beats
+        // a comptime branch around the call.
         signal.registerArena(@intFromPtr(base), total, slot_size) catch {
             allocator.free(committed);
             allocator.free(free_indices);
-            _ = munmap_fn(ret.?, total);
+            releaseReservation(base, total);
             return error.MmapFailed;
         };
 
@@ -220,12 +310,12 @@ pub const Arena = struct {
     }
 
     /// Tear down the arena: unregister with the signal handler,
-    /// release the bookkeeping, `munmap` the slab.
+    /// release the bookkeeping, and release the VA reservation.
     pub fn deinit(self: *Arena, allocator: std.mem.Allocator) void {
         signal.unregister(@intFromPtr(self.mapping_base));
         allocator.free(self.committed);
         allocator.free(self.free_indices);
-        _ = munmap_fn(@ptrCast(self.mapping_base), self.mapping_total);
+        releaseReservation(self.mapping_base, self.mapping_total);
         self.* = undefined;
     }
 
@@ -255,7 +345,14 @@ pub const Arena = struct {
         // our own lock held across it.
         self.release();
 
-        if (!already) {
+        if (!already and comptime !is_windows) {
+            // POSIX: lazy-commit the body region (top BODY_SIZE bytes)
+            // via mprotect. The arena reserved everything as PROT_NONE
+            // at init, so first use of each slot needs a syscall here.
+            // Windows pre-commits the full slab at init (see L5b notes
+            // in this file's bindings block) so this branch is a no-op
+            // there — the `already` bit is still set so reuse keeps
+            // skipping the rollback path correctly.
             const body_offset = slot_size - BODY_SIZE;
             const body_ptr: *anyopaque = @ptrCast(base + body_offset);
             const rc = mprotect_fn(body_ptr, BODY_SIZE, PROT_READ | PROT_WRITE);
@@ -367,6 +464,11 @@ test "Arena: slot reuse skips re-mprotect (commit bit sticky)" {
 }
 
 test "Arena: grow-on-demand mprotects a deeper page on access" {
+    // Windows pre-commits the full slab under L5b — there's no
+    // grow-on-demand path to exercise. L5c will reintroduce lazy
+    // commit via a VEH and this test should run there too.
+    if (comptime is_windows) return error.SkipZigTest;
+
     var a = try Arena.init(std.testing.allocator, 2);
     defer a.deinit(std.testing.allocator);
 

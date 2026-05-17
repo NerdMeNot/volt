@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const win = std.os.windows;
 
 pub const Parker = struct {
     state: std.atomic.Value(u32) = std.atomic.Value(u32).init(EMPTY),
@@ -80,6 +81,7 @@ pub const Parker = struct {
 
 const is_darwin = builtin.os.tag.isDarwin();
 const is_linux = builtin.os.tag == .linux;
+const is_windows = builtin.os.tag == .windows;
 
 // ── Darwin: __ulock_wait / __ulock_wake ──────────────────────────────
 //
@@ -106,6 +108,30 @@ extern "c" fn __ulock_wake(operation: u32, addr: *anyopaque, wake_value: u64) c_
 const FUTEX_WAIT_PRIVATE: std.os.linux.FUTEX_OP = .{ .cmd = .WAIT, .private = true };
 const FUTEX_WAKE_PRIVATE: std.os.linux.FUTEX_OP = .{ .cmd = .WAKE, .private = true };
 
+// ── Windows: WaitOnAddress / WakeByAddressSingle ─────────────────────
+//
+// Win8+ added an address-based wait/wake API that maps cleanly onto
+// our `u32` futex word. `WaitOnAddress` takes a comparand buffer
+// (stack-local copy of the expected value) and returns when the
+// monitored address differs from it. `WakeByAddressSingle` wakes one
+// waiter — matching our "at most one waiter per Parker" invariant.
+//
+// Both functions live in `api-ms-win-core-synch-l1-2-0`, re-exported
+// from `kernel32` since Windows 8 / Server 2012. Zig's std doesn't
+// expose them, so we extern-bind locally — same pattern as the IOCP
+// reactor's Win32 type bindings.
+
+const INFINITE: win.DWORD = 0xFFFFFFFF;
+
+extern "kernel32" fn WaitOnAddress(
+    Address: *const anyopaque,
+    CompareAddress: *const anyopaque,
+    AddressSize: usize,
+    dwMilliseconds: win.DWORD,
+) callconv(.winapi) win.BOOL;
+
+extern "kernel32" fn WakeByAddressSingle(Address: *const anyopaque) callconv(.winapi) void;
+
 fn futexWait(addr: *std.atomic.Value(u32), expected: u32) void {
     if (comptime is_darwin) {
         const op = UL_COMPARE_AND_WAIT | ULF_NO_ERRNO;
@@ -115,6 +141,14 @@ fn futexWait(addr: *std.atomic.Value(u32), expected: u32) void {
         // FUTEX_WAIT blocks while *uaddr == val; spurious wakes are
         // caller-handled in the park() loop above.
         _ = std.os.linux.futex_4arg(@ptrCast(addr), FUTEX_WAIT_PRIVATE, expected, null);
+    } else if (comptime is_windows) {
+        // WaitOnAddress needs the comparand in a separate buffer (the
+        // kernel reads it without atomicity guarantees and we don't
+        // want it racing on the live `state` word). A stack copy is
+        // the canonical idiom — same as `std::sync::atomic::wait` in
+        // Rust and `WaitOnAddress` MSDN samples.
+        var expected_copy: u32 = expected;
+        _ = WaitOnAddress(@ptrCast(addr), @ptrCast(&expected_copy), @sizeOf(u32), INFINITE);
     } else {
         @compileError("Parker: no futex backend for this OS (kqueue+self-pipe fallback can be added)");
     }
@@ -128,6 +162,8 @@ fn futexWake(addr: *std.atomic.Value(u32)) void {
     } else if (comptime is_linux) {
         // val = 1 — wake at most one waiter (Parker has at most one).
         _ = std.os.linux.futex_3arg(@ptrCast(addr), FUTEX_WAKE_PRIVATE, 1);
+    } else if (comptime is_windows) {
+        WakeByAddressSingle(@ptrCast(addr));
     } else {
         @compileError("Parker: no futex backend for this OS");
     }

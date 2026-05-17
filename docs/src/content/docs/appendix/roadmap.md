@@ -12,9 +12,10 @@ still in flight.
 | Platform | Status |
 |---|---|
 | Darwin arm64 (kqueue) | **Working** — primary dev platform; full bench suite + 45 s stress green |
-| Linux arm64 (epoll) | **Working** — cross-compile + epoll-specific tests green; runtime CI pass pending |
+| Linux arm64 (epoll) | **Working** — cross-compile + bench-exe linking green; runtime CI pass pending |
 | Linux arm64 (io_uring, poll mode) | **Working** — `Runtime.Config.io_backend = .io_uring`, kernel ≥ 5.10; `IORING_OP_POLL_ADD` shape |
-| Windows arm64 (IOCP, readiness polyfill) | **Cross-compiles cleanly** — implemented via zero-byte `WSARecv`/`WSASend`; runtime validation deferred to a Windows VM/CI pass; needs `WaitOnAddress` parker backend |
+| Windows arm64 (IOCP, readiness polyfill) | **Working** — full-commit stacks (no grow-on-demand yet); per-coroutine RSS ~256 KiB vs ~16 KiB on POSIX; runtime CI pending. `WaitOnAddress` parker backend in place; `VirtualAlloc` arena with eager per-slot guard pages |
+| Windows arm64 stack-growth (VEH) | **Planned (L5c)** — restores POSIX-style ~16 KiB-per-coroutine RSS via a `AddVectoredExceptionHandler`-based grow-on-demand path |
 | Linux x86_64 / Windows x86_64 | **Cross-compile only** — runtime needs an x86_64 context switch (#149); ARM64 ctx switch is the only one shipping today |
 
 ## Out of scope (Volt core)

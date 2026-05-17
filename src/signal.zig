@@ -24,6 +24,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const is_windows = builtin.os.tag == .windows;
+
 /// Maximum number of registered regions the SIGSEGV handler can
 /// recognize. With one entry per Runtime arena and a small handful of
 /// Runtime instances per process, 64 is plenty of headroom.
@@ -57,6 +59,13 @@ var regions: [MAX_REGIONS]Region = [_]Region{.{}} ** MAX_REGIONS;
 /// Single-shot install of the SIGSEGV handler. Multiple Runtime
 /// instances in the same process call this; only the first install
 /// actually fires. We never uninstall — process-lifetime handler.
+///
+/// On Windows, every public function in this file is a no-op (L5b):
+/// stack-growth via Structured Exception Handling lives in a future
+/// L5c landing. The arena pre-commits the full body region under
+/// L5b, so the SIGSEGV-style grow-on-demand machinery isn't needed
+/// to run; a guard page still catches genuine overflows via the
+/// default Windows access-violation behaviour.
 var installed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 // Signal-related libc bindings.
@@ -182,6 +191,7 @@ fn chainTo(sig: c_int, info: *SigInfo, ctx: ?*anyopaque) void {
 /// install actually touches `sigaction`. Called from `Runtime.init`
 /// at the first runtime construction in a process.
 pub fn ensureInstalled() void {
+    if (comptime is_windows) return;
     if (installed.swap(true, .acq_rel)) return;
 
     var act: Sigaction = .{
@@ -196,6 +206,7 @@ pub fn ensureInstalled() void {
 /// Register a single-stack region with the handler. `size` is the
 /// full reservation length; the bottom page is treated as the guard.
 pub fn register(base: usize, size: usize) error{RegistryFull}!void {
+    if (comptime is_windows) return;
     return registerInternal(base, size, 0);
 }
 
@@ -203,6 +214,7 @@ pub fn register(base: usize, size: usize) error{RegistryFull}!void {
 /// whole slab; `slot_size` is the per-slot stride so the handler can
 /// compute `(fault - base) % slot_size` to locate the guard page.
 pub fn registerArena(base: usize, total_size: usize, slot_size: usize) error{RegistryFull}!void {
+    if (comptime is_windows) return;
     std.debug.assert(slot_size > 0);
     std.debug.assert(total_size % slot_size == 0);
     return registerInternal(base, total_size, slot_size);
@@ -226,6 +238,7 @@ fn registerInternal(base: usize, size: usize, slot_size: usize) error{RegistryFu
 /// Unregister a stack region. Called by `stack.free()` at runtime
 /// shutdown (or pool over-cap eviction).
 pub fn unregister(base: usize) void {
+    if (comptime is_windows) return;
     var i: usize = 0;
     while (i < MAX_REGIONS) : (i += 1) {
         if (regions[i].base.load(.acquire) == base) {
