@@ -11,10 +11,10 @@ still in flight.
 
 | Platform | Status |
 |---|---|
-| Darwin arm64 (kqueue) | **Working** — primary dev platform; full bench suite + 45 s stress green |
-| Linux arm64 (epoll) | **Working** — cross-compile + bench-exe linking green; runtime CI pass pending |
+| Darwin arm64 (kqueue) | **Working** — primary dev platform; full bench suite + 45 s stress green; native CI |
+| Linux arm64 (epoll) | **Working** — native test CI on `ubuntu-24.04-arm` runners green |
 | Linux arm64 (io_uring, poll mode) | **Working** — `Runtime.Config.io_backend = .io_uring`, kernel ≥ 5.10; `IORING_OP_POLL_ADD` shape |
-| Windows arm64 (IOCP, readiness polyfill) | **Working** — grow-on-demand stacks via a Vectored Exception Handler that lazy-commits faulting pages; per-coroutine RSS parity with POSIX (~16 KiB). `WaitOnAddress` parker, `VirtualAlloc`-reserved arena. Runtime CI pending |
+| Windows arm64 (IOCP) | **Cross-compile only** — implementation complete (`WaitOnAddress` parker, `VirtualAlloc`-reserved arena, VEH-driven stack growth). Native testing blocked by a Zig 0.16 upstream bug: `zig build` segfaults on `windows-11-arm` runners. Tier 2 per [Zig's release notes](https://ziglang.org/download/0.16.0/release-notes.html); upstream Zig CI for `aarch64-windows` is also offline ([ziglang/zig#13862](https://github.com/ziglang/zig/issues/13862), [#16665](https://github.com/ziglang/zig/issues/16665)). Revisit when Zig fixes it |
 | Linux x86_64 / Windows x86_64 | **Cross-compile only** — runtime needs an x86_64 context switch (#149); ARM64 ctx switch is the only one shipping today |
 
 ## Out of scope (Volt core)

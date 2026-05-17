@@ -1,35 +1,46 @@
 name: CI
 
-# Temporarily disabled (auto-triggers removed) while the
-# `cross-platform-probe.yml` workflow runs the multi-platform
-# verification matrix. Revert by restoring the push/pull_request
-# triggers below. Manual runs still possible via the Actions tab.
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
-  # push:
-  #   branches: [main]
-  # pull_request:
-  #   branches: [main]
 
 env:
   ZIG_VERSION: "0.16.0"
 
 # ─────────────────────────────────────────────────────────────────────
-# CI structure (Darwin arm64 only for runtime)
+# CI structure
 #
-# Volt currently runs only on Darwin arm64 (kqueue reactor, AAPCS64
-# context switch). Other targets are cross-compile-only — they parse
-# and type-check but don't link, since kqueue symbols aren't available.
-# Linux (epoll/io_uring) and Windows (IOCP) backends are planned but
-# not yet implemented.
+# Volt runs natively on Darwin arm64 (kqueue reactor) and Linux arm64
+# (epoll / io_uring reactor, with the L5a-L5c runtime portability
+# work). Both are exercised by the `test` matrix job below — first
+# real cross-platform validation as of L5.
+#
+# Windows arm64 is deliberately cross-compile-only. Native Windows
+# ARM64 testing is blocked by an upstream Zig 0.16 bug: `zig build`
+# segfaults on the `windows-11-arm` runner image (`zig version` and
+# `zig fmt` both work fine). This is a Tier 2 platform per Zig's own
+# release notes (https://ziglang.org/download/0.16.0/release-notes.html)
+# and Zig's own CI doesn't currently run on Windows ARM64 either —
+# see ziglang/zig#13862 and ziglang/zig#16665. Revisit when Zig
+# upstream's `aarch64-windows` CI machine comes back online.
+#
+# x86_64 is also cross-compile-only across the board: Volt's context
+# switch is ARM64-only today; x86_64 support is tracked by #149.
 #
 # Jobs:
-# 1. format        — zig fmt --check on src/ + bench/ + build.zig
-# 2. cross-compile — every target parses + type-checks (catches
-#                    accidental Darwin-isms in portable code)
-# 3. test          — full unit test suite, native, Darwin arm64
-# 4. bench-smoke   — one bench builds + runs, Darwin arm64. Cheap
-#                    early signal that the runtime survives a
+# 1. format        — `zig fmt --check` on src/ + bench/ + build.zig
+# 2. cross-compile — every target's lib parses + type-checks
+#                    (catches accidental platform-isms in portable
+#                    code). Lazy semantic analysis — see L5b probe
+#                    notes for why this masked the `__error` symbol
+#                    bug until exe-builds surfaced it.
+# 3. test          — full unit test suite, native, matrix of
+#                    {macos arm64, linux arm64}
+# 4. bench-smoke   — one bench builds + runs, native macOS arm64.
+#                    Cheap early signal that the runtime survives a
 #                    real workload — not a perf gate.
 # 5. ci-success    — single boolean gate
 # ─────────────────────────────────────────────────────────────────────
@@ -67,10 +78,16 @@ jobs:
       - run: zig build-lib src/lib.zig -target ${{ matrix.target }} -lc -fno-emit-bin
 
   test:
-    name: Test (macos-arm64-kqueue)
+    name: Test (${{ matrix.os }})
     needs: format
-    runs-on: macos-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest       # arm64 since macos-14
+          - ubuntu-24.04-arm   # GitHub-hosted ARM64 Linux (free since 2024)
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
