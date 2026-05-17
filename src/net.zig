@@ -65,8 +65,26 @@ const c_connect = @extern(*const fn (c_int, *const anyopaque, c_uint) callconv(.
 const setsockopt = @extern(*const fn (c_int, c_int, c_int, *const anyopaque, c_uint) callconv(.c) c_int, .{ .name = "setsockopt" });
 const getsockname = @extern(*const fn (c_int, *anyopaque, *c_uint) callconv(.c) c_int, .{ .name = "getsockname" });
 const c_close = @extern(*const fn (c_int) callconv(.c) c_int, .{ .name = "close" });
-const c_error = @extern(*const fn () callconv(.c) *c_int, .{ .name = "__error" });
+
+// `errno` accessor — the libc name differs per platform:
+//   - Darwin / *BSD : `__error()` returns `*c_int`
+//   - Linux glibc   : `__errno_location()` returns `*c_int`
+//   - Windows       : sockets surface failures via `WSAGetLastError()`,
+//                     which returns the error code directly (`c_int`)
+//                     and doesn't dereference anything.
+//
+// Comptime-pick the right one. Both POSIX externs share the same
+// signature so the `errnoVal` body stays uniform on those paths.
+const c_error = if (builtin.os.tag == .windows) {} // unused; see WSAGetLastError below
+    else if (builtin.os.tag.isDarwin() or builtin.os.tag == .freebsd or builtin.os.tag == .openbsd or builtin.os.tag == .netbsd or builtin.os.tag == .dragonfly)
+        @extern(*const fn () callconv(.c) *c_int, .{ .name = "__error" })
+    else
+        @extern(*const fn () callconv(.c) *c_int, .{ .name = "__errno_location" });
+
+extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
+
 inline fn errnoVal() c_int {
+    if (comptime builtin.os.tag == .windows) return WSAGetLastError();
     return c_error().*;
 }
 
