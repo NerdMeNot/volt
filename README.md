@@ -99,7 +99,7 @@ the coordination cost. On any shape with actual parallel work
 | Darwin arm64 kqueue | **Working** — primary dev platform; full bench suite + 45 s stress green |
 | Linux arm64 epoll | **Working** — cross-compile + bench-exe linking green; runtime CI pass pending |
 | Linux arm64 io_uring (poll mode) | **Working** — `Runtime.Config.io_backend = .io_uring`, kernel ≥ 5.10 |
-| Windows arm64 IOCP (readiness polyfill) | **Working** — full-commit stacks; per-coroutine RSS ~256 KiB (vs ~16 KiB on POSIX) until L5c lands `VirtualProtect`-on-fault growth |
+| Windows arm64 IOCP (readiness polyfill) | **Working** — grow-on-demand stacks via VEH-driven `VirtualAlloc(MEM_COMMIT)`; RSS parity with POSIX (~16 KiB per coroutine) |
 | x86_64 (Linux + Windows) | **Cross-compile only** — needs an x86_64 context switch (#149); ARM64 ctx switch is the only one shipping today |
 | Cancellation | **Shipping** — `Cancel`, cancel-aware variants of every blocking op, `scope` for lexical lifetime |
 | File I/O / DNS / TLS | Not yet — these belong in libraries on top of Volt, not in core |

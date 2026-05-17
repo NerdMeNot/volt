@@ -25,6 +25,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const is_windows = builtin.os.tag == .windows;
+const win = std.os.windows;
 
 /// Maximum number of registered regions the SIGSEGV handler can
 /// recognize. With one entry per Runtime arena and a small handful of
@@ -56,16 +57,14 @@ const Region = struct {
 // ReleaseFast.
 var regions: [MAX_REGIONS]Region = [_]Region{.{}} ** MAX_REGIONS;
 
-/// Single-shot install of the SIGSEGV handler. Multiple Runtime
+/// Single-shot install of the fault handler. Multiple Runtime
 /// instances in the same process call this; only the first install
 /// actually fires. We never uninstall — process-lifetime handler.
 ///
-/// On Windows, every public function in this file is a no-op (L5b):
-/// stack-growth via Structured Exception Handling lives in a future
-/// L5c landing. The arena pre-commits the full body region under
-/// L5b, so the SIGSEGV-style grow-on-demand machinery isn't needed
-/// to run; a guard page still catches genuine overflows via the
-/// default Windows access-violation behaviour.
+/// POSIX uses `sigaction(SIGSEGV)` + `sigaction(SIGBUS)`. Windows
+/// uses `AddVectoredExceptionHandler` (VEH) at the front of the
+/// exception chain — fires before SEH unwinders and any debugger,
+/// which is what we want for grow-on-demand to be transparent.
 var installed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 // Signal-related libc bindings.
@@ -187,12 +186,122 @@ fn chainTo(sig: c_int, info: *SigInfo, ctx: ?*anyopaque) void {
     @panic("volt: SIGSEGV in unregistered region — real fault");
 }
 
+// ── Windows VEH bindings ─────────────────────────────────────────────
+//
+// EXCEPTION_RECORD / EXCEPTION_POINTERS layouts come straight from
+// `winnt.h`. `ExceptionInformation` is a variable-length array; for
+// `EXCEPTION_ACCESS_VIOLATION` it has two entries:
+//   [0] — fault type (0 = read, 1 = write, 8 = DEP execute).
+//   [1] — fault virtual address (what we want).
+//
+// `AddVectoredExceptionHandler(First, Handler)` registers a handler
+// at the front (`First=1`) of the OS exception chain. We install
+// once per process (idempotent via the `installed` atomic).
+
+const EXCEPTION_MAXIMUM_PARAMETERS: usize = 15;
+const EXCEPTION_ACCESS_VIOLATION: win.DWORD = 0xC0000005;
+const EXCEPTION_CONTINUE_EXECUTION: c_long = -1;
+const EXCEPTION_CONTINUE_SEARCH: c_long = 0;
+
+const EXCEPTION_RECORD = extern struct {
+    ExceptionCode: win.DWORD,
+    ExceptionFlags: win.DWORD,
+    ExceptionRecord: ?*EXCEPTION_RECORD,
+    ExceptionAddress: ?*anyopaque,
+    NumberParameters: win.DWORD,
+    ExceptionInformation: [EXCEPTION_MAXIMUM_PARAMETERS]usize,
+};
+
+const EXCEPTION_POINTERS = extern struct {
+    ExceptionRecord: *EXCEPTION_RECORD,
+    ContextRecord: ?*anyopaque, // CONTEXT — we don't read it
+};
+
+const VEHFn = *const fn (info: *EXCEPTION_POINTERS) callconv(.winapi) c_long;
+
+extern "kernel32" fn AddVectoredExceptionHandler(
+    First: win.ULONG,
+    Handler: VEHFn,
+) callconv(.winapi) ?*anyopaque;
+
+// Same `VirtualAlloc` import as `stack.zig`. Duplicated here rather
+// than shared because the VEH is async-signal-safe-equivalent and
+// shouldn't take any cross-file dependency that might pull in
+// initialisers.
+const MEM_COMMIT_WIN: win.DWORD = 0x1000;
+const PAGE_READWRITE_WIN: win.DWORD = 0x04;
+
+extern "kernel32" fn VirtualAlloc(
+    lpAddress: ?*anyopaque,
+    dwSize: usize,
+    flAllocationType: win.DWORD,
+    flProtect: win.DWORD,
+) callconv(.winapi) ?*anyopaque;
+
+/// VEH handler. Called from the kernel on any access violation in
+/// the process. Reads the fault address, walks the registry, and on
+/// a hit commits the faulting page + returns CONTINUE_EXECUTION so
+/// the faulting instruction reruns successfully. Misses (real
+/// faults, guard-page hits) return CONTINUE_SEARCH to chain to the
+/// next handler / default OS abort.
+///
+/// Async-callable safety: this can fire on any thread at any time.
+/// Allowed work: atomic reads of `regions`, `VirtualAlloc(MEM_COMMIT)`
+/// (the only Win32 syscall on the list of structured-exception-
+/// callable APIs). No allocator, no parking-lot, no logging.
+fn vehHandler(info: *EXCEPTION_POINTERS) callconv(.winapi) c_long {
+    const rec = info.ExceptionRecord;
+    if (rec.ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // ExceptionInformation[0] = fault type (0 read / 1 write).
+    // ExceptionInformation[1] = fault virtual address.
+    if (rec.NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    const fault_addr: usize = rec.ExceptionInformation[1];
+
+    var i: usize = 0;
+    while (i < MAX_REGIONS) : (i += 1) {
+        const base = regions[i].base.load(.acquire);
+        if (base == 0) continue;
+        const size = regions[i].size;
+        const slot_size = regions[i].slot_size;
+        const ps = regions[i].page_size;
+        if (fault_addr < base or fault_addr >= base + size) continue;
+
+        const slot_offset = if (slot_size == 0)
+            fault_addr - base
+        else
+            (fault_addr - base) % slot_size;
+
+        // Bottom-most page of the slot is the guard. Real overflow —
+        // chain to the next handler so the OS default aborts.
+        if (slot_offset < ps) return EXCEPTION_CONTINUE_SEARCH;
+
+        // Commit the faulting page. `VirtualAlloc(MEM_COMMIT)` on an
+        // already-reserved page transitions it from PAGE_NOACCESS to
+        // PAGE_READWRITE. Page-align downward.
+        const page_addr = fault_addr & ~(ps - 1);
+        const page_ptr: *anyopaque = @ptrFromInt(page_addr);
+        _ = VirtualAlloc(page_ptr, ps, MEM_COMMIT_WIN, PAGE_READWRITE_WIN);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 /// Install the handler. Idempotent across calls; only the first
-/// install actually touches `sigaction`. Called from `Runtime.init`
-/// at the first runtime construction in a process.
+/// install actually touches the OS. Called from `Runtime.init` at
+/// the first runtime construction in a process.
 pub fn ensureInstalled() void {
-    if (comptime is_windows) return;
     if (installed.swap(true, .acq_rel)) return;
+
+    if (comptime is_windows) {
+        // First-in-chain VEH: we see access violations before any
+        // SEH unwinder or debugger gets them. Necessary for grow-
+        // on-demand to be transparent.
+        _ = AddVectoredExceptionHandler(1, &vehHandler);
+        return;
+    }
 
     var act: Sigaction = .{
         .sa_sigaction = &handler,
@@ -206,7 +315,6 @@ pub fn ensureInstalled() void {
 /// Register a single-stack region with the handler. `size` is the
 /// full reservation length; the bottom page is treated as the guard.
 pub fn register(base: usize, size: usize) error{RegistryFull}!void {
-    if (comptime is_windows) return;
     return registerInternal(base, size, 0);
 }
 
@@ -214,7 +322,6 @@ pub fn register(base: usize, size: usize) error{RegistryFull}!void {
 /// whole slab; `slot_size` is the per-slot stride so the handler can
 /// compute `(fault - base) % slot_size` to locate the guard page.
 pub fn registerArena(base: usize, total_size: usize, slot_size: usize) error{RegistryFull}!void {
-    if (comptime is_windows) return;
     std.debug.assert(slot_size > 0);
     std.debug.assert(total_size % slot_size == 0);
     return registerInternal(base, total_size, slot_size);
@@ -238,7 +345,6 @@ fn registerInternal(base: usize, size: usize, slot_size: usize) error{RegistryFu
 /// Unregister a stack region. Called by `stack.free()` at runtime
 /// shutdown (or pool over-cap eviction).
 pub fn unregister(base: usize) void {
-    if (comptime is_windows) return;
     var i: usize = 0;
     while (i < MAX_REGIONS) : (i += 1) {
         if (regions[i].base.load(.acquire) == base) {

@@ -135,18 +135,24 @@ const MAP_FAILED: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1)))
 
 // ── Windows VM bindings ──────────────────────────────────────────────
 //
-// `VirtualAlloc(NULL, size, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE)`
-// reserves and commits a slab in one syscall — what the L5b "full-
-// commit" stack arena needs. Per-slot guard pages are installed via
-// `VirtualProtect(slot_base, page_size, PAGE_NOACCESS, &old)` in a
-// startup loop. `VirtualFree(base, 0, MEM_RELEASE)` releases the
-// whole reservation at deinit. `size = 0` is mandatory with
-// MEM_RELEASE (Windows reads the original reservation length from
-// its bookkeeping).
-//
-// L5c will replace MEM_RESERVE|MEM_COMMIT with just MEM_RESERVE and
-// commit per-page in the VEH on access — restoring POSIX-style
-// lazy-grow semantics.
+// L5c arena layout, mirroring POSIX:
+//   - `Arena.init` reserves the whole slab via
+//     `VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_NOACCESS)`. No
+//     pages are committed; access to anything in the slab faults.
+//   - `Arena.alloc` lazy-commits the top BODY_SIZE of the slot via
+//     `VirtualAlloc(body_base, BODY_SIZE, MEM_COMMIT,
+//     PAGE_READWRITE)` on first use (the `committed` bitmap skips
+//     the syscall on slot reuse — same shape as POSIX mprotect).
+//   - The middle "growable" region stays reserved-only. The VEH in
+//     `signal.zig` catches the access-violation, `VirtualAlloc
+//     (MEM_COMMIT)`s the faulting page, and returns
+//     `EXCEPTION_CONTINUE_EXECUTION`.
+//   - The bottom page stays reserved-only too; it's the guard.
+//     A fault there falls through the VEH with
+//     `EXCEPTION_CONTINUE_SEARCH` and the default Windows handler
+//     aborts (matching POSIX's chain-to-default behaviour).
+//   - `Arena.deinit` calls `VirtualFree(base, 0, MEM_RELEASE)`.
+//     `dwSize == 0` is mandatory with MEM_RELEASE.
 
 const MEM_COMMIT: win.DWORD = 0x1000;
 const MEM_RESERVE: win.DWORD = 0x2000;
@@ -165,13 +171,6 @@ extern "kernel32" fn VirtualFree(
     lpAddress: *anyopaque,
     dwSize: usize,
     dwFreeType: win.DWORD,
-) callconv(.winapi) win.BOOL;
-
-extern "kernel32" fn VirtualProtect(
-    lpAddress: *anyopaque,
-    dwSize: usize,
-    flNewProtect: win.DWORD,
-    lpflOldProtect: *win.DWORD,
 ) callconv(.winapi) win.BOOL;
 
 pub const Error = error{
@@ -241,28 +240,14 @@ pub const Arena = struct {
         const slot_size = slotSize();
         const total = n_slots * slot_size;
 
-        // Reserve the slab. Two platform shapes — see the bindings
-        // block above for why Windows does eager-commit.
+        // Reserve the slab — same shape on every platform. Nothing
+        // is committed yet; first access to a slot's body triggers
+        // a lazy commit in `Arena.alloc`, and faults in the growable
+        // region are handled by the signal / VEH handler.
         const base: StackPtr = if (comptime is_windows) blk: {
-            // MEM_RESERVE|MEM_COMMIT in a single call — full slab is
-            // RW. Per-slot guards installed in the loop below.
-            const p = VirtualAlloc(null, total, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            const p = VirtualAlloc(null, total, MEM_RESERVE, PAGE_NOACCESS);
             if (p == null) return error.MmapFailed;
-            const b: StackPtr = @ptrCast(@alignCast(p.?));
-            // Install the per-slot guard page (bottom page of each
-            // slot). One VirtualProtect per slot — bounded at
-            // construction, paid once.
-            const ps = std.heap.pageSize();
-            var s: usize = 0;
-            while (s < n_slots) : (s += 1) {
-                var old: win.DWORD = 0;
-                const guard_ptr: *anyopaque = @ptrCast(b + s * slot_size);
-                if (VirtualProtect(guard_ptr, ps, PAGE_NOACCESS, &old) == win.BOOL.FALSE) {
-                    _ = VirtualFree(p.?, 0, MEM_RELEASE);
-                    return error.MprotectFailed;
-                }
-            }
-            break :blk b;
+            break :blk @as(StackPtr, @ptrCast(@alignCast(p.?)));
         } else blk: {
             const ret = mmap_fn(null, total, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
             if (ret == MAP_FAILED or ret == null) return error.MmapFailed;
@@ -345,18 +330,21 @@ pub const Arena = struct {
         // our own lock held across it.
         self.release();
 
-        if (!already and comptime !is_windows) {
-            // POSIX: lazy-commit the body region (top BODY_SIZE bytes)
-            // via mprotect. The arena reserved everything as PROT_NONE
-            // at init, so first use of each slot needs a syscall here.
-            // Windows pre-commits the full slab at init (see L5b notes
-            // in this file's bindings block) so this branch is a no-op
-            // there — the `already` bit is still set so reuse keeps
-            // skipping the rollback path correctly.
+        if (!already) {
+            // Lazy-commit the body region (top BODY_SIZE bytes) on
+            // first use of this slot. POSIX uses `mprotect` to flip
+            // the region from PROT_NONE to PROT_RW (the arena
+            // reserved everything as PROT_NONE at init). Windows
+            // uses `VirtualAlloc(MEM_COMMIT)` to commit the same
+            // region into the MEM_RESERVE'd slab. The `committed`
+            // bitmap skips this on slot reuse.
             const body_offset = slot_size - BODY_SIZE;
             const body_ptr: *anyopaque = @ptrCast(base + body_offset);
-            const rc = mprotect_fn(body_ptr, BODY_SIZE, PROT_READ | PROT_WRITE);
-            if (rc != 0) {
+            const ok = if (comptime is_windows)
+                VirtualAlloc(body_ptr, BODY_SIZE, MEM_COMMIT, PAGE_READWRITE) != null
+            else
+                mprotect_fn(body_ptr, BODY_SIZE, PROT_READ | PROT_WRITE) == 0;
+            if (!ok) {
                 // Roll back: clear the commit bit and return the slot.
                 self.acquire();
                 self.committed[byte_idx] &= ~bit_mask;
@@ -463,12 +451,10 @@ test "Arena: slot reuse skips re-mprotect (commit bit sticky)" {
     try std.testing.expectEqual(@as(u8, 0x99), body_start2[0]);
 }
 
-test "Arena: grow-on-demand mprotects a deeper page on access" {
-    // Windows pre-commits the full slab under L5b — there's no
-    // grow-on-demand path to exercise. L5c will reintroduce lazy
-    // commit via a VEH and this test should run there too.
-    if (comptime is_windows) return error.SkipZigTest;
-
+test "Arena: grow-on-demand commits a deeper page on access" {
+    // POSIX uses mprotect from the SIGSEGV handler; Windows uses
+    // VirtualAlloc(MEM_COMMIT) from a Vectored Exception Handler.
+    // The test exercises both paths identically.
     var a = try Arena.init(std.testing.allocator, 2);
     defer a.deinit(std.testing.allocator);
 
