@@ -672,16 +672,23 @@ pub fn Watch(comptime T: type) type {
         };
 
         fn watchChangedValidator(addr: *const anyopaque) bool {
-            const sp: *const std.atomic.Value(u64) = @ptrCast(@alignCast(addr));
-            // Park only if there's no new version available. Caller
-            // re-checks closed in the loop above.
-            const v = sp.load(.acquire);
-            // We don't know the receiver's cursor here — the loop in
-            // `changed` re-checks after wake. The validator just
-            // confirms the version hasn't advanced under us.
-            // Conservative: always park; the caller's loop is the
-            // truth.
-            _ = v;
+            // Validator runs UNDER the parking-lot bucket lock — this
+            // is the only correct place to re-check `closed`. Without
+            // this, a `close()` that fires between the caller's
+            // `closed.load()` check and `parkOn()` actually queueing
+            // the waiter would `unparkAll` an empty queue, then the
+            // receiver would enqueue and hang forever. Recover `*Self`
+            // from the version-field address via `@fieldParentPtr`.
+            // Field is `align(CACHE_LINE)`; the parking lot only
+            // promises raw `*const anyopaque`, so re-align before
+            // recovering the parent.
+            const version_ptr: *align(CACHE_LINE) const std.atomic.Value(u64) =
+                @ptrCast(@alignCast(addr));
+            const self: *const Self = @fieldParentPtr("version", version_ptr);
+            if (self.closed.load(.acquire)) return false;
+            // We can't check the receiver's cursor from here — the
+            // caller's loop re-validates after wake. The validator's
+            // only job is the close-race fix above.
             return true;
         }
     };
@@ -786,12 +793,20 @@ pub fn Broadcast(comptime T: type, comptime cap: usize) type {
         };
 
         fn broadcastRecvValidator(addr: *const anyopaque) bool {
-            // Conservative: always park if validator runs. The recv
-            // loop re-checks head and closed under the bucket lock
-            // implicitly via the load.acquire after wake. There's no
-            // false-park risk: an unpark from `send` runs after the
-            // store, so any post-wake load sees the new head.
-            _ = addr;
+            // Same close-race as Watch's validator: a `close()` firing
+            // between the caller's `closed.load()` check and `parkOn()`
+            // actually enqueuing would leave the receiver parked
+            // forever (the `unparkAll(&head)` in `close` ran on an
+            // empty queue). Recover `*Self` via `@fieldParentPtr` and
+            // re-check `closed` UNDER the bucket lock here.
+            //
+            // We can also re-check `head > cursor`, but the caller's
+            // loop does that after wake anyway and we don't have
+            // `cursor` available in the validator — leave it.
+            const head_ptr: *align(CACHE_LINE) const std.atomic.Value(u64) =
+                @ptrCast(@alignCast(addr));
+            const self: *const Self = @fieldParentPtr("head", head_ptr);
+            if (self.closed.load(.acquire)) return false;
             return true;
         }
     };
