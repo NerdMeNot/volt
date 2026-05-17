@@ -96,10 +96,15 @@ const ULF_NO_ERRNO: u32 = 0x01000000;
 extern "c" fn __ulock_wait(operation: u32, addr: *anyopaque, value: u64, timeout: u32) c_int;
 extern "c" fn __ulock_wake(operation: u32, addr: *anyopaque, wake_value: u64) c_int;
 
-// ── Linux: futex(FUTEX_WAIT_PRIVATE / FUTEX_WAKE_PRIVATE) ────────────
+// ── Linux: futex(FUTEX_WAIT / FUTEX_WAKE, private) ───────────────────
+//
+// Zig 0.16's `std.os.linux` exposes the v1 futex syscall via
+// `futex_3arg` / `futex_4arg` taking a `FUTEX_OP{ .cmd, .private }`
+// packed struct (the old `futex_wait` / `futex_wake` wrappers and the
+// `FUTEX_WAIT_PRIVATE` constants were removed in the API refactor).
 
-const FUTEX_WAIT_PRIVATE: i32 = 128 | 0;
-const FUTEX_WAKE_PRIVATE: i32 = 128 | 1;
+const FUTEX_WAIT_PRIVATE: std.os.linux.FUTEX_OP = .{ .cmd = .WAIT, .private = true };
+const FUTEX_WAKE_PRIVATE: std.os.linux.FUTEX_OP = .{ .cmd = .WAKE, .private = true };
 
 fn futexWait(addr: *std.atomic.Value(u32), expected: u32) void {
     if (comptime is_darwin) {
@@ -107,8 +112,9 @@ fn futexWait(addr: *std.atomic.Value(u32), expected: u32) void {
         // ulock_wait blocks while *addr == expected.
         _ = __ulock_wait(op, addr, expected, 0);
     } else if (comptime is_linux) {
-        const rc = std.os.linux.futex_wait(@ptrCast(addr), FUTEX_WAIT_PRIVATE, @intCast(expected), null);
-        _ = rc;
+        // FUTEX_WAIT blocks while *uaddr == val; spurious wakes are
+        // caller-handled in the park() loop above.
+        _ = std.os.linux.futex_4arg(@ptrCast(addr), FUTEX_WAIT_PRIVATE, expected, null);
     } else {
         @compileError("Parker: no futex backend for this OS (kqueue+self-pipe fallback can be added)");
     }
@@ -120,8 +126,8 @@ fn futexWake(addr: *std.atomic.Value(u32)) void {
         // wake_value = 0 → wake one waiter; ULF_WAKE_ALL (not used) for broadcast.
         _ = __ulock_wake(op, addr, 0);
     } else if (comptime is_linux) {
-        const rc = std.os.linux.futex_wake(@ptrCast(addr), FUTEX_WAKE_PRIVATE, 1);
-        _ = rc;
+        // val = 1 — wake at most one waiter (Parker has at most one).
+        _ = std.os.linux.futex_3arg(@ptrCast(addr), FUTEX_WAKE_PRIVATE, 1);
     } else {
         @compileError("Parker: no futex backend for this OS");
     }

@@ -264,7 +264,10 @@ pub const Runtime = struct {
     /// reducing cache-line contention.
     ms: []M,
     ps: []P,
-    reactor: Reactor = .{},
+    // No struct-level default — Linux's `Reactor` is a tagged union
+    // (epoll vs io_uring) and can't default-init from `.{}`. The init
+    // site below names this field explicitly via `.reactor = reactor_inst`.
+    reactor: Reactor,
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Bit i set ⇔ ms[i] is parked. M[0] is the driver thread.
     parked_workers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),

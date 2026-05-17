@@ -57,43 +57,47 @@ comptime {
 pub extern fn voltCtxSwap(from: *Context, to: *Context) callconv(.c) void;
 pub extern fn voltCoroEntry() callconv(.c) void;
 
+// Mach-O (Darwin) adds a leading underscore to C symbol names when
+// they're emitted; ELF (Linux) and COFF (Windows) do not. The asm
+// labels below have to match whatever the linker is looking for.
+const sym_prefix = if (builtin.os.tag.isDarwin()) "_" else "";
+
 comptime {
-    asm (
-        \\.global _voltCtxSwap
-        \\.p2align 2
-        \\_voltCtxSwap:
-        \\  stp x19, x20, [x0, #0]
-        \\  stp x21, x22, [x0, #16]
-        \\  stp x23, x24, [x0, #32]
-        \\  stp x25, x26, [x0, #48]
-        \\  stp x27, x28, [x0, #64]
-        \\  stp x29, x30, [x0, #80]
-        \\  mov x9, sp
-        \\  str x9, [x0, #96]
-        \\  stp d8,  d9,  [x0, #104]
-        \\  stp d10, d11, [x0, #120]
-        \\  stp d12, d13, [x0, #136]
-        \\  stp d14, d15, [x0, #152]
-        \\  ldp x19, x20, [x1, #0]
-        \\  ldp x21, x22, [x1, #16]
-        \\  ldp x23, x24, [x1, #32]
-        \\  ldp x25, x26, [x1, #48]
-        \\  ldp x27, x28, [x1, #64]
-        \\  ldp x29, x30, [x1, #80]
-        \\  ldr x9, [x1, #96]
-        \\  mov sp, x9
-        \\  ldp d8,  d9,  [x1, #104]
-        \\  ldp d10, d11, [x1, #120]
-        \\  ldp d12, d13, [x1, #136]
-        \\  ldp d14, d15, [x1, #152]
-        \\  ret
-        \\.global _voltCoroEntry
-        \\.p2align 2
-        \\_voltCoroEntry:
-        \\  mov x0, x19
-        \\  ldr x1, [x19]
-        \\  blr x1
-        \\  brk #1
+    asm (".global " ++ sym_prefix ++ "voltCtxSwap\n" ++
+            ".p2align 2\n" ++
+            sym_prefix ++ "voltCtxSwap:\n" ++
+            \\  stp x19, x20, [x0, #0]
+            \\  stp x21, x22, [x0, #16]
+            \\  stp x23, x24, [x0, #32]
+            \\  stp x25, x26, [x0, #48]
+            \\  stp x27, x28, [x0, #64]
+            \\  stp x29, x30, [x0, #80]
+            \\  mov x9, sp
+            \\  str x9, [x0, #96]
+            \\  stp d8,  d9,  [x0, #104]
+            \\  stp d10, d11, [x0, #120]
+            \\  stp d12, d13, [x0, #136]
+            \\  stp d14, d15, [x0, #152]
+            \\  ldp x19, x20, [x1, #0]
+            \\  ldp x21, x22, [x1, #16]
+            \\  ldp x23, x24, [x1, #32]
+            \\  ldp x25, x26, [x1, #48]
+            \\  ldp x27, x28, [x1, #64]
+            \\  ldp x29, x30, [x1, #80]
+            \\  ldr x9, [x1, #96]
+            \\  mov sp, x9
+            \\  ldp d8,  d9,  [x1, #104]
+            \\  ldp d10, d11, [x1, #120]
+            \\  ldp d12, d13, [x1, #136]
+            \\  ldp d14, d15, [x1, #152]
+            \\  ret
+        ++ "\n.global " ++ sym_prefix ++ "voltCoroEntry\n" ++
+            ".p2align 2\n" ++
+            sym_prefix ++ "voltCoroEntry:\n" ++
+            \\  mov x0, x19
+            \\  ldr x1, [x19]
+            \\  blr x1
+            \\  brk #1
     );
 }
 
