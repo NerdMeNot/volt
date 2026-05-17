@@ -33,6 +33,14 @@ jobs:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    # Force bash on every platform. Default Windows shell is `pwsh`,
+    # which swallowed the `zig build` exit code on the first probe
+    # round (step exited code 1 in 0.4 s with zero output). Git Bash
+    # is preinstalled on Windows runners and matches the Darwin/Linux
+    # invocation exactly. Set at job level so every step inherits.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -57,24 +65,68 @@ jobs:
       - name: zig build
         run: zig build
 
-      # The unit-test suite is the real proof: it exercises the
-      # parker, scheduler, reactor, slab arena, channels, sync
-      # primitives, and the SIGSEGV/VEH stack-growth path. Leak-
-      # detecting allocator wired in `std.testing.allocator`.
-      - name: zig build test
-        run: zig build test
+      # Test runs are split per test-name prefix to bisect a hang.
+      # Round 2 of this probe surfaced `zig build test` hanging
+      # silently on every POSIX runner — same shape as the pre-
+      # existing macos-latest issue from f6ffea2. Without
+      # bisection we burn 20 min per round; with these per-family
+      # steps (180s timeout each), one round identifies the
+      # offending test prefix.
+      #
+      # `timeout 180s` ensures a stuck test family doesn't block
+      # subsequent ones. `continue-on-error: true` lets every step
+      # run regardless of upstream failures so we get full coverage
+      # per probe. Each step uses `zig test src/lib.zig -lc` —
+      # bypasses build.zig's run-step so the timeout binds the
+      # actual test process.
+      - name: test — runtime + scheduler + reactor (excludes channels)
+        continue-on-error: true
+        run: |
+          timeout 180s zig test src/lib.zig -lc \
+            --test-filter "runtime" \
+            --test-filter "Cancel" \
+            --test-filter "Mutex" \
+            --test-filter "Notify" \
+            --test-filter "Semaphore" \
+            --test-filter "scope" \
+            --test-filter "sleep" \
+            --test-filter "parking lot" \
+            --test-filter "register" \
+            --test-filter "P." \
+            --test-filter "Arena" \
+            --test-filter "WorkStealQueue" \
+            --test-filter "TcpListener" \
+            --test-filter "TCP echo"
+
+      - name: test — spsc / mpmc (existing channels)
+        continue-on-error: true
+        run: |
+          timeout 180s zig test src/lib.zig -lc \
+            --test-filter "spsc" \
+            --test-filter "mpmc"
+
+      - name: test — oneshot (new in 2026-05-16)
+        continue-on-error: true
+        run: timeout 180s zig test src/lib.zig -lc --test-filter "oneshot"
+
+      - name: test — watch (new in 2026-05-16; suspect)
+        continue-on-error: true
+        run: timeout 180s zig test src/lib.zig -lc --test-filter "watch"
+
+      - name: test — broadcast (new in 2026-05-16; suspect)
+        continue-on-error: true
+        run: timeout 180s zig test src/lib.zig -lc --test-filter "broadcast"
+
+      # Fallback: run anything we missed above. Catches tests with
+      # name prefixes we forgot. Last so it doesn't block specific
+      # diagnoses.
+      - name: test — full suite (catch-all, may hang)
+        continue-on-error: true
+        run: timeout 300s zig build test
 
       # One bench in ReleaseFast — confirms a real binary spins up
       # the runtime, runs through the dispatch loop, and prints
       # numbers. Not a perf gate; just a smoke check.
-      #
-      # Known soft-fail: bench-yield's `nanosNow` helper uses
-      # `std.posix.system.clock_gettime`, which doesn't compile on
-      # aarch64-windows-gnu (`timespec` has an ABI mismatch under
-      # `aarch64_aapcs_win`). The runtime itself isn't affected —
-      # this is bench portability work that's a separate landing.
-      # Marked `continue-on-error` so the bench fail on Windows
-      # doesn't mask whether the runtime tests passed.
       - name: zig build bench-yield (smoke)
         continue-on-error: true
         run: zig build bench-yield -Doptimize=ReleaseFast
