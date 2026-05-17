@@ -1,0 +1,80 @@
+name: Cross-platform probe (temp)
+
+# Temporary workflow to validate the L1–L5 cross-platform runtime
+# work against real GitHub-hosted runners. The regular CI is paused
+# while this runs — see `ci.yml`'s commented-out triggers.
+#
+# What we're checking, per platform:
+#   1. `zig build`            — module + bench targets compile.
+#   2. `zig build test`       — unit tests run and pass.
+#   3. `zig build bench-yield`— a real binary runs (smoke).
+#
+# Volt's ctx switch is ARM64-only today, so every runner is an
+# ARM64 host:
+#   - macOS arm64       → `macos-latest`        (M1+ default since macos-14)
+#   - Linux arm64       → `ubuntu-24.04-arm`    (GitHub-hosted ARM64 free since 2024)
+#   - Windows arm64     → `windows-11-arm`      (newer; may fail to schedule)
+#
+# Delete this file once the multi-platform story has stabilised
+# and `ci.yml` has absorbed whichever jobs we want long-term.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  probe:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - ubuntu-24.04-arm
+          - windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: zig version
+        run: zig version
+
+      - name: zig fmt --check
+        run: zig fmt --check src/ bench/ build.zig
+
+      - name: zig build
+        run: zig build
+
+      # The unit-test suite is the real proof: it exercises the
+      # parker, scheduler, reactor, slab arena, channels, sync
+      # primitives, and the SIGSEGV/VEH stack-growth path. Leak-
+      # detecting allocator wired in `std.testing.allocator`.
+      - name: zig build test
+        run: zig build test
+
+      # One bench in ReleaseFast — confirms a real binary spins up
+      # the runtime, runs through the dispatch loop, and prints
+      # numbers. Not a perf gate; just a smoke check.
+      #
+      # Known soft-fail: bench-yield's `nanosNow` helper uses
+      # `std.posix.system.clock_gettime`, which doesn't compile on
+      # aarch64-windows-gnu (`timespec` has an ABI mismatch under
+      # `aarch64_aapcs_win`). The runtime itself isn't affected —
+      # this is bench portability work that's a separate landing.
+      # Marked `continue-on-error` so the bench fail on Windows
+      # doesn't mask whether the runtime tests passed.
+      - name: zig build bench-yield (smoke)
+        continue-on-error: true
+        run: zig build bench-yield -Doptimize=ReleaseFast

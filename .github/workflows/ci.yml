@@ -1,10 +1,15 @@
 name: CI
 
+# Temporarily disabled (auto-triggers removed) while the
+# `cross-platform-probe.yml` workflow runs the multi-platform
+# verification matrix. Revert by restoring the push/pull_request
+# triggers below. Manual runs still possible via the Actions tab.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
+  # push:
+  #   branches: [main]
+  # pull_request:
+  #   branches: [main]
 
 env:
   ZIG_VERSION: "0.16.0"
