@@ -1,6 +1,6 @@
 ---
 title: The context switch
-description: AAPCS64 wide-save register layout, the trampoline, and why 10 ns/swap is the floor. The 28 instructions that make stackful coroutines fast.
+description: Per-arch callee-saved register save/restore — AAPCS64 on ARM64, System V x86-64 on Linux/macOS-Intel, Microsoft x64 on Windows. ~10 ns/swap is the floor.
 ---
 
 A context switch is what makes a stackful coroutine actually a
@@ -9,8 +9,20 @@ suspends, the runtime needs to save its registers, switch to a
 different stack, and restore another coroutine's registers — or
 the worker's dispatch-loop registers, on a yield.
 
-This page covers Volt's arm64 context switch. The x86_64 port is
-roadmapped; the design is parallel.
+Volt ships three implementations behind one interface
+(`src/context.zig`'s comptime-dispatch shim):
+
+| Arch + OS | File | Mechanism |
+|---|---|---|
+| ARM64 (Darwin / Linux / Windows) | `src/context_arm64.zig` | AAPCS64 wide-save via inline asm |
+| x86_64 (Linux / macOS-Intel) | `src/context_x86_64.zig` + `src/context_x86_64_sysv.S` | System V x86-64 callee-saved set via a separate `.S` file (Zig 0.16 comptime asm doesn't reliably emit ELF symbols here) |
+| x86_64 (Windows) | `src/context_x86_64.zig` + `src/context_x86_64_win.S` | Microsoft x64 callee-saved set incl. XMM6-XMM15, separate `.S` file |
+
+The narrative below covers the AAPCS64 design in depth — it's the
+oldest backend, the most documented, and conceptually the others
+parallel it with different register sets. Where the x86_64
+backends differ materially (Win64's XMM saves, shadow-space
+allocation in the trampoline), they're called out inline.
 
 ## Mental model
 
@@ -205,20 +217,35 @@ calls across chunks pay an extra branch. Volt picks contiguous
 stacks per slot — the slab arena + SIGSEGV grow gives us
 contiguous-stack ergonomics without committing 8 MiB upfront.
 
-## What's not yet built
+## x86_64 backends — what's different
 
-- **x86_64 context switch.** The shape is the same: save SysV
-  ABI callee-save regs (`rbx`, `rbp`, `r12`-`r15`, plus `rsp`
-  and a return address pushed on the new stack), restore the
-  target's. NEON equivalent: `xmm6`-`xmm15` are caller-save on
-  SysV ABI but callee-save on Windows ABI. The asm exists in
-  Volt's spike (POC-A's earlier iterations); the production port
-  is roadmapped.
-- **Module-level comptime asm on x86_64-linux ELF.** A Zig 0.16
-  gotcha: `comptime { asm(...) }` doesn't always emit symbols on
-  the x86_64-linux target. Plan is to use a separate `.S` file
-  linked via `build.zig` when the x86_64 port lands. Documented
-  in CLAUDE.md.
+The L6 work added two x86_64 variants behind the same dispatch
+shim. Both follow the same skeleton (save callee-saves to `*from`,
+load from `*to`, `ret`); they differ in register set, calling
+convention, and how the trampoline bootstraps.
+
+**System V x86-64** (Linux + macOS-Intel):
+- 6 callee-saved GPRs (`rbx`, `rbp`, `r12`-`r15`) + `rsp`. No
+  XMM callee-saves — SysV makes them all volatile. Context
+  struct: 56 bytes.
+- Args in `rdi`/`rsi` (so `swap(from, to)` maps directly).
+- Trampoline reserves no shadow space; just `call`s the user fn.
+
+**Microsoft x64** (Windows):
+- 8 callee-saved GPRs (adds `rdi`, `rsi` on top of SysV) + `rsp`
+  + XMM6-XMM15 (10 × 128-bit, saved with `movdqa`). Context
+  struct: 240 bytes, 16-byte aligned for the XMM stores.
+- Args in `rcx`/`rdx`.
+- Trampoline reserves 32 bytes of shadow space (`sub rsp, 32`)
+  before `call`ing the user fn — Win64 ABI requirement.
+
+**Why a separate `.S` file**: Zig 0.16's module-level
+`comptime { asm(...) }` doesn't reliably emit global symbols on
+the x86_64-linux ELF target (works on aarch64). The ARM64
+backend uses the inline trick; the x86_64 backends link a
+hand-written `.S` file via `build.zig`'s `addAssemblyFile`.
+Mach-O vs ELF symbol prefix is handled with
+`#if defined(__APPLE__)` inside the SysV `.S`.
 
 ## Measured
 

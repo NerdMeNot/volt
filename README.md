@@ -97,10 +97,11 @@ the coordination cost. On any shape with actual parallel work
 | | Status |
 |---|---|
 | Darwin arm64 kqueue | **Working** — primary dev platform; full bench suite + 45 s stress green; native CI |
-| Linux arm64 epoll | **Working** — native test CI on `ubuntu-24.04-arm` green |
-| Linux arm64 io_uring (poll mode) | **Working** — `Runtime.Config.io_backend = .io_uring`, kernel ≥ 5.10 |
-| Windows arm64 IOCP | **Cross-compile only** — code complete (VEH stack growth, `WaitOnAddress` parker, `VirtualAlloc`-reserved arena). Native testing blocked by an upstream Zig 0.16 bug (`zig build` segfaults on `windows-11-arm`); Zig's own ARM64 Windows CI is offline. Revisit when Zig fixes it |
-| x86_64 (Linux + Windows) | **Cross-compile only** — needs an x86_64 context switch (#149); ARM64 ctx switch is the only one shipping today |
+| Darwin x86_64 kqueue | **Working** — Intel Mac; runs natively + via Rosetta from Apple Silicon |
+| Linux arm64 (epoll / io_uring) | **Working** — native test CI on `ubuntu-24.04-arm` green |
+| Linux x86_64 (epoll / io_uring) | **Working** — native test CI on `ubuntu-latest` green; SysV x86-64 ctx switch (L6a) |
+| Windows x86_64 IOCP | **Working** — native test CI on `windows-latest` green; Microsoft x64 ABI ctx switch with XMM6-XMM15 save (L6b) |
+| Windows arm64 IOCP | **Cross-compile only** — code complete; native testing blocked by an upstream Zig 0.16 bug (`zig build` segfaults on `windows-11-arm`). Revisit when Zig fixes it |
 | Cancellation | **Shipping** — `Cancel`, cancel-aware variants of every blocking op, `scope` for lexical lifetime |
 | File I/O / DNS / TLS | Not yet — these belong in libraries on top of Volt, not in core |
 | Mutex throughput | Parking-lot + spin loop redesign on 2026-05-16 — contended-Mutex bench now 15 ns/op, ~5.4× faster than Go's 81 ns |

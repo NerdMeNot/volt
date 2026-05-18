@@ -13,32 +13,31 @@ env:
 # ─────────────────────────────────────────────────────────────────────
 # CI structure
 #
-# Volt runs natively on Darwin arm64 (kqueue reactor) and Linux arm64
-# (epoll / io_uring reactor, with the L5a-L5c runtime portability
-# work). Both are exercised by the `test` matrix job below — first
-# real cross-platform validation as of L5.
+# After L6, Volt runs natively on FOUR (arch, OS) combinations:
+#   * macOS arm64   (kqueue + Apple AAPCS64)         → macos-latest
+#   * macOS x86_64  (kqueue + SysV x86-64, Rosetta)  → macos-latest
+#                    (cross-compile, run via Rosetta)
+#   * Linux arm64   (epoll/io_uring + AAPCS64)       → ubuntu-24.04-arm
+#   * Linux x86_64  (epoll/io_uring + SysV x86-64)   → ubuntu-latest
+#   * Windows x86_64 (IOCP + Microsoft x64 ABI)      → windows-latest
 #
-# Windows arm64 is deliberately cross-compile-only. Native Windows
-# ARM64 testing is blocked by an upstream Zig 0.16 bug: `zig build`
-# segfaults on the `windows-11-arm` runner image (`zig version` and
-# `zig fmt` both work fine). This is a Tier 2 platform per Zig's own
-# release notes (https://ziglang.org/download/0.16.0/release-notes.html)
-# and Zig's own CI doesn't currently run on Windows ARM64 either —
-# see ziglang/zig#13862 and ziglang/zig#16665. Revisit when Zig
-# upstream's `aarch64-windows` CI machine comes back online.
-#
-# x86_64 is also cross-compile-only across the board: Volt's context
-# switch is ARM64-only today; x86_64 support is tracked by #149.
+# Windows arm64 is the only cross-compile-only platform. Native
+# Windows ARM64 testing is blocked by an upstream Zig 0.16 bug:
+# `zig build` segfaults on the `windows-11-arm` runner image
+# (`zig version` and `zig fmt` both work fine). This is a Tier 2
+# platform per Zig's release notes (https://ziglang.org/download/
+# 0.16.0/release-notes.html) and Zig's own CI doesn't currently
+# run on Windows ARM64 either — see ziglang/zig#13862 and
+# ziglang/zig#16665. Revisit when Zig upstream's `aarch64-windows`
+# CI machine comes back online.
 #
 # Jobs:
 # 1. format        — `zig fmt --check` on src/ + bench/ + build.zig
 # 2. cross-compile — every target's lib parses + type-checks
 #                    (catches accidental platform-isms in portable
-#                    code). Lazy semantic analysis — see L5b probe
-#                    notes for why this masked the `__error` symbol
-#                    bug until exe-builds surfaced it.
+#                    code).
 # 3. test          — full unit test suite, native, matrix of
-#                    {macos arm64, linux arm64}
+#                    {macos arm64, linux arm64, linux x86_64, windows x86_64}
 # 4. bench-smoke   — one bench builds + runs, native macOS arm64.
 #                    Cheap early signal that the runtime survives a
 #                    real workload — not a perf gate.
@@ -82,12 +81,21 @@ jobs:
     needs: format
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    # Force bash on every runner — Windows defaults to PowerShell,
+    # whose native-exit-code propagation chewed up `zig build`'s
+    # output during the L5 cross-platform probe. Git Bash is
+    # preinstalled on Windows runners.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
         os:
           - macos-latest       # arm64 since macos-14
           - ubuntu-24.04-arm   # GitHub-hosted ARM64 Linux (free since 2024)
+          - ubuntu-latest      # x86_64 Linux — exercises SysV x86-64 ctx switch
+          - windows-latest     # x86_64 Windows — exercises Microsoft x64 ABI
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2

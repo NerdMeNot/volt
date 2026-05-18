@@ -204,9 +204,11 @@ pub const WorkStealQueue = struct {
         if (to_steal == 0) return null;
 
         // Phase 1 — claim. Move real_head forward, leave steal_head.
-        // Use cmpxchgStrong: on arm64 this lowers to `casa` which
-        // doesn't spuriously fail (unlike LL/SC-backed cmpxchgWeak).
-        // Real contention still surfaces as a returned `actual` value.
+        // Use cmpxchgStrong: both arm64 (`casa`) and x86_64
+        // (`lock cmpxchg`) lower to single instructions with no
+        // spurious-failure behaviour (unlike LL/SC-backed
+        // cmpxchgWeak on arches without true CAS). Real contention
+        // still surfaces as a returned `actual` value.
         const new_src_head = pack(src_h.steal, src_h.real +% to_steal);
         if (src.head.cmpxchgStrong(src_head_packed, new_src_head, .acq_rel, .acquire)) |_| {
             return null; // lost race to another stealer or owner pop

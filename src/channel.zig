@@ -37,7 +37,11 @@ const cancel_mod = @import("cancel.zig");
 
 pub const ChannelError = error{Closed};
 
-const CACHE_LINE: usize = 128;
+// `std.atomic.cache_line` is arch-aware: 128 on ARM64 M-series,
+// 64 on x86_64, etc. Using the hardcoded 128 over-provisioned
+// padding on x86_64 by ~2× per atomic field. Match the constant
+// already used in `src/work_steal_queue.zig`.
+const CACHE_LINE = std.atomic.cache_line;
 
 inline fn currentRt() *runtime.Runtime {
     return @ptrCast(@alignCast(current.require().runtime));
