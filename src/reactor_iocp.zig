@@ -424,7 +424,10 @@ pub const Reactor = struct {
         // FALSE is a real submission failure.
         if (rc == win.BOOL.FALSE) {
             const e = WSAGetLastError();
-            if (e != WSA_IO_PENDING) return error.AcceptExFailed;
+            if (e != WSA_IO_PENDING) {
+                std.debug.print("AcceptEx submit failed: WSA error {d}\n", .{e});
+                return error.AcceptExFailed;
+            }
         }
         _ = self.pending.fetchAdd(1, .acq_rel);
         me.pending = .park;
@@ -457,7 +460,10 @@ pub const Reactor = struct {
         );
         if (rc == win.BOOL.FALSE) {
             const e = WSAGetLastError();
-            if (e != WSA_IO_PENDING) return error.ConnectExFailed;
+            if (e != WSA_IO_PENDING) {
+                std.debug.print("ConnectEx submit failed: WSA error {d}\n", .{e});
+                return error.ConnectExFailed;
+            }
         }
         _ = self.pending.fetchAdd(1, .acq_rel);
         me.pending = .park;
