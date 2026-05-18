@@ -335,10 +335,15 @@ pub const Reactor = struct {
         // and stable; the kernel can write to this address up
         // until we resume.
         var ovl: OVERLAPPED = std.mem.zeroes(OVERLAPPED);
-        // Stash the coroutine pointer in hEvent. The IOCP
-        // doesn't care what's there; we'll cast it back on
-        // wake.
-        ovl.hEvent = @ptrFromInt(@intFromPtr(me));
+        // Stash the coroutine pointer in OVERLAPPED.Pointer. The
+        // union field is unused for socket I/O (it's only the file
+        // seek offset for file I/O). We can't reuse hEvent for
+        // this: mswsock's AcceptEx / ConnectEx validate hEvent as
+        // a real Win32 event-handle and fail with
+        // ERROR_INVALID_HANDLE when it isn't. WSARecv / WSASend
+        // happen to be more lenient, but using one consistent slot
+        // is cleaner than relying on per-API leniency.
+        ovl.DUMMYUNIONNAME = .{ .Pointer = @ptrFromInt(@intFromPtr(me)) };
 
         var dummy_buf: [1]u8 = .{0};
         var wsabuf = WSABUF{
@@ -406,7 +411,7 @@ pub const Reactor = struct {
 
         const me = current.require();
         var ovl: OVERLAPPED = std.mem.zeroes(OVERLAPPED);
-        ovl.hEvent = @ptrFromInt(@intFromPtr(me));
+        ovl.DUMMYUNIONNAME = .{ .Pointer = @ptrFromInt(@intFromPtr(me)) };
         var bytes_received: win.DWORD = 0;
         const rc = accept_ex(
             listen_sock,
@@ -447,7 +452,7 @@ pub const Reactor = struct {
 
         const me = current.require();
         var ovl: OVERLAPPED = std.mem.zeroes(OVERLAPPED);
-        ovl.hEvent = @ptrFromInt(@intFromPtr(me));
+        ovl.DUMMYUNIONNAME = .{ .Pointer = @ptrFromInt(@intFromPtr(me)) };
         var bytes_sent: win.DWORD = 0;
         const rc = connect_ex(
             sock,
@@ -553,13 +558,15 @@ pub const Reactor = struct {
         while (i < count) : (i += 1) {
             const e = &entries[i];
             // Two completion shapes:
-            //   1. I/O completion (WSARecv/WSASend) — OVERLAPPED
-            //      is non-null; coroutine ptr is in OVERLAPPED.hEvent.
+            //   1. I/O completion (WSARecv/WSASend/AcceptEx/ConnectEx)
+            //      — OVERLAPPED is non-null; coroutine ptr is in
+            //      OVERLAPPED.Pointer (the union field, unused for
+            //      socket I/O — see note in submit paths).
             //   2. Timer completion (PostQueuedCompletionStatus) —
             //      OVERLAPPED is null; coroutine ptr is in
             //      CompletionKey.
             const coro_ptr: usize = if (e.lpOverlapped) |ovl|
-                @intFromPtr(ovl.hEvent)
+                @intFromPtr(ovl.DUMMYUNIONNAME.Pointer)
             else
                 e.lpCompletionKey;
 
