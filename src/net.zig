@@ -175,6 +175,12 @@ pub const Address = struct {
 
 pub const TcpListener = struct {
     fd: i32,
+    /// Windows-only: tracks whether `fd` has been associated with
+    /// the reactor's IOCP yet. CreateIoCompletionPort is one-shot
+    /// per handle (calling it twice fails), so we set this flag on
+    /// the first `accept` and skip on subsequent ones. Unused on
+    /// POSIX (epoll/kqueue need no per-fd registration).
+    iocp_associated: bool = false,
 
     /// Bind a TCP listener at `addr`. Sets SO_REUSEADDR so repeated
     /// runs don't EADDRINUSE; non-blocking from the start.
@@ -191,14 +197,10 @@ pub const TcpListener = struct {
         if (c_bind(fd, &sa, @sizeOf(sockaddr_in)) < 0) return error.BindFailed;
         if (c_listen(fd, 128) < 0) return error.ListenFailed;
         try reactor_mod.setNonblock(@intCast(fd));
-        if (comptime builtin.os.tag == .windows) {
-            // IOCP requires every socket that participates in
-            // overlapped I/O (incl. AcceptEx) to be associated with
-            // the completion port. POSIX reactors are
-            // declaration-free, so the call is Windows-only.
-            const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
-            try rt.reactor.associate(@intCast(fd));
-        }
+        // IOCP association is deferred to first `accept` — bind can
+        // be called pre-`rt.run()` (no coroutine context, no
+        // accessible reactor), but accept always runs inside a
+        // coroutine. POSIX reactors don't need the association.
         return .{ .fd = @intCast(fd) };
     }
 
@@ -240,6 +242,14 @@ pub const TcpListener = struct {
 // pre-comptime branch in `accept` can dispatch by os.tag without
 // dragging Windows-only state into the type.
 fn acceptWindows(listener: *TcpListener, rt: *runtime.Runtime) !TcpStream {
+    // First-use association — bind() can't do this because it may
+    // be called pre-`rt.run()`. AcceptEx requires the listener to
+    // be on the IOCP.
+    if (!listener.iocp_associated) {
+        try rt.reactor.associate(@intCast(listener.fd));
+        listener.iocp_associated = true;
+    }
+
     const new_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (new_fd < 0) return error.SocketCreateFailed;
     errdefer _ = c_close(new_fd);
