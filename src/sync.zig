@@ -596,10 +596,12 @@ test "Mutex: works at workers=1 (single-worker configuration)" {
 const NotifyCtx = struct {
     note: *Notify,
     fired: *std.atomic.Value(u32),
+    entered: *std.atomic.Value(u32),
     n: u32,
 };
 
 fn notifyWaiter(ctx: *NotifyCtx) void {
+    _ = ctx.entered.fetchAdd(1, .acq_rel);
     ctx.note.wait();
     _ = ctx.fired.fetchAdd(1, .acq_rel);
 }
@@ -608,7 +610,15 @@ fn notifyTestRoot(ctx: *NotifyCtx) !void {
     const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
     var waiters: [8]*@import("task.zig").Task(void) = undefined;
     for (&waiters) |*t| t.* = try rt.spawn(notifyWaiter, .{ctx});
-    // Wake them all one by one.
+    // Notify's `notifyOne`-with-no-waiter stores a single permit
+    // (Tokio-style; multiple unmatched notifies coalesce to one).
+    // If R fires its 8 notifies before any waiter has parked, 7
+    // waiters then park forever. We must wait for all waiters to
+    // reach `wait()` and then give the dispatcher a beat to swap
+    // them out — same pattern as `bench/bench_rss.zig`.
+    while (ctx.entered.load(.acquire) < ctx.n) runtime.yield();
+    var y: u32 = 0;
+    while (y < 100) : (y += 1) runtime.yield();
     var i: u32 = 0;
     while (i < waiters.len) : (i += 1) {
         ctx.note.notifyOne();
@@ -617,13 +627,19 @@ fn notifyTestRoot(ctx: *NotifyCtx) !void {
 }
 
 test "Notify: notifyOne wakes one waiter at a time, multi-worker" {
-    var rt = try Runtime.init(.{ .allocator = test_allocator });
+    // `workers = 2` deliberately forces the race density that exposes
+    // the "notify before waiter park" misuse pattern. At higher worker
+    // counts the dispatch latency hides this race on most hardware; at
+    // 2 workers it surfaces deterministically — so this test stays a
+    // regression check for the `notifyTestRoot` synchronization.
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
     defer rt.deinit();
 
     var note = Notify.init();
     defer note.deinit();
     var fired = std.atomic.Value(u32).init(0);
-    var ctx = NotifyCtx{ .note = &note, .fired = &fired, .n = 8 };
+    var entered = std.atomic.Value(u32).init(0);
+    var ctx = NotifyCtx{ .note = &note, .fired = &fired, .entered = &entered, .n = 8 };
     try (try rt.run(notifyTestRoot, .{&ctx}));
 
     try std.testing.expectEqual(@as(u32, 8), fired.load(.acquire));
