@@ -188,6 +188,67 @@ extern "ws2_32" fn WSASend(
     lpCompletionRoutine: ?*const anyopaque,
 ) callconv(.winapi) c_int;
 
+// `WSAIoctl` is used to fetch the runtime function pointers for
+// `AcceptEx` / `ConnectEx` (Winsock extension funcs aren't real DLL
+// exports — they're loaded via `SIO_GET_EXTENSION_FUNCTION_POINTER`
+// off any open socket).
+extern "ws2_32" fn WSAIoctl(
+    s: SOCKET,
+    dwIoControlCode: win.DWORD,
+    lpvInBuffer: ?*const anyopaque,
+    cbInBuffer: win.DWORD,
+    lpvOutBuffer: ?*anyopaque,
+    cbOutBuffer: win.DWORD,
+    lpcbBytesReturned: *win.DWORD,
+    lpOverlapped: ?*OVERLAPPED,
+    lpCompletionRoutine: ?*const anyopaque,
+) callconv(.winapi) c_int;
+
+// _WSAIORW(IOC_WS2, 6) = 0x80000000 | 0x40000000 | 0x08000000 | 6.
+const SIO_GET_EXTENSION_FUNCTION_POINTER: win.DWORD = 0xC8000006;
+
+const GUID = extern struct {
+    Data1: u32,
+    Data2: u16,
+    Data3: u16,
+    Data4: [8]u8,
+};
+
+// Canonical Winsock-extension GUIDs (see mswsock.h).
+const WSAID_ACCEPTEX = GUID{
+    .Data1 = 0xB5367DF1,
+    .Data2 = 0xCBAC,
+    .Data3 = 0x11CF,
+    .Data4 = .{ 0x95, 0xCA, 0x00, 0x80, 0x5F, 0x48, 0xA1, 0x92 },
+};
+const WSAID_CONNECTEX = GUID{
+    .Data1 = 0x25A207B9,
+    .Data2 = 0xDDF3,
+    .Data3 = 0x4660,
+    .Data4 = .{ 0x8E, 0xE9, 0x76, 0xE5, 0x8C, 0x74, 0x06, 0x3E },
+};
+
+const AcceptExFn = *const fn (
+    sListenSocket: SOCKET,
+    sAcceptSocket: SOCKET,
+    lpOutputBuffer: *anyopaque,
+    dwReceiveDataLength: win.DWORD,
+    dwLocalAddressLength: win.DWORD,
+    dwRemoteAddressLength: win.DWORD,
+    lpdwBytesReceived: *win.DWORD,
+    lpOverlapped: *OVERLAPPED,
+) callconv(.winapi) win.BOOL;
+
+const ConnectExFn = *const fn (
+    s: SOCKET,
+    name: *const anyopaque,
+    namelen: c_int,
+    lpSendBuffer: ?*const anyopaque,
+    dwSendDataLength: win.DWORD,
+    lpdwBytesSent: *win.DWORD,
+    lpOverlapped: *OVERLAPPED,
+) callconv(.winapi) win.BOOL;
+
 // WSADATA layout: 400 bytes is the documented max; we don't care
 // about contents.
 const WSA_DATA_BYTES: usize = 400;
@@ -204,6 +265,14 @@ pub const Reactor = struct {
 
     /// In-flight I/O ops. Same role as kqueue's `pending`.
     pending: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    /// `AcceptEx` / `ConnectEx` are dynamically loaded via WSAIoctl
+    /// (Winsock extension funcs aren't standard DLL exports). 0 means
+    /// "not loaded yet"; first caller loads and publishes via .release.
+    /// Idempotent under races — multiple loaders compute the same
+    /// pointer and the last store wins.
+    acceptex_fn_raw: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    connectex_fn_raw: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     /// `WSAStartup` is per-process; ensure it's called once across
     /// any number of Runtime instances. Idempotent in spirit;
@@ -299,6 +368,100 @@ pub const Reactor = struct {
         // On resume: poll() has unparked us. The OVERLAPPED on our
         // stack is no longer in use by the kernel. Return — caller
         // retries the real read/write.
+    }
+
+    fn loadExtensionFn(self: *Reactor, sock: SOCKET, guid: *const GUID, cache: *std.atomic.Value(usize)) !usize {
+        const cached = cache.load(.acquire);
+        if (cached != 0) return cached;
+        var fn_ptr: usize = 0;
+        var bytes_returned: win.DWORD = 0;
+        const rc = WSAIoctl(
+            sock,
+            SIO_GET_EXTENSION_FUNCTION_POINTER,
+            @ptrCast(guid),
+            @sizeOf(GUID),
+            @ptrCast(&fn_ptr),
+            @sizeOf(usize),
+            &bytes_returned,
+            null,
+            null,
+        );
+        if (rc != 0 or fn_ptr == 0) return error.LoadWinsockExtFailed;
+        cache.store(fn_ptr, .release);
+        _ = self;
+        return fn_ptr;
+    }
+
+    /// Submit `AcceptEx` on `listen_sock`, parking the current
+    /// coroutine until the connection completes.
+    ///
+    /// `accept_sock` must be a pre-created socket (AcceptEx fills
+    /// it). `out_buf` is the addresses output buffer — minimum size
+    /// is `2 * (sizeof(sockaddr_in) + 16)`; caller stack-allocates.
+    /// After resume, the caller must `setsockopt(SO_UPDATE_ACCEPT_CONTEXT)`
+    /// to finalise the inheritance from `listen_sock`.
+    pub fn submitAcceptEx(self: *Reactor, listen_sock: SOCKET, accept_sock: SOCKET, out_buf: []u8, addr_len: win.DWORD) !void {
+        const raw = try self.loadExtensionFn(listen_sock, &WSAID_ACCEPTEX, &self.acceptex_fn_raw);
+        const accept_ex: AcceptExFn = @ptrFromInt(raw);
+
+        const me = current.require();
+        var ovl: OVERLAPPED = std.mem.zeroes(OVERLAPPED);
+        ovl.hEvent = @ptrFromInt(@intFromPtr(me));
+        var bytes_received: win.DWORD = 0;
+        const rc = accept_ex(
+            listen_sock,
+            accept_sock,
+            out_buf.ptr,
+            0, // dwReceiveDataLength = 0 — don't want any initial-recv coupling.
+            addr_len,
+            addr_len,
+            &bytes_received,
+            &ovl,
+        );
+        // BOOL TRUE = synchronous completion (still posts to IOCP by
+        // default — we park, the IOCP poll wakes us). BOOL FALSE +
+        // GLE=WSA_IO_PENDING is the normal async case. Any other
+        // FALSE is a real submission failure.
+        if (rc == win.BOOL.FALSE) {
+            const e = WSAGetLastError();
+            if (e != WSA_IO_PENDING) return error.AcceptExFailed;
+        }
+        _ = self.pending.fetchAdd(1, .acq_rel);
+        me.pending = .park;
+        context.swap(&me.ctx, me.main_ctx);
+    }
+
+    /// Submit `ConnectEx` on `sock`, parking the current coroutine
+    /// until the connection completes.
+    ///
+    /// `sock` must already be bound (ConnectEx requires this — bind
+    /// to `0.0.0.0:0` works). After resume, the caller must
+    /// `setsockopt(SO_UPDATE_CONNECT_CONTEXT)` so the socket is
+    /// fully usable (getpeername etc).
+    pub fn submitConnectEx(self: *Reactor, sock: SOCKET, sa: *const anyopaque, sa_len: c_int) !void {
+        const raw = try self.loadExtensionFn(sock, &WSAID_CONNECTEX, &self.connectex_fn_raw);
+        const connect_ex: ConnectExFn = @ptrFromInt(raw);
+
+        const me = current.require();
+        var ovl: OVERLAPPED = std.mem.zeroes(OVERLAPPED);
+        ovl.hEvent = @ptrFromInt(@intFromPtr(me));
+        var bytes_sent: win.DWORD = 0;
+        const rc = connect_ex(
+            sock,
+            sa,
+            sa_len,
+            null, // lpSendBuffer — no initial data
+            0,
+            &bytes_sent,
+            &ovl,
+        );
+        if (rc == win.BOOL.FALSE) {
+            const e = WSAGetLastError();
+            if (e != WSA_IO_PENDING) return error.ConnectExFailed;
+        }
+        _ = self.pending.fetchAdd(1, .acq_rel);
+        me.pending = .park;
+        context.swap(&me.ctx, me.main_ctx);
     }
 
     /// Timer callback context — the threadpool fires this on a pool

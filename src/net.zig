@@ -31,6 +31,11 @@ const SO_REUSEADDR: c_int = switch (builtin.os.tag) {
     .windows => 0x0004,
     else => @compileError("SO_REUSEADDR not defined for this OS"),
 };
+// Windows-only — finalise the new socket's inheritance after
+// `AcceptEx` / `ConnectEx` (without these, `getpeername` etc fail
+// with WSAENOTCONN).
+const SO_UPDATE_ACCEPT_CONTEXT: c_int = 0x700B;
+const SO_UPDATE_CONNECT_CONTEXT: c_int = 0x7010;
 const EINPROGRESS: c_int = switch (builtin.os.tag) {
     .macos, .ios, .tvos, .watchos => 36,
     .linux => 115,
@@ -186,6 +191,14 @@ pub const TcpListener = struct {
         if (c_bind(fd, &sa, @sizeOf(sockaddr_in)) < 0) return error.BindFailed;
         if (c_listen(fd, 128) < 0) return error.ListenFailed;
         try reactor_mod.setNonblock(@intCast(fd));
+        if (comptime builtin.os.tag == .windows) {
+            // IOCP requires every socket that participates in
+            // overlapped I/O (incl. AcceptEx) to be associated with
+            // the completion port. POSIX reactors are
+            // declaration-free, so the call is Windows-only.
+            const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+            try rt.reactor.associate(@intCast(fd));
+        }
         return .{ .fd = @intCast(fd) };
     }
 
@@ -204,6 +217,9 @@ pub const TcpListener = struct {
     /// Accept the next incoming connection. Yields to the reactor on EAGAIN.
     pub fn accept(self: *TcpListener) !TcpStream {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+        if (comptime builtin.os.tag == .windows) {
+            return acceptWindows(self, rt);
+        }
         while (true) {
             const new_fd = c_accept(@intCast(self.fd), null, null);
             if (new_fd >= 0) {
@@ -216,6 +232,40 @@ pub const TcpListener = struct {
     }
 };
 
+// Windows accept via `AcceptEx`: a zero-byte `WSARecv` on a
+// *listening* socket is not a valid op — the readiness-polyfill that
+// works for established sockets fails here. AcceptEx is IOCP's
+// canonical accept: caller pre-creates the new socket, submits, and
+// the kernel fills it on completion. Lives outside the struct so the
+// pre-comptime branch in `accept` can dispatch by os.tag without
+// dragging Windows-only state into the type.
+fn acceptWindows(listener: *TcpListener, rt: *runtime.Runtime) !TcpStream {
+    const new_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (new_fd < 0) return error.SocketCreateFailed;
+    errdefer _ = c_close(new_fd);
+
+    // AcceptEx wants `2 * (sizeof(sockaddr_in) + 16)` bytes — 16
+    // bytes of internal padding per address (per MSDN). We don't
+    // care about the filled-in addresses here; the buffer just has
+    // to be the right size.
+    const addr_slot: comptime_int = @sizeOf(sockaddr_in) + 16;
+    var out_buf: [2 * addr_slot]u8 = undefined;
+    try rt.reactor.submitAcceptEx(@intCast(listener.fd), @intCast(new_fd), &out_buf, addr_slot);
+
+    // Inherit listener properties — without this, `getpeername` /
+    // `shutdown` / further setsockopt return WSAENOTCONN. Must
+    // happen before any further use of the new socket.
+    const listen_fd_c: c_int = @intCast(listener.fd);
+    _ = setsockopt(new_fd, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, &listen_fd_c, @sizeOf(c_int));
+
+    // Associate the new socket with the IOCP for subsequent
+    // `readAsync`/`writeAsync` ops. Then put it in non-blocking
+    // mode so the `recv`/`send` fast paths surface WSAEWOULDBLOCK.
+    try rt.reactor.associate(@intCast(new_fd));
+    try reactor_mod.setNonblock(@intCast(new_fd));
+    return .{ .fd = @intCast(new_fd) };
+}
+
 pub const TcpStream = struct {
     fd: i32,
 
@@ -224,6 +274,10 @@ pub const TcpStream = struct {
         if (fd < 0) return error.SocketCreateFailed;
         errdefer _ = c_close(fd);
         try reactor_mod.setNonblock(@intCast(fd));
+
+        if (comptime builtin.os.tag == .windows) {
+            return connectWindows(fd, addr);
+        }
 
         const sa = addr.toSockaddr();
         if (c_connect(fd, &sa, @sizeOf(sockaddr_in)) < 0) {
@@ -238,6 +292,31 @@ pub const TcpStream = struct {
 
     pub fn close(self: *TcpStream) void {
         _ = c_close(@intCast(self.fd));
+    }
+
+    // Windows connect via `ConnectEx`: same reason as AcceptEx —
+    // the zero-byte `WSASend` readiness probe is not valid on an
+    // unconnected socket. ConnectEx requires the socket be bound
+    // first (to anything, including 0.0.0.0:0), associated with the
+    // IOCP, and then completes asynchronously like AcceptEx.
+    fn connectWindows(fd: c_int, addr: Address) !TcpStream {
+        // Bind to wildcard so ConnectEx's "must be bound" precondition
+        // is satisfied. Kernel picks an ephemeral local port.
+        const any_addr = Address{ .host = .{ 0, 0, 0, 0 }, .port = 0 };
+        const any_sa = any_addr.toSockaddr();
+        if (c_bind(fd, &any_sa, @sizeOf(sockaddr_in)) < 0) return error.BindFailed;
+
+        const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+        try rt.reactor.associate(@intCast(fd));
+
+        const sa = addr.toSockaddr();
+        try rt.reactor.submitConnectEx(@intCast(fd), @ptrCast(&sa), @sizeOf(sockaddr_in));
+
+        // Same SO_UPDATE_*_CONTEXT requirement as AcceptEx — the
+        // socket is unusable for `getpeername` etc until this fires.
+        const dummy: c_int = 0;
+        _ = setsockopt(fd, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, &dummy, @sizeOf(c_int));
+        return .{ .fd = @intCast(fd) };
     }
 
     pub fn read(self: *TcpStream, buf: []u8) !usize {
