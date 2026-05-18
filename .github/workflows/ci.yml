@@ -112,7 +112,20 @@ jobs:
       # impossible to tell "hung" from "still running" from
       # observable behaviour. Direct invocation streams per-test
       # progress to stderr in real time.
-      - run: zig test src/lib.zig -lc
+      #
+      # x86_64 needs the per-OS ctx-switch `.S` file linked too;
+      # build.zig handles it normally but bypassing it via direct
+      # `zig test` means we have to plumb the asm in by hand here.
+      # ARM64 uses inline asm in `context_arm64.zig` — no extra
+      # file needed.
+      - name: Run tests
+        run: |
+          args="src/lib.zig -lc"
+          case "${{ matrix.os }}" in
+            ubuntu-latest)  args="$args src/context_x86_64_sysv.S" ;;
+            windows-latest) args="$args src/context_x86_64_win.S" ;;
+          esac
+          zig test $args
 
   bench-smoke:
     name: Bench smoke (macos-arm64-kqueue)
