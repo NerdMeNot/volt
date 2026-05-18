@@ -49,8 +49,7 @@ comptime {
 // ─── Per-OS context shape ────────────────────────────────────────
 
 pub const Context = switch (builtin.os.tag) {
-    .windows => @compileError("Volt: Windows x86_64 ctx switch lands in L6b. " ++
-        "See ~/.claude/plans/what-would-it-take-structured-panda.md"),
+    .windows => Win64Context,
     else => SysVContext,
 };
 
@@ -71,6 +70,40 @@ const SysVContext = extern struct {
     rsp: u64 = 0,
 };
 
+// Microsoft x64 (Win64) callee-saved set — bigger than SysV:
+//   GPRs: rbx, rbp, rdi, rsi, r12-r15 — 8 × u64 = 64 bytes
+//   Stack pointer: rsp — 1 × u64 = 8 bytes
+//   FP/SIMD: XMM6-XMM15 — 10 × u128 = 160 bytes (need 16-byte
+//            alignment for `movdqa`)
+//   Total: 232 bytes, 16-byte aligned.
+//
+// XMM regs come first so they're naturally aligned without padding.
+// The struct itself is `align(16)`; offsetOf checks below confirm
+// the GPRs land at the expected positions.
+const Win64Context = extern struct {
+    // XMM6..XMM15 first — each 16 bytes, struct aligned to 16.
+    xmm6: u128 align(16) = 0,
+    xmm7: u128 = 0,
+    xmm8: u128 = 0,
+    xmm9: u128 = 0,
+    xmm10: u128 = 0,
+    xmm11: u128 = 0,
+    xmm12: u128 = 0,
+    xmm13: u128 = 0,
+    xmm14: u128 = 0,
+    xmm15: u128 = 0,
+    // GPRs after the XMMs.
+    rbx: u64 = 0,
+    rbp: u64 = 0,
+    rdi: u64 = 0,
+    rsi: u64 = 0,
+    r12: u64 = 0,
+    r13: u64 = 0,
+    r14: u64 = 0,
+    r15: u64 = 0,
+    rsp: u64 = 0,
+};
+
 // Asm-side offset constants. If a `.S` file drifts from these the
 // `comptime` block below fails to compile.
 const SYSV_OFF_RBX: usize = 0;
@@ -82,8 +115,45 @@ const SYSV_OFF_R15: usize = 40;
 const SYSV_OFF_RSP: usize = 48;
 const SYSV_SIZE: usize = 56;
 
+// Win64 offsets — XMMs first (160 bytes), then GPRs.
+const WIN64_OFF_XMM6: usize = 0;
+const WIN64_OFF_XMM7: usize = 16;
+const WIN64_OFF_XMM8: usize = 32;
+const WIN64_OFF_XMM9: usize = 48;
+const WIN64_OFF_XMM10: usize = 64;
+const WIN64_OFF_XMM11: usize = 80;
+const WIN64_OFF_XMM12: usize = 96;
+const WIN64_OFF_XMM13: usize = 112;
+const WIN64_OFF_XMM14: usize = 128;
+const WIN64_OFF_XMM15: usize = 144;
+const WIN64_OFF_RBX: usize = 160;
+const WIN64_OFF_RBP: usize = 168;
+const WIN64_OFF_RDI: usize = 176;
+const WIN64_OFF_RSI: usize = 184;
+const WIN64_OFF_R12: usize = 192;
+const WIN64_OFF_R13: usize = 200;
+const WIN64_OFF_R14: usize = 208;
+const WIN64_OFF_R15: usize = 216;
+const WIN64_OFF_RSP: usize = 224;
+// Zig pads structs up to alignment-multiple; align(16) bumps 232 →
+// 240. The asm doesn't care about trailing padding (only field
+// offsets), so the bump is harmless. Tracked separately so the
+// assertion catches genuine layout drift.
+const WIN64_SIZE: usize = 240;
+
 comptime {
-    if (builtin.os.tag != .windows) {
+    if (builtin.os.tag == .windows) {
+        std.debug.assert(@offsetOf(Win64Context, "xmm6") == WIN64_OFF_XMM6);
+        std.debug.assert(@offsetOf(Win64Context, "xmm15") == WIN64_OFF_XMM15);
+        std.debug.assert(@offsetOf(Win64Context, "rbx") == WIN64_OFF_RBX);
+        std.debug.assert(@offsetOf(Win64Context, "rbp") == WIN64_OFF_RBP);
+        std.debug.assert(@offsetOf(Win64Context, "rdi") == WIN64_OFF_RDI);
+        std.debug.assert(@offsetOf(Win64Context, "rsi") == WIN64_OFF_RSI);
+        std.debug.assert(@offsetOf(Win64Context, "r12") == WIN64_OFF_R12);
+        std.debug.assert(@offsetOf(Win64Context, "r15") == WIN64_OFF_R15);
+        std.debug.assert(@offsetOf(Win64Context, "rsp") == WIN64_OFF_RSP);
+        std.debug.assert(@sizeOf(Win64Context) == WIN64_SIZE);
+    } else {
         std.debug.assert(@offsetOf(SysVContext, "rbx") == SYSV_OFF_RBX);
         std.debug.assert(@offsetOf(SysVContext, "rbp") == SYSV_OFF_RBP);
         std.debug.assert(@offsetOf(SysVContext, "r12") == SYSV_OFF_R12);

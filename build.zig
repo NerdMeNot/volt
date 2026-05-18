@@ -14,16 +14,21 @@ pub fn build(b: *std.Build) void {
     // symbols on x86_64-linux ELF (works on aarch64), so we link
     // an assembly source via `addAssemblyFile`. ARM64 uses module-
     // level inline asm in `src/context_arm64.zig` and needs no
-    // build-system wiring. Windows x64 will land its own `.S`
-    // file in L6b.
+    // build-system wiring.
+    //
+    // Two x86_64 ABIs, picked by target OS:
+    //   * System V x86-64 — Linux + macOS-Intel + BSDs
+    //     (`context_x86_64_sysv.S`)
+    //   * Microsoft x64   — Windows (`context_x86_64_win.S`).
+    //     Bigger save set: 8 callee-saved GPRs + XMM6-XMM15.
     const link_x86_64_ctx = struct {
         fn apply(mod: *std.Build.Module, builder: *std.Build, t: std.Build.ResolvedTarget) void {
             if (t.result.cpu.arch != .x86_64) return;
-            // L6a: System V x86-64 (Linux + macOS-Intel + BSDs).
-            //      Win64 lands in L6b alongside `context_x86_64_win.S`.
-            if (t.result.os.tag != .windows) {
-                mod.addAssemblyFile(builder.path("src/context_x86_64_sysv.S"));
-            }
+            const path = if (t.result.os.tag == .windows)
+                "src/context_x86_64_win.S"
+            else
+                "src/context_x86_64_sysv.S";
+            mod.addAssemblyFile(builder.path(path));
         }
     }.apply;
 

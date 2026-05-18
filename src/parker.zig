@@ -108,29 +108,29 @@ extern "c" fn __ulock_wake(operation: u32, addr: *anyopaque, wake_value: u64) c_
 const FUTEX_WAIT_PRIVATE: std.os.linux.FUTEX_OP = .{ .cmd = .WAIT, .private = true };
 const FUTEX_WAKE_PRIVATE: std.os.linux.FUTEX_OP = .{ .cmd = .WAKE, .private = true };
 
-// ── Windows: WaitOnAddress / WakeByAddressSingle ─────────────────────
+// ── Windows: RtlWaitOnAddress / RtlWakeAddressSingle ─────────────────
 //
-// Win8+ added an address-based wait/wake API that maps cleanly onto
-// our `u32` futex word. `WaitOnAddress` takes a comparand buffer
-// (stack-local copy of the expected value) and returns when the
-// monitored address differs from it. `WakeByAddressSingle` wakes one
-// waiter — matching our "at most one waiter per Parker" invariant.
+// The Win32-public `WaitOnAddress` / `WakeByAddressSingle` (Win8+)
+// are wrappers around the NT userland primitives `RtlWaitOnAddress`
+// / `RtlWakeAddressSingle` from ntdll.dll. Zig's std also goes
+// straight to the Rtl forms (see `std/Io/Threaded.zig`'s futex
+// backend) because ntdll links reliably across every mingw target,
+// while the Win32 wrappers live in synchronization.lib which mingw
+// doesn't always include as an import library.
 //
-// Both functions live in `api-ms-win-core-synch-l1-2-0`, re-exported
-// from `kernel32` since Windows 8 / Server 2012. Zig's std doesn't
-// expose them, so we extern-bind locally — same pattern as the IOCP
-// reactor's Win32 type bindings.
+// The Rtl form maps cleanly onto our `u32` futex word: the
+// comparand goes in a separate buffer (stack-local copy of the
+// expected value), and the timeout is a `*LARGE_INTEGER` instead
+// of `dwMilliseconds`. `null` timeout = wait forever.
 
-const INFINITE: win.DWORD = 0xFFFFFFFF;
-
-extern "kernel32" fn WaitOnAddress(
-    Address: *const anyopaque,
-    CompareAddress: *const anyopaque,
+extern "ntdll" fn RtlWaitOnAddress(
+    Address: ?*const anyopaque,
+    CompareAddress: ?*const anyopaque,
     AddressSize: usize,
-    dwMilliseconds: win.DWORD,
-) callconv(.winapi) win.BOOL;
+    Timeout: ?*const i64,
+) callconv(.winapi) i32;
 
-extern "kernel32" fn WakeByAddressSingle(Address: *const anyopaque) callconv(.winapi) void;
+extern "ntdll" fn RtlWakeAddressSingle(Address: ?*const anyopaque) callconv(.winapi) void;
 
 fn futexWait(addr: *std.atomic.Value(u32), expected: u32) void {
     if (comptime is_darwin) {
@@ -142,13 +142,14 @@ fn futexWait(addr: *std.atomic.Value(u32), expected: u32) void {
         // caller-handled in the park() loop above.
         _ = std.os.linux.futex_4arg(@ptrCast(addr), FUTEX_WAIT_PRIVATE, expected, null);
     } else if (comptime is_windows) {
-        // WaitOnAddress needs the comparand in a separate buffer (the
-        // kernel reads it without atomicity guarantees and we don't
-        // want it racing on the live `state` word). A stack copy is
-        // the canonical idiom — same as `std::sync::atomic::wait` in
-        // Rust and `WaitOnAddress` MSDN samples.
+        // RtlWaitOnAddress needs the comparand in a separate buffer
+        // (the kernel reads it without atomicity guarantees and we
+        // don't want it racing on the live `state` word). A stack
+        // copy is the canonical idiom — same as
+        // `std::sync::atomic::wait` in Rust and WaitOnAddress MSDN
+        // samples. Timeout = null → wait forever.
         var expected_copy: u32 = expected;
-        _ = WaitOnAddress(@ptrCast(addr), @ptrCast(&expected_copy), @sizeOf(u32), INFINITE);
+        _ = RtlWaitOnAddress(@ptrCast(addr), @ptrCast(&expected_copy), @sizeOf(u32), null);
     } else {
         @compileError("Parker: no futex backend for this OS (kqueue+self-pipe fallback can be added)");
     }
@@ -163,7 +164,7 @@ fn futexWake(addr: *std.atomic.Value(u32)) void {
         // val = 1 — wake at most one waiter (Parker has at most one).
         _ = std.os.linux.futex_3arg(@ptrCast(addr), FUTEX_WAKE_PRIVATE, 1);
     } else if (comptime is_windows) {
-        WakeByAddressSingle(@ptrCast(addr));
+        RtlWakeAddressSingle(@ptrCast(addr));
     } else {
         @compileError("Parker: no futex backend for this OS");
     }

@@ -411,8 +411,19 @@ pub const Reactor = struct {
 const FIONBIO: win.LONG = @bitCast(@as(u32, 0x8004667e));
 
 extern "ws2_32" fn ioctlsocket(s: SOCKET, cmd: win.LONG, argp: *win.ULONG) callconv(.winapi) c_int;
-extern "ws2_32" fn recv(s: SOCKET, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
-extern "ws2_32" fn send_fn(s: SOCKET, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+// `recv` and `send` are the actual ws2_32.dll symbol names; the
+// `send_zig`/`recv_zig` Zig identifiers are aliases via `@extern`
+// to avoid colliding with std identifiers. `extern "X" fn name`
+// uses the Zig identifier AS the import name, which doesn't match
+// the real DLL symbol — link fails at exe time.
+const recv_zig = @extern(
+    *const fn (SOCKET, [*]u8, c_int, c_int) callconv(.winapi) c_int,
+    .{ .name = "recv", .library_name = "ws2_32" },
+);
+const send_zig = @extern(
+    *const fn (SOCKET, [*]const u8, c_int, c_int) callconv(.winapi) c_int,
+    .{ .name = "send", .library_name = "ws2_32" },
+);
 
 const WSAEWOULDBLOCK: c_int = 10035;
 
@@ -423,7 +434,7 @@ pub fn setNonblock(fd: i32) !void {
 
 pub fn readAsync(rx: *Reactor, fd: i32, buf: []u8) !usize {
     while (true) {
-        const r = recv(@intCast(fd), buf.ptr, @intCast(buf.len), 0);
+        const r = recv_zig(@intCast(fd), buf.ptr, @intCast(buf.len), 0);
         if (r >= 0) return @intCast(r);
         if (WSAGetLastError() != WSAEWOULDBLOCK) return error.ReadFailed;
         rx.waitReadable(fd);
@@ -432,7 +443,7 @@ pub fn readAsync(rx: *Reactor, fd: i32, buf: []u8) !usize {
 
 pub fn writeAsync(rx: *Reactor, fd: i32, buf: []const u8) !usize {
     while (true) {
-        const w = send_fn(@intCast(fd), buf.ptr, @intCast(buf.len), 0);
+        const w = send_zig(@intCast(fd), buf.ptr, @intCast(buf.len), 0);
         if (w >= 0) return @intCast(w);
         if (WSAGetLastError() != WSAEWOULDBLOCK) return error.WriteFailed;
         rx.waitWritable(fd);

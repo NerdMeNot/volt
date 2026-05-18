@@ -166,7 +166,26 @@ const std = @import("std");
 
 const SleepCtx = struct { slept_ns: i128 = 0 };
 
+// Windows kernel32 perf-counter externs. Declared locally — Zig
+// 0.16's `std.os.windows.kernel32` doesn't expose them.
+extern "kernel32" fn QueryPerformanceCounter(lpPerformanceCount: *i64) callconv(.winapi) i32;
+extern "kernel32" fn QueryPerformanceFrequency(lpFrequency: *i64) callconv(.winapi) i32;
+
 fn nanosNow() i128 {
+    // Portable across Windows / Darwin / Linux. POSIX uses
+    // `clock_gettime(MONOTONIC)`; Windows uses
+    // `QueryPerformanceCounter` (the canonical Windows monotonic
+    // clock). The POSIX `timespec` doesn't compile on Windows in
+    // Zig 0.16 — `std.c.timespec` is empty on win and the extern
+    // signature rejects it under the Win64 calling convention.
+    if (@import("builtin").os.tag == .windows) {
+        var counter: i64 = 0;
+        var freq: i64 = 0;
+        _ = QueryPerformanceCounter(&counter);
+        _ = QueryPerformanceFrequency(&freq);
+        // counter * 1e9 / freq, with intermediate i128 to dodge overflow.
+        return @divTrunc(@as(i128, counter) * std.time.ns_per_s, @as(i128, freq));
+    }
     var ts: std.posix.timespec = undefined;
     _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
     return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
