@@ -68,9 +68,30 @@ var regions: [MAX_REGIONS]Region = [_]Region{.{}} ** MAX_REGIONS;
 var installed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 // Signal-related libc bindings.
-const SA_SIGINFO: c_int = 0x0040;
-const SA_NODEFER: c_int = 0x0010;
-const SA_ONSTACK: c_int = 0x0001;
+//
+// The SA_* flag values differ per OS — the constants here were
+// originally Darwin-only and broke on Linux: without SA_SIGINFO
+// actually being set on Linux (Darwin's 0x0040 means something
+// else there), the kernel calls our 3-arg handler as if it were
+// the 1-arg simple form, info/ctx args are garbage, and the
+// handler crashes when it dereferences them. Caught when the
+// stack.zig "grow-on-demand" test SIGSEGV'd on every Linux CI
+// run; see ci.yml run 26014151408 for the receipt.
+const SA_SIGINFO: c_int = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos, .freebsd, .openbsd, .netbsd, .dragonfly => 0x0040,
+    .linux => 0x00000004,
+    else => 0x0040,
+};
+const SA_NODEFER: c_int = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos, .freebsd, .openbsd, .netbsd, .dragonfly => 0x0010,
+    .linux => 0x40000000,
+    else => 0x0010,
+};
+const SA_ONSTACK: c_int = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos, .freebsd, .openbsd, .netbsd, .dragonfly => 0x0001,
+    .linux => 0x08000000,
+    else => 0x0001,
+};
 const SIGSEGV: c_int = 11;
 const SIGBUS: c_int = switch (builtin.os.tag) {
     .macos, .ios, .tvos, .watchos => 10,
