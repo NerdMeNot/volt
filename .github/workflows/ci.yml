@@ -80,7 +80,12 @@ jobs:
     name: Test (${{ matrix.os }})
     needs: format
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # Bumped from 15 to 30 to disambiguate "slow" from "hung" on
+    # the L7 investigation. CI runners (2-4 vCPU) are 3-5x slower
+    # than dev hardware (14+ core M-series); the bisected probe
+    # rounds got individual filter steps through in <180s, so the
+    # full suite SHOULD fit in 30 min if it isn't actually hung.
+    timeout-minutes: 30
     # Force bash on every runner — Windows defaults to PowerShell,
     # whose native-exit-code propagation chewed up `zig build`'s
     # output during the L5 cross-platform probe. Git Bash is
@@ -101,7 +106,13 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - run: zig build test
+      # Use `zig test` directly instead of `zig build test`. The
+      # build-runner protocol (`--listen=-`) buffers test output
+      # so a hung test produces zero visible progress in CI logs —
+      # impossible to tell "hung" from "still running" from
+      # observable behaviour. Direct invocation streams per-test
+      # progress to stderr in real time.
+      - run: zig test src/lib.zig -lc
 
   bench-smoke:
     name: Bench smoke (macos-arm64-kqueue)
