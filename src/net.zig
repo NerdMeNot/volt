@@ -46,12 +46,28 @@ const EAGAIN: c_int = switch (builtin.os.tag) {
     else => @compileError("EAGAIN not defined for this OS"),
 };
 
-const sockaddr_in = extern struct {
-    len: u8 = @sizeOf(sockaddr_in),
-    family: u8 = AF_INET,
-    port: u16, // network order
-    addr: u32, // network order
-    zero: [8]u8 = @splat(0),
+// `sockaddr_in` layout is not portable. Darwin / *BSD prepend a
+// `sin_len` byte and treat `sin_family` as u8; Linux and Windows
+// (Winsock2) have no length byte and use a u16 `sin_family` at
+// offset 0. Same total size (16 bytes) but the first two bytes
+// differ — bind() on Linux/Windows read our Darwin-shaped struct
+// and saw family=(0x02<<8|0x10)=528 instead of AF_INET=2, which
+// fails as EAFNOSUPPORT / WSAEAFNOSUPPORT. Pick per-OS at
+// comptime so each kernel sees the layout it expects.
+const sockaddr_in = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos, .freebsd, .openbsd, .netbsd, .dragonfly => extern struct {
+        len: u8 = @sizeOf(@This()),
+        family: u8 = AF_INET,
+        port: u16, // network order
+        addr: u32, // network order
+        zero: [8]u8 = @splat(0),
+    },
+    else => extern struct {
+        family: u16 = AF_INET,
+        port: u16, // network order
+        addr: u32, // network order
+        zero: [8]u8 = @splat(0),
+    },
 };
 
 // Use c_-prefixed names to avoid shadowing user method names like
