@@ -111,12 +111,12 @@ pub const Reactor = struct {
         const me = current.require();
 
         self.acquire();
-        self.ring.poll_add(@intFromPtr(me), fd, mask) catch {
+        _ = self.ring.poll_add(@intFromPtr(me), fd, mask) catch blk: {
             // SQ-full is recoverable: a submit hands queued SQEs to
             // the kernel and frees up user-space slots. Drain and
             // retry once before giving up.
             _ = self.ring.submit() catch {};
-            _ = self.ring.poll_add(@intFromPtr(me), fd, mask) catch {
+            break :blk self.ring.poll_add(@intFromPtr(me), fd, mask) catch {
                 self.release();
                 std.debug.panic("io_uring: SQ still full after submit (ring_size={d}; consider raising DEFAULT_RING_ENTRIES)", .{DEFAULT_RING_ENTRIES});
             };
@@ -139,9 +139,9 @@ pub const Reactor = struct {
         };
 
         self.acquire();
-        self.ring.timeout(@intFromPtr(me), &ts, 0, 0) catch {
+        _ = self.ring.timeout(@intFromPtr(me), &ts, 0, 0) catch blk: {
             _ = self.ring.submit() catch {};
-            _ = self.ring.timeout(@intFromPtr(me), &ts, 0, 0) catch {
+            break :blk self.ring.timeout(@intFromPtr(me), &ts, 0, 0) catch {
                 self.release();
                 std.debug.panic("io_uring: SQ still full after submit on timeout (ring_size={d})", .{DEFAULT_RING_ENTRIES});
             };
