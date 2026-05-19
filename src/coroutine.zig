@@ -124,6 +124,18 @@ pub const Coroutine = struct {
     /// coroutine import cycle. Cast back to `*cancel.Cancel` at
     /// validator time.
     cancel_in_flight: ?*anyopaque = null,
+
+    /// Set by cancel-aware reactor waits (`waitReadableCancel`
+    /// etc.) before submitting to the kernel; cleared on resume.
+    /// Points to a per-backend `WaitOp` struct that lives on this
+    /// coroutine's stack and carries the info `cancelCoro` needs
+    /// to deregister via syscall (fd + filter for kqueue, fd for
+    /// epoll, socket + OVERLAPPED for IOCP; io_uring needs no extra
+    /// state because `user_data == @intFromPtr(coro)`).
+    ///
+    /// Type-erased for the same import-cycle reason as
+    /// `cancel_in_flight`.
+    reactor_wait_op: ?*anyopaque = null,
 };
 
 // ─────────────────────────────────────────────────────────────────────

@@ -109,6 +109,35 @@ pub const Reactor = union(Backend) {
             .io_uring => |*r| r.poll(blocking),
         };
     }
+
+    pub fn cancelCoro(self: *Reactor, c: *@import("coroutine.zig").Coroutine) void {
+        switch (self.*) {
+            .epoll => |*r| r.cancelCoro(c),
+            .io_uring => |*r| r.cancelCoro(c),
+        }
+    }
+
+    pub fn waitReadableCancel(
+        self: *Reactor,
+        fd: i32,
+        c: *@import("cancel.zig").Cancel,
+    ) (posix_helpers.ReactorWaitError || @import("cancel.zig").Error)!void {
+        return switch (self.*) {
+            .epoll => |*r| r.waitReadableCancel(fd, c),
+            .io_uring => |*r| r.waitReadableCancel(fd, c),
+        };
+    }
+
+    pub fn waitWritableCancel(
+        self: *Reactor,
+        fd: i32,
+        c: *@import("cancel.zig").Cancel,
+    ) (posix_helpers.ReactorWaitError || @import("cancel.zig").Error)!void {
+        return switch (self.*) {
+            .epoll => |*r| r.waitWritableCancel(fd, c),
+            .io_uring => |*r| r.waitWritableCancel(fd, c),
+        };
+    }
 };
 
 // ─── I/O helpers ─────────────────────────────────────────────────

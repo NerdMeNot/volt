@@ -24,6 +24,7 @@ const coroutine = @import("coroutine.zig");
 const runtime = @import("runtime.zig");
 const current = @import("current.zig");
 const context = @import("context.zig");
+const cancel_mod = @import("cancel.zig");
 const posix_helpers = @import("reactor_posix.zig");
 const ReactorWaitError = posix_helpers.ReactorWaitError;
 
@@ -57,6 +58,12 @@ pub const Reactor = struct {
     }
 
     pub fn deinit(self: *Reactor) void {
+        // In-flight registrations at deinit means a coroutine is
+        // still parked in the kernel — fundamentally a shutdown-
+        // ordering bug in the caller. Asserting here catches it in
+        // debug builds; in release we close the kq anyway and the
+        // kernel cleans up the registrations on file-handle close.
+        std.debug.assert(self.pending.load(.acquire) == 0);
         if (self.kq >= 0) _ = std.c.close(self.kq);
         self.kq = -1;
     }
@@ -128,6 +135,69 @@ pub const Reactor = struct {
     /// decide whether to claim the poller role.
     pub fn pendingCount(self: *const Reactor) u32 {
         return self.pending.load(.acquire);
+    }
+
+    /// Per-call stash for cancel-aware waits: carries the (ident,
+    /// filter) key needed to issue `EV_DELETE` for this coro's
+    /// in-flight registration. Lives on the waiter's stack and is
+    /// pointed at by `Coroutine.reactor_wait_op` for the lifetime
+    /// of the park.
+    pub const WaitOp = struct {
+        ident: usize,
+        filter: i16,
+    };
+
+    /// Cancel this coro's in-flight kqueue registration.
+    ///
+    /// Race-free single-unpark: `EV_DELETE` returns 0 if it actually
+    /// removed the registration (meaning the kernel hadn't yet
+    /// pulled an event for it) — only that path decrements
+    /// `pending` and unparks. If the call returns ENOENT, the
+    /// registration was already consumed by a concurrent poll();
+    /// poll's normal unpark path is in flight, and we no-op.
+    pub fn cancelCoro(self: *Reactor, c: *coroutine.Coroutine) void {
+        const op_ptr = c.reactor_wait_op orelse return;
+        const op: *WaitOp = @ptrCast(@alignCast(op_ptr));
+        var kev = std.mem.zeroes(posix.Kevent);
+        kev.ident = op.ident;
+        kev.filter = op.filter;
+        kev.flags = posix.system.EV.DELETE;
+        var changes = [_]posix.Kevent{kev};
+        var dummy: [1]posix.Kevent = undefined;
+        const rc = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
+        if (rc < 0) return; // ENOENT — poll() owns the unpark.
+        _ = self.pending.fetchSub(1, .acq_rel);
+        runtime.unpark(c);
+    }
+
+    /// Cancel-aware variant of `waitReadable`. Returns
+    /// `error.Cancelled` if the cancel fires before or during the
+    /// park; otherwise behaves like `waitReadable` and returns
+    /// `ReactorWaitError` on register failure.
+    pub fn waitReadableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+        return self.waitFdCancel(fd, posix.system.EVFILT.READ, c);
+    }
+
+    /// Cancel-aware variant of `waitWritable`.
+    pub fn waitWritableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+        return self.waitFdCancel(fd, posix.system.EVFILT.WRITE, c);
+    }
+
+    fn waitFdCancel(self: *Reactor, fd: i32, filter: i16, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+        const me = current.require();
+        try c.checkpoint();
+
+        var op = WaitOp{ .ident = @intCast(fd), .filter = filter };
+        me.reactor_wait_op = &op;
+        defer me.reactor_wait_op = null;
+
+        var w = cancel_mod.Waiter{};
+        if (c.registerReactor(&w, me)) return error.Cancelled;
+        defer c.deregister(&w);
+
+        try self.waitFd(fd, filter);
+
+        if (c.isFired()) return error.Cancelled;
     }
 
     /// Drain ready events. Returns the number of coroutines unparked.

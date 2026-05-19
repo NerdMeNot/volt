@@ -428,6 +428,61 @@ test "TCP echo single client round-trip" {
     try std.testing.expectEqual(@as(u8, 0x42), ctx.result_byte);
 }
 
+// Cancel-aware accept: a server parks in accept; a separate
+// coro fires the Cancel; the parked accept must wake with
+// `error.Cancelled` rather than hanging forever. Exercises the
+// reactor's `waitReadableCancel` path end to end on the platform
+// reactor.
+const CancelAcceptCtx = struct {
+    listener: *TcpListener,
+    cancel: *@import("cancel.zig").Cancel,
+    got: ?anyerror = null,
+};
+
+fn cancelAcceptServer(ctx: *CancelAcceptCtx) !void {
+    const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+    // Direct reactor path: we want to test the cancel hook,
+    // not the higher-level accept wrapper.
+    const result = rt.reactor.waitReadableCancel(ctx.listener.fd, ctx.cancel);
+    ctx.got = if (result) |_| null else |e| e;
+}
+
+fn cancelAcceptFirer(ctx: *CancelAcceptCtx) void {
+    // Yield a few times so the server actually parks before we fire.
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) @import("runtime.zig").yield();
+    ctx.cancel.fire();
+}
+
+fn cancelAcceptRoot(ctx: *CancelAcceptCtx) !void {
+    const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var server = try rt.spawn(cancelAcceptServer, .{ctx});
+    var firer = try rt.spawn(cancelAcceptFirer, .{ctx});
+    _ = server.join() catch |err| return err;
+    _ = firer.join();
+}
+
+test "reactor: waitReadableCancel wakes a parked accept on Cancel.fire" {
+    // Skipped on Windows: IOCP's readiness probe is a zero-byte
+    // WSARecv, which isn't valid on a *listening* socket — the
+    // accept path uses AcceptEx (no cancel-aware variant yet).
+    // Cancel-during-read on a connected socket is exercised by
+    // higher-level libraries.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var rt = try runtime.Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
+    defer rt.deinit();
+
+    var listener = try TcpListener.bind(Address.loopback4(0));
+    defer listener.close();
+    var cancel = @import("cancel.zig").Cancel.init(rt);
+    defer cancel.deinit();
+    var ctx = CancelAcceptCtx{ .listener = &listener, .cancel = &cancel };
+    try (try rt.run(cancelAcceptRoot, .{&ctx}));
+
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), ctx.got);
+}
+
 // Linux-only: force the epoll backend (auto-mode silently picks
 // io_uring on every modern kernel, leaving the epoll path
 // untested in CI). Same workload as the auto-mode TCP echo above

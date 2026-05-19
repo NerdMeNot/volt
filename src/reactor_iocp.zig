@@ -61,6 +61,7 @@ const coroutine = @import("coroutine.zig");
 const runtime = @import("runtime.zig");
 const current = @import("current.zig");
 const context = @import("context.zig");
+const cancel_mod = @import("cancel.zig");
 
 const win = std.os.windows;
 const ws2_32 = win.ws2_32;
@@ -135,6 +136,10 @@ extern "kernel32" fn PostQueuedCompletionStatus(
 
 extern "kernel32" fn CloseHandle(hObject: win.HANDLE) callconv(.winapi) win.BOOL;
 extern "kernel32" fn GetLastError() callconv(.winapi) win.DWORD;
+extern "kernel32" fn CancelIoEx(
+    hFile: win.HANDLE,
+    lpOverlapped: ?*OVERLAPPED,
+) callconv(.winapi) win.BOOL;
 
 // Threadpool timer
 const TP_TIMER = opaque {};
@@ -303,6 +308,12 @@ pub const Reactor = struct {
     }
 
     pub fn deinit(self: *Reactor) void {
+        // In-flight IOCP ops at deinit would post completions to
+        // a closed port (kernel: silently dropped or worse). The
+        // caller's shutdown sequence must drain all parked
+        // coroutines first — the assertion fails loudly in debug
+        // if it didn't.
+        std.debug.assert(self.pending.load(.acquire) == 0);
         _ = CloseHandle(self.iocp);
         // WSACleanup is intentionally not called; matches the
         // single-Runtime-per-process common case. A future
@@ -415,6 +426,12 @@ pub const Reactor = struct {
         const accept_ex: AcceptExFn = @ptrFromInt(raw);
 
         const me = current.require();
+        // Stack-allocate OVERLAPPED. The kernel writes to this
+        // address up until the completion fires; safe because Volt
+        // stacks are mmap'd and stable across the suspend (see
+        // `src/stack.zig`). A future scheme that ever copies or
+        // moves coroutine stacks across suspends MUST switch IOCP
+        // submit paths to a coroutine-pool-backed allocation.
         var ovl: OVERLAPPED = std.mem.zeroes(OVERLAPPED);
         ovl.DUMMYUNIONNAME = .{ .Pointer = @ptrFromInt(@intFromPtr(me)) };
         var bytes_received: win.DWORD = 0;
@@ -453,6 +470,12 @@ pub const Reactor = struct {
         const connect_ex: ConnectExFn = @ptrFromInt(raw);
 
         const me = current.require();
+        // Stack-allocate OVERLAPPED. The kernel writes to this
+        // address up until the completion fires; safe because Volt
+        // stacks are mmap'd and stable across the suspend (see
+        // `src/stack.zig`). A future scheme that ever copies or
+        // moves coroutine stacks across suspends MUST switch IOCP
+        // submit paths to a coroutine-pool-backed allocation.
         var ovl: OVERLAPPED = std.mem.zeroes(OVERLAPPED);
         ovl.DUMMYUNIONNAME = .{ .Pointer = @ptrFromInt(@intFromPtr(me)) };
         var bytes_sent: win.DWORD = 0;
@@ -532,6 +555,79 @@ pub const Reactor = struct {
 
     pub fn pendingCount(self: *const Reactor) u32 {
         return self.pending.load(.acquire);
+    }
+
+    /// Per-call stash for cancel-aware waits. Carries the socket
+    /// handle and the OVERLAPPED address that `CancelIoEx` needs
+    /// to deregister.
+    pub const WaitOp = struct {
+        sock: usize,
+        overlapped: *OVERLAPPED,
+    };
+
+    /// Cancel this coro's in-flight IOCP op.
+    ///
+    /// `CancelIoEx` queues a completion with status
+    /// `STATUS_CANCELLED` for the matched op. The poll path picks
+    /// it up and unparks via the normal route — no double-unpark
+    /// risk because exactly one completion fires per submitted op.
+    pub fn cancelCoro(self: *Reactor, c: *coroutine.Coroutine) void {
+        _ = self;
+        const op_ptr = c.reactor_wait_op orelse return;
+        const op: *WaitOp = @ptrCast(@alignCast(op_ptr));
+        _ = CancelIoEx(@ptrFromInt(op.sock), op.overlapped);
+        // Don't unpark here — the cancellation completion will
+        // fire via the IOCP poll loop's normal path.
+    }
+
+    pub fn waitReadableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+        return self.submitReadinessCancel(@intCast(fd), .read, c);
+    }
+
+    pub fn waitWritableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+        return self.submitReadinessCancel(@intCast(fd), .write, c);
+    }
+
+    fn submitReadinessCancel(self: *Reactor, sock: usize, dir: Direction, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+        const me = current.require();
+        try c.checkpoint();
+
+        var ovl: OVERLAPPED = std.mem.zeroes(OVERLAPPED);
+        ovl.DUMMYUNIONNAME = .{ .Pointer = @ptrFromInt(@intFromPtr(me)) };
+
+        var dummy_buf: [1]u8 = .{0};
+        var wsabuf = WSABUF{ .len = 0, .buf = &dummy_buf };
+        var bytes_transferred: win.DWORD = 0;
+        var flags: win.DWORD = 0;
+
+        const rc = switch (dir) {
+            .read => WSARecv(@intCast(sock), @ptrCast(&wsabuf), 1, &bytes_transferred, &flags, &ovl, null),
+            .write => WSASend(@intCast(sock), @ptrCast(&wsabuf), 1, &bytes_transferred, 0, &ovl, null),
+        };
+        if (rc != 0) {
+            const e = WSAGetLastError();
+            if (e != WSA_IO_PENDING) return wsaToSetupError(e);
+        }
+
+        var op = WaitOp{ .sock = sock, .overlapped = &ovl };
+        me.reactor_wait_op = &op;
+        defer me.reactor_wait_op = null;
+
+        var w = cancel_mod.Waiter{};
+        const already_fired = c.registerReactor(&w, me);
+        defer c.deregister(&w);
+        if (already_fired) {
+            // Cancel fired between checkpoint and register —
+            // issue CancelIoEx now so the kernel's completion path
+            // wakes us with `STATUS_CANCELLED`.
+            _ = CancelIoEx(@ptrFromInt(sock), &ovl);
+        }
+
+        _ = self.pending.fetchAdd(1, .acq_rel);
+        me.pending = .park;
+        context.swap(&me.ctx, me.main_ctx);
+
+        if (c.isFired()) return error.Cancelled;
     }
 
     pub fn poll(self: *Reactor, blocking: bool) usize {

@@ -45,6 +45,7 @@ const coroutine = @import("coroutine.zig");
 const runtime = @import("runtime.zig");
 const current = @import("current.zig");
 const context = @import("context.zig");
+const cancel_mod = @import("cancel.zig");
 
 const EPOLL_EVENTS_BATCH: usize = 32;
 
@@ -161,7 +162,11 @@ pub const Reactor = struct {
     }
 
     pub fn deinit(self: *Reactor) void {
-        if (self.epfd >= 0) _ = close(self.epfd);
+        // See `reactor_kqueue.zig` for the in-flight-at-deinit
+        // contract. Caller is responsible for ensuring no coros
+        // are parked in the kernel before tearing down.
+        std.debug.assert(self.pending.load(.acquire) == 0);
+        if (self.epfd >= 0) _ = posix_helpers.close(self.epfd);
         self.epfd = -1;
     }
 
@@ -235,6 +240,52 @@ pub const Reactor = struct {
 
     pub fn pendingCount(self: *const Reactor) u32 {
         return self.pending.load(.acquire);
+    }
+
+    /// Per-call stash for cancel-aware waits. `fd` is the
+    /// epoll-registered descriptor (a socket fd, or — TODO —
+    /// a timerfd for timer waits).
+    pub const WaitOp = struct {
+        fd: c_int,
+    };
+
+    /// Cancel this coro's in-flight epoll registration.
+    /// Race-free single-unpark: `EPOLL_CTL_DEL` returns 0 if it
+    /// actually removed the registration; ENOENT means the
+    /// registration was already consumed by poll() and the normal
+    /// unpark path is in flight.
+    pub fn cancelCoro(self: *Reactor, c: *coroutine.Coroutine) void {
+        const op_ptr = c.reactor_wait_op orelse return;
+        const op: *WaitOp = @ptrCast(@alignCast(op_ptr));
+        const rc = epoll_ctl(self.epfd, EPOLL_CTL_DEL, op.fd, null);
+        if (rc < 0) return; // ENOENT — poll() owns the unpark.
+        _ = self.pending.fetchSub(1, .acq_rel);
+        runtime.unpark(c);
+    }
+
+    pub fn waitReadableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+        return self.waitFdCancel(@intCast(fd), EPOLLIN, c);
+    }
+
+    pub fn waitWritableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+        return self.waitFdCancel(@intCast(fd), EPOLLOUT, c);
+    }
+
+    fn waitFdCancel(self: *Reactor, fd: c_int, filter: u32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+        const me = current.require();
+        try c.checkpoint();
+
+        var op = WaitOp{ .fd = fd };
+        me.reactor_wait_op = &op;
+        defer me.reactor_wait_op = null;
+
+        var w = cancel_mod.Waiter{};
+        if (c.registerReactor(&w, me)) return error.Cancelled;
+        defer c.deregister(&w);
+
+        try self.waitFd(fd, filter);
+
+        if (c.isFired()) return error.Cancelled;
     }
 
     pub fn poll(self: *Reactor, blocking: bool) usize {

@@ -44,14 +44,35 @@
 const std = @import("std");
 const park = @import("park.zig");
 const runtime = @import("runtime.zig");
+const coroutine = @import("coroutine.zig");
 
 pub const Error = error{Cancelled};
 
+/// A `Waiter` represents a single registered "fire me on cancel"
+/// hook. The `Kind` variant decides how `fire()` wakes the
+/// owner:
+///
+///   * `.park_addr` — owner is parked in the parking lot keyed on
+///     that address. Fire calls `parking_lot.unparkAll` on the key
+///     and the validator-under-lock pattern re-checks `isFired`.
+///     Used by `Mutex.lockCancel`, `Spsc.recvCancel`, etc.
+///   * `.reactor_coro` — owner is parked in the kernel's event
+///     queue (kqueue/epoll/io_uring/IOCP). Fire calls
+///     `runtime.reactor.cancelCoro(coro)`, which performs the
+///     per-platform deregistration syscall and unparks. The
+///     reactor's deregister returns "did we actually remove the
+///     pending op", arbitrating the race against a concurrent
+///     poll() to avoid double-unpark / double-decrement.
 pub const Waiter = struct {
-    park_addr: usize = 0,
+    kind: Kind = .{ .park_addr = 0 },
     next: ?*Waiter = null,
     prev: ?*Waiter = null,
     in_list: bool = false,
+
+    pub const Kind = union(enum) {
+        park_addr: usize,
+        reactor_coro: *coroutine.Coroutine,
+    };
 };
 
 pub const Cancel = struct {
@@ -90,14 +111,30 @@ pub const Cancel = struct {
         self.lock.store(0, .release);
     }
 
-    /// Register `w` to be woken on fire. `park_addr` is the
-    /// parking-lot key the caller is about to park on; `fire()`
-    /// uses it to call `unparkAll` and wake this coro.
+    /// Register `w` to be woken on fire via the parking lot.
+    /// `park_addr` is the parking-lot key the caller is about to
+    /// park on; `fire()` uses it to call `unparkAll` and wake this
+    /// coro.
     ///
     /// Returns true if the cancel has already fired (caller MUST
     /// NOT park; nothing to deregister). Returns false otherwise;
     /// caller MUST call `deregister(w)` after wake.
     pub fn register(self: *Cancel, w: *Waiter, park_addr: usize) bool {
+        w.kind = .{ .park_addr = park_addr };
+        return self.registerCommon(w);
+    }
+
+    /// Register `w` to be woken on fire via the reactor's
+    /// per-platform `cancelCoro` syscall. Used by cancel-aware
+    /// fd-wait variants (`waitReadableCancel` etc.) whose parked
+    /// owner lives in the kernel's event queue, not the parking
+    /// lot.
+    pub fn registerReactor(self: *Cancel, w: *Waiter, coro: *coroutine.Coroutine) bool {
+        w.kind = .{ .reactor_coro = coro };
+        return self.registerCommon(w);
+    }
+
+    fn registerCommon(self: *Cancel, w: *Waiter) bool {
         // Fast pre-check (avoids the lock if already fired).
         if (self.fired_flag.load(.acquire)) return true;
         self.acquireLock();
@@ -105,7 +142,6 @@ pub const Cancel = struct {
             self.releaseLock();
             return true;
         }
-        w.park_addr = park_addr;
         w.next = self.head;
         w.prev = null;
         w.in_list = true;
@@ -131,8 +167,11 @@ pub const Cancel = struct {
         self.releaseLock();
     }
 
-    /// Set the fired flag and wake every registered waiter via the
-    /// parking lot. Idempotent — second call is a no-op.
+    /// Set the fired flag and wake every registered waiter.
+    /// Dispatches per-`Waiter.kind`: parking-lot waiters go through
+    /// `unparkAll`; reactor waiters go through the reactor's
+    /// `cancelCoro` syscall path. Idempotent — second call is a
+    /// no-op.
     pub fn fire(self: *Cancel) void {
         if (self.fired_flag.swap(true, .acq_rel)) return;
         // Drain the list under the lock; mark each waiter as removed
@@ -146,12 +185,15 @@ pub const Cancel = struct {
         }
         self.head = null;
         self.releaseLock();
-        // Wake each parked op (outside the lock — unparkAll can be
+        // Wake each parked op (outside the lock — both paths can be
         // a non-trivial amount of work).
         var w = drained;
         while (w) |it| {
             w = it.next;
-            _ = park.unparkAll(self.rt, @ptrFromInt(it.park_addr));
+            switch (it.kind) {
+                .park_addr => |addr| _ = park.unparkAll(self.rt, @ptrFromInt(addr)),
+                .reactor_coro => |c| self.rt.reactor.cancelCoro(c),
+            }
         }
     }
 };
