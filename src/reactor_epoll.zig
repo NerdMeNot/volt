@@ -129,6 +129,21 @@ pub const writeAll = posix_helpers.writeAll;
 // stays here rather than in the shared POSIX module.
 const EEXIST: c_int = 17;
 
+const ReactorWaitError = posix_helpers.ReactorWaitError;
+
+/// Map an `epoll_ctl` / `timerfd_*` errno into the categorical
+/// `ReactorWaitError` set. Resource-exhaustion cases (EMFILE / ENFILE
+/// / ENOMEM) are surfaced explicitly so libraries can decide
+/// back-off; EBADF means the fd was closed under us.
+fn registerError(e: c_int) ReactorWaitError {
+    return switch (e) {
+        posix_helpers.Errno.EBADF, posix_helpers.Errno.ENOTSOCK => error.BadDescriptor,
+        posix_helpers.Errno.EMFILE, posix_helpers.Errno.ENFILE => error.OutOfDescriptors,
+        posix_helpers.Errno.ENOMEM, posix_helpers.Errno.ENOBUFS => error.SystemResources,
+        else => error.Unexpected,
+    };
+}
+
 // ─── Reactor ─────────────────────────────────────────────────────
 
 pub const Reactor = struct {
@@ -150,15 +165,15 @@ pub const Reactor = struct {
         self.epfd = -1;
     }
 
-    pub fn waitReadable(self: *Reactor, fd: i32) void {
-        self.waitFd(@intCast(fd), EPOLLIN);
+    pub fn waitReadable(self: *Reactor, fd: i32) ReactorWaitError!void {
+        return self.waitFd(@intCast(fd), EPOLLIN);
     }
 
-    pub fn waitWritable(self: *Reactor, fd: i32) void {
-        self.waitFd(@intCast(fd), EPOLLOUT);
+    pub fn waitWritable(self: *Reactor, fd: i32) ReactorWaitError!void {
+        return self.waitFd(@intCast(fd), EPOLLOUT);
     }
 
-    fn waitFd(self: *Reactor, fd: c_int, filter: u32) void {
+    fn waitFd(self: *Reactor, fd: c_int, filter: u32) ReactorWaitError!void {
         const me = current.require();
         var ev = epoll_event{
             .events = filter | EPOLLONESHOT,
@@ -172,14 +187,14 @@ pub const Reactor = struct {
         if (rc < 0 and errnoVal() == EEXIST) {
             rc = epoll_ctl(self.epfd, EPOLL_CTL_MOD, fd, &ev);
         }
-        if (rc < 0) std.debug.panic("epoll_ctl(ADD/MOD) failed: errno={d}", .{errnoVal()});
+        if (rc < 0) return registerError(errnoVal());
         _ = self.pending.fetchAdd(1, .acq_rel);
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
         // Resume: pending decremented by poll() before unpark.
     }
 
-    pub fn waitTimer(self: *Reactor, ns: u64) void {
+    pub fn waitTimer(self: *Reactor, ns: u64) ReactorWaitError!void {
         const me = current.require();
 
         // Create a one-shot timerfd. Closed before this function
@@ -187,7 +202,8 @@ pub const Reactor = struct {
         // timerfds is the natural optimisation if `bench-sleep`-
         // style workloads show the syscall overhead; deferred.
         const tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-        if (tfd < 0) std.debug.panic("timerfd_create failed: errno={d}", .{errnoVal()});
+        if (tfd < 0) return registerError(errnoVal());
+        errdefer _ = close(tfd);
 
         const spec = itimerspec{
             .it_interval = .{ .sec = 0, .nsec = 0 },
@@ -196,13 +212,13 @@ pub const Reactor = struct {
                 .nsec = @intCast(ns % std.time.ns_per_s),
             },
         };
-        if (timerfd_settime(tfd, 0, &spec, null) < 0) std.debug.panic("timerfd_settime failed: errno={d}", .{errnoVal()});
+        if (timerfd_settime(tfd, 0, &spec, null) < 0) return registerError(errnoVal());
 
         var ev = epoll_event{
             .events = EPOLLIN | EPOLLONESHOT,
             .data = @intFromPtr(me),
         };
-        if (epoll_ctl(self.epfd, EPOLL_CTL_ADD, tfd, &ev) < 0) std.debug.panic("epoll_ctl(timerfd) failed: errno={d}", .{errnoVal()});
+        if (epoll_ctl(self.epfd, EPOLL_CTL_ADD, tfd, &ev) < 0) return registerError(errnoVal());
 
         _ = self.pending.fetchAdd(1, .acq_rel);
         me.pending = .park;

@@ -61,6 +61,7 @@ const POLLOUT: u32 = 0x0004;
 // helpers take the reactor as `anytype`, so they bind to this
 // backend at the call site without a shared base class.
 const posix_helpers = @import("reactor_posix.zig");
+const ReactorWaitError = posix_helpers.ReactorWaitError;
 pub const setNonblock = posix_helpers.setNonblock;
 pub const readAsync = posix_helpers.readAsync;
 pub const writeAsync = posix_helpers.writeAsync;
@@ -99,29 +100,27 @@ pub const Reactor = struct {
         self.ring.deinit();
     }
 
-    pub fn waitReadable(self: *Reactor, fd: i32) void {
-        self.waitFd(@intCast(fd), POLLIN);
+    pub fn waitReadable(self: *Reactor, fd: i32) ReactorWaitError!void {
+        return self.waitFd(@intCast(fd), POLLIN);
     }
 
-    pub fn waitWritable(self: *Reactor, fd: i32) void {
-        self.waitFd(@intCast(fd), POLLOUT);
+    pub fn waitWritable(self: *Reactor, fd: i32) ReactorWaitError!void {
+        return self.waitFd(@intCast(fd), POLLOUT);
     }
 
-    fn waitFd(self: *Reactor, fd: i32, mask: u32) void {
+    fn waitFd(self: *Reactor, fd: i32, mask: u32) ReactorWaitError!void {
         const me = current.require();
 
         self.acquire();
-        _ = self.ring.poll_add(@intFromPtr(me), fd, mask) catch blk: {
+        const submitted = (self.ring.poll_add(@intFromPtr(me), fd, mask) catch blk: {
             // SQ-full is recoverable: a submit hands queued SQEs to
             // the kernel and frees up user-space slots. Drain and
             // retry once before giving up.
             _ = self.ring.submit() catch {};
-            break :blk self.ring.poll_add(@intFromPtr(me), fd, mask) catch {
-                self.release();
-                std.debug.panic("io_uring: SQ still full after submit (ring_size={d}; consider raising DEFAULT_RING_ENTRIES)", .{DEFAULT_RING_ENTRIES});
-            };
-        };
+            break :blk self.ring.poll_add(@intFromPtr(me), fd, mask) catch null;
+        }) != null;
         self.release();
+        if (!submitted) return error.SystemResources;
 
         // SQE is queued but not yet submitted. The dispatcher's
         // poll() call will submit_and_wait — that batched syscall
@@ -131,7 +130,7 @@ pub const Reactor = struct {
         context.swap(&me.ctx, me.main_ctx);
     }
 
-    pub fn waitTimer(self: *Reactor, ns: u64) void {
+    pub fn waitTimer(self: *Reactor, ns: u64) ReactorWaitError!void {
         const me = current.require();
         const ts = linux.kernel_timespec{
             .sec = @intCast(ns / std.time.ns_per_s),
@@ -139,14 +138,12 @@ pub const Reactor = struct {
         };
 
         self.acquire();
-        _ = self.ring.timeout(@intFromPtr(me), &ts, 0, 0) catch blk: {
+        const submitted = (self.ring.timeout(@intFromPtr(me), &ts, 0, 0) catch blk: {
             _ = self.ring.submit() catch {};
-            break :blk self.ring.timeout(@intFromPtr(me), &ts, 0, 0) catch {
-                self.release();
-                std.debug.panic("io_uring: SQ still full after submit on timeout (ring_size={d})", .{DEFAULT_RING_ENTRIES});
-            };
-        };
+            break :blk self.ring.timeout(@intFromPtr(me), &ts, 0, 0) catch null;
+        }) != null;
         self.release();
+        if (!submitted) return error.SystemResources;
 
         _ = self.pending.fetchAdd(1, .acq_rel);
         me.pending = .park;

@@ -322,17 +322,17 @@ pub const Reactor = struct {
         if (ret == null) return error.IocpAssociateFailed;
     }
 
-    pub fn waitReadable(self: *Reactor, fd: i32) void {
-        self.submitReadiness(@intCast(fd), .read);
+    pub fn waitReadable(self: *Reactor, fd: i32) ReactorWaitError!void {
+        return self.submitReadiness(@intCast(fd), .read);
     }
 
-    pub fn waitWritable(self: *Reactor, fd: i32) void {
-        self.submitReadiness(@intCast(fd), .write);
+    pub fn waitWritable(self: *Reactor, fd: i32) ReactorWaitError!void {
+        return self.submitReadiness(@intCast(fd), .write);
     }
 
     const Direction = enum { read, write };
 
-    fn submitReadiness(self: *Reactor, sock: usize, dir: Direction) void {
+    fn submitReadiness(self: *Reactor, sock: usize, dir: Direction) ReactorWaitError!void {
         const me = current.require();
 
         // Stack-allocate OVERLAPPED. Volt's stacks are mmap'd
@@ -367,8 +367,9 @@ pub const Reactor = struct {
         // is already in the desired state). Returns SOCKET_ERROR
         // (-1) for both errors and async-in-progress; WSAGetLastError
         // == WSA_IO_PENDING is the normal path.
-        if (rc != 0 and WSAGetLastError() != WSA_IO_PENDING) {
-            std.debug.panic("WSARecv/WSASend zero-byte readiness submission failed: WSA error {d}", .{WSAGetLastError()});
+        if (rc != 0) {
+            const e = WSAGetLastError();
+            if (e != WSA_IO_PENDING) return wsaToSetupError(e);
         }
 
         _ = self.pending.fetchAdd(1, .acq_rel);
@@ -499,7 +500,7 @@ pub const Reactor = struct {
         );
     }
 
-    pub fn waitTimer(self: *Reactor, ns: u64) void {
+    pub fn waitTimer(self: *Reactor, ns: u64) ReactorWaitError!void {
         const me = current.require();
 
         // Per-sleep allocation. A future per-P pool of pre-created
@@ -507,7 +508,7 @@ pub const Reactor = struct {
         // CreateThreadpoolTimer cost.
         var ctx = TimerCtx{ .reactor = self, .coro = me };
         const timer = CreateThreadpoolTimer(&timerCallback, &ctx, null) orelse
-            std.debug.panic("CreateThreadpoolTimer failed: GLE={d}", .{GetLastError()});
+            return error.SystemResources;
         ctx.timer = timer;
 
         // Windows FILETIME is in 100ns units, negative for relative
@@ -599,32 +600,90 @@ const send_zig = @extern(
     .{ .name = "send", .library_name = "ws2_32" },
 );
 
+// WSA error codes. Subset we map; the rest fall through to
+// `error.Unexpected`.
 const WSAEWOULDBLOCK: c_int = 10035;
+const WSAECONNRESET: c_int = 10054;
+const WSAECONNABORTED: c_int = 10053;
+const WSAECONNREFUSED: c_int = 10061;
+const WSAENOTCONN: c_int = 10057;
+const WSAESHUTDOWN: c_int = 10058;
+const WSAETIMEDOUT: c_int = 10060;
+const WSAENOTSOCK: c_int = 10038;
+const WSAEBADF: c_int = 10009;
+const WSAEMFILE: c_int = 10024;
+const WSAENOBUFS: c_int = 10055;
+const WSAEINTR: c_int = 10004;
 
-pub fn setNonblock(fd: i32) !void {
-    var mode: win.ULONG = 1;
-    if (ioctlsocket(@intCast(fd), FIONBIO, &mode) != 0) return error.FcntlSetFailed;
+const reactor_mod = @import("reactor.zig");
+pub const IoError = reactor_mod.IoError;
+pub const ReactorSetupError = reactor_mod.ReactorSetupError;
+pub const ReactorWaitError = reactor_mod.ReactorWaitError;
+
+/// Translate a WSA error code into the categorical `IoError` set.
+/// Unknown values collapse to `error.Unexpected` — callers can
+/// still printf the raw code for diagnostics, but the typed error
+/// is what downstream libraries match on.
+pub fn wsaToIoError(e: c_int) IoError {
+    return switch (e) {
+        WSAECONNRESET => error.ConnectionReset,
+        WSAESHUTDOWN => error.BrokenPipe,
+        WSAECONNABORTED => error.ConnectionAborted,
+        WSAENOTCONN => error.NotConnected,
+        WSAECONNREFUSED => error.ConnectionRefused,
+        WSAETIMEDOUT => error.Timeout,
+        WSAENOTSOCK, WSAEBADF => error.BadDescriptor,
+        WSAEMFILE => error.OutOfDescriptors,
+        WSAENOBUFS => error.SystemResources,
+        else => error.Unexpected,
+    };
 }
 
-pub fn readAsync(rx: *Reactor, fd: i32, buf: []u8) !usize {
+/// Same mapping projected onto `ReactorSetupError`. Used by
+/// register-type calls (`setNonblock`, `associate`, AcceptEx /
+/// ConnectEx submit) which can't surface connection-state errors.
+pub fn wsaToSetupError(e: c_int) ReactorSetupError {
+    return switch (e) {
+        WSAEMFILE => error.OutOfDescriptors,
+        WSAENOBUFS => error.SystemResources,
+        else => error.Unexpected,
+    };
+}
+
+pub fn setNonblock(fd: i32) ReactorSetupError!void {
+    var mode: win.ULONG = 1;
+    if (ioctlsocket(@intCast(fd), FIONBIO, &mode) != 0) return wsaToSetupError(WSAGetLastError());
+}
+
+pub fn readAsync(rx: *Reactor, fd: i32, buf: []u8) IoError!usize {
     while (true) {
         const r = recv_zig(@intCast(fd), buf.ptr, @intCast(buf.len), 0);
         if (r >= 0) return @intCast(r);
-        if (WSAGetLastError() != WSAEWOULDBLOCK) return error.ReadFailed;
-        rx.waitReadable(fd);
+        const e = WSAGetLastError();
+        if (e == WSAEWOULDBLOCK) {
+            try rx.waitReadable(fd);
+            continue;
+        }
+        if (e == WSAEINTR) continue;
+        return wsaToIoError(e);
     }
 }
 
-pub fn writeAsync(rx: *Reactor, fd: i32, buf: []const u8) !usize {
+pub fn writeAsync(rx: *Reactor, fd: i32, buf: []const u8) IoError!usize {
     while (true) {
         const w = send_zig(@intCast(fd), buf.ptr, @intCast(buf.len), 0);
         if (w >= 0) return @intCast(w);
-        if (WSAGetLastError() != WSAEWOULDBLOCK) return error.WriteFailed;
-        rx.waitWritable(fd);
+        const e = WSAGetLastError();
+        if (e == WSAEWOULDBLOCK) {
+            try rx.waitWritable(fd);
+            continue;
+        }
+        if (e == WSAEINTR) continue;
+        return wsaToIoError(e);
     }
 }
 
-pub fn readFull(rx: *Reactor, fd: i32, buf: []u8) !usize {
+pub fn readFull(rx: *Reactor, fd: i32, buf: []u8) IoError!usize {
     var total: usize = 0;
     while (total < buf.len) {
         const got = try readAsync(rx, fd, buf[total..]);
@@ -634,7 +693,7 @@ pub fn readFull(rx: *Reactor, fd: i32, buf: []u8) !usize {
     return total;
 }
 
-pub fn writeAll(rx: *Reactor, fd: i32, buf: []const u8) !void {
+pub fn writeAll(rx: *Reactor, fd: i32, buf: []const u8) IoError!void {
     var total: usize = 0;
     while (total < buf.len) {
         const w = try writeAsync(rx, fd, buf[total..]);

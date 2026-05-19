@@ -75,25 +75,25 @@ pub const Reactor = union(Backend) {
         }
     }
 
-    pub fn waitReadable(self: *Reactor, fd: i32) void {
-        switch (self.*) {
+    pub fn waitReadable(self: *Reactor, fd: i32) posix_helpers.ReactorWaitError!void {
+        return switch (self.*) {
             .epoll => |*r| r.waitReadable(fd),
             .io_uring => |*r| r.waitReadable(fd),
-        }
+        };
     }
 
-    pub fn waitWritable(self: *Reactor, fd: i32) void {
-        switch (self.*) {
+    pub fn waitWritable(self: *Reactor, fd: i32) posix_helpers.ReactorWaitError!void {
+        return switch (self.*) {
             .epoll => |*r| r.waitWritable(fd),
             .io_uring => |*r| r.waitWritable(fd),
-        }
+        };
     }
 
-    pub fn waitTimer(self: *Reactor, ns: u64) void {
-        switch (self.*) {
+    pub fn waitTimer(self: *Reactor, ns: u64) posix_helpers.ReactorWaitError!void {
+        return switch (self.*) {
             .epoll => |*r| r.waitTimer(ns),
             .io_uring => |*r| r.waitTimer(ns),
-        }
+        };
     }
 
     pub fn pendingCount(self: *const Reactor) u32 {

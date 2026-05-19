@@ -8,12 +8,10 @@
 //! file regardless of platform.
 //!
 //! Each backend lives in its own file:
-//!   * `reactor_kqueue.zig`   — Darwin / BSD (shipping)
-//!   * `reactor_epoll.zig`    — Linux (stub today; impl in L2a)
-//!   * `reactor_io_uring.zig` — Linux (stub today; impl in L2b,
-//!                                     selected runtime-side via
-//!                                     `Runtime.Config.io_backend`)
-//!   * `reactor_iocp.zig`     — Windows (stub today; impl in L3)
+//!   * `reactor_kqueue.zig`   — Darwin / BSD
+//!   * `reactor_epoll.zig`    — Linux (readiness)
+//!   * `reactor_io_uring.zig` — Linux (poll-mode)
+//!   * `reactor_iocp.zig`     — Windows
 //!
 //! Adding a backend is a self-contained file + an entry in the
 //! switch below. The interface (`Reactor.init`/`deinit`/
@@ -35,6 +33,61 @@ pub const Reactor = backend.Reactor;
 /// `.epoll` and `.io_uring`; on other platforms the Config field
 /// is accepted but ignored. Public for `runtime.zig`'s use.
 pub const IoBackend = enum { auto, epoll, io_uring };
+
+// ─── Public error vocabulary ─────────────────────────────────────
+//
+// One categorical surface for every reactor backend. Library
+// authors can `catch err switch (err) { ... }` without caring
+// which platform produced it. New variants get added here as
+// downstream libraries (HTTP, TLS, S3) tell us what they need to
+// distinguish.
+
+/// Errors from `setNonblock` / `bind` / `accept` / `connect`-type
+/// setup syscalls. Includes the kernel-resource exhaustion cases
+/// that downstream libraries actively retry on.
+pub const ReactorSetupError = error{
+    /// Process or system file-descriptor table exhausted (EMFILE
+    /// / ENFILE / WSAEMFILE). Library should back off + retry.
+    OutOfDescriptors,
+    /// Kernel out of memory (ENOMEM / WSAENOBUFS).
+    SystemResources,
+    /// Generic fall-through — error code didn't match any
+    /// categorical variant. errno/GLE was already printed in the
+    /// panic path if this came from there.
+    Unexpected,
+};
+
+/// Errors from `waitReadable` / `waitWritable` / `waitTimer`.
+/// These ride alongside `ReactorSetupError` because the underlying
+/// register syscall (kevent / epoll_ctl / io_uring SQE / IOCP
+/// submit) can hit the same resource limits.
+pub const ReactorWaitError = ReactorSetupError || error{
+    /// The fd was closed (or never valid) before the registration
+    /// landed — EBADF / WSAENOTSOCK.
+    BadDescriptor,
+};
+
+/// Errors from `readAsync` / `writeAsync` / `readFull` / `writeAll`.
+/// Categorised per common errno; rare ones collapse into
+/// `Unexpected`. Includes everything in `ReactorWaitError` because
+/// the I/O loop yields through `wait*` on EAGAIN.
+pub const IoError = ReactorWaitError || error{
+    /// Peer reset the connection (ECONNRESET / WSAECONNRESET).
+    ConnectionReset,
+    /// Local write side closed (EPIPE / WSAESHUTDOWN on write).
+    BrokenPipe,
+    /// Local abort, in-flight ops cancelled
+    /// (ECONNABORTED / WSAECONNABORTED).
+    ConnectionAborted,
+    /// Op on an unconnected socket (ENOTCONN / WSAENOTCONN).
+    NotConnected,
+    /// Connect target rejected — usable to discriminate retry vs
+    /// bail in client code (ECONNREFUSED / WSAECONNREFUSED).
+    ConnectionRefused,
+    /// Kernel-side IO timeout. Distinct from app-level timeout
+    /// (ETIMEDOUT / WSAETIMEDOUT).
+    Timeout,
+};
 
 // I/O helpers — same shape across platforms; impls live in each
 // backend file because errno / EAGAIN / fcntl details differ.

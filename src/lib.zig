@@ -35,6 +35,14 @@ pub const channel = @import("channel.zig");
 pub const sync = @import("sync.zig");
 pub const net = @import("net.zig");
 
+/// Categorical I/O error vocabulary. Every `readAsync` / `writeAsync`
+/// / `readFull` / `writeAll` call returns an `IoError`; the
+/// reactor's wait primitives return a subset (`ReactorWaitError`).
+/// Library authors `catch err switch (err) { ... }` against these.
+pub const IoError = @import("reactor.zig").IoError;
+pub const ReactorWaitError = @import("reactor.zig").ReactorWaitError;
+pub const ReactorSetupError = @import("reactor.zig").ReactorSetupError;
+
 /// Threadlocal "current coroutine" lookup.
 pub const current = @import("current.zig");
 
@@ -72,15 +80,21 @@ pub fn spawn(comptime user_fn: anytype, args: anytype) !*Task(@typeInfo(@TypeOf(
 /// called from inside a coroutine.
 pub const yield = @import("runtime.zig").yield;
 
-/// Sleep for at least `ns` nanoseconds. Routes through the kqueue
-/// reactor's `EVFILT_TIMER` — uses zero worker-thread time, just
-/// like a parked socket read. Must be called from inside a coroutine.
+/// Sleep for at least `ns` nanoseconds. Routes through the
+/// reactor's timer (`EVFILT_TIMER` on kqueue, `timerfd` on epoll,
+/// `IORING_OP_TIMEOUT` on io_uring, `CreateThreadpoolTimer` on
+/// IOCP) — uses zero worker-thread time, just like a parked socket
+/// read. Must be called from inside a coroutine.
+///
+/// Returns `ReactorWaitError` if the underlying timer registration
+/// fails (e.g., kernel out of resources). For normal kernels this
+/// effectively never errors.
 ///
 /// Kernel timer resolution is bounded below by ~1 µs on Darwin arm64;
 /// shorter sleeps round up.
-pub fn sleep(ns: u64) void {
+pub fn sleep(ns: u64) ReactorWaitError!void {
     const rt = runtime();
-    rt.reactor.waitTimer(ns);
+    return rt.reactor.waitTimer(ns);
 }
 
 /// Run `body` with a fresh `*Cancel`. If `body` returns an error,
@@ -193,7 +207,7 @@ fn nanosNow() i128 {
 
 fn sleepTestRoot(ctx: *SleepCtx) !void {
     const start = nanosNow();
-    sleep(10 * std.time.ns_per_ms);
+    try sleep(10 * std.time.ns_per_ms);
     ctx.slept_ns = nanosNow() - start;
 }
 

@@ -229,7 +229,7 @@ pub const TcpListener = struct {
                 return .{ .fd = @intCast(new_fd) };
             }
             if (errnoVal() != EAGAIN) return error.AcceptFailed;
-            rt.reactor.waitReadable(self.fd);
+            try rt.reactor.waitReadable(self.fd);
         }
     }
 };
@@ -295,7 +295,7 @@ pub const TcpStream = struct {
             if (e != EINPROGRESS) return error.ConnectFailed;
             // Wait for writable = connect completed.
             const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
-            rt.reactor.waitWritable(fd);
+            try rt.reactor.waitWritable(fd);
         }
         return .{ .fd = @intCast(fd) };
     }

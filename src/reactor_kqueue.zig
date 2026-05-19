@@ -24,6 +24,8 @@ const coroutine = @import("coroutine.zig");
 const runtime = @import("runtime.zig");
 const current = @import("current.zig");
 const context = @import("context.zig");
+const posix_helpers = @import("reactor_posix.zig");
+const ReactorWaitError = posix_helpers.ReactorWaitError;
 
 const KEV_BATCH: usize = 32;
 
@@ -61,20 +63,20 @@ pub const Reactor = struct {
 
     /// Park the current coroutine until `fd` is readable.
     /// Caller is expected to retry the read after this returns.
-    pub fn waitReadable(self: *Reactor, fd: i32) void {
-        self.waitFd(fd, posix.system.EVFILT.READ);
+    pub fn waitReadable(self: *Reactor, fd: i32) ReactorWaitError!void {
+        return self.waitFd(fd, posix.system.EVFILT.READ);
     }
 
     /// Park the current coroutine until `fd` is writable.
-    pub fn waitWritable(self: *Reactor, fd: i32) void {
-        self.waitFd(fd, posix.system.EVFILT.WRITE);
+    pub fn waitWritable(self: *Reactor, fd: i32) ReactorWaitError!void {
+        return self.waitFd(fd, posix.system.EVFILT.WRITE);
     }
 
     /// Park the current coroutine for at least `ns` nanoseconds.
     /// Single-shot kqueue timer keyed on the coroutine's pointer
     /// (each coro can have at most one outstanding sleep at a time).
     /// Kernel timer resolution is bounded below by ~1 µs on Darwin.
-    pub fn waitTimer(self: *Reactor, ns: u64) void {
+    pub fn waitTimer(self: *Reactor, ns: u64) ReactorWaitError!void {
         const me = current.require();
         var kev = std.mem.zeroes(posix.Kevent);
         kev.ident = @intFromPtr(me);
@@ -86,13 +88,13 @@ pub const Reactor = struct {
         var changes = [_]posix.Kevent{kev};
         var dummy: [1]posix.Kevent = undefined;
         const n = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
-        if (n < 0) std.debug.panic("kevent timer register failed: errno={d}", .{posix_helpers.errnoVal()});
+        if (n < 0) return registerError(posix_helpers.errnoVal());
         _ = self.pending.fetchAdd(1, .acq_rel);
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
     }
 
-    fn waitFd(self: *Reactor, fd: i32, filter: i16) void {
+    fn waitFd(self: *Reactor, fd: i32, filter: i16) ReactorWaitError!void {
         const me = current.require();
         var kev = std.mem.zeroes(posix.Kevent);
         kev.ident = @intCast(fd);
@@ -102,11 +104,24 @@ pub const Reactor = struct {
         var changes = [_]posix.Kevent{kev};
         var dummy: [1]posix.Kevent = undefined;
         const n = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
-        if (n < 0) std.debug.panic("kevent register failed: errno={d}", .{posix_helpers.errnoVal()});
+        if (n < 0) return registerError(posix_helpers.errnoVal());
         _ = self.pending.fetchAdd(1, .acq_rel);
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
         // Resume: pending decremented by poll() before unpark.
+    }
+
+    /// Map a `kevent` registration errno into the categorical
+    /// `ReactorWaitError` set. EBADF means the fd was closed under
+    /// us; resource-exhaustion variants are the common
+    /// retry-and-back-off targets for downstream libraries.
+    fn registerError(e: c_int) ReactorWaitError {
+        return switch (e) {
+            posix_helpers.Errno.EBADF, posix_helpers.Errno.ENOTSOCK => error.BadDescriptor,
+            posix_helpers.Errno.EMFILE, posix_helpers.Errno.ENFILE => error.OutOfDescriptors,
+            posix_helpers.Errno.ENOMEM, posix_helpers.Errno.ENOBUFS => error.SystemResources,
+            else => error.Unexpected,
+        };
     }
 
     /// Number of in-flight registrations. Used by the dispatcher to
@@ -141,7 +156,6 @@ pub const Reactor = struct {
 // Non-blocking IO helpers — shared with epoll / io_uring backends.
 // ─────────────────────────────────────────────────────────────────────
 
-const posix_helpers = @import("reactor_posix.zig");
 pub const setNonblock = posix_helpers.setNonblock;
 pub const readAsync = posix_helpers.readAsync;
 pub const writeAsync = posix_helpers.writeAsync;

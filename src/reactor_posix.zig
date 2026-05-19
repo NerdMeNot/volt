@@ -7,14 +7,19 @@
 //! drifting independently. Centralised here so a fix is applied
 //! once.
 //!
-//! Per-OS values (errno accessor, `EAGAIN`, `O_NONBLOCK`) are
-//! comptime-switched on `builtin.os.tag`. The reactor-facing helpers
-//! (`readAsync` etc.) take the reactor as `anytype` so each backend
-//! stays free of a shared base type while the syscall plumbing is
-//! identical.
+//! Per-OS values (errno accessor, `EAGAIN`, `O_NONBLOCK`, the
+//! `errno → IoError` mapping) are comptime-switched on
+//! `builtin.os.tag`. The reactor-facing helpers (`readAsync` etc.)
+//! take the reactor as `anytype` so each backend stays free of a
+//! shared base type while the syscall plumbing is identical.
 
 const std = @import("std");
 const builtin = @import("builtin");
+const reactor_mod = @import("reactor.zig");
+
+pub const IoError = reactor_mod.IoError;
+pub const ReactorSetupError = reactor_mod.ReactorSetupError;
+pub const ReactorWaitError = reactor_mod.ReactorWaitError;
 
 // ─── libc externs ────────────────────────────────────────────────
 
@@ -58,39 +63,120 @@ pub const EAGAIN: c_int = switch (builtin.os.tag) {
     else => @compileError("EAGAIN not defined for this OS"),
 };
 
+// Errno values used for the IoError mapping. Linux glibc + Darwin
+// disagree on the numbers; we keep both branches in one place.
+pub const Errno = switch (builtin.os.tag) {
+    .linux => struct {
+        pub const ECONNRESET: c_int = 104;
+        pub const EPIPE: c_int = 32;
+        pub const ECONNABORTED: c_int = 103;
+        pub const ENOTCONN: c_int = 107;
+        pub const ECONNREFUSED: c_int = 111;
+        pub const ETIMEDOUT: c_int = 110;
+        pub const EBADF: c_int = 9;
+        pub const ENOTSOCK: c_int = 88;
+        pub const EMFILE: c_int = 24;
+        pub const ENFILE: c_int = 23;
+        pub const ENOMEM: c_int = 12;
+        pub const ENOBUFS: c_int = 105;
+        pub const EINTR: c_int = 4;
+    },
+    .macos, .ios, .tvos, .watchos, .freebsd, .openbsd, .netbsd, .dragonfly => struct {
+        pub const ECONNRESET: c_int = 54;
+        pub const EPIPE: c_int = 32;
+        pub const ECONNABORTED: c_int = 53;
+        pub const ENOTCONN: c_int = 57;
+        pub const ECONNREFUSED: c_int = 61;
+        pub const ETIMEDOUT: c_int = 60;
+        pub const EBADF: c_int = 9;
+        pub const ENOTSOCK: c_int = 38;
+        pub const EMFILE: c_int = 24;
+        pub const ENFILE: c_int = 23;
+        pub const ENOMEM: c_int = 12;
+        pub const ENOBUFS: c_int = 55;
+        pub const EINTR: c_int = 4;
+    },
+    else => @compileError("Errno table missing for this OS"),
+};
+
+/// Translate a POSIX errno into the categorical `IoError` set.
+/// Unknown values collapse to `error.Unexpected`. Callers can
+/// still `std.debug.print("errno={d}", .{e})` in their own
+/// diagnostics path; this helper just produces the typed error.
+pub fn errnoToIoError(e: c_int) IoError {
+    return switch (e) {
+        Errno.ECONNRESET => error.ConnectionReset,
+        Errno.EPIPE => error.BrokenPipe,
+        Errno.ECONNABORTED => error.ConnectionAborted,
+        Errno.ENOTCONN => error.NotConnected,
+        Errno.ECONNREFUSED => error.ConnectionRefused,
+        Errno.ETIMEDOUT => error.Timeout,
+        Errno.EBADF, Errno.ENOTSOCK => error.BadDescriptor,
+        Errno.EMFILE, Errno.ENFILE => error.OutOfDescriptors,
+        Errno.ENOMEM, Errno.ENOBUFS => error.SystemResources,
+        else => error.Unexpected,
+    };
+}
+
+/// Same mapping projected onto the smaller `ReactorSetupError`
+/// set (no connection-state cases — those don't apply to register-
+/// type syscalls). Resource-exhaustion + Unexpected only.
+pub fn errnoToSetupError(e: c_int) ReactorSetupError {
+    return switch (e) {
+        Errno.EMFILE, Errno.ENFILE => error.OutOfDescriptors,
+        Errno.ENOMEM, Errno.ENOBUFS => error.SystemResources,
+        else => error.Unexpected,
+    };
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────
 
-pub fn setNonblock(fd: i32) !void {
+pub fn setNonblock(fd: i32) ReactorSetupError!void {
     const flags = fcntl(@intCast(fd), F_GETFL, @as(c_int, 0));
-    if (flags < 0) return error.FcntlGetFailed;
-    if (fcntl(@intCast(fd), F_SETFL, flags | O_NONBLOCK) < 0) return error.FcntlSetFailed;
+    if (flags < 0) return errnoToSetupError(errnoVal());
+    if (fcntl(@intCast(fd), F_SETFL, flags | O_NONBLOCK) < 0) return errnoToSetupError(errnoVal());
 }
 
 /// Read up to `buf.len` bytes from `fd`, yielding to `rx` on
 /// `EAGAIN`. `rx` is taken as `anytype` so each reactor backend can
 /// supply its own concrete type without a shared base class — the
-/// only requirement is a `waitReadable(fd: i32)` method.
-pub fn readAsync(rx: anytype, fd: i32, buf: []u8) !usize {
+/// only requirement is a `waitReadable(fd: i32) !void` method.
+///
+/// Non-EAGAIN errnos map through `errnoToIoError` into the typed
+/// `IoError` set. Library callers can match on `error.ConnectionReset`
+/// vs `error.BrokenPipe` etc. instead of a single coarse
+/// `ReadFailed`.
+pub fn readAsync(rx: anytype, fd: i32, buf: []u8) IoError!usize {
     while (true) {
         const r = read(@intCast(fd), buf.ptr, buf.len);
         if (r >= 0) return @intCast(r);
-        if (errnoVal() != EAGAIN) return error.ReadFailed;
-        rx.waitReadable(fd);
+        const e = errnoVal();
+        if (e == EAGAIN) {
+            try rx.waitReadable(fd);
+            continue;
+        }
+        if (e == Errno.EINTR) continue; // retry transparently
+        return errnoToIoError(e);
     }
 }
 
-pub fn writeAsync(rx: anytype, fd: i32, buf: []const u8) !usize {
+pub fn writeAsync(rx: anytype, fd: i32, buf: []const u8) IoError!usize {
     while (true) {
         const w = write(@intCast(fd), buf.ptr, buf.len);
         if (w >= 0) return @intCast(w);
-        if (errnoVal() != EAGAIN) return error.WriteFailed;
-        rx.waitWritable(fd);
+        const e = errnoVal();
+        if (e == EAGAIN) {
+            try rx.waitWritable(fd);
+            continue;
+        }
+        if (e == Errno.EINTR) continue;
+        return errnoToIoError(e);
     }
 }
 
 /// Read EXACTLY `buf.len` bytes (loop until EOF or full). Returns the
 /// total bytes read — may be < buf.len if the peer closed early.
-pub fn readFull(rx: anytype, fd: i32, buf: []u8) !usize {
+pub fn readFull(rx: anytype, fd: i32, buf: []u8) IoError!usize {
     var total: usize = 0;
     while (total < buf.len) {
         const got = try readAsync(rx, fd, buf[total..]);
@@ -101,7 +187,7 @@ pub fn readFull(rx: anytype, fd: i32, buf: []u8) !usize {
 }
 
 /// Write EXACTLY `buf.len` bytes (loop on partial writes).
-pub fn writeAll(rx: anytype, fd: i32, buf: []const u8) !void {
+pub fn writeAll(rx: anytype, fd: i32, buf: []const u8) IoError!void {
     var total: usize = 0;
     while (total < buf.len) {
         const w = try writeAsync(rx, fd, buf[total..]);
