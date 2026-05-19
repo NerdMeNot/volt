@@ -309,9 +309,12 @@ pub const Reactor = struct {
     }
 
     /// Associate a socket with this reactor's IOCP. Called by
-    /// `net.zig` after each socket creation. The CompletionKey is
-    /// the socket handle itself; the per-op coroutine pointer
-    /// goes in `OVERLAPPED.hEvent` (see `submitReadiness`).
+    /// `net.zig` after each socket creation (or on first use, for
+    /// listener sockets that may be constructed pre-`rt.run`). The
+    /// CompletionKey is the socket handle itself; the per-op
+    /// coroutine pointer goes in `OVERLAPPED.DUMMYUNIONNAME.Pointer`
+    /// (see the submit paths — `hEvent` can't be reused because
+    /// mswsock validates it as a real Win32 event handle).
     pub fn associate(self: *Reactor, sock_handle: usize) !void {
         const handle: win.HANDLE = @ptrFromInt(sock_handle);
         const ret = CreateIoCompletionPort(handle, self.iocp, sock_handle, 0);
@@ -364,7 +367,7 @@ pub const Reactor = struct {
         // (-1) for both errors and async-in-progress; WSAGetLastError
         // == WSA_IO_PENDING is the normal path.
         if (rc != 0 and WSAGetLastError() != WSA_IO_PENDING) {
-            @panic("WSARecv/WSASend zero-byte readiness submission failed");
+            std.debug.panic("WSARecv/WSASend zero-byte readiness submission failed: WSA error {d}", .{WSAGetLastError()});
         }
 
         _ = self.pending.fetchAdd(1, .acq_rel);
@@ -429,10 +432,7 @@ pub const Reactor = struct {
         // FALSE is a real submission failure.
         if (rc == win.BOOL.FALSE) {
             const e = WSAGetLastError();
-            if (e != WSA_IO_PENDING) {
-                std.debug.print("AcceptEx submit failed: WSA error {d}\n", .{e});
-                return error.AcceptExFailed;
-            }
+            if (e != WSA_IO_PENDING) return error.AcceptExFailed;
         }
         _ = self.pending.fetchAdd(1, .acq_rel);
         me.pending = .park;
@@ -465,10 +465,7 @@ pub const Reactor = struct {
         );
         if (rc == win.BOOL.FALSE) {
             const e = WSAGetLastError();
-            if (e != WSA_IO_PENDING) {
-                std.debug.print("ConnectEx submit failed: WSA error {d}\n", .{e});
-                return error.ConnectExFailed;
-            }
+            if (e != WSA_IO_PENDING) return error.ConnectExFailed;
         }
         _ = self.pending.fetchAdd(1, .acq_rel);
         me.pending = .park;
@@ -509,7 +506,7 @@ pub const Reactor = struct {
         // CreateThreadpoolTimer cost.
         var ctx = TimerCtx{ .reactor = self, .coro = me };
         const timer = CreateThreadpoolTimer(&timerCallback, &ctx, null) orelse
-            @panic("CreateThreadpoolTimer failed");
+            std.debug.panic("CreateThreadpoolTimer failed: GLE={d}", .{@as(c_int, @bitCast(win.kernel32.GetLastError()))});
         ctx.timer = timer;
 
         // Windows FILETIME is in 100ns units, negative for relative

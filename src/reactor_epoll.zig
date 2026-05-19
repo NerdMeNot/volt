@@ -60,12 +60,32 @@ const EPOLLIN: u32 = 0x001;
 const EPOLLOUT: u32 = 0x004;
 const EPOLLONESHOT: u32 = 1 << 30;
 
-// epoll_event is `__attribute__ ((packed))` on x86_64 for
-// 32-bit-compat reasons. `align(1)` matches the C layout.
-const epoll_event = extern struct {
-    events: u32,
-    data: u64, // we stash the coroutine pointer here
-};
+// `epoll_event` layout differs by arch: the kernel header uses
+// `__attribute__((packed))` on x86_64 (12 bytes) and natural
+// alignment everywhere else (16 bytes, with 4 padding bytes
+// between `events` and `data`). The Zig struct must match the
+// kernel's per-arch layout exactly — otherwise epoll_wait writes
+// N×kernelSize bytes into our buffer but we read N×zigSize-byte
+// strides, and every event past index 0 reads garbage.
+//
+// Comptime assertion below pins the layout against the kernel
+// per arch so any drift fails the build, not silently at runtime.
+const epoll_event = if (builtin.target.cpu.arch == .x86_64)
+    extern struct {
+        events: u32 align(1),
+        data: u64 align(1),
+    }
+else
+    extern struct {
+        events: u32,
+        data: u64,
+    };
+comptime {
+    const expected: usize = if (builtin.target.cpu.arch == .x86_64) 12 else 16;
+    if (@sizeOf(epoll_event) != expected) {
+        @compileError("epoll_event size mismatch vs Linux kernel layout");
+    }
+}
 
 extern "c" fn epoll_create1(flags: c_int) c_int;
 extern "c" fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: ?*epoll_event) c_int;
@@ -91,22 +111,23 @@ extern "c" fn timerfd_settime(fd: c_int, flags: c_int, new_value: *const itimers
 
 // ─── generic libc ────────────────────────────────────────────────
 
-extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
-extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-extern "c" fn close(fd: c_int) c_int;
-extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
-extern "c" fn __errno_location() *c_int;
+const posix_helpers = @import("reactor_posix.zig");
+const read = posix_helpers.read;
+const close = posix_helpers.close;
+const errnoVal = posix_helpers.errnoVal;
 
-inline fn errnoVal() c_int {
-    return __errno_location().*;
-}
+// Re-exported as the shim's public surface. setNonblock /
+// readAsync / writeAsync / readFull / writeAll are identical
+// across kqueue / epoll / io_uring.
+pub const setNonblock = posix_helpers.setNonblock;
+pub const readAsync = posix_helpers.readAsync;
+pub const writeAsync = posix_helpers.writeAsync;
+pub const readFull = posix_helpers.readFull;
+pub const writeAll = posix_helpers.writeAll;
 
-const EAGAIN: c_int = 11;
+// EEXIST is specific to epoll_ctl's ADD-vs-MOD branching, so it
+// stays here rather than in the shared POSIX module.
 const EEXIST: c_int = 17;
-
-inline fn isAgain(e: c_int) bool {
-    return e == EAGAIN;
-}
 
 // ─── Reactor ─────────────────────────────────────────────────────
 
@@ -151,7 +172,7 @@ pub const Reactor = struct {
         if (rc < 0 and errnoVal() == EEXIST) {
             rc = epoll_ctl(self.epfd, EPOLL_CTL_MOD, fd, &ev);
         }
-        if (rc < 0) @panic("epoll_ctl(ADD/MOD) failed");
+        if (rc < 0) std.debug.panic("epoll_ctl(ADD/MOD) failed: errno={d}", .{errnoVal()});
         _ = self.pending.fetchAdd(1, .acq_rel);
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
@@ -166,7 +187,7 @@ pub const Reactor = struct {
         // timerfds is the natural optimisation if `bench-sleep`-
         // style workloads show the syscall overhead; deferred.
         const tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-        if (tfd < 0) @panic("timerfd_create failed");
+        if (tfd < 0) std.debug.panic("timerfd_create failed: errno={d}", .{errnoVal()});
 
         const spec = itimerspec{
             .it_interval = .{ .sec = 0, .nsec = 0 },
@@ -175,13 +196,13 @@ pub const Reactor = struct {
                 .nsec = @intCast(ns % std.time.ns_per_s),
             },
         };
-        if (timerfd_settime(tfd, 0, &spec, null) < 0) @panic("timerfd_settime failed");
+        if (timerfd_settime(tfd, 0, &spec, null) < 0) std.debug.panic("timerfd_settime failed: errno={d}", .{errnoVal()});
 
         var ev = epoll_event{
             .events = EPOLLIN | EPOLLONESHOT,
             .data = @intFromPtr(me),
         };
-        if (epoll_ctl(self.epfd, EPOLL_CTL_ADD, tfd, &ev) < 0) @panic("epoll_ctl(timerfd) failed");
+        if (epoll_ctl(self.epfd, EPOLL_CTL_ADD, tfd, &ev) < 0) std.debug.panic("epoll_ctl(timerfd) failed: errno={d}", .{errnoVal()});
 
         _ = self.pending.fetchAdd(1, .acq_rel);
         me.pending = .park;
@@ -216,61 +237,6 @@ pub const Reactor = struct {
         return count;
     }
 };
-
-// ─────────────────────────────────────────────────────────────────────
-// Non-blocking IO helpers (parallel to reactor_kqueue.zig's)
-// ─────────────────────────────────────────────────────────────────────
-
-const F_GETFL: c_int = 3;
-const F_SETFL: c_int = 4;
-const O_NONBLOCK: c_int = 0o4000;
-
-pub fn setNonblock(fd: i32) !void {
-    const flags = fcntl(@intCast(fd), F_GETFL, @as(c_int, 0));
-    if (flags < 0) return error.FcntlGetFailed;
-    if (fcntl(@intCast(fd), F_SETFL, flags | O_NONBLOCK) < 0) return error.FcntlSetFailed;
-}
-
-pub fn readAsync(rx: *Reactor, fd: i32, buf: []u8) !usize {
-    while (true) {
-        const r = read(@intCast(fd), buf.ptr, buf.len);
-        if (r >= 0) return @intCast(r);
-        const e = errnoVal();
-        if (!isAgain(e)) return error.ReadFailed;
-        rx.waitReadable(fd);
-    }
-}
-
-pub fn writeAsync(rx: *Reactor, fd: i32, buf: []const u8) !usize {
-    while (true) {
-        const w = write(@intCast(fd), buf.ptr, buf.len);
-        if (w >= 0) return @intCast(w);
-        const e = errnoVal();
-        if (!isAgain(e)) return error.WriteFailed;
-        rx.waitWritable(fd);
-    }
-}
-
-/// Read EXACTLY `buf.len` bytes (loop until EOF or full). Returns the
-/// total bytes read (which may be < buf.len if EOF hit).
-pub fn readFull(rx: *Reactor, fd: i32, buf: []u8) !usize {
-    var total: usize = 0;
-    while (total < buf.len) {
-        const got = try readAsync(rx, fd, buf[total..]);
-        if (got == 0) return total;
-        total += got;
-    }
-    return total;
-}
-
-/// Write EXACTLY `buf.len` bytes (loop on partial writes).
-pub fn writeAll(rx: *Reactor, fd: i32, buf: []const u8) !void {
-    var total: usize = 0;
-    while (total < buf.len) {
-        const w = try writeAsync(rx, fd, buf[total..]);
-        total += w;
-    }
-}
 
 // Compile-time check: this file is only meaningful on Linux.
 comptime {

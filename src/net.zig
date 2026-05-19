@@ -427,3 +427,27 @@ test "TCP echo single client round-trip" {
     try std.testing.expect(ctx.client_done);
     try std.testing.expectEqual(@as(u8, 0x42), ctx.result_byte);
 }
+
+// Linux-only: force the epoll backend (auto-mode silently picks
+// io_uring on every modern kernel, leaving the epoll path
+// untested in CI). Same workload as the auto-mode TCP echo above
+// — gives us regression coverage on the second Linux reactor.
+test "TCP echo round-trip on forced .epoll backend (Linux only)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var rt = try runtime.Runtime.init(.{
+        .allocator = test_allocator,
+        .workers = 1,
+        .io_backend = .epoll,
+    });
+    defer rt.deinit();
+
+    var listener = try TcpListener.bind(Address.loopback4(0));
+    defer listener.close();
+    var ctx = EchoTestCtx{ .listener = &listener };
+    ctx.addr = try listener.localAddress();
+    try (try rt.run(echoTestRoot, .{&ctx}));
+
+    try std.testing.expect(ctx.server_done);
+    try std.testing.expect(ctx.client_done);
+    try std.testing.expectEqual(@as(u8, 0x42), ctx.result_byte);
+}

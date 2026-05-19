@@ -56,21 +56,16 @@ const DEFAULT_RING_ENTRIES: u16 = 256;
 const POLLIN: u32 = 0x0001;
 const POLLOUT: u32 = 0x0004;
 
-extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
-extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-extern "c" fn close(fd: c_int) c_int;
-extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
-extern "c" fn __errno_location() *c_int;
-
-inline fn errnoVal() c_int {
-    return __errno_location().*;
-}
-
-const EAGAIN: c_int = 11;
-
-inline fn isAgain(e: c_int) bool {
-    return e == EAGAIN;
-}
+// Shared POSIX helpers — same setNonblock / readAsync / writeAsync
+// / readFull / writeAll as kqueue + epoll. The reactor-facing
+// helpers take the reactor as `anytype`, so they bind to this
+// backend at the call site without a shared base class.
+const posix_helpers = @import("reactor_posix.zig");
+pub const setNonblock = posix_helpers.setNonblock;
+pub const readAsync = posix_helpers.readAsync;
+pub const writeAsync = posix_helpers.writeAsync;
+pub const readFull = posix_helpers.readFull;
+pub const writeAll = posix_helpers.writeAll;
 
 // ─── Reactor ─────────────────────────────────────────────────────
 
@@ -116,9 +111,15 @@ pub const Reactor = struct {
         const me = current.require();
 
         self.acquire();
-        _ = self.ring.poll_add(@intFromPtr(me), fd, mask) catch {
-            self.release();
-            @panic("io_uring: SQ full (consider raising ring_size)");
+        self.ring.poll_add(@intFromPtr(me), fd, mask) catch {
+            // SQ-full is recoverable: a submit hands queued SQEs to
+            // the kernel and frees up user-space slots. Drain and
+            // retry once before giving up.
+            _ = self.ring.submit() catch {};
+            _ = self.ring.poll_add(@intFromPtr(me), fd, mask) catch {
+                self.release();
+                std.debug.panic("io_uring: SQ still full after submit (ring_size={d}; consider raising DEFAULT_RING_ENTRIES)", .{DEFAULT_RING_ENTRIES});
+            };
         };
         self.release();
 
@@ -138,9 +139,12 @@ pub const Reactor = struct {
         };
 
         self.acquire();
-        _ = self.ring.timeout(@intFromPtr(me), &ts, 0, 0) catch {
-            self.release();
-            @panic("io_uring: SQ full on timeout (consider raising ring_size)");
+        self.ring.timeout(@intFromPtr(me), &ts, 0, 0) catch {
+            _ = self.ring.submit() catch {};
+            _ = self.ring.timeout(@intFromPtr(me), &ts, 0, 0) catch {
+                self.release();
+                std.debug.panic("io_uring: SQ still full after submit on timeout (ring_size={d})", .{DEFAULT_RING_ENTRIES});
+            };
         };
         self.release();
 
@@ -194,58 +198,6 @@ pub const Reactor = struct {
         self.lock.store(0, .release);
     }
 };
-
-// ─────────────────────────────────────────────────────────────────────
-// Non-blocking IO helpers (parallel to reactor_kqueue.zig's)
-// ─────────────────────────────────────────────────────────────────────
-
-const F_GETFL: c_int = 3;
-const F_SETFL: c_int = 4;
-const O_NONBLOCK: c_int = 0o4000;
-
-pub fn setNonblock(fd: i32) !void {
-    const flags = fcntl(@intCast(fd), F_GETFL, @as(c_int, 0));
-    if (flags < 0) return error.FcntlGetFailed;
-    if (fcntl(@intCast(fd), F_SETFL, flags | O_NONBLOCK) < 0) return error.FcntlSetFailed;
-}
-
-pub fn readAsync(rx: *Reactor, fd: i32, buf: []u8) !usize {
-    while (true) {
-        const r = read(@intCast(fd), buf.ptr, buf.len);
-        if (r >= 0) return @intCast(r);
-        const e = errnoVal();
-        if (!isAgain(e)) return error.ReadFailed;
-        rx.waitReadable(fd);
-    }
-}
-
-pub fn writeAsync(rx: *Reactor, fd: i32, buf: []const u8) !usize {
-    while (true) {
-        const w = write(@intCast(fd), buf.ptr, buf.len);
-        if (w >= 0) return @intCast(w);
-        const e = errnoVal();
-        if (!isAgain(e)) return error.WriteFailed;
-        rx.waitWritable(fd);
-    }
-}
-
-pub fn readFull(rx: *Reactor, fd: i32, buf: []u8) !usize {
-    var total: usize = 0;
-    while (total < buf.len) {
-        const got = try readAsync(rx, fd, buf[total..]);
-        if (got == 0) return total;
-        total += got;
-    }
-    return total;
-}
-
-pub fn writeAll(rx: *Reactor, fd: i32, buf: []const u8) !void {
-    var total: usize = 0;
-    while (total < buf.len) {
-        const w = try writeAsync(rx, fd, buf[total..]);
-        total += w;
-    }
-}
 
 // Compile-time check: Linux-only.
 comptime {

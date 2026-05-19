@@ -86,7 +86,7 @@ pub const Reactor = struct {
         var changes = [_]posix.Kevent{kev};
         var dummy: [1]posix.Kevent = undefined;
         const n = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
-        if (n < 0) @panic("kevent timer register failed");
+        if (n < 0) std.debug.panic("kevent timer register failed: errno={d}", .{posix_helpers.errnoVal()});
         _ = self.pending.fetchAdd(1, .acq_rel);
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
@@ -102,7 +102,7 @@ pub const Reactor = struct {
         var changes = [_]posix.Kevent{kev};
         var dummy: [1]posix.Kevent = undefined;
         const n = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
-        if (n < 0) @panic("kevent register failed");
+        if (n < 0) std.debug.panic("kevent register failed: errno={d}", .{posix_helpers.errnoVal()});
         _ = self.pending.fetchAdd(1, .acq_rel);
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
@@ -138,71 +138,12 @@ pub const Reactor = struct {
 };
 
 // ─────────────────────────────────────────────────────────────────────
-// Non-blocking IO helpers
+// Non-blocking IO helpers — shared with epoll / io_uring backends.
 // ─────────────────────────────────────────────────────────────────────
 
-const F_GETFL: c_int = 3;
-const F_SETFL: c_int = 4;
-const O_NONBLOCK: c_int = 4;
-extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
-extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
-extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-extern "c" fn __error() *c_int;
-
-inline fn errnoVal() c_int {
-    return __error().*;
-}
-
-const EAGAIN_DARWIN: c_int = 35;
-const EAGAIN_LINUX: c_int = 11;
-
-inline fn isAgain(e: c_int) bool {
-    return e == EAGAIN_DARWIN or e == EAGAIN_LINUX;
-}
-
-pub fn setNonblock(fd: i32) !void {
-    const flags = fcntl(@intCast(fd), F_GETFL, @as(c_int, 0));
-    if (flags < 0) return error.FcntlGetFailed;
-    if (fcntl(@intCast(fd), F_SETFL, flags | O_NONBLOCK) < 0) return error.FcntlSetFailed;
-}
-
-pub fn readAsync(rx: *Reactor, fd: i32, buf: []u8) !usize {
-    while (true) {
-        const r = read(@intCast(fd), buf.ptr, buf.len);
-        if (r >= 0) return @intCast(r);
-        const e = errnoVal();
-        if (!isAgain(e)) return error.ReadFailed;
-        rx.waitReadable(fd);
-    }
-}
-
-pub fn writeAsync(rx: *Reactor, fd: i32, buf: []const u8) !usize {
-    while (true) {
-        const w = write(@intCast(fd), buf.ptr, buf.len);
-        if (w >= 0) return @intCast(w);
-        const e = errnoVal();
-        if (!isAgain(e)) return error.WriteFailed;
-        rx.waitWritable(fd);
-    }
-}
-
-/// Read EXACTLY `buf.len` bytes (loop until EOF or full). Returns the
-/// total bytes read (which may be < buf.len if EOF hit).
-pub fn readFull(rx: *Reactor, fd: i32, buf: []u8) !usize {
-    var total: usize = 0;
-    while (total < buf.len) {
-        const got = try readAsync(rx, fd, buf[total..]);
-        if (got == 0) return total;
-        total += got;
-    }
-    return total;
-}
-
-/// Write EXACTLY `buf.len` bytes (loop on partial writes).
-pub fn writeAll(rx: *Reactor, fd: i32, buf: []const u8) !void {
-    var total: usize = 0;
-    while (total < buf.len) {
-        const w = try writeAsync(rx, fd, buf[total..]);
-        total += w;
-    }
-}
+const posix_helpers = @import("reactor_posix.zig");
+pub const setNonblock = posix_helpers.setNonblock;
+pub const readAsync = posix_helpers.readAsync;
+pub const writeAsync = posix_helpers.writeAsync;
+pub const readFull = posix_helpers.readFull;
+pub const writeAll = posix_helpers.writeAll;

@@ -27,13 +27,17 @@ const io_uring = @import("reactor_io_uring.zig");
 pub const Backend = enum { epoll, io_uring };
 
 /// Runtime probe: does `io_uring_setup` succeed on this kernel?
-/// Linux ≥ 5.10 (Tokio's compatibility floor) supports the ops
-/// Volt uses. Older kernels or sysctl-disabled environments (some
-/// distros disable io_uring) return false; we fall back to epoll.
-pub fn probeIoUring() bool {
-    var ring = std.os.linux.IoUring.init(8, 0) catch return false;
+///
+/// Returns the actual error from `IoUring.init` on failure (rather
+/// than coercing to `bool`), so callers can distinguish kernel-too-
+/// old (`ENOSYS` → `error.SystemOutdated`), sysctl-disabled
+/// (`EPERM` → `error.PermissionDenied`), and friends from a generic
+/// "not available". The default `Reactor.init` discards the error
+/// and falls back to epoll — but a user diagnosing "why is io_uring
+/// not being used" can call `probeIoUring` directly to see.
+pub fn probeIoUring() !void {
+    var ring = try std.os.linux.IoUring.init(8, 0);
     ring.deinit();
-    return true;
 }
 
 /// The Linux Reactor — tagged union dispatch over both backends.
@@ -45,8 +49,14 @@ pub const Reactor = union(Backend) {
     /// Default constructor matches the other platforms' shape — no
     /// args, no config-injection. `Runtime.init` calls
     /// `initBackend(backend)` directly when it wants to override.
+    /// Silently falls back to epoll if io_uring is unavailable;
+    /// callers wanting the failure reason use `probeIoUring`.
     pub fn init() !Reactor {
-        return initBackend(if (probeIoUring()) .io_uring else .epoll);
+        if (probeIoUring()) {
+            return initBackend(.io_uring);
+        } else |_| {
+            return initBackend(.epoll);
+        }
     }
 
     /// Explicit-backend constructor. Used by `Runtime.init` when
@@ -103,74 +113,17 @@ pub const Reactor = union(Backend) {
 
 // ─── I/O helpers ─────────────────────────────────────────────────
 //
-// The I/O helpers (`setNonblock`, `readAsync`, etc.) don't depend on
-// which reactor backend is active — both use the same libc
-// `fcntl`/`read`/`write` syscalls. Forward to the epoll module's
-// versions; they'd be identical if defined here.
-//
-// Wait — they take `*Reactor`, but the Reactor type is the tagged
-// union here, not `epoll.Reactor`. The free-function helpers route
-// through the union's `waitReadable` / `waitWritable` methods, so
-// they need to be redefined locally.
-
-const F_GETFL: c_int = 3;
-const F_SETFL: c_int = 4;
-const O_NONBLOCK: c_int = 0o4000;
-
-extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
-extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
-extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
-extern "c" fn __errno_location() *c_int;
-
-inline fn errnoVal() c_int {
-    return __errno_location().*;
-}
-
-const EAGAIN: c_int = 11;
-
-pub fn setNonblock(fd: i32) !void {
-    const flags = fcntl(@intCast(fd), F_GETFL, @as(c_int, 0));
-    if (flags < 0) return error.FcntlGetFailed;
-    if (fcntl(@intCast(fd), F_SETFL, flags | O_NONBLOCK) < 0) return error.FcntlSetFailed;
-}
-
-pub fn readAsync(rx: *Reactor, fd: i32, buf: []u8) !usize {
-    while (true) {
-        const r = read(@intCast(fd), buf.ptr, buf.len);
-        if (r >= 0) return @intCast(r);
-        const e = errnoVal();
-        if (e != EAGAIN) return error.ReadFailed;
-        rx.waitReadable(fd);
-    }
-}
-
-pub fn writeAsync(rx: *Reactor, fd: i32, buf: []const u8) !usize {
-    while (true) {
-        const w = write(@intCast(fd), buf.ptr, buf.len);
-        if (w >= 0) return @intCast(w);
-        const e = errnoVal();
-        if (e != EAGAIN) return error.WriteFailed;
-        rx.waitWritable(fd);
-    }
-}
-
-pub fn readFull(rx: *Reactor, fd: i32, buf: []u8) !usize {
-    var total: usize = 0;
-    while (total < buf.len) {
-        const got = try readAsync(rx, fd, buf[total..]);
-        if (got == 0) return total;
-        total += got;
-    }
-    return total;
-}
-
-pub fn writeAll(rx: *Reactor, fd: i32, buf: []const u8) !void {
-    var total: usize = 0;
-    while (total < buf.len) {
-        const w = try writeAsync(rx, fd, buf[total..]);
-        total += w;
-    }
-}
+// The I/O helpers don't care which backend is active — they call
+// libc read/write and yield to `rx.waitReadable` / `.waitWritable`
+// on EAGAIN. The shared POSIX helpers take the reactor as
+// `anytype`, so the tagged-union `Reactor` here binds cleanly with
+// no per-backend dispatch glue.
+const posix_helpers = @import("reactor_posix.zig");
+pub const setNonblock = posix_helpers.setNonblock;
+pub const readAsync = posix_helpers.readAsync;
+pub const writeAsync = posix_helpers.writeAsync;
+pub const readFull = posix_helpers.readFull;
+pub const writeAll = posix_helpers.writeAll;
 
 comptime {
     if (builtin.os.tag != .linux) {
