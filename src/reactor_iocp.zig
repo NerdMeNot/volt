@@ -134,6 +134,7 @@ extern "kernel32" fn PostQueuedCompletionStatus(
 ) callconv(.winapi) win.BOOL;
 
 extern "kernel32" fn CloseHandle(hObject: win.HANDLE) callconv(.winapi) win.BOOL;
+extern "kernel32" fn GetLastError() callconv(.winapi) win.DWORD;
 
 // Threadpool timer
 const TP_TIMER = opaque {};
@@ -506,7 +507,7 @@ pub const Reactor = struct {
         // CreateThreadpoolTimer cost.
         var ctx = TimerCtx{ .reactor = self, .coro = me };
         const timer = CreateThreadpoolTimer(&timerCallback, &ctx, null) orelse
-            std.debug.panic("CreateThreadpoolTimer failed: GLE={d}", .{@as(c_int, @bitCast(win.kernel32.GetLastError()))});
+            std.debug.panic("CreateThreadpoolTimer failed: GLE={d}", .{GetLastError()});
         ctx.timer = timer;
 
         // Windows FILETIME is in 100ns units, negative for relative
