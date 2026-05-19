@@ -161,6 +161,15 @@ pub const Reactor = struct {
         return self.pending.load(.acquire);
     }
 
+    /// Sentinel `user_data` for cancel SQEs themselves — the poll
+    /// path skips CQEs carrying this value (they're acknowledgement
+    /// completions for `ASYNC_CANCEL` ops, not parked coroutines).
+    /// Zero would alias the null pointer at @ptrFromInt time, so we
+    /// pick a value that can't collide with any real coroutine
+    /// address (heap allocations are at least 8-byte aligned;
+    /// 0x1 is reserved as our sentinel).
+    const CANCEL_SQE_USER_DATA: u64 = 0x1;
+
     /// Cancel this coro's in-flight io_uring op.
     ///
     /// Unlike kqueue/epoll, io_uring's `ASYNC_CANCEL` produces a
@@ -172,11 +181,13 @@ pub const Reactor = struct {
     ///
     /// `user_data` for the original op == `@intFromPtr(coro)`
     /// (set in `waitFd`/`waitTimer`), so no per-coro stash needed.
+    /// The CANCEL SQE itself carries the sentinel `user_data` so
+    /// the poll loop discards its own completion.
     pub fn cancelCoro(self: *Reactor, c: *coroutine.Coroutine) void {
         self.acquire();
-        _ = self.ring.cancel(0, @intFromPtr(c), 0) catch blk: {
+        _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(c), 0) catch blk: {
             _ = self.ring.submit() catch {};
-            break :blk self.ring.cancel(0, @intFromPtr(c), 0) catch null;
+            break :blk self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(c), 0) catch null;
         };
         self.release();
     }
@@ -221,14 +232,22 @@ pub const Reactor = struct {
         const n = self.ring.copy_cqes(&cqes, 0) catch return 0;
         if (n == 0) return 0;
         const count: usize = @intCast(n);
-        _ = self.pending.fetchSub(@intCast(count), .acq_rel);
+        var real_count: usize = 0;
         var i: usize = 0;
         while (i < count) : (i += 1) {
-            // `user_data` is the coroutine pointer we set in
-            // waitFd/waitTimer. Cast back and unpark.
+            // CANCEL SQE acknowledgements arrive with the sentinel
+            // user_data — skip them (the cancelled op's own CQE
+            // arrives separately and carries the real coro ptr).
+            if (cqes[i].user_data == CANCEL_SQE_USER_DATA) continue;
+            real_count += 1;
+            // `user_data` for normal ops is the coroutine pointer
+            // we set in waitFd/waitTimer. Cast back and unpark.
             const coro: *coroutine.Coroutine = @ptrFromInt(cqes[i].user_data);
             runtime.unpark(coro);
         }
+        // Pending was incremented per real-op submit, not per
+        // cancel SQE — only decrement by the real-op count.
+        _ = self.pending.fetchSub(@intCast(real_count), .acq_rel);
         return count;
     }
 
