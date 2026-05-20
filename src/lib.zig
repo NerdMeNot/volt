@@ -246,6 +246,9 @@ pub const Broadcast = channel.Broadcast;
 pub const Mutex = sync.Mutex;
 pub const Notify = sync.Notify;
 pub const Semaphore = sync.Semaphore;
+pub const RwLock = sync.RwLock;
+pub const OnceCell = sync.OnceCell;
+pub const Barrier = sync.Barrier;
 
 /// Go-style cancellation handle. Caller-owned; fire to wake every
 /// cancel-aware blocking op holding `*Cancel`. See `src/cancel.zig`.
