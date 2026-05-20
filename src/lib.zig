@@ -43,6 +43,15 @@ pub const IoError = @import("reactor.zig").IoError;
 pub const ReactorWaitError = @import("reactor.zig").ReactorWaitError;
 pub const ReactorSetupError = @import("reactor.zig").ReactorSetupError;
 
+/// Typed time vocabulary — `Duration` (a length of time) and
+/// `Instant` (a point on the monotonic clock). Library APIs that
+/// take timeouts / deadlines should accept `Duration`; the raw
+/// `u64` nanosecond form is still available via `sleepNanos` for
+/// bench loops that need the unboxed integer.
+pub const time = @import("time.zig");
+pub const Duration = time.Duration;
+pub const Instant = time.Instant;
+
 /// Threadlocal "current coroutine" lookup.
 pub const current = @import("current.zig");
 
@@ -80,8 +89,8 @@ pub fn spawn(comptime user_fn: anytype, args: anytype) !*Task(@typeInfo(@TypeOf(
 /// called from inside a coroutine.
 pub const yield = @import("runtime.zig").yield;
 
-/// Sleep for at least `ns` nanoseconds. Routes through the
-/// reactor's timer (`EVFILT_TIMER` on kqueue, `timerfd` on epoll,
+/// Sleep for at least `d`. Routes through the reactor's timer
+/// (`EVFILT_TIMER` on kqueue, `timerfd` on epoll,
 /// `IORING_OP_TIMEOUT` on io_uring, `CreateThreadpoolTimer` on
 /// IOCP) — uses zero worker-thread time, just like a parked socket
 /// read. Must be called from inside a coroutine.
@@ -92,7 +101,15 @@ pub const yield = @import("runtime.zig").yield;
 ///
 /// Kernel timer resolution is bounded below by ~1 µs on Darwin arm64;
 /// shorter sleeps round up.
-pub fn sleep(ns: u64) ReactorWaitError!void {
+pub fn sleep(d: Duration) ReactorWaitError!void {
+    const rt = runtime();
+    return rt.reactor.waitTimer(d.ns);
+}
+
+/// Raw-nanosecond variant of `sleep`. Use this only for bench
+/// loops where the `Duration` constructor's instructions show up
+/// in measurement noise; library code should prefer `sleep`.
+pub fn sleepNanos(ns: u64) ReactorWaitError!void {
     const rt = runtime();
     return rt.reactor.waitTimer(ns);
 }
@@ -172,6 +189,7 @@ test {
     _ = @import("signal.zig");
     _ = @import("context.zig");
     _ = @import("cancel.zig");
+    _ = @import("time.zig");
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
@@ -207,7 +225,7 @@ fn nanosNow() i128 {
 
 fn sleepTestRoot(ctx: *SleepCtx) !void {
     const start = nanosNow();
-    try sleep(10 * std.time.ns_per_ms);
+    try sleep(Duration.fromMillis(10));
     ctx.slept_ns = nanosNow() - start;
 }
 
