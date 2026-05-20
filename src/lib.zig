@@ -252,6 +252,21 @@ pub const Semaphore = sync.Semaphore;
 pub const cancel = @import("cancel.zig");
 pub const Cancel = cancel.Cancel;
 
+/// First-of-N event multiplexer over channels and timers. See
+/// `src/select.zig` for the full API; the common shape is:
+///
+/// ```zig
+/// const r = try volt.select(.{
+///     .data    = volt.selectRecv(&ch),
+///     .timeout = volt.selectTimer(volt.Duration.fromMillis(100)),
+/// });
+/// switch (r) { .data => |v| ..., .timeout => ... }
+/// ```
+pub const select = @import("select.zig").select;
+pub const selectRecv = @import("select.zig").selectRecv;
+pub const selectSend = @import("select.zig").selectSend;
+pub const selectTimer = @import("select.zig").selectTimer;
+
 // ─── Internal (not for user code) ────────────────────────────────────
 
 /// Internal-use namespaces. Stable enough that volt's tests + benches
@@ -289,6 +304,7 @@ test {
     _ = @import("context.zig");
     _ = @import("cancel.zig");
     _ = @import("time.zig");
+    _ = @import("select.zig");
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────

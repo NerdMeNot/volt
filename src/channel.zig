@@ -69,6 +69,11 @@ pub fn Spsc(comptime T: type, comptime cap: usize) type {
         const Self = @This();
         const MASK: u64 = cap - 1;
 
+        /// Element type — exposed so generic consumers
+        /// (e.g. `volt.select`) can extract it without `@TypeOf`-on-
+        /// recvCancel-return gymnastics.
+        pub const Payload = T;
+
         ring: [cap]T align(CACHE_LINE) = undefined,
 
         /// Producer-owned cache line. Consumers park on `&head`
@@ -256,6 +261,8 @@ pub fn Mpmc(comptime T: type, comptime cap: usize) type {
     return struct {
         const Self = @This();
         const MASK: u64 = cap - 1;
+
+        pub const Payload = T;
 
         const Cell = struct {
             seq: std.atomic.Value(u64),
@@ -493,6 +500,8 @@ pub fn Oneshot(comptime T: type) type {
         const FULL: u32 = 1;
         const CONSUMED: u32 = 2;
         const CLOSED: u32 = 3;
+
+        pub const Payload = T;
 
         state: std.atomic.Value(u32) align(CACHE_LINE) = std.atomic.Value(u32).init(EMPTY),
         value: T = undefined,
