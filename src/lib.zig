@@ -114,6 +114,15 @@ pub fn sleepNanos(ns: u64) ReactorWaitError!void {
     return rt.reactor.waitTimer(ns);
 }
 
+/// Cancel-aware variant of `sleep`. Returns `error.Cancelled` if
+/// `c` fires before the duration elapses; the kernel-side timer
+/// is deregistered eagerly so the resource isn't held past the
+/// cancel.
+pub fn sleepCancel(d: Duration, c: *Cancel) (ReactorWaitError || cancel.Error)!void {
+    const rt = runtime();
+    return rt.reactor.waitTimerCancel(d.ns, c);
+}
+
 /// Run `body` with a fresh `*Cancel`. If `body` returns an error,
 /// the Cancel fires automatically — every coroutine that was given
 /// `&cancel` and is mid-blocking-op wakes with `error.Cancelled`.
@@ -151,7 +160,8 @@ pub const Semaphore = sync.Semaphore;
 
 /// Go-style cancellation handle. Caller-owned; fire to wake every
 /// cancel-aware blocking op holding `*Cancel`. See `src/cancel.zig`.
-pub const Cancel = @import("cancel.zig").Cancel;
+pub const cancel = @import("cancel.zig");
+pub const Cancel = cancel.Cancel;
 
 // ─── Internal (not for user code) ────────────────────────────────────
 

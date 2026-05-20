@@ -553,31 +553,101 @@ pub const Reactor = struct {
         CloseThreadpoolTimer(timer);
     }
 
+    /// Cancel-aware variant of `waitTimer`. Stashes the timer
+    /// handle in the per-coro `WaitOp.timer` slot so `cancelCoro`
+    /// can disarm + post a manual completion if the cancel fires
+    /// before the timer.
+    pub fn waitTimerCancel(self: *Reactor, ns: u64, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+        const me = current.require();
+        try c.checkpoint();
+
+        var ctx = TimerCtx{ .reactor = self, .coro = me };
+        const timer = CreateThreadpoolTimer(&timerCallback, &ctx, null) orelse
+            return error.SystemResources;
+        ctx.timer = timer;
+
+        const ticks_100ns: i64 = -@as(i64, @intCast(ns / 100));
+        const due_time = win.FILETIME{
+            .dwLowDateTime = @intCast(ticks_100ns & 0xFFFFFFFF),
+            .dwHighDateTime = @intCast((ticks_100ns >> 32) & 0xFFFFFFFF),
+        };
+        SetThreadpoolTimer(timer, &due_time, 0, 0);
+
+        var op = WaitOp{ .timer = .{ .timer = timer } };
+        me.reactor_wait_op = &op;
+        defer me.reactor_wait_op = null;
+
+        var w = cancel_mod.Waiter{};
+        const already_fired = c.registerReactor(&w, me);
+        defer c.deregister(&w);
+        if (already_fired) {
+            // Cancel fired between checkpoint and register — tear
+            // down the timer before parking.
+            SetThreadpoolTimer(timer, null, 0, 0);
+            WaitForThreadpoolTimerCallbacks(timer, win.BOOL.TRUE);
+            CloseThreadpoolTimer(timer);
+            return error.Cancelled;
+        }
+
+        _ = self.pending.fetchAdd(1, .acq_rel);
+        me.pending = .park;
+        context.swap(&me.ctx, me.main_ctx);
+
+        WaitForThreadpoolTimerCallbacks(timer, win.BOOL.FALSE);
+        CloseThreadpoolTimer(timer);
+
+        if (c.isFired()) return error.Cancelled;
+    }
+
     pub fn pendingCount(self: *const Reactor) u32 {
         return self.pending.load(.acquire);
     }
 
-    /// Per-call stash for cancel-aware waits. Carries the socket
-    /// handle and the OVERLAPPED address that `CancelIoEx` needs
-    /// to deregister.
-    pub const WaitOp = struct {
-        sock: usize,
-        overlapped: *OVERLAPPED,
+    /// Per-call stash for cancel-aware waits. A tagged union of
+    /// the two cancel mechanisms we use — `CancelIoEx` for socket
+    /// I/O and `SetThreadpoolTimer(NULL)` + manual completion-post
+    /// for timer waits.
+    pub const WaitOp = union(enum) {
+        io: struct {
+            sock: usize,
+            overlapped: *OVERLAPPED,
+        },
+        timer: struct {
+            timer: *TP_TIMER,
+        },
     };
 
     /// Cancel this coro's in-flight IOCP op.
     ///
-    /// `CancelIoEx` queues a completion with status
-    /// `STATUS_CANCELLED` for the matched op. The poll path picks
-    /// it up and unparks via the normal route — no double-unpark
-    /// risk because exactly one completion fires per submitted op.
+    /// For I/O: `CancelIoEx` queues a `STATUS_CANCELLED` completion
+    /// that the poll path picks up and unparks via the normal route
+    /// — no double-unpark because exactly one completion fires per
+    /// submitted op.
+    ///
+    /// For timers: `SetThreadpoolTimer(NULL)` disarms the timer
+    /// (preventing the natural fire callback), and we explicitly
+    /// `PostQueuedCompletionStatus` with the coro ptr as the
+    /// CompletionKey so the poll path sees the same shape it would
+    /// from a natural timer fire.
     pub fn cancelCoro(self: *Reactor, c: *coroutine.Coroutine) void {
-        _ = self;
         const op_ptr = c.reactor_wait_op orelse return;
         const op: *WaitOp = @ptrCast(@alignCast(op_ptr));
-        _ = CancelIoEx(@ptrFromInt(op.sock), op.overlapped);
-        // Don't unpark here — the cancellation completion will
-        // fire via the IOCP poll loop's normal path.
+        switch (op.*) {
+            .io => |io| {
+                _ = CancelIoEx(@ptrFromInt(io.sock), io.overlapped);
+                // Don't unpark here — the cancellation completion
+                // will fire via the IOCP poll loop's normal path.
+            },
+            .timer => |t| {
+                SetThreadpoolTimer(t.timer, null, 0, 0);
+                _ = PostQueuedCompletionStatus(
+                    self.iocp,
+                    0,
+                    @intFromPtr(c),
+                    null,
+                );
+            },
+        }
     }
 
     pub fn waitReadableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
@@ -609,7 +679,7 @@ pub const Reactor = struct {
             if (e != WSA_IO_PENDING) return wsaToSetupError(e);
         }
 
-        var op = WaitOp{ .sock = sock, .overlapped = &ovl };
+        var op = WaitOp{ .io = .{ .sock = sock, .overlapped = &ovl } };
         me.reactor_wait_op = &op;
         defer me.reactor_wait_op = null;
 

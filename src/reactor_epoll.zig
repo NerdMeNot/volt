@@ -243,10 +243,14 @@ pub const Reactor = struct {
     }
 
     /// Per-call stash for cancel-aware waits. `fd` is the
-    /// epoll-registered descriptor (a socket fd, or — TODO —
-    /// a timerfd for timer waits).
+    /// epoll-registered descriptor (a socket fd or a timerfd).
+    /// `is_timer` differentiates the two on the cancel path —
+    /// timer cancels must also close the per-call timerfd, since
+    /// the wait function won't run its own `close` if it never
+    /// resumes naturally.
     pub const WaitOp = struct {
         fd: c_int,
+        is_timer: bool = false,
     };
 
     /// Cancel this coro's in-flight epoll registration.
@@ -259,6 +263,10 @@ pub const Reactor = struct {
         const op: *WaitOp = @ptrCast(@alignCast(op_ptr));
         const rc = epoll_ctl(self.epfd, EPOLL_CTL_DEL, op.fd, null);
         if (rc < 0) return; // ENOENT — poll() owns the unpark.
+        // For timer waits, the per-call timerfd is also our
+        // responsibility — the wait fn won't run its natural
+        // close-after-read path because it never resumes.
+        if (op.is_timer) _ = posix_helpers.close(op.fd);
         _ = self.pending.fetchSub(1, .acq_rel);
         runtime.unpark(c);
     }
@@ -284,6 +292,67 @@ pub const Reactor = struct {
         defer c.deregister(&w);
 
         try self.waitFd(fd, filter);
+
+        if (c.isFired()) return error.Cancelled;
+    }
+
+    /// Cancel-aware variant of `waitTimer`. The timerfd is set up
+    /// inline (we can't share state with `waitTimer` because the
+    /// op stash would be a stack-frame address held across one of
+    /// our calls). On cancel, `cancelCoro` is what closes the
+    /// timerfd via the `is_timer` branch.
+    pub fn waitTimerCancel(self: *Reactor, ns: u64, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+        const me = current.require();
+        try c.checkpoint();
+
+        const tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+        if (tfd < 0) return registerError(errnoVal());
+
+        const spec = itimerspec{
+            .it_interval = .{ .sec = 0, .nsec = 0 },
+            .it_value = .{
+                .sec = @intCast(ns / std.time.ns_per_s),
+                .nsec = @intCast(ns % std.time.ns_per_s),
+            },
+        };
+        if (timerfd_settime(tfd, 0, &spec, null) < 0) {
+            _ = posix_helpers.close(tfd);
+            return registerError(errnoVal());
+        }
+
+        var ev = epoll_event{
+            .events = EPOLLIN | EPOLLONESHOT,
+            .data = @intFromPtr(me),
+        };
+        if (epoll_ctl(self.epfd, EPOLL_CTL_ADD, tfd, &ev) < 0) {
+            _ = posix_helpers.close(tfd);
+            return registerError(errnoVal());
+        }
+
+        var op = WaitOp{ .fd = tfd, .is_timer = true };
+        me.reactor_wait_op = &op;
+        defer me.reactor_wait_op = null;
+
+        var w = cancel_mod.Waiter{};
+        const already_fired = c.registerReactor(&w, me);
+        defer c.deregister(&w);
+        if (already_fired) {
+            // Cancel fired between checkpoint and register — tear
+            // down without parking.
+            _ = epoll_ctl(self.epfd, EPOLL_CTL_DEL, tfd, null);
+            _ = posix_helpers.close(tfd);
+            return error.Cancelled;
+        }
+
+        _ = self.pending.fetchAdd(1, .acq_rel);
+        me.pending = .park;
+        context.swap(&me.ctx, me.main_ctx);
+
+        // We resumed naturally (timer fired, not cancel). Drain
+        // the 8-byte expiration count and close the timerfd.
+        var buf: [8]u8 = undefined;
+        _ = read(tfd, &buf, 8);
+        _ = posix_helpers.close(tfd);
 
         if (c.isFired()) return error.Cancelled;
     }

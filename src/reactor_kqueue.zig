@@ -200,6 +200,27 @@ pub const Reactor = struct {
         if (c.isFired()) return error.Cancelled;
     }
 
+    /// Cancel-aware variant of `waitTimer`. The kqueue timer
+    /// registration is keyed on `(coro_ptr, EVFILT_TIMER)`, so the
+    /// same `WaitOp` mechanism + `EV_DELETE` deregister carries
+    /// through unchanged from the fd cancel path.
+    pub fn waitTimerCancel(self: *Reactor, ns: u64, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+        const me = current.require();
+        try c.checkpoint();
+
+        var op = WaitOp{ .ident = @intFromPtr(me), .filter = EVFILT_TIMER };
+        me.reactor_wait_op = &op;
+        defer me.reactor_wait_op = null;
+
+        var w = cancel_mod.Waiter{};
+        if (c.registerReactor(&w, me)) return error.Cancelled;
+        defer c.deregister(&w);
+
+        try self.waitTimer(ns);
+
+        if (c.isFired()) return error.Cancelled;
+    }
+
     /// Drain ready events. Returns the number of coroutines unparked.
     /// If `blocking` is true and `pending > 0`, blocks until ≥ 1
     /// event fires. If `blocking` is false, returns immediately

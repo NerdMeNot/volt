@@ -138,6 +138,17 @@ pub const Reactor = union(Backend) {
             .io_uring => |*r| r.waitWritableCancel(fd, c),
         };
     }
+
+    pub fn waitTimerCancel(
+        self: *Reactor,
+        ns: u64,
+        c: *@import("cancel.zig").Cancel,
+    ) (posix_helpers.ReactorWaitError || @import("cancel.zig").Error)!void {
+        return switch (self.*) {
+            .epoll => |*r| r.waitTimerCancel(ns, c),
+            .io_uring => |*r| r.waitTimerCancel(ns, c),
+        };
+    }
 };
 
 // ─── I/O helpers ─────────────────────────────────────────────────

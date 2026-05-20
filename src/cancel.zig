@@ -257,3 +257,45 @@ test "Cancel: deregister on already-drained waiter is a no-op" {
     c.deregister(&w);
     try std.testing.expect(!w.in_list);
 }
+
+// ─── sleepCancel: timer-side cancel-aware reactor parking ────────
+
+const lib = @import("lib.zig");
+
+const SleepCancelCtx = struct {
+    cancel: *Cancel,
+    got: ?anyerror = null,
+};
+
+fn sleepCancelSleeper(ctx: *SleepCancelCtx) void {
+    // A 10s sleep — way longer than the test's wall-clock budget,
+    // so if cancel doesn't fire eagerly the test times out and
+    // we know the wiring is broken.
+    const result = lib.sleepCancel(lib.Duration.fromSecs(10), ctx.cancel);
+    ctx.got = if (result) |_| null else |e| e;
+}
+
+fn sleepCancelFirer(ctx: *SleepCancelCtx) void {
+    // Yield enough that the sleeper has parked before we fire.
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) @import("runtime.zig").yield();
+    ctx.cancel.fire();
+}
+
+fn sleepCancelRoot(ctx: *SleepCancelCtx) !void {
+    const rt: *runtime.Runtime = @ptrCast(@alignCast(@import("current.zig").require().runtime));
+    var sleeper = try rt.spawn(sleepCancelSleeper, .{ctx});
+    var firer = try rt.spawn(sleepCancelFirer, .{ctx});
+    _ = sleeper.join();
+    _ = firer.join();
+}
+
+test "Cancel: sleepCancel wakes a sleeping coro on Cancel.fire" {
+    var rt = try runtime.Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
+    defer rt.deinit();
+    var c = Cancel.init(rt);
+    defer c.deinit();
+    var ctx = SleepCancelCtx{ .cancel = &c };
+    try (try rt.run(sleepCancelRoot, .{&ctx}));
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), ctx.got);
+}

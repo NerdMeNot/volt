@@ -213,6 +213,23 @@ pub const Reactor = struct {
         if (c.isFired()) return error.Cancelled;
     }
 
+    /// Cancel-aware variant of `waitTimer`. The timeout SQE's
+    /// `user_data` is `@intFromPtr(coro)` (same as fd waits), so
+    /// the existing `ASYNC_CANCEL`-by-user_data path in
+    /// `cancelCoro` matches it without any new bookkeeping.
+    pub fn waitTimerCancel(self: *Reactor, ns: u64, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+        try c.checkpoint();
+        const me = current.require();
+
+        var w = cancel_mod.Waiter{};
+        if (c.registerReactor(&w, me)) return error.Cancelled;
+        defer c.deregister(&w);
+
+        try self.waitTimer(ns);
+
+        if (c.isFired()) return error.Cancelled;
+    }
+
     pub fn poll(self: *Reactor, blocking: bool) usize {
         if (self.pending.load(.acquire) == 0) return 0;
 
