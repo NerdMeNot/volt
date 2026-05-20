@@ -146,6 +146,95 @@ pub fn scope(comptime body: anytype) anyerror!void {
     };
 }
 
+/// Race `body(args..., *Cancel)` against `d`. Returns `body`'s
+/// result if it completes first; returns `error.Timeout` if the
+/// duration elapses first.
+///
+/// **Body shape**: the body must accept `*Cancel` as its last
+/// argument and propagate it through cancel-aware blocking calls
+/// (`sleepCancel`, `Mutex.lockCancel`, `Spsc.recvCancel`, etc.).
+/// Bodies that ignore the cancel will still race the timer, but
+/// won't be interrupted mid-blocking-op.
+///
+/// **Mechanism**: spawn a timer-firer child coroutine that calls
+/// `sleepCancel(d, &c)`. If the sleep returns naturally (timer
+/// expired), the firer CAS-claims the "winner = timer" slot and
+/// calls `c.fire()`. If the body returns first, it CAS-claims
+/// "winner = body" and calls `c.fire()` — the firer's sleepCancel
+/// returns `error.Cancelled` and it exits cleanly.
+///
+/// The CAS arbitration is what determines the outcome: whichever
+/// side flips the winner slot first wins the race, even if the
+/// other side completes a few cycles later.
+///
+/// No background threads — the timer-firer is a coroutine on the
+/// existing work-stealing fabric.
+pub fn withTimeout(
+    d: Duration,
+    comptime body: anytype,
+    args: anytype,
+) WithTimeoutReturn(@TypeOf(body)) {
+    const Winner = enum(u8) { unset = 0, body = 1, timer = 2 };
+
+    const Ctx = struct {
+        cancel: *Cancel,
+        dur: Duration,
+        winner: *std.atomic.Value(u8),
+
+        fn timerFirer(self: *@This()) void {
+            sleepCancel(self.dur, self.cancel) catch return;
+            // Slept the full duration — claim the win, fire the cancel.
+            if (self.winner.cmpxchgStrong(
+                @intFromEnum(Winner.unset),
+                @intFromEnum(Winner.timer),
+                .acq_rel,
+                .acquire,
+            ) == null) {
+                self.cancel.fire();
+            }
+        }
+    };
+
+    var c = Cancel.init(runtime());
+    defer c.deinit();
+
+    var winner = std.atomic.Value(u8).init(@intFromEnum(Winner.unset));
+    var ctx = Ctx{ .cancel = &c, .dur = d, .winner = &winner };
+
+    var firer = try spawn(Ctx.timerFirer, .{&ctx});
+
+    const args_with_cancel = args ++ .{&c};
+    const result = @call(.auto, body, args_with_cancel);
+
+    const body_won = winner.cmpxchgStrong(
+        @intFromEnum(Winner.unset),
+        @intFromEnum(Winner.body),
+        .acq_rel,
+        .acquire,
+    ) == null;
+    c.fire(); // wake the firer if it's still sleeping; no-op otherwise.
+    _ = firer.join();
+
+    if (!body_won) return error.Timeout;
+    return result;
+}
+
+/// `withTimeout`'s return type is body's success-payload with
+/// `anyerror` on the error side — because we union body's error
+/// set with `spawn`'s (OOM / MmapFailed / etc.) plus
+/// `error.Timeout`, and the spawn error set is inferred (no
+/// stable name to pluck off comptime). Library callers that need
+/// a tighter set can wrap and re-map.
+fn WithTimeoutReturn(comptime BodyT: type) type {
+    const fn_info = @typeInfo(BodyT).@"fn";
+    const inner = fn_info.return_type.?;
+    const inner_info = @typeInfo(inner);
+    if (inner_info == .error_union) {
+        return anyerror!inner_info.error_union.payload;
+    }
+    return anyerror!inner;
+}
+
 // ─── Channel & sync convenience re-exports ───────────────────────────
 
 pub const Spsc = channel.Spsc;
@@ -291,4 +380,43 @@ test "scope: ok body returns OK; error body propagates error" {
     defer rt.deinit();
     var dummy: void = {};
     try (try rt.run(scopeRoot, .{&dummy}));
+}
+
+// ─── withTimeout tests ───────────────────────────────────────────────
+
+fn fastBody(c: *Cancel) !u32 {
+    try sleepCancel(Duration.fromMillis(5), c);
+    return 0x42;
+}
+
+fn slowBody(c: *Cancel) !u32 {
+    try sleepCancel(Duration.fromSecs(10), c);
+    return 0x99;
+}
+
+fn withTimeoutBodyWinsRoot() !void {
+    const r = try withTimeout(Duration.fromMillis(100), fastBody, .{});
+    try std.testing.expectEqual(@as(u32, 0x42), r);
+}
+
+fn withTimeoutTimerWinsRoot() !void {
+    const r = withTimeout(Duration.fromMillis(10), slowBody, .{});
+    try std.testing.expectError(error.Timeout, r);
+}
+
+// Note: pinned to workers = 1, matching the existing TCP-echo /
+// reactor-cancel tests. With workers ≥ 2, Runtime.deinit can hang
+// because a worker parked in `reactor.poll(blocking=true)` has no
+// external wake mechanism — see Phase 6 (reactor.interrupt()) for
+// the fix; once that lands these tests should move to workers=2.
+test "withTimeout: body finishes within budget — returns body's result" {
+    var rt = try Runtime.init(.{ .allocator = std.heap.smp_allocator, .workers = 1 });
+    defer rt.deinit();
+    try (try rt.run(withTimeoutBodyWinsRoot, .{}));
+}
+
+test "withTimeout: body exceeds budget — returns error.Timeout" {
+    var rt = try Runtime.init(.{ .allocator = std.heap.smp_allocator, .workers = 1 });
+    defer rt.deinit();
+    try (try rt.run(withTimeoutTimerWinsRoot, .{}));
 }
