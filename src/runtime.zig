@@ -74,6 +74,36 @@ pub const MAX_WORKERS: usize = 64; // bitmap is u64
 /// permission failure during lazy slot commit).
 pub const SpawnError = std.mem.Allocator.Error || stack_mod.Error;
 
+/// Minimalist runtime instrumentation hook. Set
+/// `Runtime.Config.observer = &my_observer` and the runtime fires
+/// these callbacks at the corresponding lifecycle points. When
+/// `observer == null`, every hook site folds to a dead branch at
+/// optimisation time — zero overhead.
+///
+/// Use this for: spawn/done counters, hung-coroutine investigators,
+/// per-coroutine timing profilers, custom tracing emitters
+/// (StatsD, JSON-lines, OpenTelemetry — whatever shape you want).
+/// Volt deliberately doesn't ship a tracing impl in v1; this is the
+/// hook layer downstream observers build on.
+///
+/// Async-signal-safety: callbacks run from the dispatching worker.
+/// They are NOT signal-handler safe. Keep callbacks fast — they
+/// fire on the hot scheduler path.
+pub const Observer = struct {
+    /// Fired after a new coroutine is constructed and queued by
+    /// `Runtime.spawn`. The coroutine has not yet started running.
+    onSpawn: ?*const fn (coro: *Coroutine) void = null,
+    /// Fired when a coroutine begins parking (after the primitive
+    /// has registered the waiter; just before the ctx swap).
+    onPark: ?*const fn (coro: *Coroutine) void = null,
+    /// Fired when `runtime.unpark` re-queues a parked coroutine.
+    onUnpark: ?*const fn (coro: *Coroutine) void = null,
+    /// Fired when a coroutine's trampoline returns (terminal state).
+    /// The `coro` pointer is about to be recycled — read fields
+    /// before returning from the callback.
+    onComplete: ?*const fn (coro: *Coroutine) void = null,
+};
+
 pub const Config = struct {
     allocator: std.mem.Allocator,
     /// Worker thread count. null = std.Thread.getCpuCount.
@@ -111,6 +141,11 @@ pub const Config = struct {
     /// concurrent sync work at 128 threads; raise for sync-IO-heavy
     /// services. See `src/blocking_pool.zig`.
     blocking: blocking_pool_mod.Config = .{},
+    /// Optional instrumentation hook. Set to `&my_observer` to
+    /// receive callbacks on spawn / park / unpark / complete.
+    /// Default `null` — every hook site folds away at optimisation
+    /// time, zero runtime cost.
+    observer: ?*const Observer = null,
 };
 
 /// Cooperative yield. Re-queues the current coroutine onto the
@@ -142,6 +177,8 @@ pub fn yield() void {
 /// race on the same stack.
 pub fn park() void {
     const c = current.require();
+    const rt: *Runtime = @ptrCast(@alignCast(c.runtime));
+    if (rt.observer) |o| if (o.onPark) |cb| cb(c);
     c.pending = .park;
     context.swap(&c.ctx, c.main_ctx);
 }
@@ -154,6 +191,10 @@ pub fn park() void {
 ///              branch and re-queues immediately — no double-dispatch.
 ///   NOTIFIED → no-op (already queued for self-wake by dispatch).
 pub fn unpark(c: *Coroutine) void {
+    {
+        const rt: *Runtime = @ptrCast(@alignCast(c.runtime));
+        if (rt.observer) |o| if (o.onUnpark) |cb| cb(c);
+    }
     while (true) {
         const s = c.park_state.load(.acquire);
         switch (s) {
@@ -240,6 +281,7 @@ pub fn tryDispatchInline(target: *Coroutine) bool {
             // Same cleanup as the M's dispatch `.done` branch. We
             // duplicate it here rather than calling into dispatch
             // because dispatch expects an M.main_ctx swap path.
+            if (rt.observer) |o| if (o.onComplete) |cb| cb(target);
             if (target.task_done) |done| {
                 done.store(task_mod.DONE, .release);
                 _ = park_mod.unparkOne(rt, done);
@@ -320,6 +362,10 @@ pub const Runtime = struct {
     /// OS-thread pool used by `volt.spawnBlocking`. Lazy — no
     /// threads spawn until the first submit. See `src/blocking_pool.zig`.
     blocking_pool: blocking_pool_mod.Pool,
+    /// Optional instrumentation hook — see `Observer` doc. Read by
+    /// the four hook sites (spawn, park, unpark, complete). Nullable
+    /// so the hot path stays branch-and-fold when no observer is set.
+    observer: ?*const Observer = null,
     // Diagnostic counters live per-P now (see `P.stat_*`) — they
     // were on Runtime as shared atomics, but every spawn / done /
     // unpark hit the same cache line, costing ~40 % of multi-worker
@@ -358,6 +404,7 @@ pub const Runtime = struct {
             .parking_lot = park_mod.ParkingLot.init(),
             .stack_arena = try stack_mod.Arena.init(cfg.allocator, cfg.max_concurrent_stacks, cfg.stack_reservation_size),
             .blocking_pool = try blocking_pool_mod.Pool.init(cfg.allocator, cfg.blocking),
+            .observer = cfg.observer,
         };
         errdefer rt.stack_arena.deinit(cfg.allocator);
         errdefer rt.blocking_pool.deinit();
@@ -495,6 +542,7 @@ pub const Runtime = struct {
         } else {
             _ = self.ps[0].stat_spawned.fetchAdd(1, .monotonic);
         }
+        if (self.observer) |o| if (o.onSpawn) |cb| cb(c);
         self.pushNew(c);
         return &combined.task;
     }
@@ -1013,6 +1061,7 @@ fn dispatch(rt: *Runtime, m: *M, c: *Coroutine) void {
             }
         },
         .done => {
+            if (rt.observer) |o| if (o.onComplete) |cb| cb(c);
             // Signal the joiner. The parking-lot's validator-under-
             // lock guarantees no register-then-park race here: a
             // joiner that observes `done == DONE` in its validator
@@ -1317,6 +1366,53 @@ test "runDetached: workers=1 returns error.NeedMultipleWorkers" {
     defer rt.deinit();
     const r = rt.runDetached(detachedAdd, .{ @as(u32, 1), @as(u32, 2) });
     try std.testing.expectError(error.NeedMultipleWorkers, r);
+}
+
+// ─── Observer hook test ────────────────────────────────────────────
+
+// Process-global counters — the Observer hooks are bare function
+// pointers (no per-callback context capability in v1), so we have
+// to use file-scope state to communicate from the callbacks back to
+// the test.
+var test_obs_spawn: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+var test_obs_complete: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+fn testObsOnSpawn(c: *Coroutine) void {
+    _ = c;
+    _ = test_obs_spawn.fetchAdd(1, .acq_rel);
+}
+fn testObsOnComplete(c: *Coroutine) void {
+    _ = c;
+    _ = test_obs_complete.fetchAdd(1, .acq_rel);
+}
+
+fn observerTinyTask() void {}
+
+fn observerRoot() !void {
+    // Spawn five trivial tasks; each fires onSpawn at queue time
+    // and onComplete at dispatch's `.done` branch.
+    var tasks: [5]*Task(void) = undefined;
+    for (&tasks) |*t| t.* = try @import("lib.zig").spawn(observerTinyTask, .{});
+    for (tasks) |t| _ = t.join();
+}
+
+test "Observer: onSpawn + onComplete fire once per task" {
+    test_obs_spawn.store(0, .release);
+    test_obs_complete.store(0, .release);
+    var obs = Observer{
+        .onSpawn = &testObsOnSpawn,
+        .onComplete = &testObsOnComplete,
+    };
+    var rt = try Runtime.init(.{
+        .allocator = test_allocator,
+        .workers = 2,
+        .observer = &obs,
+    });
+    defer rt.deinit();
+    try (try rt.run(observerRoot, .{}));
+    // 5 user tasks + 1 root = 6 onSpawn / 6 onComplete.
+    try std.testing.expectEqual(@as(u32, 6), test_obs_spawn.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 6), test_obs_complete.load(.acquire));
 }
 
 // ─── runWithSignals tests ──────────────────────────────────────────

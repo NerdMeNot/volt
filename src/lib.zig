@@ -76,7 +76,9 @@ pub const Task = @import("task.zig").Task;
 pub const DetachedHandle = @import("runtime.zig").DetachedHandle;
 pub const MAX_WORKERS = @import("runtime.zig").MAX_WORKERS;
 pub const SpawnError = @import("runtime.zig").SpawnError;
+pub const Observer = @import("runtime.zig").Observer;
 // `runWithSignals` is a method on `Runtime` — see runtime.zig.
+// `dumpState` is a method on `Runtime` — see runtime.zig.
 
 // ─── Inside-coroutine helpers ────────────────────────────────────────
 
