@@ -143,4 +143,33 @@ pub fn build(b: *std.Build) void {
         run.step.dependOn(&install.step);
         b.step(b.fmt("spike-{s}", .{sp.name}), sp.desc).dependOn(&run.step);
     }
+
+    // Examples — runnable apps that mirror the cookbook. Each one
+    // compiles + runs end-to-end. The `examples` step builds all
+    // of them, providing a quality gate against API drift: any
+    // breaking change to volt's public surface fails this step
+    // before any user notices via a stale doc.
+    const examples = [_]struct { name: []const u8, src: []const u8, desc: []const u8 }{
+        .{ .name = "echo-server", .src = "examples/echo_server.zig", .desc = "TCP echo server (Ctrl-C to stop)" },
+        .{ .name = "fan-out", .src = "examples/fan_out.zig", .desc = "Parallel map + heterogeneous joinAll" },
+        .{ .name = "rate-limiter", .src = "examples/rate_limiter.zig", .desc = "Bounded concurrency via Semaphore" },
+    };
+    const examples_step = b.step("examples", "Build every example program");
+    for (examples) |ex| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(ex.src),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("volt", volt_mod);
+        const exe = b.addExecutable(.{
+            .name = b.fmt("volt-example-{s}", .{ex.name}),
+            .root_module = mod,
+        });
+        const install = b.addInstallArtifact(exe, .{});
+        examples_step.dependOn(&install.step);
+        const run = b.addRunArtifact(exe);
+        run.step.dependOn(&install.step);
+        b.step(b.fmt("run-{s}", .{ex.name}), ex.desc).dependOn(&run.step);
+    }
 }
