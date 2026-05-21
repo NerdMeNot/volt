@@ -318,6 +318,62 @@ fn JoinFirstResult(comptime TasksT: type) type {
     return @Union(.auto, Tag, &names, &union_types, &union_attrs);
 }
 
+/// Run `f` over every element of `items` in parallel; write each
+/// result into the matching slot of `results`. Returns when every
+/// element has been processed.
+///
+/// ```zig
+/// const inputs = [_]u32{ 1, 2, 3, 4, 5 };
+/// var outputs: [5]u64 = undefined;
+/// try volt.collect(&inputs, doubleU64, &outputs);
+/// // outputs == [_]u64{ 2, 4, 6, 8, 10 }, all computed in parallel
+/// ```
+///
+/// `items` and `results` must be slices / arrays of the same length;
+/// `f` must have shape `fn(ItemT) ResultT`. Spawns one coroutine per
+/// item (cheap — pool-allocated Coroutine + Frame). Allocates a
+/// single `[N]*Task(void)` buffer on the runtime's allocator to
+/// track the spawned coros; the per-task closure rides in the
+/// Frame's args (no separate Ctx allocation).
+///
+/// For `f` shapes that can fail (`fn(ItemT) E!ResultT`), have
+/// `ResultT` itself be an error union: each slot carries the per-
+/// item result-or-error, and the caller unwraps with `try`.
+///
+/// **Must be called from inside a coroutine** (uses `spawn`).
+pub fn collect(
+    items: anytype,
+    comptime f: anytype,
+    results: anytype,
+) (SpawnError || std.mem.Allocator.Error)!void {
+    std.debug.assert(items.len == results.len);
+    const ItemT = std.meta.Elem(@TypeOf(items));
+    const ResultT = std.meta.Elem(@TypeOf(results));
+
+    const Ctx = struct {
+        item: ItemT,
+        slot: *ResultT,
+
+        // Args are copied into each Task's Frame by `spawn`, so a
+        // `ctx` value on the loop's stack is stable for that single
+        // spawn call — no aliasing issue when the loop variable
+        // is reused next iteration.
+        fn run(ctx: @This()) void {
+            ctx.slot.* = f(ctx.item);
+        }
+    };
+
+    const rt = runtime();
+    const tasks = try rt.allocator.alloc(*Task(void), items.len);
+    defer rt.allocator.free(tasks);
+
+    for (items, results, 0..) |item, *slot, i| {
+        const ctx = Ctx{ .item = item, .slot = slot };
+        tasks[i] = try spawn(Ctx.run, .{ctx});
+    }
+    for (tasks) |t| _ = t.join();
+}
+
 /// Cooperative yield. Re-queues the current coroutine to the running
 /// worker's tail (FIFO — yields don't bounce via lifo_slot). Must be
 /// called from inside a coroutine.
@@ -845,4 +901,25 @@ test "joinFirst: fast task wins, slow task observes cancel" {
     var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
     defer rt.deinit();
     try (try rt.run(joinFirstOuter, .{}));
+}
+
+// ─── collect tests ───────────────────────────────────────────────────
+
+fn doubleU64(x: u32) u64 {
+    return @as(u64, x) * 2;
+}
+
+fn collectRoot() !void {
+    const inputs = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var outputs: [8]u64 = undefined;
+    try collect(&inputs, doubleU64, &outputs);
+    inline for (inputs, 0..) |x, i| {
+        try std.testing.expectEqual(@as(u64, x) * 2, outputs[i]);
+    }
+}
+
+test "collect: parallel map over slice, results in order" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 4 });
+    defer rt.deinit();
+    try (try rt.run(collectRoot, .{}));
 }
