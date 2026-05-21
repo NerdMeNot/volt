@@ -245,31 +245,25 @@ pub fn withTimeout(
     comptime body: anytype,
     args: anytype,
 ) WithTimeoutReturn(@TypeOf(body)) {
-    const Winner = enum(u8) { unset = 0, body = 1, timer = 2 };
+    // Two racers — body (idx 0) and timer (idx 1).
+    const race = @import("race.zig");
 
     const Ctx = struct {
         cancel: *Cancel,
         dur: Duration,
-        winner: *std.atomic.Value(u8),
+        winner: *race.WinnerSlot(2),
 
         fn timerFirer(self: *@This()) void {
             sleepCancel(self.dur, self.cancel) catch return;
             // Slept the full duration — claim the win, fire the cancel.
-            if (self.winner.cmpxchgStrong(
-                @intFromEnum(Winner.unset),
-                @intFromEnum(Winner.timer),
-                .acq_rel,
-                .acquire,
-            ) == null) {
-                self.cancel.fire();
-            }
+            if (self.winner.claim(1)) self.cancel.fire();
         }
     };
 
     var c = Cancel.init(runtime());
     defer c.deinit();
 
-    var winner = std.atomic.Value(u8).init(@intFromEnum(Winner.unset));
+    var winner = race.WinnerSlot(2){};
     var ctx = Ctx{ .cancel = &c, .dur = d, .winner = &winner };
 
     var firer = try spawn(Ctx.timerFirer, .{&ctx});
@@ -277,12 +271,7 @@ pub fn withTimeout(
     const args_with_cancel = args ++ .{&c};
     const result = @call(.auto, body, args_with_cancel);
 
-    const body_won = winner.cmpxchgStrong(
-        @intFromEnum(Winner.unset),
-        @intFromEnum(Winner.body),
-        .acq_rel,
-        .acquire,
-    ) == null;
+    const body_won = winner.claim(0);
     c.fire(); // wake the firer if it's still sleeping; no-op otherwise.
     _ = firer.join();
 

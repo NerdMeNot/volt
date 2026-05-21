@@ -44,6 +44,7 @@ const cancel_mod = @import("cancel.zig");
 const lib = @import("lib.zig");
 const current = @import("current.zig");
 const runtime_mod = @import("runtime.zig");
+const race_mod = @import("race.zig");
 
 // ─── Branch builders ─────────────────────────────────────────────
 
@@ -110,8 +111,8 @@ pub fn select(branches: anytype) !SelectResult(@TypeOf(branches)) {
 
     const Result = SelectResult(BranchesT);
 
-    // Per-branch result slot + a winner index. The first child to
-    // succeed CAS-claims the winner slot (atomically) and writes
+    // Per-branch result slot + a winner slot. The first child to
+    // succeed claims the winner slot (CAS, via WinnerSlot) and writes
     // its result; the others' ops return error.Cancelled and exit
     // without touching anything.
     // Only the winning child writes its slot; the rest remain
@@ -119,7 +120,7 @@ pub fn select(branches: anytype) !SelectResult(@TypeOf(branches)) {
     // post-join switch indexes by `winner`.
     const SlotsT = Slots(BranchesT);
     var slots: SlotsT = undefined;
-    var winner = std.atomic.Value(i32).init(-1);
+    var winner = race_mod.WinnerSlot(fields.len){};
 
     var c = cancel_mod.Cancel.init(lib.runtime());
     defer c.deinit();
@@ -132,14 +133,12 @@ pub fn select(branches: anytype) !SelectResult(@TypeOf(branches)) {
         const ChildCtx = struct {
             br: f.type,
             slots: *SlotsT,
-            winner: *std.atomic.Value(i32),
+            winner: *race_mod.WinnerSlot(fields.len),
             cancel: *cancel_mod.Cancel,
 
             fn entry(self: *@This()) void {
                 const r = self.br.run(self.cancel);
-                // CAS-claim the winner slot. The winner index
-                // doubles as the publish-fence for the result.
-                if (self.winner.cmpxchgStrong(-1, @as(i32, @intCast(i)), .acq_rel, .acquire) == null) {
+                if (self.winner.claim(i)) {
                     @field(self.slots, f.name) = r;
                     self.cancel.fire();
                 }
@@ -159,12 +158,11 @@ pub fn select(branches: anytype) !SelectResult(@TypeOf(branches)) {
     for (children) |child| _ = child.join();
 
     // Read the winner and construct the typed union.
-    const winning_idx = winner.load(.acquire);
-    std.debug.assert(winning_idx >= 0);
+    const winning_idx = winner.winner() orelse unreachable;
 
     var r: Result = undefined;
     inline for (fields, 0..) |f, i| {
-        if (winning_idx == @as(i32, @intCast(i))) {
+        if (winning_idx == i) {
             const slot_value = try @field(slots, f.name);
             r = @unionInit(Result, f.name, slot_value);
         }
