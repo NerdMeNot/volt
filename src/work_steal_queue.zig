@@ -268,22 +268,6 @@ test "WorkStealQueue: single-threaded push/pop FIFO" {
 }
 
 test "WorkStealQueue: stealInto moves half" {
-    // FIXME — test was never running before commit ab81833 (R1
-    // broke test discovery; this test along with everything else
-    // was silently skipped). With discovery fixed, this test now
-    // runs and FAILS — stealInto returns null on the first call
-    // even on a fresh, fully-populated src queue. Production
-    // `stealFromSiblings` retries via its outer dispatch loop so
-    // this hasn't caused real-world breakage (stress + benches
-    // green), but the data-structure bug is real and needs a
-    // proper investigation.
-    //
-    // Skipping unblocks the rest of the test suite (46/47 green)
-    // so we can land cancellation work; remove the early return and
-    // fix when there's a quiet host + an unobstructed afternoon.
-    if (true) return;
-
-    // Original body, kept for when we come back:
     var src = WorkStealQueue.init();
     var dst = WorkStealQueue.init();
     var inj = worker_mod.Mailbox{};
@@ -291,7 +275,7 @@ test "WorkStealQueue: stealInto moves half" {
     var coros: [8]Coroutine = .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} };
     for (&coros) |*c| src.push(c, &inj);
 
-    const stolen = dst.stealInto(&src);
+    const stolen = src.stealInto(&dst);
     try std.testing.expect(stolen != null);
     try std.testing.expectEqual(@as(?*Coroutine, &coros[0]), stolen);
     try std.testing.expectEqual(@as(u32, 3), dst.len());
