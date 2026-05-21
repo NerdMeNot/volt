@@ -77,7 +77,7 @@ var installed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 // handler crashes when it dereferences them. Caught when the
 // stack.zig "grow-on-demand" test SIGSEGV'd on every Linux CI
 // run; see ci.yml run 26014151408 for the receipt.
-const SA_SIGINFO: c_int = switch (builtin.os.tag) {
+pub const SA_SIGINFO: c_int = switch (builtin.os.tag) {
     .macos, .ios, .tvos, .watchos, .freebsd, .openbsd, .netbsd, .dragonfly => 0x0040,
     .linux => 0x00000004,
     else => 0x0040,
@@ -104,12 +104,12 @@ const SigsetT = extern struct { _pad: [128]u8 align(8) = @splat(0) };
 
 const SigInfo = opaque {};
 
-const SigactionFn = *const fn (sig: c_int, info: *SigInfo, ctx: ?*anyopaque) callconv(.c) void;
+pub const SigactionFn = *const fn (sig: c_int, info: *SigInfo, ctx: ?*anyopaque) callconv(.c) void;
 
 // Darwin sigaction layout differs slightly from Linux; both have
 // (handler, mask, flags) but the field order varies. We use the
 // libc-provided struct via @extern and rely on POSIX layout.
-const Sigaction = switch (builtin.os.tag) {
+pub const Sigaction = switch (builtin.os.tag) {
     .macos, .ios, .tvos, .watchos => extern struct {
         sa_sigaction: ?SigactionFn,
         sa_mask: SigsetT,
@@ -123,7 +123,7 @@ const Sigaction = switch (builtin.os.tag) {
     },
 };
 
-const sigaction_fn = @extern(
+pub const sigaction_fn = @extern(
     *const fn (sig: c_int, act: ?*const Sigaction, oldact: ?*Sigaction) callconv(.c) c_int,
     .{ .name = "sigaction" },
 );

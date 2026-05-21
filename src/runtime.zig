@@ -45,6 +45,8 @@ const parker_mod = @import("parker.zig");
 const park_mod = @import("park.zig");
 const stack_mod = @import("stack.zig");
 const blocking_pool_mod = @import("blocking_pool.zig");
+const signal_mod = @import("signal.zig");
+const builtin = @import("builtin");
 
 pub const Coroutine = coroutine.Coroutine;
 pub const Frame = coroutine.Frame;
@@ -661,7 +663,144 @@ pub const Runtime = struct {
         task.coro.task_thread_parker = &handle.parker;
         return handle;
     }
+
+    /// Run `body(*Cancel, args...)` as the root coroutine. Installs
+    /// a SIGINT handler (POSIX) that fires the `*Cancel` on signal.
+    /// When the handler fires, every cancel-aware blocking call in
+    /// the body's coroutine tree wakes with `error.Cancelled` and
+    /// the body unwinds for graceful shutdown.
+    ///
+    /// **POSIX-only for v1.** On Windows this falls back to plain
+    /// `run` with a no-op Cancel (Wave 2.5 will wire
+    /// `SetConsoleCtrlHandler`).
+    ///
+    /// Body shape: `fn(*Cancel, ...args) E!T`. On natural body
+    /// completion the cancel fires anyway (to release the internal
+    /// signal-poller); the body's return value still surfaces.
+    ///
+    /// Caller contract: do not call concurrently from multiple
+    /// runtimes in the same process — the signal handler dispatches
+    /// via a single process-global fd.
+    pub fn runWithSignals(
+        self: *Runtime,
+        comptime body: anytype,
+        args: anytype,
+    ) !@typeInfo(@typeInfo(@TypeOf(body)).@"fn".return_type.?).error_union.payload {
+        if (comptime is_windows_rt) {
+            return self.runWithSignalsNoOpWindows(body, args);
+        }
+
+        var pipe_fds: [2]c_int = undefined;
+        if (posix_pipe(&pipe_fds) != 0) return error.PipeCreateFailed;
+        defer _ = posix_close(pipe_fds[0]);
+        defer _ = posix_close(pipe_fds[1]);
+
+        // Non-blocking on both ends. The handler's `write` is in a
+        // signal context and must not block; the poller drives reads
+        // through the reactor's wait-readable path.
+        reactor_mod.setNonblock(pipe_fds[0]) catch {};
+        reactor_mod.setNonblock(pipe_fds[1]) catch {};
+
+        sigint_pipe_write_fd.store(pipe_fds[1], .release);
+        defer sigint_pipe_write_fd.store(-1, .release);
+
+        const SIGINT: c_int = 2;
+        var old_action: signal_mod.Sigaction = undefined;
+        var new_action: signal_mod.Sigaction = std.mem.zeroes(signal_mod.Sigaction);
+        new_action.sa_sigaction = @ptrCast(&sigintHandler);
+        new_action.sa_flags = signal_mod.SA_SIGINFO;
+        _ = signal_mod.sigaction_fn(SIGINT, &new_action, &old_action);
+        defer _ = signal_mod.sigaction_fn(SIGINT, &old_action, null);
+
+        const ArgsT = @TypeOf(args);
+        const Internal = struct {
+            fn run(read_fd: c_int, user_args: ArgsT) !@typeInfo(@typeInfo(@TypeOf(body)).@"fn".return_type.?).error_union.payload {
+                var c = @import("cancel.zig").Cancel.init(@ptrCast(@alignCast(current.require().runtime)));
+                defer c.deinit();
+
+                const Poller = struct {
+                    fn run(cn: *@import("cancel.zig").Cancel, fd: c_int) void {
+                        const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+                        rt.reactor.waitReadableCancel(fd, cn) catch return;
+                        cn.fire();
+                    }
+                };
+                var poller = try (@import("lib.zig").spawn(Poller.run, .{ &c, read_fd }));
+
+                const body_args = .{&c} ++ user_args;
+                const result = @call(.auto, body, body_args);
+
+                // Body done — fire cancel (idempotent if already
+                // fired by the signal handler) so the poller wakes
+                // and exits.
+                c.fire();
+                _ = poller.join();
+                return result;
+            }
+        };
+
+        return try self.run(Internal.run, .{ pipe_fds[0], args });
+    }
+
+    /// Windows fallback for `runWithSignals` — provides the Cancel
+    /// to the body but doesn't install any signal handler. The body
+    /// must fire the cancel itself (e.g. via custom Win32 console
+    /// control handler) for graceful shutdown.
+    fn runWithSignalsNoOpWindows(
+        self: *Runtime,
+        comptime body: anytype,
+        args: anytype,
+    ) !@typeInfo(@typeInfo(@TypeOf(body)).@"fn".return_type.?).error_union.payload {
+        const ArgsT = @TypeOf(args);
+        const Internal = struct {
+            fn run(user_args: ArgsT) !@typeInfo(@typeInfo(@TypeOf(body)).@"fn".return_type.?).error_union.payload {
+                var c = @import("cancel.zig").Cancel.init(@ptrCast(@alignCast(current.require().runtime)));
+                defer c.deinit();
+                const body_args = .{&c} ++ user_args;
+                return @call(.auto, body, body_args);
+            }
+        };
+        return try self.run(Internal.run, .{args});
+    }
 };
+
+// ─── runWithSignals — graceful-shutdown infrastructure ─────────────
+//
+// File-scope helpers used by Runtime.runWithSignals (which lives on
+// Runtime as a method, below). SIGINT (and on POSIX SIGTERM) wire to
+// a Cancel the user's root owns. The mechanism is the classic POSIX
+// self-pipe: signal handler writes one byte; a poller coroutine waits
+// on the read end via the reactor; on wake, fires the cancel.
+//
+// Async-signal-safety: the handler only does `write(fd, &byte, 1)`.
+// One global pipe fd — signals are process-wide, so multi-runtime
+// graceful-shutdown isn't supported in v1 (it'd race on this slot).
+
+const is_windows_rt = builtin.os.tag == .windows;
+const posix_pipe = if (is_windows_rt) {} else @extern(
+    *const fn (fds: *[2]c_int) callconv(.c) c_int,
+    .{ .name = "pipe" },
+);
+const posix_close = if (is_windows_rt) {} else @extern(
+    *const fn (fd: c_int) callconv(.c) c_int,
+    .{ .name = "close" },
+);
+const posix_write = if (is_windows_rt) {} else @extern(
+    *const fn (fd: c_int, buf: [*]const u8, count: usize) callconv(.c) isize,
+    .{ .name = "write" },
+);
+
+var sigint_pipe_write_fd: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(-1);
+
+fn sigintHandler(sig: c_int, info: *anyopaque, ctx: ?*anyopaque) callconv(.c) void {
+    _ = sig;
+    _ = info;
+    _ = ctx;
+    const fd = sigint_pipe_write_fd.load(.acquire);
+    if (fd < 0) return;
+    const byte: u8 = 1;
+    _ = posix_write(fd, @ptrCast(&byte), 1);
+}
 
 /// Handle returned by `Runtime.runDetached`. The OS-thread parker
 /// equivalent of `Task.join`: `wait()` blocks the calling thread
@@ -1178,4 +1317,62 @@ test "runDetached: workers=1 returns error.NeedMultipleWorkers" {
     defer rt.deinit();
     const r = rt.runDetached(detachedAdd, .{ @as(u32, 1), @as(u32, 2) });
     try std.testing.expectError(error.NeedMultipleWorkers, r);
+}
+
+// ─── runWithSignals tests ──────────────────────────────────────────
+
+fn runWithSignalsNoSigBody(c: *@import("cancel.zig").Cancel) !void {
+    _ = c;
+    // Body returns immediately — exercises the setup/teardown path
+    // without ever needing a real signal.
+}
+
+test "runWithSignals: clean setup + teardown when body returns" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+    try rt.runWithSignals(runWithSignalsNoSigBody, .{});
+}
+
+const SignalCtx = struct {
+    cancelled_observed: bool = false,
+};
+
+// Body that parks on a long sleep via the shared Cancel. When the
+// SIGINT handler fires the cancel, sleepCancel returns
+// error.Cancelled and the body sets a flag we assert on.
+fn runWithSignalsCancelBody(
+    c: *@import("cancel.zig").Cancel,
+    ctx: *SignalCtx,
+) !void {
+    const lib = @import("lib.zig");
+    // Spawn a side coro that raise()s SIGINT after yielding a few
+    // times — that gives the poller time to install + park.
+    const Raiser = struct {
+        fn run() void {
+            var i: u32 = 0;
+            while (i < 100) : (i += 1) lib.yield();
+            const raise_fn = @extern(*const fn (sig: c_int) callconv(.c) c_int, .{ .name = "raise" });
+            _ = raise_fn(2); // SIGINT
+        }
+    };
+    const raiser = lib.spawn(Raiser.run, .{}) catch return;
+
+    // Park on sleepCancel for far longer than the test could
+    // possibly need — the signal-driven cancel.fire is the only
+    // way this completes within reasonable time.
+    lib.sleepCancel(lib.Duration.fromSecs(60), c) catch |e| switch (e) {
+        error.Cancelled => ctx.cancelled_observed = true,
+        else => {},
+    };
+
+    _ = raiser.join();
+}
+
+test "runWithSignals: SIGINT fires Cancel; body unwinds gracefully" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+    var ctx = SignalCtx{};
+    try rt.runWithSignals(runWithSignalsCancelBody, .{&ctx});
+    try std.testing.expect(ctx.cancelled_observed);
 }
