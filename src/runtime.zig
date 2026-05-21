@@ -94,7 +94,7 @@ pub const Config = struct {
     /// OS-thread pool used by `volt.spawnBlocking` to run sync /
     /// CPU-bound code without pinning a worker. Lazy — no threads
     /// spawn until the first `spawnBlocking` call. Default caps
-    /// concurrent sync work at 32 threads; raise for sync-IO-heavy
+    /// concurrent sync work at 128 threads; raise for sync-IO-heavy
     /// services. See `src/blocking_pool.zig`.
     blocking: blocking_pool_mod.Config = .{},
 };

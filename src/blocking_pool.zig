@@ -50,10 +50,15 @@ const builtin = @import("builtin");
 const parker_mod = @import("parker.zig");
 
 pub const Config = struct {
-    /// Upper bound on concurrent OS threads in the pool. Sized for
-    /// "I have ~max_threads concurrent sync calls at steady state."
-    /// 32 covers typical workloads; raise for sync-IO-heavy services.
-    max_threads: u32 = 32,
+    /// Upper bound on concurrent OS threads in the pool. Lazy — the
+    /// pool only spawns up to this many when there's actually
+    /// concurrent work for that many; idle = zero threads. The cap
+    /// caps the *peak*, not the steady-state cost. 128 covers
+    /// realistic services (e.g. a few hundred concurrent HTTP
+    /// requests each making a sync DB call); raise to 512 or more
+    /// for sync-IO-heavy workloads, lower if you want the pool to
+    /// surface contention as queueing earlier.
+    max_threads: u32 = 128,
     /// **v1: ignored.** Eventual idle timeout before a pool thread
     /// terminates. Present in Config so future versions can tune
     /// without an API break.
