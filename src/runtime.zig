@@ -349,6 +349,14 @@ pub const Runtime = struct {
 
     pub fn deinit(self: *Runtime) void {
         self.shutdown.store(true, .release);
+        // Wake any spawned M currently blocked inside `reactor.poll(true)`.
+        // `parker.unpark` below only wakes Ms parked on their own parker;
+        // an M inside a blocking kevent / epoll_wait / submit_and_wait /
+        // GetQueuedCompletionStatusEx is in a syscall and won't observe
+        // the shutdown flag without this nudge. Combined with the
+        // `!shutdown` guard in `tryFindAndDispatch`, the woken M
+        // returns from poll, loops, and exits cleanly.
+        self.reactor.interrupt();
         // Wake every spawned M so it observes shutdown. M[0] is the
         // driver thread — by this point it has already returned from
         // run() and is on the deinit path, so it doesn't need an unpark.
@@ -662,6 +670,16 @@ fn tryFindAndDispatch(rt: *Runtime, m: *M) bool {
         return true;
     }
     if (rt.reactor.pendingCount() > 0 and rt.tryClaimPoller()) {
+        // Don't enter the blocking poll if shutdown has fired: we'd
+        // immediately be woken by `reactor.interrupt()` (deinit
+        // always fires one), but a worker re-checking pending after
+        // shutdown could otherwise spin entering+exiting poll. Just
+        // surrender the claim; caller decrements num_searching and
+        // re-checks shutdown.
+        if (rt.shutdown.load(.acquire)) {
+            rt.releasePoller();
+            return false;
+        }
         // Drop searching count while inside the blocking kevent —
         // this thread can't pick up other work while in the syscall,
         // and pushers should be able to wake parked siblings.
@@ -967,4 +985,51 @@ test "runtime: tryDispatchInline returns false when target parks, target complet
     var out: u32 = 0;
     try (try rt.run(inlineParkRoot, .{&out}));
     try std.testing.expectEqual(@as(u32, 99), out);
+}
+
+fn noopRoot() void {}
+
+test "runtime: deinit unblocks a worker stuck inside reactor.poll" {
+    // Provokes the race the Phase 6 follow-up fixes: a worker is
+    // inside `reactor.poll(true)` when deinit is called. Before
+    // the fix, `parker.unpark` doesn't reach a thread inside a
+    // syscall, so deinit hangs forever on `m.thread.join()`.
+    //
+    // Darwin-only because Linux's `Reactor` is a tagged union over
+    // {epoll, io_uring} and doesn't expose `pending` at the top
+    // level. The deinit wire-up + tryFindAndDispatch guard tested
+    // here run on every platform; the interrupt() mechanism each
+    // backend dispatches to is covered in its respective unit test
+    // (reactor_kqueue.zig has one; epoll/io_uring/iocp gated by
+    // the cross-compile + their own future direct tests).
+    if (comptime @import("builtin").os.tag != .macos) return error.SkipZigTest;
+
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+
+    // run() exits when the root coro returns; spawned Ms remain in
+    // workerLoopUntilShutdown. With pending bumped artificially,
+    // any worker that enters tryFindAndDispatch's "claim poller"
+    // branch will enter poll(true). The dispatcher's reactor-poll
+    // branch fires only on pendingCount > 0.
+    try rt.run(noopRoot, .{});
+
+    rt.reactor.pending.store(1, .release);
+
+    // Brief spin so at least one of the two workers actually enters
+    // poll. The spin doesn't need to be tight — if no worker is in
+    // poll when interrupt fires, the test still passes (interrupt
+    // becomes a no-op and the parker.unpark path drives shutdown).
+    // The 1M iterations gives plenty of opportunity to enter kevent
+    // without depending on a wall-clock sleep API.
+    var i: u32 = 0;
+    while (i < 1_000_000) : (i += 1) std.atomic.spinLoopHint();
+
+    // Reset pending so reactor.deinit's `pending == 0` assertion
+    // holds — we only bumped it to provoke the race, not because
+    // any real coroutine is parked.
+    rt.reactor.pending.store(0, .release);
+
+    // Test passes if deinit returns; it hangs forever if the fix
+    // is missing.
+    rt.deinit();
 }
