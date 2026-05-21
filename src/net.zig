@@ -348,6 +348,117 @@ pub const TcpStream = struct {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         return reactor_mod.readFull(&rt.reactor, self.fd, buf);
     }
+
+    /// Construct a `std.Io.Reader` adapter — lets std-library code
+    /// (formatters, parsers, anything that takes `*std.Io.Reader`)
+    /// consume bytes from this socket. Caller provides the buffered-
+    /// storage backing buffer. Must be called from inside a coroutine
+    /// (reads route through the reactor and may park).
+    ///
+    /// On reactor I/O error, the categorical `reactor.IoError` is
+    /// stashed on the returned `Reader.err` field; the `std.Io.Reader`
+    /// interface surfaces `error.ReadFailed`. Callers that need the
+    /// typed error inspect `.err` after observing `ReadFailed`.
+    pub fn reader(self: *TcpStream, buffer: []u8) Reader {
+        return Reader.init(self, buffer);
+    }
+
+    /// Construct a `std.Io.Writer` adapter. Same shape as `reader`:
+    /// caller-provided buffer, typed `IoError` stashed on
+    /// `Writer.err` when the std interface returns `WriteFailed`.
+    pub fn writer(self: *TcpStream, buffer: []u8) Writer {
+        return Writer.init(self, buffer);
+    }
+
+    /// `std.Io.Reader` adapter — see `TcpStream.reader`. The Volt
+    /// I/O handle conformance shape: every Volt async byte source
+    /// exposes `reader(buffer) -> XReader` where `XReader.interface`
+    /// is a `std.Io.Reader`. Downstream `volt-fs` / `volt-net` libs
+    /// mirror this shape so the same std-library code composes.
+    pub const Reader = struct {
+        stream: *TcpStream,
+        interface: std.Io.Reader,
+        /// Last categorical I/O error observed while servicing a
+        /// stream call. Set before returning `error.ReadFailed` /
+        /// `error.EndOfStream`; reset to null by `init`.
+        err: ?reactor_mod.IoError = null,
+
+        pub fn init(s: *TcpStream, buffer: []u8) Reader {
+            return .{
+                .stream = s,
+                .interface = .{
+                    .vtable = &.{ .stream = streamImpl },
+                    .buffer = buffer,
+                    .seek = 0,
+                    .end = 0,
+                },
+            };
+        }
+
+        fn streamImpl(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            const self: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
+            const dest = limit.slice(try io_w.writableSliceGreedy(1));
+            const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+            const n = reactor_mod.readAsync(&rt.reactor, self.stream.fd, dest) catch |err| {
+                self.err = err;
+                return error.ReadFailed;
+            };
+            if (n == 0) return error.EndOfStream;
+            io_w.advance(n);
+            return n;
+        }
+    };
+
+    /// `std.Io.Writer` adapter — see `TcpStream.writer`.
+    pub const Writer = struct {
+        stream: *TcpStream,
+        interface: std.Io.Writer,
+        err: ?reactor_mod.IoError = null,
+
+        pub fn init(s: *TcpStream, buffer: []u8) Writer {
+            return .{
+                .stream = s,
+                .interface = .{
+                    .vtable = &.{ .drain = drainImpl },
+                    .buffer = buffer,
+                    .end = 0,
+                },
+            };
+        }
+
+        fn drainImpl(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
+            const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+
+            // First, drain the writer's internal buffer.
+            const buffered = io_w.buffer[0..io_w.end];
+            if (buffered.len > 0) {
+                reactor_mod.writeAll(&rt.reactor, self.stream.fd, buffered) catch |err| {
+                    self.err = err;
+                    return error.WriteFailed;
+                };
+                io_w.end = 0;
+            }
+
+            // Then write each data slice. The last slice is repeated
+            // `splat` times; others written once. drain returns the
+            // count of `data` bytes written (excluding `buffer`).
+            var total: usize = 0;
+            const last_idx = data.len - 1;
+            for (data, 0..) |slice, i| {
+                const repeats: usize = if (i == last_idx) splat else 1;
+                var rep: usize = 0;
+                while (rep < repeats) : (rep += 1) {
+                    reactor_mod.writeAll(&rt.reactor, self.stream.fd, slice) catch |err| {
+                        self.err = err;
+                        return error.WriteFailed;
+                    };
+                    total += slice.len;
+                }
+            }
+            return total;
+        }
+    };
 };
 
 // Note: the `EAGAIN` constant is defined at the top of this file
@@ -425,6 +536,65 @@ test "TCP echo single client round-trip" {
     try std.testing.expect(ctx.server_done);
     try std.testing.expect(ctx.client_done);
     try std.testing.expectEqual(@as(u8, 0x42), ctx.result_byte);
+}
+
+// std.Io.Reader/Writer adapter round-trip — proves the adapters work
+// with the new Zig 0.16 vtable. The server reads via the std.Io.Reader
+// (formatter-friendly path), and the client writes via std.Io.Writer.
+
+const IoAdapterCtx = struct {
+    listener: *TcpListener,
+    addr: Address = undefined,
+    server_done: bool = false,
+    client_done: bool = false,
+    received: u8 = 0,
+};
+
+fn ioAdapterServer(ctx: *IoAdapterCtx) !void {
+    var stream = try ctx.listener.accept();
+    defer stream.close();
+    var read_buf: [16]u8 = undefined;
+    var reader = stream.reader(&read_buf);
+    // Use std.Io.Reader's takeByte to consume one byte; proves the
+    // adapter participates correctly in std's buffered-read protocol.
+    const byte = try reader.interface.takeByte();
+    ctx.received = byte;
+    ctx.server_done = true;
+}
+
+fn ioAdapterClient(ctx: *IoAdapterCtx) !void {
+    var stream = try TcpStream.connect(ctx.addr);
+    defer stream.close();
+    var write_buf: [16]u8 = undefined;
+    var writer = stream.writer(&write_buf);
+    // Write via std.Io.Writer's writeAll. The byte fits in the
+    // 16-byte buffer; flush forces a drain → reactor.writeAll path.
+    try writer.interface.writeAll(&[_]u8{0x77});
+    try writer.interface.flush();
+    ctx.client_done = true;
+}
+
+fn ioAdapterRoot(ctx: *IoAdapterCtx) !void {
+    const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var server = try rt.spawn(ioAdapterServer, .{ctx});
+    var client = try rt.spawn(ioAdapterClient, .{ctx});
+    _ = server.join() catch |err| return err;
+    _ = client.join() catch |err| return err;
+}
+
+test "TcpStream: std.Io.Reader/Writer adapter round-trip" {
+    var rt = try runtime.Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
+    defer rt.deinit();
+
+    var listener = try TcpListener.bind(Address.loopback4(0));
+    defer listener.close();
+    var ctx = IoAdapterCtx{ .listener = &listener };
+    ctx.addr = try listener.localAddress();
+    try (try rt.run(ioAdapterRoot, .{&ctx}));
+
+    try std.testing.expect(ctx.server_done);
+    try std.testing.expect(ctx.client_done);
+    try std.testing.expectEqual(@as(u8, 0x77), ctx.received);
 }
 
 // Cancel-aware accept: a server parks in accept; a separate
