@@ -261,6 +261,12 @@ const WSA_DATA_BYTES: usize = 400;
 
 const WSA_IO_PENDING: c_int = 997;
 
+// Sentinel `CompletionKey` for the cross-thread interrupt
+// completion. Coroutine pointers are heap-allocated and never null,
+// so `0` is a safe sentinel; timer completions and I/O completions
+// both carry a real coroutine ptr.
+const INTERRUPT_KEY: usize = 0;
+
 // ─── Reactor ─────────────────────────────────────────────────────
 
 pub const Reactor = struct {
@@ -828,18 +834,25 @@ pub const Reactor = struct {
         if (ok == win.BOOL.FALSE) return 0;
 
         const count: usize = @intCast(removed);
-        _ = self.pending.fetchSub(@intCast(count), .acq_rel);
+        var real_count: usize = 0;
         var i: usize = 0;
         while (i < count) : (i += 1) {
             const e = &entries[i];
-            // Two completion shapes:
+            // Three completion shapes:
             //   1. I/O completion (WSARecv/WSASend/AcceptEx/ConnectEx)
             //      — OVERLAPPED is non-null; coroutine ptr is in
             //      OVERLAPPED.Pointer (the union field, unused for
             //      socket I/O — see note in submit paths).
-            //   2. Timer completion (PostQueuedCompletionStatus) —
-            //      OVERLAPPED is null; coroutine ptr is in
-            //      CompletionKey.
+            //   2. Timer completion (PostQueuedCompletionStatus from
+            //      the threadpool callback) — OVERLAPPED is null;
+            //      coroutine ptr is in CompletionKey.
+            //   3. Interrupt completion (PostQueuedCompletionStatus
+            //      from `interrupt()`) — OVERLAPPED is null;
+            //      CompletionKey == INTERRUPT_KEY (the sentinel).
+            //      Doesn't count toward `pending` — skip the unpark.
+            if (e.lpOverlapped == null and e.lpCompletionKey == INTERRUPT_KEY) continue;
+
+            real_count += 1;
             const coro_ptr: usize = if (e.lpOverlapped) |ovl|
                 @intFromPtr(ovl.DUMMYUNIONNAME.Pointer)
             else
@@ -848,7 +861,21 @@ pub const Reactor = struct {
             const coro: *coroutine.Coroutine = @ptrFromInt(coro_ptr);
             runtime.unpark(coro);
         }
-        return count;
+        if (real_count > 0) _ = self.pending.fetchSub(@intCast(real_count), .acq_rel);
+        return real_count;
+    }
+
+    /// Wake a worker currently blocked in `poll(true)`. Safe to call
+    /// from any thread. The posted completion carries the
+    /// `INTERRUPT_KEY` sentinel; the poll loop recognises and
+    /// discards it without unparking any coroutine.
+    pub fn interrupt(self: *Reactor) void {
+        _ = PostQueuedCompletionStatus(
+            self.iocp,
+            0,
+            INTERRUPT_KEY,
+            null,
+        );
     }
 };
 
