@@ -73,6 +73,7 @@ pub const testing = @import("testing.zig");
 pub const Runtime = @import("runtime.zig").Runtime;
 pub const Config = @import("runtime.zig").Config;
 pub const Task = @import("task.zig").Task;
+pub const DetachedHandle = @import("runtime.zig").DetachedHandle;
 pub const MAX_WORKERS = @import("runtime.zig").MAX_WORKERS;
 pub const SpawnError = @import("runtime.zig").SpawnError;
 

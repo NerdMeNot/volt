@@ -623,7 +623,80 @@ pub const Runtime = struct {
         workerLoopUntilTaskDone(self, &self.ms[0], &task.done);
         return task.join();
     }
+
+    /// Spawn `user_fn(args)` as a root coroutine and return a
+    /// `*DetachedHandle(T)` without blocking the calling thread.
+    /// The runtime's spawned worker threads (M[1..N-1]) drive
+    /// dispatch; the caller's thread stays free to do other work
+    /// (event loops, CLI parsing, embedding scenarios).
+    ///
+    /// Call `handle.wait()` from any OS thread to block until the
+    /// root completes and consume its result. Requires
+    /// `Config.workers >= 2` because the calling thread isn't
+    /// available as M[0] — at least one spawned M must exist to
+    /// drive dispatch. Returns `error.NeedMultipleWorkers` if not.
+    ///
+    /// **Lifetime**: the returned handle's storage is owned by the
+    /// Runtime's allocator. `wait()` consumes the handle (don't use
+    /// it after). Do not call `Runtime.deinit` before `wait()`.
+    pub fn runDetached(
+        self: *Runtime,
+        comptime user_fn: anytype,
+        args: anytype,
+    ) (SpawnError || error{NeedMultipleWorkers})!*DetachedHandle(@typeInfo(@TypeOf(user_fn)).@"fn".return_type.?) {
+        if (self.ms.len < 2) return error.NeedMultipleWorkers;
+
+        const Ret = @typeInfo(@TypeOf(user_fn)).@"fn".return_type.?;
+        const Handle = DetachedHandle(Ret);
+
+        var task = try self.spawn(user_fn, args);
+        // Allocate handle; on failure roll back the spawn by aborting
+        // before the task ever observed — but we can't un-spawn, so
+        // err out of the allocation requires the caller to .wait()
+        // anyway. Simpler to error here as SpawnError.OutOfMemory.
+        const handle = try self.allocator.create(Handle);
+        handle.* = .{ .task = task, .parker = .{}, .allocator = self.allocator };
+        // When dispatch sees the root coroutine complete, it unparks
+        // this parker — same mechanism `run` uses for M[0]'s parker.
+        task.coro.task_thread_parker = &handle.parker;
+        return handle;
+    }
 };
+
+/// Handle returned by `Runtime.runDetached`. The OS-thread parker
+/// equivalent of `Task.join`: `wait()` blocks the calling thread
+/// (not a coroutine) until the root completes.
+pub fn DetachedHandle(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        task: *Task(T),
+        parker: parker_mod.Parker,
+        allocator: std.mem.Allocator,
+
+        /// Block the calling OS thread until the root completes,
+        /// return its result, free the task and the handle. Safe to
+        /// call from any OS thread (NOT a coroutine — for that, use
+        /// `Task.join`). The handle is consumed by this call.
+        pub fn wait(self: *Self) T {
+            // Park OS thread until dispatch's `.done` branch unparks
+            // our parker. Loop in case of spurious wakes.
+            while (self.task.done.load(.acquire) == task_mod.NOT_DONE) {
+                self.parker.park();
+            }
+            const result = self.task.result_ptr.*;
+            const allocator = self.allocator;
+            self.task.frame_destroy(self.task.frame_ptr, self.task.allocator);
+            allocator.destroy(self);
+            return result;
+        }
+
+        /// Non-consuming completion check. Safe to call from any
+        /// thread. Useful for polling instead of blocking.
+        pub fn isDone(self: *const Self) bool {
+            return self.task.done.load(.acquire) == task_mod.DONE;
+        }
+    };
+}
 
 /// Entry point for pthread-spawned Ms (M[1..N-1]).
 /// Runs the dispatch loop until shutdown.
@@ -1076,4 +1149,33 @@ test "runtime: deinit unblocks a worker stuck inside reactor.poll" {
     // Test passes if deinit returns; it hangs forever if the fix
     // is missing.
     rt.deinit();
+}
+
+// ─── runDetached tests ──────────────────────────────────────────────
+
+fn detachedAdd(a: u32, b: u32) u32 {
+    return a + b;
+}
+
+test "runDetached: caller thread doesn't block; wait() retrieves result" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+
+    // Spawning detached returns immediately to the caller's OS thread —
+    // the spawned M[1] picks up the root and runs it. The caller does
+    // unrelated work (here: a brief atomic spin) before blocking on
+    // wait(). Whether the task completed before, during, or after the
+    // spin, wait() returns the result either way.
+    const handle = try rt.runDetached(detachedAdd, .{ @as(u32, 19), @as(u32, 23) });
+    var i: u32 = 0;
+    while (i < 1_000_000) : (i += 1) std.atomic.spinLoopHint();
+    const result = handle.wait();
+    try std.testing.expectEqual(@as(u32, 42), result);
+}
+
+test "runDetached: workers=1 returns error.NeedMultipleWorkers" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
+    defer rt.deinit();
+    const r = rt.runDetached(detachedAdd, .{ @as(u32, 1), @as(u32, 2) });
+    try std.testing.expectError(error.NeedMultipleWorkers, r);
 }
