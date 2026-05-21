@@ -798,15 +798,14 @@ fn dispatch(rt: *Runtime, m: *M, c: *Coroutine) void {
 // Tests
 // ─────────────────────────────────────────────────────────────────────
 
-// Tests use the smp_allocator (thread-safe, no stack-trace cache).
-// `std.testing.allocator` is a GeneralPurposeAllocator with stack-trace
-// capture for leak detection — but the trace capture walks
-// `debug.SelfInfo`'s module hash map without synchronization. Under
-// multi-worker spawn, several workers call `allocator.create(Coroutine)`
-// concurrently; the unwinder corrupts the module map and crashes with
-// EXC_BAD_ACCESS. The smp_allocator is fast, thread-safe, and what
-// production workloads use.
-const test_allocator = std.heap.smp_allocator;
+// `volt.testing.allocator` — leak-detecting + multi-worker-safe.
+// `std.testing.allocator`'s DebugAllocator captures stack traces via
+// `debug.SelfInfo`'s module map, which the unwinder walks without
+// synchronization. Multi-worker spawn corrupts that map and crashes
+// with EXC_BAD_ACCESS. Our wrapper sets `stack_trace_frames = 0`
+// (kills the unwinder race) and `thread_safe = true` (DebugAllocator's
+// own bookkeeping mutex).
+const test_allocator = @import("testing.zig").allocator;
 
 fn returnInt(x: u32) u32 {
     return x * 2;

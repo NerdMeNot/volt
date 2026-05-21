@@ -202,9 +202,9 @@ pub const Cancel = struct {
 // Tests
 // ─────────────────────────────────────────────────────────────────────
 
-// Use smp_allocator (not std.testing.allocator) — see comment in
-// src/runtime.zig.
-const test_allocator = std.heap.smp_allocator;
+// `volt.testing.allocator` — leak-detecting + multi-worker-safe.
+// See src/testing.zig for why std.testing.allocator doesn't fit.
+const test_allocator = @import("testing.zig").allocator;
 
 test "Cancel: checkpoint returns Cancelled after fire" {
     var rt = try runtime.Runtime.init(.{ .allocator = test_allocator, .workers = 1 });

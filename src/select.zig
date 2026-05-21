@@ -256,7 +256,7 @@ fn selectRecvTimerRoot(ctx: *SelectRecvTimerCtx) !void {
 }
 
 test "select: recv wins against a longer timeout" {
-    var rt = try lib.Runtime.init(.{ .allocator = std.heap.smp_allocator, .workers = 1 });
+    var rt = try lib.Runtime.init(.{ .allocator = lib.testing.allocator, .workers = 1 });
     defer rt.deinit();
     var ch = channel.Spsc(u32, 4){};
     var ctx = SelectRecvTimerCtx{ .ch = &ch };
@@ -281,7 +281,7 @@ fn selectTimeoutRoot(ctx: *SelectTimeoutCtx) !void {
 }
 
 test "select: timer wins when no channel ever fires" {
-    var rt = try lib.Runtime.init(.{ .allocator = std.heap.smp_allocator, .workers = 1 });
+    var rt = try lib.Runtime.init(.{ .allocator = lib.testing.allocator, .workers = 1 });
     defer rt.deinit();
     var ctx = SelectTimeoutCtx{};
     try (try rt.run(selectTimeoutRoot, .{&ctx}));

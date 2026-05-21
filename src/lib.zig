@@ -61,6 +61,13 @@ pub const current = @import("current.zig");
 /// See `docs/internals/parking-lot.md`.
 pub const parking = @import("park.zig");
 
+/// Test-allocator namespace. `volt.testing.allocator` is a leak-
+/// detecting allocator that's safe under multi-worker Runtimes
+/// (unlike `std.testing.allocator`, whose stack-trace capture races
+/// with worker stack writes). Use this for any test that constructs
+/// a Runtime with `workers >= 2`.
+pub const testing = @import("testing.zig");
+
 // ─── Bootstrap & types ───────────────────────────────────────────────
 
 pub const Runtime = @import("runtime.zig").Runtime;
@@ -314,6 +321,10 @@ test {
 
 const std = @import("std");
 
+// `volt.testing.allocator` — leak-detecting + multi-worker-safe.
+// See src/testing.zig for why std.testing.allocator doesn't fit.
+const test_allocator = testing.allocator;
+
 const SleepCtx = struct { slept_ns: i128 = 0 };
 
 // Windows kernel32 perf-counter externs. Declared locally — Zig
@@ -348,7 +359,7 @@ fn sleepTestRoot(ctx: *SleepCtx) !void {
 }
 
 test "sleep parks for ~10ms via kqueue timer" {
-    var rt = try Runtime.init(.{ .allocator = std.heap.smp_allocator });
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
     defer rt.deinit();
     var ctx = SleepCtx{};
     try (try rt.run(sleepTestRoot, .{&ctx}));
@@ -395,7 +406,7 @@ fn scopeRoot(_: *void) !void {
 }
 
 test "scope: ok body returns OK; error body propagates error" {
-    var rt = try Runtime.init(.{ .allocator = std.heap.smp_allocator });
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
     defer rt.deinit();
     var dummy: void = {};
     try (try rt.run(scopeRoot, .{&dummy}));
@@ -429,13 +440,13 @@ fn withTimeoutTimerWinsRoot() !void {
 // external wake mechanism — see Phase 6 (reactor.interrupt()) for
 // the fix; once that lands these tests should move to workers=2.
 test "withTimeout: body finishes within budget — returns body's result" {
-    var rt = try Runtime.init(.{ .allocator = std.heap.smp_allocator, .workers = 1 });
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
     defer rt.deinit();
     try (try rt.run(withTimeoutBodyWinsRoot, .{}));
 }
 
 test "withTimeout: body exceeds budget — returns error.Timeout" {
-    var rt = try Runtime.init(.{ .allocator = std.heap.smp_allocator, .workers = 1 });
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
     defer rt.deinit();
     try (try rt.run(withTimeoutTimerWinsRoot, .{}));
 }
