@@ -97,6 +97,24 @@ pub fn spawn(
     comptime user_fn: anytype,
     args: anytype,
 ) SpawnError!*Task(@typeInfo(@TypeOf(user_fn)).@"fn".return_type.?) {
+    comptime {
+        const FnInfo = @typeInfo(@TypeOf(user_fn));
+        if (FnInfo != .@"fn") @compileError(
+            "spawn's first argument must be a function; got " ++ @typeName(@TypeOf(user_fn)),
+        );
+        const ArgsT = @TypeOf(args);
+        const ArgsInfo = @typeInfo(ArgsT);
+        if (ArgsInfo != .@"struct" or !ArgsInfo.@"struct".is_tuple) @compileError(
+            "spawn's second argument must be a tuple of args; got " ++ @typeName(ArgsT) ++
+                " — wrap your args in .{...}",
+        );
+        const expected = FnInfo.@"fn".params.len;
+        const got = ArgsInfo.@"struct".fields.len;
+        if (expected != got) @compileError(std.fmt.comptimePrint(
+            "spawn arg count mismatch: function expects {d} args, got {d}",
+            .{ expected, got },
+        ));
+    }
     return runtime().spawn(user_fn, args);
 }
 

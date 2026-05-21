@@ -108,6 +108,11 @@ pub fn select(branches: anytype) !SelectResult(@TypeOf(branches)) {
     const BranchesT = @TypeOf(branches);
     const fields = @typeInfo(BranchesT).@"struct".fields;
     if (comptime fields.len == 0) @compileError("select needs at least one branch");
+    if (comptime fields.len == 1) @compileError(
+        \\select with exactly one branch is just the branch — call it
+        \\directly. select's whole point is racing multiple branches
+        \\against each other; with one branch the race is degenerate.
+    );
 
     const Result = SelectResult(BranchesT);
 
