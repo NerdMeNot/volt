@@ -60,6 +60,18 @@ pub const Parker = parker_mod.Parker;
 pub const STACK_SIZE: usize = stack_mod.BODY_SIZE;
 pub const MAX_WORKERS: usize = 64; // bitmap is u64
 
+/// Errors `Runtime.spawn` (and `volt.spawn`) can return. Explicit
+/// named set so library callers can `catch err switch` exhaustively
+/// — and so `scope`/`withTimeout`/`joinFirst` can union it with
+/// the body's error set instead of inheriting `anyerror`.
+///
+/// `OutOfMemory` comes from the per-spawn Frame+Task heap alloc and
+/// the coroutine-struct pool's allocator fallback. The other three
+/// come from the stack arena: `ArenaExhausted` (every slot in use),
+/// `MmapFailed` / `MprotectFailed` (kernel VM-space exhaustion or
+/// permission failure during lazy slot commit).
+pub const SpawnError = std.mem.Allocator.Error || stack_mod.Error;
+
 pub const Config = struct {
     allocator: std.mem.Allocator,
     /// Worker thread count. null = std.Thread.getCpuCount.
@@ -423,7 +435,7 @@ pub const Runtime = struct {
         self: *Runtime,
         comptime user_fn: anytype,
         args: anytype,
-    ) !*Task(@typeInfo(@TypeOf(user_fn)).@"fn".return_type.?) {
+    ) SpawnError!*Task(@typeInfo(@TypeOf(user_fn)).@"fn".return_type.?) {
         const FWT = task_mod.FrameWithTask(user_fn, @TypeOf(args));
 
         const combined = try self.allocator.create(FWT);

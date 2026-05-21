@@ -74,6 +74,7 @@ pub const Runtime = @import("runtime.zig").Runtime;
 pub const Config = @import("runtime.zig").Config;
 pub const Task = @import("task.zig").Task;
 pub const MAX_WORKERS = @import("runtime.zig").MAX_WORKERS;
+pub const SpawnError = @import("runtime.zig").SpawnError;
 
 // ─── Inside-coroutine helpers ────────────────────────────────────────
 
@@ -87,7 +88,14 @@ pub fn runtime() *Runtime {
 /// Spawn a child coroutine on the running coroutine's runtime.
 /// Returns `*Task(T)` whose `.join()` parks until the child completes.
 /// **Must be called from inside a coroutine** — panics otherwise.
-pub fn spawn(comptime user_fn: anytype, args: anytype) !*Task(@typeInfo(@TypeOf(user_fn)).@"fn".return_type.?) {
+///
+/// The error set is `SpawnError` (heap exhaustion + stack-arena
+/// exhaustion) — explicit so callers and helpers like `scope`/
+/// `withTimeout` can compose typed unions.
+pub fn spawn(
+    comptime user_fn: anytype,
+    args: anytype,
+) SpawnError!*Task(@typeInfo(@TypeOf(user_fn)).@"fn".return_type.?) {
     return runtime().spawn(user_fn, args);
 }
 
@@ -207,14 +215,29 @@ pub fn sleepCancel(d: Duration, c: *Cancel) (ReactorWaitError || cancel.Error)!v
 /// Auto-await of child tasks is library territory and may land in
 /// a v1.x extension.
 ///
+/// Return type mirrors `body`'s — if `body` returns `E!void`,
+/// `scope` returns `E!void`. No `anyerror` widening.
+///
 /// Must be called from inside a coroutine (needs `runtime()`).
-pub fn scope(comptime body: anytype) anyerror!void {
+pub fn scope(comptime body: anytype) ScopeReturn(@TypeOf(body)) {
     var c = Cancel.init(runtime());
     defer c.deinit();
     body(&c) catch |e| {
         c.fire();
         return e;
     };
+}
+
+/// `scope`'s return type — preserves body's error set, no widening.
+/// If body returns `E!void`, returns `E!void`. If body's return type
+/// has no error union (rare; body is infallible), returns it as-is.
+fn ScopeReturn(comptime BodyT: type) type {
+    const ret = @typeInfo(BodyT).@"fn".return_type.?;
+    const info = @typeInfo(ret);
+    if (info == .error_union) {
+        return info.error_union.error_set!void;
+    }
+    return ret;
 }
 
 /// Race `body(args..., *Cancel)` against `d`. Returns `body`'s
@@ -279,20 +302,22 @@ pub fn withTimeout(
     return result;
 }
 
-/// `withTimeout`'s return type is body's success-payload with
-/// `anyerror` on the error side — because we union body's error
-/// set with `spawn`'s (OOM / MmapFailed / etc.) plus
-/// `error.Timeout`, and the spawn error set is inferred (no
-/// stable name to pluck off comptime). Library callers that need
-/// a tighter set can wrap and re-map.
+/// `withTimeout`'s return type — body's payload, with the typed
+/// union `BodyError || SpawnError || error{Timeout}` on the error
+/// side. No `anyerror` widening; callers see exactly which errors
+/// can surface and can `catch err switch` exhaustively.
+///
+/// `SpawnError` enters because the timer-firer child is spawned;
+/// `error.Timeout` enters because the duration may elapse before
+/// the body completes; the body's own error set enters because
+/// the body's error propagates unchanged on the non-timeout path.
 fn WithTimeoutReturn(comptime BodyT: type) type {
     const fn_info = @typeInfo(BodyT).@"fn";
     const inner = fn_info.return_type.?;
     const inner_info = @typeInfo(inner);
-    if (inner_info == .error_union) {
-        return anyerror!inner_info.error_union.payload;
-    }
-    return anyerror!inner;
+    const Payload = if (inner_info == .error_union) inner_info.error_union.payload else inner;
+    const BodyError = if (inner_info == .error_union) inner_info.error_union.error_set else error{};
+    return (BodyError || SpawnError || error{Timeout})!Payload;
 }
 
 // ─── Channel & sync convenience re-exports ───────────────────────────
@@ -502,6 +527,60 @@ test "withTimeout: body exceeds budget — returns error.Timeout" {
     var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
     defer rt.deinit();
     try (try rt.run(withTimeoutTimerWinsRoot, .{}));
+}
+
+// ─── typed-error story for scope + withTimeout ───────────────────────
+//
+// Asserts the comptime return type is the user's body error set unioned
+// with SpawnError + error{Timeout}, NOT anyerror. The test is mostly
+// at compile-time: if `WithTimeoutReturn` widens to anyerror, the
+// `catch err switch` against a closed set fails to compile.
+
+const TypedBodyError = error{ Boom, Squish };
+
+fn typedScopeBody(c: *Cancel) TypedBodyError!void {
+    _ = c;
+    return error.Boom;
+}
+
+fn typedScopeRoot(_: *void) !void {
+    // scope's return type is `TypedBodyError!void` — the exhaustive
+    // switch compiles only if the set isn't widened to anyerror.
+    const r = scope(typedScopeBody);
+    if (r) |_| return error.UnexpectedOk else |e| switch (e) {
+        error.Boom => {}, // expected
+        error.Squish => return error.UnexpectedSquish,
+    }
+}
+
+test "scope: body error set propagates, no anyerror widening" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
+    defer rt.deinit();
+    var dummy: void = {};
+    try (try rt.run(typedScopeRoot, .{&dummy}));
+}
+
+fn typedTimeoutBody(c: *Cancel) TypedBodyError!u32 {
+    _ = c;
+    return error.Squish;
+}
+
+fn typedTimeoutRoot() !void {
+    // withTimeout's return type is `(TypedBodyError || SpawnError ||
+    // error{Timeout})!u32`. Exhaustive switch confirms no anyerror.
+    const r = withTimeout(Duration.fromMillis(100), typedTimeoutBody, .{});
+    if (r) |_| return error.UnexpectedOk else |e| switch (e) {
+        error.Squish => {},
+        error.Boom => return error.UnexpectedBoom,
+        error.Timeout => return error.UnexpectedTimeout,
+        error.OutOfMemory, error.ArenaExhausted, error.MmapFailed, error.MprotectFailed => return error.UnexpectedSpawnError,
+    }
+}
+
+test "withTimeout: body error set + SpawnError + Timeout propagate, no anyerror widening" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
+    defer rt.deinit();
+    try (try rt.run(typedTimeoutRoot, .{}));
 }
 
 // ─── spawnBlocking tests ─────────────────────────────────────────────
