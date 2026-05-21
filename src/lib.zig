@@ -164,6 +164,160 @@ pub fn spawnBlocking(
     return closure.result;
 }
 
+/// Wait for every task in `tasks` to complete and return a struct
+/// of their results. `tasks` is a struct literal of `*Task(T)` values
+/// — fields may have different payload types; the returned struct's
+/// fields carry the same names with the corresponding payloads.
+///
+/// ```zig
+/// const t_a = try volt.spawn(fetchUser,  .{user_id});  // *Task(User)
+/// const t_b = try volt.spawn(fetchPrefs, .{user_id});  // *Task(Prefs)
+/// const r = volt.joinAll(.{ .user = t_a, .prefs = t_b });
+/// // r.user: User, r.prefs: Prefs
+/// ```
+///
+/// Zero allocation, comptime-generated heterogeneous struct. For tasks
+/// whose body returns `E!T`, the corresponding result field is `E!T`
+/// and the caller unwraps with `try`. Each task is consumed by its
+/// `.join()` (frame freed); don't reuse handles after.
+///
+/// **Must be called from inside a coroutine** (uses `Task.join`).
+pub fn joinAll(tasks: anytype) JoinAllResult(@TypeOf(tasks)) {
+    var results: JoinAllResult(@TypeOf(tasks)) = undefined;
+    inline for (@typeInfo(@TypeOf(tasks)).@"struct".fields) |f| {
+        @field(results, f.name) = @field(tasks, f.name).join();
+    }
+    return results;
+}
+
+fn JoinAllResult(comptime TasksT: type) type {
+    const fields = @typeInfo(TasksT).@"struct".fields;
+    comptime var names: [fields.len][]const u8 = undefined;
+    comptime var types: [fields.len]type = undefined;
+    comptime var attrs: [fields.len]std.builtin.Type.StructField.Attributes = undefined;
+    inline for (fields, 0..) |f, i| {
+        names[i] = f.name;
+        // f.type is `*Task(P)` — pluck the public `Payload` const off
+        // the pointed-to Task to get P. Errors and all.
+        types[i] = @typeInfo(f.type).pointer.child.Payload;
+        attrs[i] = .{};
+    }
+    return @Struct(.auto, null, &names, &types, &attrs);
+}
+
+/// Wait for the FIRST task in `tasks` to complete; cancel the rest
+/// and return a tagged union variant indicating which won + its
+/// result. Mirrors `select`'s mental model — same field-named shape,
+/// same "first wins" semantic — but races task *completions* instead
+/// of channel/timer ops.
+///
+/// ```zig
+/// var c = volt.Cancel.init(rt);
+/// defer c.deinit();
+/// const t_a = try volt.spawn(fetchPrimary,   .{&c, args});
+/// const t_b = try volt.spawn(fetchFallback,  .{&c, args});
+/// const winner = volt.joinFirst(&c, .{ .primary = t_a, .fallback = t_b });
+/// switch (winner) {
+///     .primary  => |r| return try r,
+///     .fallback => |r| return try r,
+/// }
+/// ```
+///
+/// **Caller contract**: every task must share `c` and propagate it
+/// through cancel-aware blocking calls (`sleepCancel`, `recvCancel`,
+/// `Mutex.lockCancel`, etc.). When the first task wins, `c` fires
+/// and the losers wake with `error.Cancelled`. Tasks that ignore the
+/// cancel still complete naturally — `joinFirst` waits for all of
+/// them to settle before returning. If a task ignores `c` and runs
+/// forever, `joinFirst` runs forever; that's a caller bug.
+///
+/// **Must be called from inside a coroutine** (uses `spawn` + `join`).
+pub fn joinFirst(
+    c: *Cancel,
+    tasks: anytype,
+) SpawnError!JoinFirstResult(@TypeOf(tasks)) {
+    const TasksT = @TypeOf(tasks);
+    const fields = @typeInfo(TasksT).@"struct".fields;
+    if (comptime fields.len == 0) @compileError("joinFirst needs at least one task");
+
+    const race = @import("race.zig");
+    const SlotsT = JoinFirstSlots(TasksT);
+    var slots: SlotsT = undefined;
+    var winner = race.WinnerSlot(fields.len){};
+
+    // Spawn one watcher per task. Watcher joins its target, then
+    // CAS-claims the winner slot and fires the shared Cancel — the
+    // losers' cancel-aware blocking calls wake with error.Cancelled,
+    // their bodies return, their tasks complete, their watchers
+    // observe done and exit.
+    var watchers: [fields.len]*Task(void) = undefined;
+    inline for (fields, 0..) |f, i| {
+        const target = @field(tasks, f.name);
+        const Watcher = struct {
+            target: f.type,
+            slots: *SlotsT,
+            winner: *race.WinnerSlot(fields.len),
+            cancel: *Cancel,
+
+            fn entry(self: *@This()) void {
+                const r = self.target.join();
+                if (self.winner.claim(i)) {
+                    @field(self.slots, f.name) = r;
+                    self.cancel.fire();
+                }
+            }
+        };
+        var ctx = Watcher{
+            .target = target,
+            .slots = &slots,
+            .winner = &winner,
+            .cancel = c,
+        };
+        watchers[i] = try spawn(Watcher.entry, .{&ctx});
+    }
+
+    // Wait for all watchers. The winner already fired the cancel,
+    // so the losers' tasks settle and their watchers exit promptly.
+    for (watchers) |w| _ = w.join();
+
+    const winning_idx = winner.winner() orelse unreachable;
+    var result: JoinFirstResult(TasksT) = undefined;
+    inline for (fields, 0..) |f, i| {
+        if (winning_idx == i) {
+            result = @unionInit(JoinFirstResult(TasksT), f.name, @field(slots, f.name));
+        }
+    }
+    return result;
+}
+
+fn JoinFirstSlots(comptime TasksT: type) type {
+    // Heterogeneous slots — same shape as JoinAllResult, but each
+    // field is initialised only when its task is the winner. The
+    // post-switch only reads the winning slot.
+    return JoinAllResult(TasksT);
+}
+
+fn JoinFirstResult(comptime TasksT: type) type {
+    const fields = @typeInfo(TasksT).@"struct".fields;
+    comptime var names: [fields.len][]const u8 = undefined;
+    comptime var tag_vals: [fields.len]std.math.IntFittingRange(0, fields.len) = undefined;
+    comptime var union_types: [fields.len]type = undefined;
+    comptime var union_attrs: [fields.len]std.builtin.Type.UnionField.Attributes = undefined;
+    inline for (fields, 0..) |f, i| {
+        names[i] = f.name;
+        tag_vals[i] = @intCast(i);
+        union_types[i] = @typeInfo(f.type).pointer.child.Payload;
+        union_attrs[i] = .{};
+    }
+    const Tag = @Enum(
+        std.math.IntFittingRange(0, fields.len),
+        .exhaustive,
+        &names,
+        &tag_vals,
+    );
+    return @Union(.auto, Tag, &names, &union_types, &union_attrs);
+}
+
 /// Cooperative yield. Re-queues the current coroutine to the running
 /// worker's tail (FIFO — yields don't bounce via lifo_slot). Must be
 /// called from inside a coroutine.
@@ -632,4 +786,63 @@ test "spawnBlocking: queue overflows past max_threads, all jobs run" {
     var counter = std.atomic.Value(u32).init(0);
     var ctx = ManyCtx{ .counter = &counter };
     try (try rt.run(spawnBlockingManyRoot, .{&ctx}));
+}
+
+// ─── joinAll / joinFirst tests ──────────────────────────────────────
+
+fn produceU32() u32 {
+    return 0x42;
+}
+fn produceBytes() []const u8 {
+    return "hello";
+}
+
+fn joinAllRoot() !void {
+    const t_u = try spawn(produceU32, .{});
+    const t_b = try spawn(produceBytes, .{});
+    const r = joinAll(.{ .num = t_u, .text = t_b });
+    // Heterogeneous result struct — num is u32, text is []const u8.
+    // If joinAll widened to anyopaque or anything erased, this
+    // wouldn't compile.
+    try std.testing.expectEqual(@as(u32, 0x42), r.num);
+    try std.testing.expectEqualStrings("hello", r.text);
+}
+
+test "joinAll: heterogeneous results, typed struct return" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+    try (try rt.run(joinAllRoot, .{}));
+}
+
+fn quickWinner(c: *Cancel) u32 {
+    _ = c;
+    return 1;
+}
+
+fn slowLoser(c: *Cancel) u32 {
+    // Park on the shared cancel via a long sleep. When the winner
+    // fires c, sleepCancel returns error.Cancelled — we map back to a
+    // sentinel value the test recognises.
+    sleepCancel(Duration.fromSecs(10), c) catch return 0xCA;
+    return 0xFF;
+}
+
+fn joinFirstRoot(c: *Cancel) !void {
+    const t_w = try spawn(quickWinner, .{c});
+    const t_l = try spawn(slowLoser, .{c});
+    const winner = try joinFirst(c, .{ .fast = t_w, .slow = t_l });
+    switch (winner) {
+        .fast => |v| try std.testing.expectEqual(@as(u32, 1), v),
+        .slow => return error.SlowShouldNotWin,
+    }
+}
+
+fn joinFirstOuter() !void {
+    try scope(joinFirstRoot);
+}
+
+test "joinFirst: fast task wins, slow task observes cancel" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+    try (try rt.run(joinFirstOuter, .{}));
 }
