@@ -195,8 +195,16 @@ Critical recent invariants:
 3. **Atomic ops need ordering justification** — every `.acq_rel` /
    `.release` / `.acquire` should be paired against a matching read or
    write in the memory-model doc.
-4. **No raw pointers across yield points** — a coroutine may resume on a
-   different worker thread.
+4. **No thread-identity state across yield points** — a coroutine may
+   resume on a different worker thread, so anything that depends on
+   *which OS thread you're on* is invalid after a yield/park: TLS
+   reads, thread-locals, cached `pthread_self()`, per-thread runtime
+   state, pointers returned from thread-local lookups. Stack
+   pointers into your *own* (or another live) coroutine's frame are
+   fine — slots are at stable VAs for the coroutine's lifetime.
+   (Known instance worked around: x86_64 Linux LLVM cached `%fs:0`
+   in r12 across yield; fix was `@call(.never_inline)` around TLS
+   reads.)
 5. **Stackful means stack contents preserved across suspension** — heap
    pointers stashed on a coroutine's stack live as long as the coroutine.
 6. **Explicit allocators** — Zig idiom; the runtime takes one allocator

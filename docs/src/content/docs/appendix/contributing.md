@@ -239,9 +239,13 @@ These show up across the source tree:
    / `.release` / `.acquire` should be paired against a matching
    read or write in the [memory-model](/architecture/memory-model/)
    doc.
-4. **No raw pointers across yield points.** A coroutine can
-   resume on a different worker thread. Re-read any threadlocal-
-   cached pointers after every potential yield.
+4. **No thread-identity state across yield points.** A coroutine
+   can resume on a different worker thread, so re-read TLS,
+   thread-locals, cached `pthread_self()`, or any pointer
+   computed from per-thread state after every potential yield.
+   Stack pointers into a live coroutine's own frame are *not*
+   affected — slots sit at stable virtual addresses for the
+   coroutine's lifetime.
 5. **Stackful means stack contents preserved across suspension.**
    Heap pointers stashed on a coroutine's stack live as long as
    the coroutine. This is what makes the synchronous-shape API
