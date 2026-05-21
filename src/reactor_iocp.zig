@@ -458,6 +458,64 @@ pub const Reactor = struct {
         context.swap(&me.ctx, me.main_ctx);
     }
 
+    /// Cancel-aware variant of `submitAcceptEx`. Same `CancelIoEx`
+    /// mechanism as `submitReadinessCancel`: the kernel posts a
+    /// `STATUS_CANCELLED` completion for the cancelled OVERLAPPED,
+    /// the poll loop unparks via the normal path, and the caller
+    /// observes `error.Cancelled` because `Cancel.isFired()` is true.
+    pub fn submitAcceptExCancel(
+        self: *Reactor,
+        listen_sock: SOCKET,
+        accept_sock: SOCKET,
+        out_buf: []u8,
+        addr_len: win.DWORD,
+        c: *cancel_mod.Cancel,
+    ) (ReactorWaitError || cancel_mod.Error)!void {
+        const raw = try self.loadExtensionFn(listen_sock, &WSAID_ACCEPTEX, &self.acceptex_fn_raw);
+        const accept_ex: AcceptExFn = @ptrFromInt(raw);
+
+        const me = current.require();
+        try c.checkpoint();
+
+        var ovl: OVERLAPPED = std.mem.zeroes(OVERLAPPED);
+        ovl.DUMMYUNIONNAME = .{ .Pointer = @ptrFromInt(@intFromPtr(me)) };
+        var bytes_received: win.DWORD = 0;
+        const rc = accept_ex(
+            listen_sock,
+            accept_sock,
+            out_buf.ptr,
+            0,
+            addr_len,
+            addr_len,
+            &bytes_received,
+            &ovl,
+        );
+        if (rc == win.BOOL.FALSE) {
+            const e = WSAGetLastError();
+            if (e != WSA_IO_PENDING) return wsaToSetupError(e);
+        }
+
+        // CancelIoEx targets the OVERLAPPED on the listener handle —
+        // AcceptEx is bound to listen_sock, not the pre-created
+        // accept_sock.
+        var op = WaitOp{ .io = .{ .sock = listen_sock, .overlapped = &ovl } };
+        me.reactor_wait_op = &op;
+        defer me.reactor_wait_op = null;
+
+        var w = cancel_mod.Waiter{};
+        const already_fired = c.registerReactor(&w, me);
+        defer c.deregister(&w);
+        if (already_fired) {
+            _ = CancelIoEx(@ptrFromInt(listen_sock), &ovl);
+        }
+
+        _ = self.pending.fetchAdd(1, .acq_rel);
+        me.pending = .park;
+        context.swap(&me.ctx, me.main_ctx);
+
+        if (c.isFired()) return error.Cancelled;
+    }
+
     /// Submit `ConnectEx` on `sock`, parking the current coroutine
     /// until the connection completes.
     ///
@@ -495,6 +553,58 @@ pub const Reactor = struct {
         _ = self.pending.fetchAdd(1, .acq_rel);
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
+    }
+
+    /// Cancel-aware variant of `submitConnectEx`. Same mechanism as
+    /// `submitAcceptExCancel`: `CancelIoEx` against the connecting
+    /// socket's OVERLAPPED, completion path unparks via the normal
+    /// route.
+    pub fn submitConnectExCancel(
+        self: *Reactor,
+        sock: SOCKET,
+        sa: *const anyopaque,
+        sa_len: c_int,
+        c: *cancel_mod.Cancel,
+    ) (ReactorWaitError || cancel_mod.Error)!void {
+        const raw = try self.loadExtensionFn(sock, &WSAID_CONNECTEX, &self.connectex_fn_raw);
+        const connect_ex: ConnectExFn = @ptrFromInt(raw);
+
+        const me = current.require();
+        try c.checkpoint();
+
+        var ovl: OVERLAPPED = std.mem.zeroes(OVERLAPPED);
+        ovl.DUMMYUNIONNAME = .{ .Pointer = @ptrFromInt(@intFromPtr(me)) };
+        var bytes_sent: win.DWORD = 0;
+        const rc = connect_ex(
+            sock,
+            sa,
+            sa_len,
+            null,
+            0,
+            &bytes_sent,
+            &ovl,
+        );
+        if (rc == win.BOOL.FALSE) {
+            const e = WSAGetLastError();
+            if (e != WSA_IO_PENDING) return wsaToSetupError(e);
+        }
+
+        var op = WaitOp{ .io = .{ .sock = sock, .overlapped = &ovl } };
+        me.reactor_wait_op = &op;
+        defer me.reactor_wait_op = null;
+
+        var w = cancel_mod.Waiter{};
+        const already_fired = c.registerReactor(&w, me);
+        defer c.deregister(&w);
+        if (already_fired) {
+            _ = CancelIoEx(@ptrFromInt(sock), &ovl);
+        }
+
+        _ = self.pending.fetchAdd(1, .acq_rel);
+        me.pending = .park;
+        context.swap(&me.ctx, me.main_ctx);
+
+        if (c.isFired()) return error.Cancelled;
     }
 
     /// Timer callback context — the threadpool fires this on a pool
