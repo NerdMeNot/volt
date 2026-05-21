@@ -57,7 +57,7 @@ reading" footer pointing at adjacent topics.
    │  ▼                                                             │
    │  ┌────────────────────────────────────────────────────────┐    │
    │  │                  Coroutine                              │    │
-   │  │   stack: → slot in stack_arena (256 KiB virtual,        │    │
+   │  │   stack: → slot in stack_arena (1 MiB virtual,          │    │
    │  │                                 16 KiB committed)       │    │
    │  │   ctx:   saved registers (AAPCS64 wide-save)            │    │
    │  │   pending: yield / park / done                          │    │
@@ -137,9 +137,10 @@ IOCP (Windows, polyfilled as readiness via zero-byte WSARecv).
 ### 5. The slab arena
 
 Coroutine stacks come from a **single mmap reservation** at
-runtime init. N slots of 256 KiB virtual each, lazy-mprotect on
-first use. Per-P pools cache freed slots for cache locality;
-arena is the backing store for cross-P balancing.
+runtime init. N slots of 1 MiB virtual each by default (tunable
+via `Runtime.Config.stack_reservation_size`), lazy-mprotect on
+first use. Per-P pools cache freed slots for cache locality; arena
+is the backing store for cross-P balancing.
 
 The arena replaced a per-spawn `mmap` design that hit a 30× cliff
 when batch size exceeded the cache cap. The

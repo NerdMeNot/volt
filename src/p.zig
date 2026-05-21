@@ -106,6 +106,12 @@ pub const P = struct {
     /// drain go through here. Opaque-typed to avoid an import cycle —
     /// resolved to `*stack_mod.Arena` at use site.
     arena: ?*stack_mod.Arena = null,
+    /// Cached `arena.usableOffset()`. Hot-path optimisation: spawn
+    /// reads this on every allocStack call, and the arena's slot_size
+    /// is fixed for the runtime's lifetime, so we copy it here to
+    /// avoid a pointer-indirection load on the spawn hot path.
+    /// Set by `Runtime.init` when it assigns `arena`.
+    arena_usable_offset: usize = 0,
 
     pub fn init(self: *P, id: usize, runtime: *anyopaque) void {
         self.* = .{
@@ -184,9 +190,11 @@ pub const P = struct {
     /// the local pool is empty and the arena is fully allocated.
     pub fn allocStack(self: *P) !StackPtr {
         if (self.stack_pool) |base| {
-            // Next-pointer lives at offset `usableOffset()` — start
-            // of the committed body region.
-            const next_loc: *?StackPtr = @ptrCast(@alignCast(base + stack_mod.usableOffset()));
+            // Next-pointer lives at offset `usable_offset` — start
+            // of the committed body region. Cached at init so we
+            // hit one local field load instead of an arena
+            // pointer-indirection on every spawn.
+            const next_loc: *?StackPtr = @ptrCast(@alignCast(base + self.arena_usable_offset));
             self.stack_pool = next_loc.*;
             self.stack_pool_count -= 1;
             return base;
@@ -201,12 +209,13 @@ pub const P = struct {
     /// after warm-up unless the workload is asymmetric).
     pub fn freeStack(self: *P, base: StackPtr) void {
         if (self.stack_pool_count >= self.stack_pool_cap) {
-            if (self.arena) |arena| {
-                arena.free(base);
-                return;
-            }
+            // The pool only ever holds slots from `self.arena`; a P
+            // without an arena can't have allocated a stack, so it
+            // also can't be freeing one.
+            self.arena.?.free(base);
+            return;
         }
-        const next_loc: *?StackPtr = @ptrCast(@alignCast(base + stack_mod.usableOffset()));
+        const next_loc: *?StackPtr = @ptrCast(@alignCast(base + self.arena_usable_offset));
         next_loc.* = self.stack_pool;
         self.stack_pool = base;
         self.stack_pool_count += 1;
@@ -225,7 +234,7 @@ pub const P = struct {
         self.coro_pool_count = 0;
         if (self.arena) |arena| {
             while (self.stack_pool) |base| {
-                const next_loc: *?StackPtr = @ptrCast(@alignCast(base + stack_mod.usableOffset()));
+                const next_loc: *?StackPtr = @ptrCast(@alignCast(base + self.arena_usable_offset));
                 self.stack_pool = next_loc.*;
                 arena.free(base);
             }
@@ -303,9 +312,10 @@ test "P.stack_pool: alloc/free round-trip recycles the same memory" {
     var p: P = undefined;
     p.init(0, undefined);
     const a = std.testing.allocator;
-    var arena = try stack_mod.Arena.init(a, 4);
+    var arena = try stack_mod.Arena.init(a, 4, stack_mod.DEFAULT_RESERVATION_SIZE);
     defer arena.deinit(a);
     p.arena = &arena;
+    p.arena_usable_offset = arena.usableOffset();
 
     const s1 = try p.allocStack();
     p.freeStack(s1);

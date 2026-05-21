@@ -8,9 +8,10 @@ much and you can't have a million coroutines. Pay too little and
 deep recursion segfaults randomly.
 
 The way out: **pay for the top page, reserve the rest as virtual,
-and grow on fault.** SP starts at the top of a 256 KiB virtual
-reservation; the top 16 KiB is committed RW; everything below
-(including the bottom guard page) is PROT_NONE. When SP walks into
+and grow on fault.** SP starts at the top of a 1 MiB virtual
+reservation (tunable via `Runtime.Config.stack_reservation_size`);
+the top 16 KiB is committed RW; everything below (including the
+bottom guard page) is PROT_NONE. When SP walks into
 PROT_NONE — recursion past the initial body — the kernel raises
 SIGSEGV. A handler catches it, mprotects the touched page to RW,
 and returns. The faulting instruction reruns. SP keeps going.
@@ -21,7 +22,7 @@ Volt does it under coroutine slabs.
 
 ## Mental model
 
-> Each coroutine's stack is a **256 KiB sealed envelope** sitting
+> Each coroutine's stack is a **1 MiB sealed envelope** sitting
 > inside the slab arena. The envelope is mostly empty (PROT_NONE).
 > A 16 KiB window at the top is open from the start. The bottom
 > page is sealed with a "tripwire" — touching it aborts the
@@ -67,13 +68,16 @@ Reference: `src/stack.zig:1-49` (the layout comment).
 
 Sizes:
 
-- `RESERVATION_SIZE = 256 KiB` — total per-slot virtual reservation.
+- `DEFAULT_RESERVATION_SIZE = 1 MiB` — default per-slot virtual
+  reservation. Tune via `Runtime.Config.stack_reservation_size` (must
+  be a multiple of the page size and strictly greater than guard +
+  `BODY_SIZE`).
 - `BODY_SIZE = 16 KiB` — top region committed at first allocation.
 - Guard = one page = 16 KiB on Darwin arm64 (one Darwin page),
   4 KiB on Linux.
-- Growable region = `RESERVATION_SIZE - guardSize() - BODY_SIZE`
-  ≈ 224 KiB on Darwin. That's the recursion budget before clean
-  abort.
+- Growable region = `reservation - guardSize() - BODY_SIZE`
+  ≈ 1008 KiB on Darwin / 1020 KiB on Linux at the default. That's
+  the recursion budget before clean abort.
 
 ## The SIGSEGV handler
 
@@ -151,28 +155,27 @@ per-coroutine registration; with the arena that's overkill.
 
 ## What happens at runtime
 
-A coroutine starts with SP at `base + 256 KiB`. The body region
-(top 16 KiB) is committed. The coroutine runs, calls some
-functions, locals push onto the stack. SP moves down.
+A coroutine starts with SP at `base + 1 MiB` (or whatever
+`stack_reservation_size` is configured to). The body region (top
+16 KiB) is committed. The coroutine runs, calls some functions,
+locals push onto the stack. SP moves down.
 
-While SP stays above `base + 240 KiB` (the body's lower edge),
-every access is regular memory — the CPU walks the page tables,
-finds RW pages, no fault.
+While SP stays above `base + (reservation - 16 KiB)` — the body's
+lower edge — every access is regular memory: the CPU walks the
+page tables, finds RW pages, no fault.
 
 If a deep recursion (or a big local array, or an alloca) pushes SP
-to `base + 230 KiB`, that's in the growable region. The page
-containing `base + 230 KiB` is PROT_NONE. The CPU faults. Kernel
-delivers SIGSEGV with `siginfo.si_addr = base + 230 KiB`. Our
-handler runs:
+into the growable region (anywhere below the committed body but
+above the guard page), the page containing SP is PROT_NONE. The
+CPU faults. Kernel delivers SIGSEGV with `siginfo.si_addr` pointing
+at the faulting address. Our handler runs:
 
 1. Linear-scan the region registry. Find the arena entry.
-2. Compute `slot_offset = (230 KiB - base_of_slot) % 256 KiB`.
-3. `slot_offset` is 230 KiB inside the slot — above the guard
-   (which is the bottom 16 KiB). So this is a growable-region
-   fault.
-4. Page-align the fault address down: `page_addr = 230 KiB`
-   (already aligned to 16 KiB Darwin pages).
-5. `mprotect(page_addr, 16 KiB, PROT_READ | PROT_WRITE)` — that
+2. Compute `slot_offset = (fault_addr - base_of_slot) % reservation`.
+3. If `slot_offset >= pageSize()` (above the guard), this is a
+   growable-region fault.
+4. Page-align the fault address down to a page boundary.
+5. `mprotect(page_addr, pageSize(), PROT_READ | PROT_WRITE)` — that
    page is now committed RW.
 6. Return from the handler. The faulting instruction reruns.
 
@@ -229,9 +232,9 @@ laptop with 32 GiB RAM, you can have ~4096 coroutines before the
 swapper takes over. Goroutine-style runtimes that brag about
 "1M concurrent" need ~few-KiB stacks; 8 MiB doesn't work.
 
-Growable stacks give us the best of both: cheap idle (16 KiB),
-real recursion budget (224 KiB), bounded virtual reservation
-(256 KiB).
+Growable stacks give us the best of both: cheap idle (16 KiB
+committed), real recursion budget (~1 MiB usable at the default),
+bounded virtual reservation per slot (1 MiB default, tunable).
 
 ## What's not yet handled
 

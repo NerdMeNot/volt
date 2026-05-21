@@ -64,9 +64,9 @@ pub const Config = struct {
     /// Worker thread count. null = std.Thread.getCpuCount.
     workers: ?usize = null,
     /// Hard cap on concurrently-live coroutine stacks. The runtime
-    /// pre-reserves `max_concurrent_stacks * 256 KiB` of virtual
-    /// address space at init (PROT_NONE — zero RSS until used) and
-    /// hands slots out from a slab arena. Spawn returns
+    /// pre-reserves `max_concurrent_stacks * stack_reservation_size`
+    /// of virtual address space at init (PROT_NONE — zero RSS until
+    /// used) and hands slots out from a slab arena. Spawn returns
     /// `error.ArenaExhausted` once every slot is in use.
     ///
     /// The default covers typical interactive workloads and the full
@@ -74,6 +74,17 @@ pub const Config = struct {
     /// thousands of HTTP connections); lower to bound virtual address
     /// usage on tight 32-bit-style budgets.
     max_concurrent_stacks: usize = stack_mod.DEFAULT_MAX_STACKS,
+    /// Per-coroutine stack VA reservation. The effective stack ceiling
+    /// is `stack_reservation_size - guard_page - 0` (the top body is
+    /// committed lazily; deeper pages commit on SIGSEGV up to the
+    /// guard). Default 1 MiB → ~1008 KiB usable on Darwin, ~1020 KiB
+    /// on Linux. Raise for deep-recursion / heavy C-library callouts;
+    /// lower to pack more concurrent coroutines into the same VA
+    /// budget. Must be a multiple of the page size.
+    ///
+    /// RSS is unaffected — every coroutine starts with the same 16
+    /// KiB body commit; only this knob's *virtual* cost scales.
+    stack_reservation_size: usize = stack_mod.DEFAULT_RESERVATION_SIZE,
     /// **Linux only.** Chooses between epoll and io_uring backends.
     /// `.auto` probes for io_uring at init and falls back to epoll
     /// on older kernels (< 5.10) or sysctl-disabled environments.
@@ -321,7 +332,7 @@ pub const Runtime = struct {
             .ps = ps,
             .reactor = reactor_inst,
             .parking_lot = park_mod.ParkingLot.init(),
-            .stack_arena = try stack_mod.Arena.init(cfg.allocator, cfg.max_concurrent_stacks),
+            .stack_arena = try stack_mod.Arena.init(cfg.allocator, cfg.max_concurrent_stacks, cfg.stack_reservation_size),
         };
         errdefer rt.stack_arena.deinit(cfg.allocator);
         // Initialize each P, then bind each M to its P (1:1 in Phase 1).
@@ -332,6 +343,7 @@ pub const Runtime = struct {
         for (rt.ps, 0..) |*p, i| {
             p.init(i, rt);
             p.arena = &rt.stack_arena;
+            p.arena_usable_offset = rt.stack_arena.usableOffset();
             p.stack_pool_cap = fair_share;
         }
         for (rt.ms, 0..) |*m, i| m.init(&rt.ps[i]);
@@ -430,7 +442,7 @@ pub const Runtime = struct {
         };
         // SP grows down from the top of the body region. The guard
         // page sits below — overflow walks into PROT_NONE and SIGSEGVs.
-        const stack_top: [*]u8 = stack + stack_mod.slotSize();
+        const stack_top: [*]u8 = stack + self.stack_arena.slotSize();
         context.initContext(&c.ctx, stack_top, &combined.frame);
 
         combined.task = .{
