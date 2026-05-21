@@ -44,6 +44,7 @@ const p_mod = @import("p.zig");
 const parker_mod = @import("parker.zig");
 const park_mod = @import("park.zig");
 const stack_mod = @import("stack.zig");
+const blocking_pool_mod = @import("blocking_pool.zig");
 
 pub const Coroutine = coroutine.Coroutine;
 pub const Frame = coroutine.Frame;
@@ -90,6 +91,12 @@ pub const Config = struct {
     /// on older kernels (< 5.10) or sysctl-disabled environments.
     /// Ignored on Darwin (always kqueue) and Windows (always IOCP).
     io_backend: reactor_mod.IoBackend = .auto,
+    /// OS-thread pool used by `volt.spawnBlocking` to run sync /
+    /// CPU-bound code without pinning a worker. Lazy — no threads
+    /// spawn until the first `spawnBlocking` call. Default caps
+    /// concurrent sync work at 32 threads; raise for sync-IO-heavy
+    /// services. See `src/blocking_pool.zig`.
+    blocking: blocking_pool_mod.Config = .{},
 };
 
 /// Cooperative yield. Re-queues the current coroutine onto the
@@ -296,6 +303,9 @@ pub const Runtime = struct {
     /// `init`, one `munmap` at `deinit`; per-P pools cache freed
     /// slots so the steady-state hot path is allocation-free.
     stack_arena: stack_mod.Arena,
+    /// OS-thread pool used by `volt.spawnBlocking`. Lazy — no
+    /// threads spawn until the first submit. See `src/blocking_pool.zig`.
+    blocking_pool: blocking_pool_mod.Pool,
     // Diagnostic counters live per-P now (see `P.stat_*`) — they
     // were on Runtime as shared atomics, but every spawn / done /
     // unpark hit the same cache line, costing ~40 % of multi-worker
@@ -333,8 +343,10 @@ pub const Runtime = struct {
             .reactor = reactor_inst,
             .parking_lot = park_mod.ParkingLot.init(),
             .stack_arena = try stack_mod.Arena.init(cfg.allocator, cfg.max_concurrent_stacks, cfg.stack_reservation_size),
+            .blocking_pool = try blocking_pool_mod.Pool.init(cfg.allocator, cfg.blocking),
         };
         errdefer rt.stack_arena.deinit(cfg.allocator);
+        errdefer rt.blocking_pool.deinit();
         // Initialize each P, then bind each M to its P (1:1 in Phase 1).
         // Each P's stack pool cap = fair share of the arena across
         // workers, so asymmetric spawn (one driver, many workers)
@@ -375,6 +387,15 @@ pub const Runtime = struct {
         for (self.ms[1..]) |*m| m.parker.unpark();
         for (self.ms[1..]) |*m| m.thread.join();
         for (self.ms) |*m| m.deinit();
+        // Blocking pool teardown happens BEFORE reactor + parking_lot
+        // teardown: a pool thread completing a job calls
+        // `park.unparkOne(rt, ...)`, which touches the parking_lot.
+        // Draining the pool first guarantees no such call races the
+        // deinit. The pool itself blocks on in-flight jobs to
+        // complete — caller contract is "drain spawnBlocking before
+        // calling Runtime.deinit", same shape as the
+        // `reactor.deinit pending == 0` invariant.
+        self.blocking_pool.deinit();
         // Pools are quiescent now — every M has stopped dispatching,
         // so no further spawn/done can touch them. Drain coroutine
         // pools back to the allocator and stack pools back to the

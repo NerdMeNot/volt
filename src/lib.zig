@@ -91,6 +91,70 @@ pub fn spawn(comptime user_fn: anytype, args: anytype) !*Task(@typeInfo(@TypeOf(
     return runtime().spawn(user_fn, args);
 }
 
+/// Run `user_fn(args)` on the runtime's OS-thread pool. Parks the
+/// calling coroutine until the function returns; the result is the
+/// function's return value. Use this for sync / CPU-bound work that
+/// would otherwise pin a worker (long syscalls, blocking C library
+/// calls, gzip on a megabyte). Same shape as Tokio's
+/// `spawn_blocking().await`.
+///
+/// **Must be called from inside a coroutine** — parks via the
+/// parking-lot.
+///
+/// Backpressure: if every pool thread is busy and the pool is at
+/// `Runtime.Config.blocking.max_threads`, the job queues. No error.
+/// If you need to bound concurrent sync work, wrap calls in a
+/// `Semaphore.acquire` at the boundary.
+///
+/// Errors: `error.SystemResources` if the pool needed to spawn a new
+/// OS thread and the kernel refused (RLIMIT_NPROC, ENOMEM).
+/// `error.PoolShuttingDown` if `Runtime.deinit` already started.
+pub fn spawnBlocking(
+    comptime user_fn: anytype,
+    args: anytype,
+) !@typeInfo(@TypeOf(user_fn)).@"fn".return_type.? {
+    const Ret = @typeInfo(@TypeOf(user_fn)).@"fn".return_type.?;
+    const Args = @TypeOf(args);
+
+    const Closure = struct {
+        rt: *Runtime,
+        args: Args,
+        result: Ret = undefined,
+        done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+        fn run(opaque_ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(opaque_ptr));
+            self.result = @call(.auto, user_fn, self.args);
+            self.done.store(1, .release);
+            // Wake the parked coroutine. unparkOne is thread-safe;
+            // the pool thread isn't the coroutine's owning worker.
+            _ = parking.unparkOne(self.rt, &self.done);
+        }
+    };
+
+    const rt = runtime();
+    var closure = Closure{ .rt = rt, .args = args };
+    var job = @import("blocking_pool.zig").Job{
+        .run_fn = &Closure.run,
+        .arg_ptr = &closure,
+    };
+    try rt.blocking_pool.submit(&job);
+
+    // Park until the pool thread sets done. Validator rechecks under
+    // the parking-lot bucket lock — if the pool thread happened to
+    // complete + signal between our submit and our parkOn, the
+    // validator returns false and parkOn returns immediately without
+    // suspending.
+    parking.parkOn(&closure.done, struct {
+        fn validator(addr: *const anyopaque) bool {
+            const done: *const std.atomic.Value(u32) = @ptrCast(@alignCast(addr));
+            return done.load(.acquire) == 0;
+        }
+    }.validator);
+
+    return closure.result;
+}
+
 /// Cooperative yield. Re-queues the current coroutine to the running
 /// worker's tail (FIFO — yields don't bounce via lifo_slot). Must be
 /// called from inside a coroutine.
@@ -449,4 +513,54 @@ test "withTimeout: body exceeds budget — returns error.Timeout" {
     var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
     defer rt.deinit();
     try (try rt.run(withTimeoutTimerWinsRoot, .{}));
+}
+
+// ─── spawnBlocking tests ─────────────────────────────────────────────
+
+fn doubleSync(x: u32) u32 {
+    return x * 2;
+}
+
+fn spawnBlockingRoot() !void {
+    const result = try spawnBlocking(doubleSync, .{@as(u32, 21)});
+    try std.testing.expectEqual(@as(u32, 42), result);
+}
+
+test "spawnBlocking: sync fn runs on pool, result delivered to coroutine" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+    try (try rt.run(spawnBlockingRoot, .{}));
+}
+
+const ManyCtx = struct { counter: *std.atomic.Value(u32) };
+
+fn incOnce(c: *std.atomic.Value(u32)) u32 {
+    return c.fetchAdd(1, .acq_rel);
+}
+
+fn spawnBlockingManyRoot(ctx: *ManyCtx) !void {
+    // 64 concurrent spawnBlockings against a pool sized to 8 — the
+    // queue absorbs the overflow and every job eventually runs.
+    var tasks: [64]*Task(anyerror!u32) = undefined;
+    for (&tasks) |*t| {
+        t.* = try spawn(struct {
+            fn body(counter: *std.atomic.Value(u32)) anyerror!u32 {
+                return try spawnBlocking(incOnce, .{counter});
+            }
+        }.body, .{ctx.counter});
+    }
+    for (tasks) |t| _ = try (t.join());
+    try std.testing.expectEqual(@as(u32, 64), ctx.counter.load(.acquire));
+}
+
+test "spawnBlocking: queue overflows past max_threads, all jobs run" {
+    var rt = try Runtime.init(.{
+        .allocator = test_allocator,
+        .workers = 2,
+        .blocking = .{ .max_threads = 8 },
+    });
+    defer rt.deinit();
+    var counter = std.atomic.Value(u32).init(0);
+    var ctx = ManyCtx{ .counter = &counter };
+    try (try rt.run(spawnBlockingManyRoot, .{&ctx}));
 }
