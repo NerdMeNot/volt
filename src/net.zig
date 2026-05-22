@@ -131,10 +131,15 @@ pub const options = @import("net/options.zig");
 pub const Keepalive = options.Keepalive;
 pub const Linger = options.Linger;
 
+/// Re-exported from `src/net/udp.zig` — UDP socket with full
+/// multicast (IPv4 + IPv6) and broadcast support.
+pub const UdpSocket = @import("net/udp.zig").UdpSocket;
+
 // Pull in tests from the new sub-files via the test runner.
 test {
     _ = @import("net/address.zig");
     _ = @import("net/options.zig");
+    _ = @import("net/udp.zig");
 }
 
 pub const TcpListener = struct {

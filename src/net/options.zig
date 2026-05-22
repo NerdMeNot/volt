@@ -185,7 +185,7 @@ pub fn getIntOption(fd: i32, level: c_int, opt: c_int) OptionError!i32 {
     return v;
 }
 
-fn setRaw(fd: i32, level: c_int, opt: c_int, payload: []const u8) OptionError!void {
+pub fn setRaw(fd: i32, level: c_int, opt: c_int, payload: []const u8) OptionError!void {
     if (comptime builtin.os.tag == .windows) {
         const sock: usize = @intCast(fd);
         const rc = ws2_setsockopt(sock, level, opt, payload.ptr, @intCast(payload.len));
