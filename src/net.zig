@@ -144,12 +144,21 @@ pub const UnixStream = @import("net/unix.zig").UnixStream;
 pub const UnixListener = @import("net/unix.zig").UnixListener;
 pub const UnixDatagram = @import("net/unix.zig").UnixDatagram;
 
+/// DNS resolution via `getaddrinfo` bridged through the blocking
+/// pool. See `src/net/resolver.zig`. Sync `getaddrinfo` v1; full
+/// async DNS resolver is a v1.x stretch.
+pub const lookupHost = @import("net/resolver.zig").lookupHost;
+pub const lookupHostFirst = @import("net/resolver.zig").lookupHostFirst;
+pub const connectHost = @import("net/resolver.zig").connectHost;
+pub const LookupError = @import("net/resolver.zig").LookupError;
+
 // Pull in tests from the new sub-files via the test runner.
 test {
     _ = @import("net/address.zig");
     _ = @import("net/options.zig");
     _ = @import("net/udp.zig");
     _ = @import("net/unix.zig");
+    _ = @import("net/resolver.zig");
 }
 
 pub const TcpListener = struct {
