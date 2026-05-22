@@ -135,11 +135,21 @@ pub const Linger = options.Linger;
 /// multicast (IPv4 + IPv6) and broadcast support.
 pub const UdpSocket = @import("net/udp.zig").UdpSocket;
 
+/// Re-exported from `src/net/unix.zig` — Unix domain sockets
+/// (stream + listener + datagram). POSIX-only; each type is
+/// `void` on Windows so misuse fails at compile time with a clean
+/// "expected type" error.
+pub const UnixAddr = @import("net/unix.zig").UnixAddr;
+pub const UnixStream = @import("net/unix.zig").UnixStream;
+pub const UnixListener = @import("net/unix.zig").UnixListener;
+pub const UnixDatagram = @import("net/unix.zig").UnixDatagram;
+
 // Pull in tests from the new sub-files via the test runner.
 test {
     _ = @import("net/address.zig");
     _ = @import("net/options.zig");
     _ = @import("net/udp.zig");
+    _ = @import("net/unix.zig");
 }
 
 pub const TcpListener = struct {
