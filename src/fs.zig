@@ -33,6 +33,15 @@ pub const WalkAction = @import("fs/dir.zig").WalkAction;
 pub const WalkOptions = @import("fs/dir.zig").WalkOptions;
 pub const glob = @import("fs/dir.zig").glob;
 
+pub const MappedFile = @import("fs/mmap.zig").MappedFile;
+pub const MmapProtection = @import("fs/mmap.zig").Protection;
+pub const MmapSharing = @import("fs/mmap.zig").Sharing;
+pub const MmapOptions = @import("fs/mmap.zig").MapOptions;
+pub const MmapAnonOptions = @import("fs/mmap.zig").AnonOptions;
+pub const MmapAdvice = @import("fs/mmap.zig").Advice;
+pub const mapFile = @import("fs/mmap.zig").mapFile;
+pub const mapAnonymous = @import("fs/mmap.zig").mapAnonymous;
+
 pub const FsError = fs_error.FsError;
 pub const FileError = fs_error.FileError;
 
@@ -195,6 +204,7 @@ test {
     _ = @import("fs/error.zig");
     _ = @import("fs/file.zig");
     _ = @import("fs/dir.zig");
+    _ = @import("fs/mmap.zig");
 }
 
 // ─── Tests ───────────────────────────────────────────────────────
