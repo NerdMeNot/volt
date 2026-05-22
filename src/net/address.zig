@@ -382,7 +382,7 @@ pub const Address = struct {
             }
             try writer.print("]:{d}", .{self.port()});
         } else {
-            try writer.print("<unknown family {d}>", .{@intFromEnum(self.storage.family)});
+            try writer.print("<unknown family {d}>", .{self.storage.family});
         }
     }
 };

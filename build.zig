@@ -153,6 +153,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "echo-server", .src = "examples/echo_server.zig", .desc = "TCP echo server (Ctrl-C to stop)" },
         .{ .name = "fan-out", .src = "examples/fan_out.zig", .desc = "Parallel map + heterogeneous joinAll" },
         .{ .name = "rate-limiter", .src = "examples/rate_limiter.zig", .desc = "Bounded concurrency via Semaphore" },
+        .{ .name = "udp-echo", .src = "examples/udp_echo.zig", .desc = "UDP echo round-trip (4 messages)" },
+        .{ .name = "ticker-heartbeat", .src = "examples/ticker_heartbeat.zig", .desc = "Ticker firing every 100ms × 10" },
+        .{ .name = "dns-lookup", .src = "examples/dns_lookup.zig", .desc = "DNS lookup via spawnBlocking" },
     };
     const examples_step = b.step("examples", "Build every example program");
     for (examples) |ex| {
