@@ -12,6 +12,12 @@ const runtime = @import("runtime.zig");
 const current = @import("current.zig");
 
 const AF_INET: c_int = 2;
+const AF_INET6: c_int = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos, .freebsd, .openbsd, .netbsd, .dragonfly => 30,
+    .linux => 10,
+    .windows => 23,
+    else => 10,
+};
 const SOCK_STREAM: c_int = 1;
 const IPPROTO_TCP: c_int = 6;
 
@@ -85,6 +91,7 @@ const c_accept = @extern(*const fn (c_int, ?*anyopaque, ?*c_uint) callconv(.c) c
 const c_connect = @extern(*const fn (c_int, *const anyopaque, c_uint) callconv(.c) c_int, .{ .name = "connect" });
 const setsockopt = @extern(*const fn (c_int, c_int, c_int, *const anyopaque, c_uint) callconv(.c) c_int, .{ .name = "setsockopt" });
 const getsockname = @extern(*const fn (c_int, *anyopaque, *c_uint) callconv(.c) c_int, .{ .name = "getsockname" });
+const getpeername = @extern(*const fn (c_int, *anyopaque, *c_uint) callconv(.c) c_int, .{ .name = "getpeername" });
 const c_close = @extern(*const fn (c_int) callconv(.c) c_int, .{ .name = "close" });
 
 // `errno` accessor — the libc name differs per platform:
@@ -113,65 +120,22 @@ inline fn errnoVal() c_int {
 // platform's backend). The duplicate that used to live here was
 // consolidated as part of the L1 reactor refactor.
 
-pub const Address = struct {
-    /// IPv4 host bytes in host order (192.168.1.1 → {192,168,1,1}).
-    host: [4]u8,
-    /// Port in host order.
-    port: u16,
+/// Re-exported from `src/net/address.zig` — full IPv4 + IPv6
+/// support, posix.sockaddr.storage-backed. See that file for the
+/// complete public surface.
+pub const Address = @import("net/address.zig").Address;
 
-    /// IPv4 loopback (127.0.0.1) at the given port. Use port 0 to
-    /// let the kernel pick (see `TcpListener.localAddress`).
-    pub fn loopback4(port: u16) Address {
-        return .{ .host = .{ 127, 0, 0, 1 }, .port = port };
-    }
+/// Re-exported from `src/net/options.zig` — typed socket-option
+/// helpers (Keepalive, Linger) + free setters/getters.
+pub const options = @import("net/options.zig");
+pub const Keepalive = options.Keepalive;
+pub const Linger = options.Linger;
 
-    /// IPv4 "any" (0.0.0.0) — listen on every interface.
-    pub fn any4(port: u16) Address {
-        return .{ .host = .{ 0, 0, 0, 0 }, .port = port };
-    }
-
-    /// Parse a dotted-quad IPv4 string (`"192.168.1.1"`). Returns
-    /// `error.InvalidAddress` on malformed input. No DNS — that's
-    /// library territory.
-    pub fn parse4(host: []const u8, port: u16) error{InvalidAddress}!Address {
-        var bytes: [4]u8 = undefined;
-        var i: usize = 0;
-        var start: usize = 0;
-        for (host, 0..) |ch, idx| {
-            if (ch == '.') {
-                if (i >= 4 or idx == start) return error.InvalidAddress;
-                bytes[i] = std.fmt.parseInt(u8, host[start..idx], 10) catch return error.InvalidAddress;
-                i += 1;
-                start = idx + 1;
-            }
-        }
-        if (i != 3 or start >= host.len) return error.InvalidAddress;
-        bytes[3] = std.fmt.parseInt(u8, host[start..], 10) catch return error.InvalidAddress;
-        return .{ .host = bytes, .port = port };
-    }
-
-    fn toSockaddr(self: Address) sockaddr_in {
-        const addr_he: u32 = (@as(u32, self.host[0]) << 24) | (@as(u32, self.host[1]) << 16) |
-            (@as(u32, self.host[2]) << 8) | @as(u32, self.host[3]);
-        return .{
-            .port = std.mem.nativeToBig(u16, self.port),
-            .addr = std.mem.nativeToBig(u32, addr_he),
-        };
-    }
-
-    fn fromSockaddr(sa: sockaddr_in) Address {
-        const addr_he = std.mem.bigToNative(u32, sa.addr);
-        return .{
-            .host = .{
-                @intCast((addr_he >> 24) & 0xFF),
-                @intCast((addr_he >> 16) & 0xFF),
-                @intCast((addr_he >> 8) & 0xFF),
-                @intCast(addr_he & 0xFF),
-            },
-            .port = std.mem.bigToNative(u16, sa.port),
-        };
-    }
-};
+// Pull in tests from the new sub-files via the test runner.
+test {
+    _ = @import("net/address.zig");
+    _ = @import("net/options.zig");
+}
 
 pub const TcpListener = struct {
     fd: i32,
@@ -183,9 +147,13 @@ pub const TcpListener = struct {
     iocp_associated: bool = false,
 
     /// Bind a TCP listener at `addr`. Sets SO_REUSEADDR so repeated
-    /// runs don't EADDRINUSE; non-blocking from the start.
+    /// runs don't EADDRINUSE; non-blocking from the start. The
+    /// socket family (AF_INET vs AF_INET6) is chosen from `addr`'s
+    /// family — pass `Address.any4(port)` / `loopback4(port)` for
+    /// IPv4, `any6(port)` / `loopback6(port)` for IPv6.
     pub fn bind(addr: Address) !TcpListener {
-        const fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        const af: c_int = if (addr.isIpv6()) AF_INET6 else AF_INET;
+        const fd = socket(af, SOCK_STREAM, IPPROTO_TCP);
         if (fd < 0) return error.SocketCreateFailed;
         errdefer _ = c_close(fd);
 
@@ -193,8 +161,7 @@ pub const TcpListener = struct {
         const one: c_int = 1;
         _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, @sizeOf(c_int));
 
-        const sa = addr.toSockaddr();
-        if (c_bind(fd, &sa, @sizeOf(sockaddr_in)) < 0) return error.BindFailed;
+        if (c_bind(fd, addr.sockaddr(), addr.len) < 0) return error.BindFailed;
         if (c_listen(fd, 128) < 0) return error.ListenFailed;
         try reactor_mod.setNonblock(@intCast(fd));
         // IOCP association is deferred to first `accept` — bind can
@@ -208,12 +175,33 @@ pub const TcpListener = struct {
         _ = c_close(@intCast(self.fd));
     }
 
+    // ─── Socket options on the listener ──────────────────────────
+
+    /// Enable SO_REUSEPORT. Multiple processes / threads can bind
+    /// the same address; the kernel load-balances incoming
+    /// connections across them. Useful for HTTP servers that fork
+    /// per-CPU workers. Windows maps this to SO_REUSEADDR.
+    pub fn setReusePort(self: *TcpListener, enabled: bool) options.OptionError!void {
+        return options.setReusePort(self.fd, enabled);
+    }
+
+    pub fn setRecvBufferSize(self: *TcpListener, bytes: u32) options.OptionError!void {
+        return options.setRecvBufferSize(self.fd, bytes);
+    }
+
+    pub fn setSendBufferSize(self: *TcpListener, bytes: u32) options.OptionError!void {
+        return options.setSendBufferSize(self.fd, bytes);
+    }
+
     /// Get the bound local address (useful when bind port = 0).
+    /// Reads via `getsockname` into a polymorphic sockaddr.storage,
+    /// so the returned `Address` is whatever family the listener
+    /// was bound on (IPv4, IPv6, dual-stack via `::`).
     pub fn localAddress(self: *const TcpListener) !Address {
-        var sa: sockaddr_in = undefined;
-        var len: c_uint = @sizeOf(sockaddr_in);
-        if (getsockname(@intCast(self.fd), &sa, &len) < 0) return error.GetSockNameFailed;
-        return Address.fromSockaddr(sa);
+        var storage: std.posix.sockaddr.storage = undefined;
+        var len: c_uint = @sizeOf(std.posix.sockaddr.storage);
+        if (getsockname(@intCast(self.fd), &storage, &len) < 0) return error.GetSockNameFailed;
+        return Address.fromSockaddr(@ptrCast(@alignCast(&storage)), len);
     }
 
     /// Accept the next incoming connection. Yields to the reactor on EAGAIN.
@@ -280,7 +268,8 @@ pub const TcpStream = struct {
     fd: i32,
 
     pub fn connect(addr: Address) !TcpStream {
-        const fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        const af: c_int = if (addr.isIpv6()) AF_INET6 else AF_INET;
+        const fd = socket(af, SOCK_STREAM, IPPROTO_TCP);
         if (fd < 0) return error.SocketCreateFailed;
         errdefer _ = c_close(fd);
         try reactor_mod.setNonblock(@intCast(fd));
@@ -289,8 +278,10 @@ pub const TcpStream = struct {
             return connectWindows(fd, addr);
         }
 
-        const sa = addr.toSockaddr();
-        if (c_connect(fd, &sa, @sizeOf(sockaddr_in)) < 0) {
+        // bind on family-specific socket so the kernel chooses the
+        // right protocol stack. Caller created socket with AF_INET;
+        // an IPv6 addr will fail here — that's caught at connect time.
+        if (c_connect(fd, addr.sockaddr(), addr.len) < 0) {
             const e = errnoVal();
             if (e != EINPROGRESS) return error.ConnectFailed;
             // Wait for writable = connect completed.
@@ -312,15 +303,13 @@ pub const TcpStream = struct {
     fn connectWindows(fd: c_int, addr: Address) !TcpStream {
         // Bind to wildcard so ConnectEx's "must be bound" precondition
         // is satisfied. Kernel picks an ephemeral local port.
-        const any_addr = Address{ .host = .{ 0, 0, 0, 0 }, .port = 0 };
-        const any_sa = any_addr.toSockaddr();
-        if (c_bind(fd, &any_sa, @sizeOf(sockaddr_in)) < 0) return error.BindFailed;
+        const any_addr = Address.any4(0);
+        if (c_bind(fd, any_addr.sockaddr(), any_addr.len) < 0) return error.BindFailed;
 
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try rt.reactor.associate(@intCast(fd));
 
-        const sa = addr.toSockaddr();
-        try rt.reactor.submitConnectEx(@intCast(fd), @ptrCast(&sa), @sizeOf(sockaddr_in));
+        try rt.reactor.submitConnectEx(@intCast(fd), @ptrCast(addr.sockaddr()), @intCast(addr.len));
 
         // Same SO_UPDATE_*_CONTEXT requirement as AcceptEx — the
         // socket is unusable for `getpeername` etc until this fires.
@@ -348,6 +337,98 @@ pub const TcpStream = struct {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         return reactor_mod.readFull(&rt.reactor, self.fd, buf);
     }
+
+    // ─── Socket options ─────────────────────────────────────────────
+
+    /// Disable Nagle's algorithm — small writes go out immediately
+    /// rather than coalescing. The right default for latency-
+    /// sensitive protocols (RPC, gaming); the wrong default for
+    /// bulk transfer.
+    pub fn setNoDelay(self: *TcpStream, enabled: bool) options.OptionError!void {
+        return options.setTcpNoDelay(self.fd, enabled);
+    }
+
+    pub fn getNoDelay(self: TcpStream) options.OptionError!bool {
+        return options.getTcpNoDelay(self.fd);
+    }
+
+    /// Enable TCP keepalive with the given (idle, interval, retries)
+    /// schedule. Pass `null` to disable.
+    pub fn setKeepalive(self: *TcpStream, ka: ?Keepalive) options.OptionError!void {
+        return options.setKeepalive(self.fd, ka);
+    }
+
+    pub fn setSendBufferSize(self: *TcpStream, bytes: u32) options.OptionError!void {
+        return options.setSendBufferSize(self.fd, bytes);
+    }
+
+    pub fn setRecvBufferSize(self: *TcpStream, bytes: u32) options.OptionError!void {
+        return options.setRecvBufferSize(self.fd, bytes);
+    }
+
+    pub fn setLinger(self: *TcpStream, linger: ?Linger) options.OptionError!void {
+        return options.setLinger(self.fd, linger);
+    }
+
+    /// Peer's address. Reads via `getpeername`; works after connect
+    /// (sync) or after `accept` (TcpListener fills it).
+    pub fn peerAddress(self: *const TcpStream) !Address {
+        var storage: std.posix.sockaddr.storage = undefined;
+        var len: c_uint = @sizeOf(std.posix.sockaddr.storage);
+        if (getpeername(@intCast(self.fd), &storage, &len) < 0) return error.GetPeerNameFailed;
+        return Address.fromSockaddr(@ptrCast(@alignCast(&storage)), len);
+    }
+
+    /// Local-side address. Reads via `getsockname`.
+    pub fn localAddress(self: *const TcpStream) !Address {
+        var storage: std.posix.sockaddr.storage = undefined;
+        var len: c_uint = @sizeOf(std.posix.sockaddr.storage);
+        if (getsockname(@intCast(self.fd), &storage, &len) < 0) return error.GetSockNameFailed;
+        return Address.fromSockaddr(@ptrCast(@alignCast(&storage)), len);
+    }
+
+    // ─── Half-duplex split (borrowed) ──────────────────────────────
+
+    /// Split into read- and write-half references. Both halves share
+    /// the underlying `TcpStream` lifetime — the caller keeps the
+    /// stream alive (e.g. on its own stack) while both halves are
+    /// in use, typically by passing `&halves.read` and `&halves.write`
+    /// into two coroutines that join before the stream is closed.
+    ///
+    /// No allocation. For owned halves that can move independently
+    /// across coroutines, see `TcpStream.intoSplit` (v1.x).
+    pub fn split(self: *TcpStream) struct { read: ReadHalf, write: WriteHalf } {
+        return .{
+            .read = .{ .stream = self },
+            .write = .{ .stream = self },
+        };
+    }
+
+    pub const ReadHalf = struct {
+        stream: *TcpStream,
+        pub fn read(self: *ReadHalf, buf: []u8) !usize {
+            return self.stream.read(buf);
+        }
+        pub fn readFull(self: *ReadHalf, buf: []u8) !usize {
+            return self.stream.readFull(buf);
+        }
+        pub fn reader(self: *ReadHalf, buf: []u8) TcpStream.Reader {
+            return self.stream.reader(buf);
+        }
+    };
+
+    pub const WriteHalf = struct {
+        stream: *TcpStream,
+        pub fn write(self: *WriteHalf, buf: []const u8) !usize {
+            return self.stream.write(buf);
+        }
+        pub fn writeAll(self: *WriteHalf, buf: []const u8) !void {
+            return self.stream.writeAll(buf);
+        }
+        pub fn writer(self: *WriteHalf, buf: []u8) TcpStream.Writer {
+            return self.stream.writer(buf);
+        }
+    };
 
     /// Construct a `std.Io.Reader` adapter — lets std-library code
     /// (formatters, parsers, anything that takes `*std.Io.Reader`)
@@ -477,7 +558,7 @@ fn testListenerLifecycle() !void {
     var listener = try TcpListener.bind(Address.loopback4(0));
     defer listener.close();
     const addr = try listener.localAddress();
-    if (addr.port == 0) return error.BadPort;
+    if (addr.port() == 0) return error.BadPort;
 }
 
 test "TcpListener: bind + localAddress" {
@@ -629,6 +710,126 @@ fn cancelAcceptRoot(ctx: *CancelAcceptCtx) !void {
     var firer = try rt.spawn(cancelAcceptFirer, .{ctx});
     _ = server.join() catch |err| return err;
     _ = firer.join();
+}
+
+// ─── TCP options + split halves ──────────────────────────────────────
+
+fn testTcpOptionsRoot(_: *void) !void {
+    var listener = try TcpListener.bind(Address.loopback4(0));
+    defer listener.close();
+    // SO_REUSEPORT — should round-trip without error on the listener.
+    try listener.setReusePort(true);
+    try listener.setRecvBufferSize(64 * 1024);
+
+    const local = try listener.localAddress();
+    var client = try TcpStream.connect(local);
+    defer client.close();
+
+    // TCP_NODELAY round-trip + KEEPALIVE configure.
+    try client.setNoDelay(true);
+    try std.testing.expect(try client.getNoDelay());
+    try client.setKeepalive(.{ .idle = 30, .interval = 10, .retries = 3 });
+
+    // peerAddress / localAddress accessors.
+    const peer = try client.peerAddress();
+    try std.testing.expectEqual(local.port(), peer.port());
+}
+
+test "TcpStream: TCP options + peerAddress/localAddress" {
+    var rt = try runtime.Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
+    defer rt.deinit();
+    var dummy: void = {};
+    try (try rt.run(testTcpOptionsRoot, .{&dummy}));
+}
+
+const SplitCtx = struct {
+    listener: *TcpListener,
+    addr: Address = undefined,
+    received: [4]u8 = undefined,
+    server_done: bool = false,
+};
+
+fn splitServer(ctx: *SplitCtx) !void {
+    var stream = try ctx.listener.accept();
+    defer stream.close();
+    var halves = stream.split();
+    _ = try halves.read.readFull(&ctx.received);
+    try halves.write.writeAll(&ctx.received);
+    ctx.server_done = true;
+}
+
+fn splitClient(ctx: *SplitCtx) !void {
+    var stream = try TcpStream.connect(ctx.addr);
+    defer stream.close();
+    var halves = stream.split();
+    try halves.write.writeAll(&[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF });
+    var echo: [4]u8 = undefined;
+    _ = try halves.read.readFull(&echo);
+    try std.testing.expectEqual([_]u8{ 0xDE, 0xAD, 0xBE, 0xEF }, echo);
+}
+
+fn splitRoot(ctx: *SplitCtx) !void {
+    const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var srv = try rt.spawn(splitServer, .{ctx});
+    var cli = try rt.spawn(splitClient, .{ctx});
+    _ = srv.join() catch |e| return e;
+    _ = cli.join() catch |e| return e;
+}
+
+test "TcpStream.split: borrowed halves echo round-trip" {
+    var rt = try runtime.Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
+    defer rt.deinit();
+    var listener = try TcpListener.bind(Address.loopback4(0));
+    defer listener.close();
+    var ctx = SplitCtx{ .listener = &listener };
+    ctx.addr = try listener.localAddress();
+    try (try rt.run(splitRoot, .{&ctx}));
+    try std.testing.expect(ctx.server_done);
+}
+
+// ─── IPv6 round-trip ───────────────────────────────────────────────
+
+fn ipv6EchoServer(ctx: *EchoTestCtx) !void {
+    var stream = try ctx.listener.accept();
+    defer stream.close();
+    var buf: [4]u8 = undefined;
+    _ = try stream.readFull(&buf);
+    try stream.writeAll(&buf);
+    ctx.server_done = true;
+}
+
+fn ipv6EchoClient(ctx: *EchoTestCtx) !void {
+    var stream = try TcpStream.connect(ctx.addr);
+    defer stream.close();
+    try stream.writeAll(&[_]u8{ 1, 2, 3, 4 });
+    var got: [4]u8 = undefined;
+    _ = try stream.readFull(&got);
+    ctx.result_byte = got[3];
+    ctx.client_done = true;
+}
+
+fn ipv6EchoRoot(ctx: *EchoTestCtx) !void {
+    const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var s = try rt.spawn(ipv6EchoServer, .{ctx});
+    var c = try rt.spawn(ipv6EchoClient, .{ctx});
+    _ = s.join() catch |e| return e;
+    _ = c.join() catch |e| return e;
+}
+
+test "TCP echo over IPv6 loopback (::1)" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var rt = try runtime.Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
+    defer rt.deinit();
+
+    var listener = try TcpListener.bind(Address.loopback6(0));
+    defer listener.close();
+    var ctx = EchoTestCtx{ .listener = &listener };
+    ctx.addr = try listener.localAddress();
+    try (try rt.run(ipv6EchoRoot, .{&ctx}));
+
+    try std.testing.expect(ctx.server_done);
+    try std.testing.expect(ctx.client_done);
+    try std.testing.expectEqual(@as(u8, 4), ctx.result_byte);
 }
 
 test "reactor: waitReadableCancel wakes a parked accept on Cancel.fire" {
