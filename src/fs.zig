@@ -27,6 +27,12 @@ pub const PlatformStat = @import("fs/metadata.zig").PlatformStat;
 pub const File = @import("fs/file.zig").File;
 pub const OpenOptions = @import("fs/file.zig").OpenOptions;
 
+pub const Dir = @import("fs/dir.zig").Dir;
+pub const DirEntry = @import("fs/dir.zig").Entry;
+pub const WalkAction = @import("fs/dir.zig").WalkAction;
+pub const WalkOptions = @import("fs/dir.zig").WalkOptions;
+pub const glob = @import("fs/dir.zig").glob;
+
 pub const FsError = fs_error.FsError;
 pub const FileError = fs_error.FileError;
 
@@ -188,6 +194,7 @@ test {
     _ = @import("fs/syscall.zig");
     _ = @import("fs/error.zig");
     _ = @import("fs/file.zig");
+    _ = @import("fs/dir.zig");
 }
 
 // ─── Tests ───────────────────────────────────────────────────────
