@@ -24,6 +24,9 @@ pub const Permissions = @import("fs/metadata.zig").Permissions;
 pub const SystemTime = @import("fs/metadata.zig").SystemTime;
 pub const PlatformStat = @import("fs/metadata.zig").PlatformStat;
 
+pub const File = @import("fs/file.zig").File;
+pub const OpenOptions = @import("fs/file.zig").OpenOptions;
+
 pub const FsError = fs_error.FsError;
 pub const FileError = fs_error.FileError;
 
@@ -184,6 +187,7 @@ test {
     _ = @import("fs/metadata.zig");
     _ = @import("fs/syscall.zig");
     _ = @import("fs/error.zig");
+    _ = @import("fs/file.zig");
 }
 
 // ─── Tests ───────────────────────────────────────────────────────

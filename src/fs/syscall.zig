@@ -138,10 +138,21 @@ pub const c_close = if (is_windows) {} else @extern(
     *const fn (c_int) callconv(.c) c_int,
     .{ .name = "close" },
 );
-pub const c_open = if (is_windows) {} else @extern(
-    *const fn ([*:0]const u8, c_int, std.c.mode_t) callconv(.c) c_int,
-    .{ .name = "open" },
-);
+// `open` is variadic in libc — `int open(const char *, int, ...)`.
+// On Darwin arm64 the variadic and non-variadic ABIs differ (varargs
+// go on the stack, regulars in registers), so we MUST declare it
+// variadic or the third arg (mode) is silently dropped.
+//
+// Zig's `extern "c" fn foo(...) ...` syntax supports varargs via
+// the literal `...` in the parameter list. @extern doesn't take a
+// var-arg type, so we declare via top-level `pub extern fn`.
+pub extern "c" fn open(path: [*:0]const u8, oflag: c_int, ...) c_int;
+
+/// Wrapper preserving the prior `c_open(path, flags, mode)` shape.
+pub fn c_open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int {
+    if (is_windows) @compileError("c_open not available on Windows");
+    return open(path, flags, mode);
+}
 pub const c_write = if (is_windows) {} else @extern(
     *const fn (c_int, [*]const u8, usize) callconv(.c) isize,
     .{ .name = "write" },
