@@ -98,6 +98,21 @@ pub const Instant = struct {
     }
 };
 
+// ─── Re-exports for volt.time submodule ──────────────────────────────
+
+pub const Timer = @import("time/timer.zig").Timer;
+pub const Ticker = @import("time/ticker.zig").Ticker;
+pub const MissedTickBehavior = @import("time/ticker.zig").MissedTickBehavior;
+pub const afterFunc = @import("time/after.zig").afterFunc;
+pub const afterFuncCancel = @import("time/after.zig").afterFuncCancel;
+
+// Force discovery of tests in sub-files (see fs.zig for rationale).
+test {
+    _ = @import("time/timer.zig");
+    _ = @import("time/ticker.zig");
+    _ = @import("time/after.zig");
+}
+
 // ─── Per-platform monotonic clock ────────────────────────────────
 
 fn nowPosix() Instant {

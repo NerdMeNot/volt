@@ -34,6 +34,7 @@
 pub const channel = @import("channel.zig");
 pub const sync = @import("sync.zig");
 pub const net = @import("net.zig");
+pub const fs = @import("fs.zig");
 
 /// Categorical I/O error vocabulary. Every `readAsync` / `writeAsync`
 /// / `readFull` / `writeAll` call returns an `IoError`; the
@@ -51,6 +52,11 @@ pub const ReactorSetupError = @import("reactor.zig").ReactorSetupError;
 pub const time = @import("time.zig");
 pub const Duration = time.Duration;
 pub const Instant = time.Instant;
+pub const Timer = time.Timer;
+pub const Ticker = time.Ticker;
+pub const MissedTickBehavior = time.MissedTickBehavior;
+pub const afterFunc = time.afterFunc;
+pub const afterFuncCancel = time.afterFuncCancel;
 
 /// Threadlocal "current coroutine" lookup.
 pub const current = @import("current.zig");
@@ -625,6 +631,7 @@ test {
     _ = @import("cancel.zig");
     _ = @import("time.zig");
     _ = @import("select.zig");
+    _ = @import("fs.zig");
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
