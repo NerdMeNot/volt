@@ -110,6 +110,13 @@ pub const Reactor = union(Backend) {
         };
     }
 
+    pub fn interrupt(self: *Reactor) void {
+        switch (self.*) {
+            .epoll => |*r| r.interrupt(),
+            .io_uring => |*r| r.interrupt(),
+        }
+    }
+
     pub fn cancelCoro(self: *Reactor, c: *@import("coroutine.zig").Coroutine) void {
         switch (self.*) {
             .epoll => |*r| r.cancelCoro(c),

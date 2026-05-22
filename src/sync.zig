@@ -314,6 +314,519 @@ pub const Mutex = struct {
 };
 
 // ─────────────────────────────────────────────────────────────────────
+// RwLock — multiple-readers OR single-writer
+// ─────────────────────────────────────────────────────────────────────
+//
+// State word (atomic u32):
+//   bits 0-29 (30 bits): active reader count (~1 billion max)
+//   bit 30: WRITER_WAITING — ≥1 writer parked / in slow path
+//   bit 31: WRITER_HELD — a writer holds the lock exclusively
+//
+// Parking key: `&self.state` (single key; readers + writers park
+// here, validators sort out who can proceed). Wakes use
+// `unparkAll` so woken readers can rush in together; woken writers
+// re-CAS for WRITER_HELD. This trades a little wake-thrash under
+// contention for a very small state-machine — the parking-lot
+// queue stays the only data structure that holds waiters.
+
+pub const RwLock = struct {
+    state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    const WRITER_HELD: u32 = 1 << 31;
+    const WRITER_WAITING: u32 = 1 << 30;
+    const READER_MASK: u32 = (1 << 30) - 1;
+    const SPIN_LIMIT: u32 = 40;
+
+    pub fn init() RwLock {
+        return .{};
+    }
+
+    pub fn deinit(self: *RwLock) void {
+        _ = self;
+    }
+
+    /// Acquire shared (read) access. Blocks while a writer holds
+    /// or is waiting.
+    pub fn readLock(self: *RwLock) void {
+        if (self.tryReadLockFast()) return;
+        self.readLockSlow();
+    }
+
+    inline fn tryReadLockFast(self: *RwLock) bool {
+        const s = self.state.load(.monotonic);
+        if (s & (WRITER_HELD | WRITER_WAITING) != 0) return false;
+        return self.state.cmpxchgWeak(s, s + 1, .acquire, .monotonic) == null;
+    }
+
+    fn readLockSlow(self: *RwLock) void {
+        @branchHint(.cold);
+        var spin: u32 = 0;
+        while (true) {
+            const s = self.state.load(.monotonic);
+            if (s & (WRITER_HELD | WRITER_WAITING) == 0) {
+                if (self.state.cmpxchgWeak(s, s + 1, .acquire, .monotonic) == null) return;
+                continue;
+            }
+            if (spin < SPIN_LIMIT) {
+                std.atomic.spinLoopHint();
+                spin += 1;
+                continue;
+            }
+            park.parkOn(&self.state, readValidator);
+            spin = 0;
+        }
+    }
+
+    /// Try to acquire a read lock without blocking. Returns true
+    /// on success.
+    pub fn tryReadLock(self: *RwLock) bool {
+        return self.tryReadLockFast();
+    }
+
+    /// Cancel-aware read lock. Returns `error.Cancelled` if the
+    /// cancel fires while parked.
+    pub fn readLockCancel(self: *RwLock, c: *cancel_mod.Cancel) cancel_mod.Error!void {
+        if (c.isFired()) return error.Cancelled;
+        if (self.tryReadLockFast()) return;
+        return self.readLockCancelSlow(c);
+    }
+
+    fn readLockCancelSlow(self: *RwLock, c: *cancel_mod.Cancel) cancel_mod.Error!void {
+        @branchHint(.cold);
+        var spin: u32 = 0;
+        while (true) {
+            if (c.isFired()) return error.Cancelled;
+            const s = self.state.load(.monotonic);
+            if (s & (WRITER_HELD | WRITER_WAITING) == 0) {
+                if (self.state.cmpxchgWeak(s, s + 1, .acquire, .monotonic) == null) return;
+                continue;
+            }
+            if (spin < SPIN_LIMIT) {
+                std.atomic.spinLoopHint();
+                spin += 1;
+                continue;
+            }
+
+            var waiter: cancel_mod.Waiter = .{};
+            if (c.register(&waiter, @intFromPtr(&self.state))) return error.Cancelled;
+            const me = current.require();
+            me.cancel_in_flight = @ptrCast(c);
+            park.parkOn(&self.state, readValidator);
+            me.cancel_in_flight = null;
+            c.deregister(&waiter);
+            if (c.isFired()) return error.Cancelled;
+            spin = 0;
+        }
+    }
+
+    /// Release a previously-acquired read lock. Last reader out
+    /// with a writer waiting wakes the wait queue.
+    pub fn readUnlock(self: *RwLock) void {
+        const prev = self.state.fetchSub(1, .release);
+        // If we were the last reader and a writer is waiting, wake.
+        // `unparkAll` (vs One) is intentional — parked readers
+        // re-check via their validator and re-park if needed; the
+        // writer wakes and races for WRITER_HELD.
+        if ((prev & READER_MASK) == 1 and (prev & WRITER_WAITING) != 0) {
+            const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+            _ = park.unparkAll(rt, &self.state);
+        }
+    }
+
+    /// Acquire exclusive (write) access. Blocks while any reader or
+    /// another writer holds.
+    pub fn writeLock(self: *RwLock) void {
+        if (self.state.cmpxchgStrong(0, WRITER_HELD, .acquire, .monotonic) == null) return;
+        self.writeLockSlow();
+    }
+
+    fn writeLockSlow(self: *RwLock) void {
+        @branchHint(.cold);
+        var spin: u32 = 0;
+        while (true) {
+            const s = self.state.load(.monotonic);
+            // Free / only-other-writers-waiting → try to claim.
+            if (s == 0) {
+                if (self.state.cmpxchgWeak(0, WRITER_HELD, .acquire, .monotonic) == null) return;
+                continue;
+            }
+            if (s == WRITER_WAITING) {
+                if (self.state.cmpxchgWeak(WRITER_WAITING, WRITER_HELD | WRITER_WAITING, .acquire, .monotonic) == null) return;
+                continue;
+            }
+            // Otherwise: holders present. Ensure WRITER_WAITING is set
+            // so future readers park.
+            if (s & WRITER_WAITING == 0) {
+                if (self.state.cmpxchgWeak(s, s | WRITER_WAITING, .monotonic, .monotonic) != null) continue;
+            }
+            if (spin < SPIN_LIMIT) {
+                std.atomic.spinLoopHint();
+                spin += 1;
+                continue;
+            }
+            park.parkOn(&self.state, writeValidator);
+            spin = 0;
+        }
+    }
+
+    /// Try to acquire a write lock without blocking.
+    pub fn tryWriteLock(self: *RwLock) bool {
+        return self.state.cmpxchgStrong(0, WRITER_HELD, .acquire, .monotonic) == null;
+    }
+
+    /// Cancel-aware write lock.
+    pub fn writeLockCancel(self: *RwLock, c: *cancel_mod.Cancel) cancel_mod.Error!void {
+        if (c.isFired()) return error.Cancelled;
+        if (self.state.cmpxchgStrong(0, WRITER_HELD, .acquire, .monotonic) == null) return;
+        return self.writeLockCancelSlow(c);
+    }
+
+    fn writeLockCancelSlow(self: *RwLock, c: *cancel_mod.Cancel) cancel_mod.Error!void {
+        @branchHint(.cold);
+        var spin: u32 = 0;
+        while (true) {
+            if (c.isFired()) return error.Cancelled;
+            const s = self.state.load(.monotonic);
+            if (s == 0) {
+                if (self.state.cmpxchgWeak(0, WRITER_HELD, .acquire, .monotonic) == null) return;
+                continue;
+            }
+            if (s == WRITER_WAITING) {
+                if (self.state.cmpxchgWeak(WRITER_WAITING, WRITER_HELD | WRITER_WAITING, .acquire, .monotonic) == null) return;
+                continue;
+            }
+            if (s & WRITER_WAITING == 0) {
+                if (self.state.cmpxchgWeak(s, s | WRITER_WAITING, .monotonic, .monotonic) != null) continue;
+            }
+            if (spin < SPIN_LIMIT) {
+                std.atomic.spinLoopHint();
+                spin += 1;
+                continue;
+            }
+
+            var waiter: cancel_mod.Waiter = .{};
+            if (c.register(&waiter, @intFromPtr(&self.state))) return error.Cancelled;
+            const me = current.require();
+            me.cancel_in_flight = @ptrCast(c);
+            park.parkOn(&self.state, writeValidator);
+            me.cancel_in_flight = null;
+            c.deregister(&waiter);
+            if (c.isFired()) return error.Cancelled;
+            spin = 0;
+        }
+    }
+
+    /// Release a write lock. Wakes everyone parked on the state
+    /// word; readers and the next writer race for entry via their
+    /// validators + CAS.
+    pub fn writeUnlock(self: *RwLock) void {
+        // Common case: no waiters → just clear and done.
+        if (self.state.cmpxchgStrong(WRITER_HELD, 0, .release, .monotonic) == null) return;
+        self.writeUnlockSlow();
+    }
+
+    fn writeUnlockSlow(self: *RwLock) void {
+        @branchHint(.cold);
+        // state was WRITER_HELD | WRITER_WAITING. Drop WRITER_HELD,
+        // keep WRITER_WAITING (the queued writers re-claim it
+        // themselves on the next CAS). All parked waiters re-evaluate.
+        _ = self.state.fetchAnd(~WRITER_HELD, .release);
+        const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+        _ = park.unparkAll(rt, &self.state);
+    }
+
+    fn readValidator(addr: *const anyopaque) bool {
+        if (currentCancelFired()) return false;
+        const sp: *const std.atomic.Value(u32) = @ptrCast(@alignCast(addr));
+        const s = sp.load(.acquire);
+        // Keep parking iff a writer holds OR a writer is waiting.
+        return (s & (WRITER_HELD | WRITER_WAITING)) != 0;
+    }
+
+    fn writeValidator(addr: *const anyopaque) bool {
+        if (currentCancelFired()) return false;
+        const sp: *const std.atomic.Value(u32) = @ptrCast(@alignCast(addr));
+        const s = sp.load(.acquire);
+        // Keep parking iff there's a holder. State == 0 or
+        // WRITER_WAITING-only means we can race to acquire.
+        return !(s == 0 or s == WRITER_WAITING);
+    }
+};
+
+/// Shared helper for sync primitives' validators — checks
+/// whether the currently-running coroutine has a `Cancel`
+/// in flight that has fired.
+inline fn currentCancelFired() bool {
+    if (current.get()) |me| {
+        if (me.cancel_in_flight) |cp| {
+            const c: *cancel_mod.Cancel = @ptrCast(@alignCast(cp));
+            return c.isFired();
+        }
+    }
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// OnceCell(T) — lazy single-init
+// ─────────────────────────────────────────────────────────────────────
+//
+// State word:
+//   0 = EMPTY   (no init started)
+//   1 = INIT_IN_FLIGHT (some coroutine is inside `init_fn`)
+//   2 = INITIALIZED (value is published)
+//
+// Init is one-shot: the first `get` caller CAS-claims the slot,
+// runs `init_fn`, stores the value, and unparks any followers.
+// The followers see INIT_IN_FLIGHT and park on `&self.state`
+// until the initial caller publishes.
+//
+// Cancel applies only to the *parking* side — `init_fn` itself
+// runs to completion, matching Tokio's semantics: interrupting
+// the initializer mid-flight would leave the cell wedged with
+// no clean recovery.
+
+pub fn OnceCell(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        const EMPTY: u32 = 0;
+        const INIT_IN_FLIGHT: u32 = 1;
+        const INITIALIZED: u32 = 2;
+
+        state: std.atomic.Value(u32) = std.atomic.Value(u32).init(EMPTY),
+        value: T = undefined,
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        pub fn deinit(self: *Self) void {
+            _ = self;
+        }
+
+        /// Returns true if the cell has been initialized — useful
+        /// for cheap non-blocking checks.
+        pub inline fn isInitialized(self: *const Self) bool {
+            return self.state.load(.acquire) == INITIALIZED;
+        }
+
+        /// Returns the cell's value, calling `init_fn(init_ctx)`
+        /// to compute it on the first call (across all callers).
+        /// Concurrent callers block on `&self.state` until the
+        /// first caller's `init_fn` returns.
+        pub fn get(self: *Self, init_ctx: anytype, comptime init_fn: anytype) T {
+            // Fast path: already initialized.
+            if (self.state.load(.acquire) == INITIALIZED) return self.value;
+            return self.getSlow(init_ctx, init_fn);
+        }
+
+        fn getSlow(self: *Self, init_ctx: anytype, comptime init_fn: anytype) T {
+            @branchHint(.cold);
+            while (true) {
+                const s = self.state.load(.acquire);
+                if (s == INITIALIZED) return self.value;
+                if (s == EMPTY) {
+                    if (self.state.cmpxchgStrong(EMPTY, INIT_IN_FLIGHT, .acquire, .acquire) == null) {
+                        // We own the init.
+                        self.value = init_fn(init_ctx);
+                        self.state.store(INITIALIZED, .release);
+                        const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+                        _ = park.unparkAll(rt, &self.state);
+                        return self.value;
+                    }
+                    continue;
+                }
+                // INIT_IN_FLIGHT — park.
+                park.parkOn(&self.state, onceValidator);
+            }
+        }
+
+        /// Cancel-aware variant. Only affects waiters parked on a
+        /// concurrent initializer — never interrupts `init_fn` if
+        /// the calling coro is the one doing the init.
+        pub fn getCancel(self: *Self, init_ctx: anytype, comptime init_fn: anytype, c: *cancel_mod.Cancel) cancel_mod.Error!T {
+            if (self.state.load(.acquire) == INITIALIZED) return self.value;
+            return self.getCancelSlow(init_ctx, init_fn, c);
+        }
+
+        fn getCancelSlow(self: *Self, init_ctx: anytype, comptime init_fn: anytype, c: *cancel_mod.Cancel) cancel_mod.Error!T {
+            @branchHint(.cold);
+            while (true) {
+                if (c.isFired()) return error.Cancelled;
+                const s = self.state.load(.acquire);
+                if (s == INITIALIZED) return self.value;
+                if (s == EMPTY) {
+                    if (self.state.cmpxchgStrong(EMPTY, INIT_IN_FLIGHT, .acquire, .acquire) == null) {
+                        // We own the init — runs to completion
+                        // even if cancel fires.
+                        self.value = init_fn(init_ctx);
+                        self.state.store(INITIALIZED, .release);
+                        const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+                        _ = park.unparkAll(rt, &self.state);
+                        return self.value;
+                    }
+                    continue;
+                }
+
+                var waiter: cancel_mod.Waiter = .{};
+                if (c.register(&waiter, @intFromPtr(&self.state))) return error.Cancelled;
+                const me = current.require();
+                me.cancel_in_flight = @ptrCast(c);
+                park.parkOn(&self.state, onceValidator);
+                me.cancel_in_flight = null;
+                c.deregister(&waiter);
+                if (c.isFired()) return error.Cancelled;
+            }
+        }
+
+        fn onceValidator(addr: *const anyopaque) bool {
+            if (currentCancelFired()) return false;
+            const sp: *const std.atomic.Value(u32) = @ptrCast(@alignCast(addr));
+            return sp.load(.acquire) == INIT_IN_FLIGHT;
+        }
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Barrier — N-way cyclic rendezvous
+// ─────────────────────────────────────────────────────────────────────
+//
+// Each `arrive` decrements `remaining`. When `remaining` reaches
+// 0, all parked siblings wake (and `remaining` resets to N for
+// the next cycle — Barrier is cyclic, matching the C/POSIX
+// pthread_barrier_t shape).
+//
+// Each cycle bumps `generation`. Parked coroutines remember the
+// generation they entered on; the validator keeps them parked
+// only while `remaining > 0 AND generation == entry_gen`. This
+// avoids the classic "early arrivers from cycle N+1 race with
+// late wake of cycle N" hazard.
+
+pub const Barrier = struct {
+    /// Packed state — high 16 bits: generation counter (wraps);
+    /// low 16 bits: `remaining` arrivals for the current cycle.
+    /// Atomic so multi-worker `arrive`s race correctly.
+    state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    n: u16,
+
+    const REMAINING_MASK: u32 = 0xFFFF;
+    const GEN_SHIFT: u5 = 16;
+
+    pub fn init(n: u32) Barrier {
+        std.debug.assert(n > 0 and n <= std.math.maxInt(u16));
+        return .{ .n = @intCast(n), .state = std.atomic.Value(u32).init(n) };
+    }
+
+    pub fn deinit(self: *Barrier) void {
+        _ = self;
+    }
+
+    /// Block until N-1 other coroutines have also arrived. The
+    /// last arrival wakes all and rolls the generation.
+    pub fn arrive(self: *Barrier) void {
+        // Snapshot generation under which we entered.
+        const entry_state = self.state.load(.acquire);
+        const entry_gen = entry_state >> GEN_SHIFT;
+
+        // Decrement remaining.
+        const prev = self.state.fetchSub(1, .acq_rel);
+        const prev_remaining = prev & REMAINING_MASK;
+        if (prev_remaining == 1) {
+            // We're the last arrival — reset remaining to n,
+            // bump generation, wake everyone.
+            const new_gen = ((prev >> GEN_SHIFT) + 1) & 0xFFFF;
+            self.state.store((new_gen << GEN_SHIFT) | @as(u32, self.n), .release);
+            const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+            _ = park.unparkAll(rt, &self.state);
+            return;
+        }
+
+        // Not last — park until generation rolls.
+        var ctx = BarrierWaitCtx{ .entry_gen = entry_gen };
+        const me = current.require();
+        // Stash the entry_gen so the validator can compare. We
+        // reuse `cancel_in_flight` as a generic scratch slot —
+        // safe because validators only fire on the parked coro
+        // and we restore null on exit.
+        const saved = me.cancel_in_flight;
+        me.cancel_in_flight = @ptrCast(&ctx);
+        park.parkOn(&self.state, barrierValidator);
+        me.cancel_in_flight = saved;
+    }
+
+    /// Cancel-aware variant. If the cancel fires while parked,
+    /// the coro returns `error.Cancelled` and the barrier
+    /// counter is rolled back so the remaining N-1 cohort can
+    /// still rendezvous.
+    pub fn arriveCancel(self: *Barrier, c: *cancel_mod.Cancel) cancel_mod.Error!void {
+        if (c.isFired()) return error.Cancelled;
+
+        const entry_state = self.state.load(.acquire);
+        const entry_gen = entry_state >> GEN_SHIFT;
+        const prev = self.state.fetchSub(1, .acq_rel);
+        const prev_remaining = prev & REMAINING_MASK;
+        if (prev_remaining == 1) {
+            const new_gen = ((prev >> GEN_SHIFT) + 1) & 0xFFFF;
+            self.state.store((new_gen << GEN_SHIFT) | @as(u32, self.n), .release);
+            const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+            _ = park.unparkAll(rt, &self.state);
+            return;
+        }
+
+        var waiter: cancel_mod.Waiter = .{};
+        if (c.register(&waiter, @intFromPtr(&self.state))) {
+            // Cancel already fired — roll back our arrival so
+            // the remaining cohort still rendezvouses.
+            _ = self.state.fetchAdd(1, .acq_rel);
+            return error.Cancelled;
+        }
+
+        const me = current.require();
+        const saved = me.cancel_in_flight;
+        var ctx = BarrierCancelWaitCtx{ .entry_gen = entry_gen, .cancel = c };
+        me.cancel_in_flight = @ptrCast(&ctx);
+        park.parkOn(&self.state, barrierCancelValidator);
+        me.cancel_in_flight = saved;
+        c.deregister(&waiter);
+
+        if (c.isFired()) {
+            // Cancel fired while parked. Roll back our decrement
+            // so the barrier doesn't release the cohort short.
+            _ = self.state.fetchAdd(1, .acq_rel);
+            return error.Cancelled;
+        }
+    }
+};
+
+const BarrierWaitCtx = struct {
+    entry_gen: u32,
+};
+
+const BarrierCancelWaitCtx = struct {
+    entry_gen: u32,
+    cancel: *cancel_mod.Cancel,
+};
+
+fn barrierValidator(addr: *const anyopaque) bool {
+    const me = current.get() orelse return false;
+    const ctx_ptr = me.cancel_in_flight orelse return false;
+    const ctx: *const BarrierWaitCtx = @ptrCast(@alignCast(ctx_ptr));
+    const sp: *const std.atomic.Value(u32) = @ptrCast(@alignCast(addr));
+    const s = sp.load(.acquire);
+    // Keep parking iff generation hasn't rolled forward.
+    return (s >> Barrier.GEN_SHIFT) == ctx.entry_gen;
+}
+
+fn barrierCancelValidator(addr: *const anyopaque) bool {
+    const me = current.get() orelse return false;
+    const ctx_ptr = me.cancel_in_flight orelse return false;
+    const ctx: *const BarrierCancelWaitCtx = @ptrCast(@alignCast(ctx_ptr));
+    if (ctx.cancel.isFired()) return false;
+    const sp: *const std.atomic.Value(u32) = @ptrCast(@alignCast(addr));
+    const s = sp.load(.acquire);
+    return (s >> Barrier.GEN_SHIFT) == ctx.entry_gen;
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Notify — one-shot or broadcast signal
 // ─────────────────────────────────────────────────────────────────────
 //
@@ -465,10 +978,9 @@ pub const Semaphore = struct {
 // is a special configuration check, not the default test fixture.
 // ─────────────────────────────────────────────────────────────────────
 
-// See note in src/runtime.zig: std.testing.allocator's stack-trace
-// capture corrupts under multi-worker spawn. smp_allocator is the
-// thread-safe choice for runtime-touching tests.
-const test_allocator = std.heap.smp_allocator;
+// `volt.testing.allocator` — leak-detecting + multi-worker-safe.
+// See src/testing.zig for why std.testing.allocator doesn't fit.
+const test_allocator = @import("testing.zig").allocator;
 const Runtime = runtime.Runtime;
 
 // Mutex test — N concurrent coros each incrementing a shared counter.
@@ -676,4 +1188,172 @@ test "Semaphore: 100 coros acquire/release with cap=3, multi-worker" {
 
     try std.testing.expectEqual(@as(u32, 100), counter.load(.acquire));
     try std.testing.expectEqual(@as(u32, 3), sem.permits.load(.acquire));
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// RwLock tests
+// ─────────────────────────────────────────────────────────────────────
+
+const RwCtx = struct {
+    rw: *RwLock,
+    counter: *u64,
+    reads_done: *std.atomic.Value(u32),
+    writes_done: *std.atomic.Value(u32),
+};
+
+fn rwReader(ctx: *RwCtx) void {
+    var i: u32 = 0;
+    while (i < 10) : (i += 1) {
+        ctx.rw.readLock();
+        _ = ctx.counter.*;
+        ctx.rw.readUnlock();
+    }
+    _ = ctx.reads_done.fetchAdd(1, .acq_rel);
+}
+
+fn rwWriter(ctx: *RwCtx) void {
+    var i: u32 = 0;
+    while (i < 10) : (i += 1) {
+        ctx.rw.writeLock();
+        ctx.counter.* += 1;
+        ctx.rw.writeUnlock();
+    }
+    _ = ctx.writes_done.fetchAdd(1, .acq_rel);
+}
+
+fn rwTestRoot(ctx: *RwCtx) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var readers: [4]*@import("task.zig").Task(void) = undefined;
+    var writers: [4]*@import("task.zig").Task(void) = undefined;
+    for (&readers) |*t| t.* = try rt.spawn(rwReader, .{ctx});
+    for (&writers) |*t| t.* = try rt.spawn(rwWriter, .{ctx});
+    for (readers) |t| t.join();
+    for (writers) |t| t.join();
+}
+
+test "RwLock: 4 readers x 4 writers, multi-worker counter sanity" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
+    defer rt.deinit();
+    var rw = RwLock.init();
+    defer rw.deinit();
+    var counter: u64 = 0;
+    var reads_done = std.atomic.Value(u32).init(0);
+    var writes_done = std.atomic.Value(u32).init(0);
+    var ctx = RwCtx{
+        .rw = &rw,
+        .counter = &counter,
+        .reads_done = &reads_done,
+        .writes_done = &writes_done,
+    };
+    try (try rt.run(rwTestRoot, .{&ctx}));
+    // Each writer adds 10; 4 writers × 10 increments → counter == 40.
+    try std.testing.expectEqual(@as(u64, 40), counter);
+    try std.testing.expectEqual(@as(u32, 4), reads_done.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 4), writes_done.load(.acquire));
+}
+
+const RwCancelCtx = struct {
+    rw: *RwLock,
+    cancel: *cancel_mod.Cancel,
+    got: ?anyerror = null,
+};
+
+fn rwCancelReader(ctx: *RwCancelCtx) void {
+    const r = ctx.rw.readLockCancel(ctx.cancel);
+    ctx.got = if (r) |_| null else |e| e;
+}
+
+fn rwCancelRoot(ctx: *RwCancelCtx) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    // Writer holds — reader can't get in.
+    ctx.rw.writeLock();
+    var reader = try rt.spawn(rwCancelReader, .{ctx});
+    // Yield enough that the reader parks.
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) runtime.yield();
+    ctx.cancel.fire();
+    _ = reader.join();
+    ctx.rw.writeUnlock();
+}
+
+test "RwLock.readLockCancel: fires while parked, returns Cancelled" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
+    defer rt.deinit();
+    var rw = RwLock.init();
+    defer rw.deinit();
+    var c = cancel_mod.Cancel.init(rt);
+    defer c.deinit();
+    var ctx = RwCancelCtx{ .rw = &rw, .cancel = &c };
+    try (try rt.run(rwCancelRoot, .{&ctx}));
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), ctx.got);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// OnceCell + Barrier tests
+// ─────────────────────────────────────────────────────────────────────
+
+const OnceInitCount = struct { calls: std.atomic.Value(u32) = std.atomic.Value(u32).init(0) };
+fn onceInitFn(ctx: *OnceInitCount) u32 {
+    _ = ctx.calls.fetchAdd(1, .acq_rel);
+    return 0x42;
+}
+
+const OnceCtx = struct {
+    cell: *OnceCell(u32),
+    init_ctx: *OnceInitCount,
+    results: [8]u32 = .{0} ** 8,
+};
+
+fn onceGetter(ctx: *OnceCtx, idx: u32) void {
+    ctx.results[idx] = ctx.cell.get(ctx.init_ctx, onceInitFn);
+}
+
+fn onceTestRoot(ctx: *OnceCtx) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var tasks: [8]*@import("task.zig").Task(void) = undefined;
+    for (&tasks, 0..) |*t, i| t.* = try rt.spawn(onceGetter, .{ ctx, @as(u32, @intCast(i)) });
+    for (tasks) |t| t.join();
+}
+
+test "OnceCell: init_fn runs exactly once under contention" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
+    defer rt.deinit();
+    var cell = OnceCell(u32){};
+    var init_ctx = OnceInitCount{};
+    var ctx = OnceCtx{ .cell = &cell, .init_ctx = &init_ctx };
+    try (try rt.run(onceTestRoot, .{&ctx}));
+    try std.testing.expectEqual(@as(u32, 1), init_ctx.calls.load(.acquire));
+    for (ctx.results) |r| try std.testing.expectEqual(@as(u32, 0x42), r);
+}
+
+const BarrierCtx = struct {
+    bar: *Barrier,
+    arrived: *std.atomic.Value(u32),
+    passed: *std.atomic.Value(u32),
+};
+
+fn barrierArrival(ctx: *BarrierCtx) void {
+    _ = ctx.arrived.fetchAdd(1, .acq_rel);
+    ctx.bar.arrive();
+    _ = ctx.passed.fetchAdd(1, .acq_rel);
+}
+
+fn barrierTestRoot(ctx: *BarrierCtx) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var tasks: [4]*@import("task.zig").Task(void) = undefined;
+    for (&tasks) |*t| t.* = try rt.spawn(barrierArrival, .{ctx});
+    for (tasks) |t| t.join();
+}
+
+test "Barrier: 4-way rendezvous releases all arrivals together" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
+    defer rt.deinit();
+    var bar = Barrier.init(4);
+    defer bar.deinit();
+    var arrived = std.atomic.Value(u32).init(0);
+    var passed = std.atomic.Value(u32).init(0);
+    var ctx = BarrierCtx{ .bar = &bar, .arrived = &arrived, .passed = &passed };
+    try (try rt.run(barrierTestRoot, .{&ctx}));
+    try std.testing.expectEqual(@as(u32, 4), arrived.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 4), passed.load(.acquire));
 }

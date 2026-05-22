@@ -128,16 +128,42 @@ jobs:
           zig test $args
 
   bench-smoke:
-    name: Bench smoke (macos-arm64-kqueue)
+    name: Bench smoke (${{ matrix.os }})
     needs: format
-    runs-on: macos-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          # macOS arm64: kqueue reactor.
+          - macos-latest
+          # Linux x86_64: epoll/io_uring path (Runtime.Config.io_backend
+          # = .auto picks io_uring when available, falls back to epoll).
+          # Validating the runtime survives a real bench on each
+          # Linux backend is the prerequisite for issue #3 (file
+          # io_uring) + issue #7 structural work.
+          - ubuntu-latest
+          - ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - run: zig build bench-yield bench-spsc bench-rss -Doptimize=ReleaseFast
+      # Smoke-run a representative slice of benches. Validates:
+      #   - bench-yield: ctx switch + dispatch end-to-end
+      #   - bench-spsc:  SPSC channel + parking-lot
+      #   - bench-rss:   stack pool + per-platform mmap
+      #   - bench-tcp-echo: full reactor I/O path
+      #   - bench-mutex: contention + cross-CPU cache traffic
+      # If any bench panics / segfaults on a target platform, this
+      # job catches it — the existing test job sometimes passes when
+      # the runtime is structurally broken because tests don't
+      # exercise full multi-worker load.
+      - name: Bench smoke
+        run: |
+          zig build bench-yield bench-spsc bench-rss bench-mutex -Doptimize=ReleaseFast
+          zig build bench-tcp-echo -Doptimize=ReleaseFast
 
   ci-success:
     name: CI Success

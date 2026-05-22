@@ -84,3 +84,4 @@ build.zig.tmp
 *.dll
 *.def
 *.pdb
+sigint_repro

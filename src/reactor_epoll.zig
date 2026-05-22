@@ -92,6 +92,16 @@ extern "c" fn epoll_create1(flags: c_int) c_int;
 extern "c" fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: ?*epoll_event) c_int;
 extern "c" fn epoll_wait(epfd: c_int, events: [*]epoll_event, maxevents: c_int, timeout: c_int) c_int;
 
+// ─── eventfd (interrupt mechanism) ───────────────────────────────
+
+const EFD_NONBLOCK: c_int = 0o4000; // O_NONBLOCK
+const EFD_CLOEXEC: c_int = 0o2000000;
+extern "c" fn eventfd(initval: c_uint, flags: c_int) c_int;
+
+// Sentinel `data` value for the interrupt registration. Coroutine
+// pointers are heap-allocated and never null, so 0 is safe.
+const INTERRUPT_DATA: u64 = 0;
+
 // ─── timerfd syscalls ────────────────────────────────────────────
 
 const TFD_NONBLOCK: c_int = 0o4000; // O_NONBLOCK
@@ -149,16 +159,38 @@ fn registerError(e: c_int) ReactorWaitError {
 
 pub const Reactor = struct {
     epfd: c_int = -1,
+    /// eventfd registered with the epoll instance for cross-thread
+    /// wakeups (`interrupt`). Lives for the reactor's lifetime; the
+    /// epoll registration is level-triggered (no EPOLLONESHOT) so a
+    /// single ADD covers every subsequent interrupt.
+    interrupt_fd: c_int = -1,
 
     /// In-flight epoll registrations (one per coroutine parked on
     /// an fd or timer). Read by every dispatcher to decide whether
     /// to claim the poller role; same role as kqueue's `pending`.
+    /// The eventfd interrupt registration is excluded — it's a
+    /// reactor-internal wake channel, not a coroutine park.
     pending: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     pub fn init() !Reactor {
         const ep = epoll_create1(EPOLL_CLOEXEC);
         if (ep < 0) return error.EpollCreateFailed;
-        return .{ .epfd = ep };
+        errdefer _ = posix_helpers.close(ep);
+
+        const efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (efd < 0) return error.EpollCreateFailed;
+        errdefer _ = posix_helpers.close(efd);
+
+        // Register the interrupt eventfd. Level-triggered (no
+        // ONESHOT) so re-arm isn't needed — the drain in `poll`
+        // resets the readable state.
+        var ev = epoll_event{
+            .events = EPOLLIN,
+            .data = INTERRUPT_DATA,
+        };
+        if (epoll_ctl(ep, EPOLL_CTL_ADD, efd, &ev) < 0) return error.EpollCreateFailed;
+
+        return .{ .epfd = ep, .interrupt_fd = efd };
     }
 
     pub fn deinit(self: *Reactor) void {
@@ -166,7 +198,9 @@ pub const Reactor = struct {
         // contract. Caller is responsible for ensuring no coros
         // are parked in the kernel before tearing down.
         std.debug.assert(self.pending.load(.acquire) == 0);
+        if (self.interrupt_fd >= 0) _ = posix_helpers.close(self.interrupt_fd);
         if (self.epfd >= 0) _ = posix_helpers.close(self.epfd);
+        self.interrupt_fd = -1;
         self.epfd = -1;
     }
 
@@ -364,13 +398,36 @@ pub const Reactor = struct {
         const n = epoll_wait(self.epfd, &events, EPOLL_EVENTS_BATCH, timeout_ms);
         if (n <= 0) return 0;
         const count: usize = @intCast(n);
-        _ = self.pending.fetchSub(@intCast(count), .acq_rel);
+        var real_count: usize = 0;
         var i: usize = 0;
         while (i < count) : (i += 1) {
+            // Interrupt event: drain the eventfd counter to clear
+            // its readable state (level-triggered registration would
+            // re-fire on the next epoll_wait otherwise). Doesn't
+            // count toward `pending`.
+            if (events[i].data == INTERRUPT_DATA) {
+                var drain_buf: [8]u8 = undefined;
+                _ = read(self.interrupt_fd, &drain_buf, 8);
+                continue;
+            }
+            real_count += 1;
             const coro: *coroutine.Coroutine = @ptrFromInt(events[i].data);
             runtime.unpark(coro);
         }
-        return count;
+        if (real_count > 0) _ = self.pending.fetchSub(@intCast(real_count), .acq_rel);
+        return real_count;
+    }
+
+    /// Wake a worker currently blocked in `poll(true)`. Safe to call
+    /// from any thread. The eventfd write is non-blocking; if a
+    /// previous interrupt's counter hasn't been drained yet, the
+    /// kernel coalesces (writes ADD to the u64). The first epoll
+    /// return will drain whatever has accumulated.
+    pub fn interrupt(self: *Reactor) void {
+        const one: u64 = 1;
+        var bytes: [8]u8 = undefined;
+        @memcpy(&bytes, std.mem.asBytes(&one));
+        _ = posix_helpers.write(self.interrupt_fd, &bytes, 8);
     }
 };
 

@@ -66,14 +66,22 @@ methodology + receipts.
 | Workload | Volt | Go | Volt/Go |
 |---|---|---|---|
 | yield (one-way ctx switch) | 9 ns | 42 ns | 0.21× |
-| Mutex contended (8 × 50k) | 15 ns | 81 ns | 0.18× |
+| Mutex contended (8 × 50k) | 10 ns | 81 ns | 0.12× |
 | Spsc send+recv (cap=16) | 12 ns | 33 ns | 0.36× |
-| TCP echo (64 × 16 RTT × 1 KB) | 8,449 ns | 9,050 ns | 0.93× |
-| spawn+join workers=1 | 101 ns | 136 ns | 0.74× |
-| fan-out scaling workers=11 | 117 ns | 107 ns | 1.10× |
-| parallel-compute (8 workers) | 5.8× speedup | — | near-ideal |
-| stress (mixed, 45 s) | ~840 M ops | — | green |
-| spawn+join workers=11 (synthetic) | 575 ns | 213 ns | 2.70× |
+| TCP echo (64 × 16 RTT × 1 KB) | ~9,500 ns | 9,050 ns | ~1.0× |
+| spawn+join workers=1 | 78 ns | 136 ns | 0.57× |
+| fan-out scaling workers=4 | 64 ns | — | — |
+| fan-out scaling workers=11 | 113 ns | 107 ns | 1.06× |
+| parallel-compute (8 workers) | 6.5× speedup | — | near-ideal |
+| stress (mixed, 45 s) | ~850 M ops | — | green |
+| spawn+join workers=11 (synthetic) | 421 ns | 213 ns | 1.97× |
+
+Numbers reflect the 2026-05 perf cycle (driver-poll-wakeup fix,
+spin-before-park, log-N stealing cap, runtime cache-line padding,
+Coroutine extern-struct field reorder for cache locality). Range
+on spawn-hot tightened from ±32 % variance to ±10 % at a 25 % lower
+median. The synthetic-shape Volt/Go gap dropped under 2× for the
+first time. See `git log` for the commit trail.
 
 The single workers=11 outlier is a synthetic spawn-heavy shape (one
 driver feeding 11 workers trivial tasks) where adding workers can
@@ -195,8 +203,16 @@ Critical recent invariants:
 3. **Atomic ops need ordering justification** — every `.acq_rel` /
    `.release` / `.acquire` should be paired against a matching read or
    write in the memory-model doc.
-4. **No raw pointers across yield points** — a coroutine may resume on a
-   different worker thread.
+4. **No thread-identity state across yield points** — a coroutine may
+   resume on a different worker thread, so anything that depends on
+   *which OS thread you're on* is invalid after a yield/park: TLS
+   reads, thread-locals, cached `pthread_self()`, per-thread runtime
+   state, pointers returned from thread-local lookups. Stack
+   pointers into your *own* (or another live) coroutine's frame are
+   fine — slots are at stable VAs for the coroutine's lifetime.
+   (Known instance worked around: x86_64 Linux LLVM cached `%fs:0`
+   in r12 across yield; fix was `@call(.never_inline)` around TLS
+   reads.)
 5. **Stackful means stack contents preserved across suspension** — heap
    pointers stashed on a coroutine's stack live as long as the coroutine.
 6. **Explicit allocators** — Zig idiom; the runtime takes one allocator

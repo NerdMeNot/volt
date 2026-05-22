@@ -57,7 +57,7 @@ reading" footer pointing at adjacent topics.
    │  ▼                                                             │
    │  ┌────────────────────────────────────────────────────────┐    │
    │  │                  Coroutine                              │    │
-   │  │   stack: → slot in stack_arena (256 KiB virtual,        │    │
+   │  │   stack: → slot in stack_arena (1 MiB virtual,          │    │
    │  │                                 16 KiB committed)       │    │
    │  │   ctx:   saved registers (AAPCS64 wide-save)            │    │
    │  │   pending: yield / park / done                          │    │
@@ -137,9 +137,10 @@ IOCP (Windows, polyfilled as readiness via zero-byte WSARecv).
 ### 5. The slab arena
 
 Coroutine stacks come from a **single mmap reservation** at
-runtime init. N slots of 256 KiB virtual each, lazy-mprotect on
-first use. Per-P pools cache freed slots for cache locality;
-arena is the backing store for cross-P balancing.
+runtime init. N slots of 1 MiB virtual each by default (tunable
+via `Runtime.Config.stack_reservation_size`), lazy-mprotect on
+first use. Per-P pools cache freed slots for cache locality; arena
+is the backing store for cross-P balancing.
 
 The arena replaced a per-spawn `mmap` design that hit a 30× cliff
 when batch size exceeded the cache cap. The
@@ -242,9 +243,15 @@ integration.
    read or write in the [memory-model](/architecture/memory-model/)
    doc. If the ordering is `.monotonic`, the comment says why
    it's safe.
-3. **No raw pointers across yield points.** A coroutine can resume
-   on a different worker thread. Anything threadlocal-cached must
-   be re-read after every potential yield.
+3. **No thread-identity state across yield points.** A coroutine
+   can resume on a different worker thread, so anything that
+   depends on *which OS thread you're on* is invalid after a
+   yield: TLS reads, thread-locals, cached `pthread_self()`,
+   per-thread runtime state, pointers returned from thread-local
+   lookups. **Stack pointers into your own (or another live)
+   coroutine's frame are fine** — slots sit at stable virtual
+   addresses for the coroutine's lifetime. The rule is about
+   thread-identity, not about stack memory.
 4. **Stackful means stack contents preserved across suspension.**
    Heap pointers stashed on a coroutine's stack live as long as
    the coroutine. This is what makes the synchronous-shape API

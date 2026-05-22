@@ -41,7 +41,10 @@ pub fn build(b: *std.Build) void {
     volt_mod.link_libc = true;
     link_x86_64_ctx(volt_mod, b, target);
 
-    // Unit tests.
+    // Unit tests. `-Dtest-filter=substr` narrows the run to tests
+    // whose name contains the substring — useful for working on a
+    // single subsystem (e.g. `-Dtest-filter=fs.`) or for dodging
+    // a known-hanging test while developing.
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
@@ -49,7 +52,14 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.link_libc = true;
     link_x86_64_ctx(test_mod, b, target);
-    const unit_tests = b.addTest(.{ .root_module = test_mod });
+    const test_filter = b.option([]const u8, "test-filter", "Only run tests matching this substring");
+    var test_opts: std.Build.TestOptions = .{ .root_module = test_mod };
+    if (test_filter) |f| {
+        const filters = b.allocator.alloc([]const u8, 1) catch @panic("OOM");
+        filters[0] = f;
+        test_opts.filters = filters;
+    }
+    const unit_tests = b.addTest(test_opts);
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(unit_tests).step);
 
     // Documentation.
@@ -79,6 +89,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "mutex", .src = "bench/bench_mutex.zig", .desc = "Mutex contended (8 coros × 50k acquires)" },
         .{ .name = "parallel-compute", .src = "bench/bench_parallel_compute.zig", .desc = "Parallel CPU-bound work across N workers" },
         .{ .name = "reactor-throughput", .src = "bench/bench_reactor_throughput.zig", .desc = "Reactor wakes/s — single connection, 1-byte payload, 1 worker (cross-platform receipt)" },
+        .{ .name = "reactor-fanout", .src = "bench/bench_reactor_fanout.zig", .desc = "High-fd-pressure TCP echo (512 clients × 64 RTT, NumCPU workers) — Lane 4 measurement bench" },
     };
     for (benches) |bench| {
         const mod = b.createModule(.{
@@ -142,5 +153,41 @@ pub fn build(b: *std.Build) void {
         const run = b.addRunArtifact(exe);
         run.step.dependOn(&install.step);
         b.step(b.fmt("spike-{s}", .{sp.name}), sp.desc).dependOn(&run.step);
+    }
+
+    // Examples — runnable apps that mirror the cookbook. Each one
+    // compiles + runs end-to-end. The `examples` step builds all
+    // of them, providing a quality gate against API drift: any
+    // breaking change to volt's public surface fails this step
+    // before any user notices via a stale doc.
+    const examples = [_]struct { name: []const u8, src: []const u8, desc: []const u8 }{
+        .{ .name = "echo-server", .src = "examples/echo_server.zig", .desc = "TCP echo server (Ctrl-C to stop)" },
+        .{ .name = "fan-out", .src = "examples/fan_out.zig", .desc = "Parallel map + heterogeneous joinAll" },
+        .{ .name = "rate-limiter", .src = "examples/rate_limiter.zig", .desc = "Bounded concurrency via Semaphore" },
+        .{ .name = "udp-echo", .src = "examples/udp_echo.zig", .desc = "UDP echo round-trip (4 messages)" },
+        .{ .name = "ticker-heartbeat", .src = "examples/ticker_heartbeat.zig", .desc = "Ticker firing every 100ms × 10" },
+        .{ .name = "dns-lookup", .src = "examples/dns_lookup.zig", .desc = "DNS lookup via spawnBlocking" },
+        .{ .name = "file-copy", .src = "examples/file_copy.zig", .desc = "Copy a file via volt.fs.copyFile" },
+        .{ .name = "dir-walk", .src = "examples/dir_walk.zig", .desc = "Walk a directory tree printing each entry" },
+        .{ .name = "mmap-count", .src = "examples/mmap_count.zig", .desc = "Count newlines via mmap (zero-copy)" },
+        .{ .name = "file-watcher", .src = "examples/file_watcher.zig", .desc = "Watch a dir + print events (Ctrl-C to stop)" },
+    };
+    const examples_step = b.step("examples", "Build every example program");
+    for (examples) |ex| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(ex.src),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("volt", volt_mod);
+        const exe = b.addExecutable(.{
+            .name = b.fmt("volt-example-{s}", .{ex.name}),
+            .root_module = mod,
+        });
+        const install = b.addInstallArtifact(exe, .{});
+        examples_step.dependOn(&install.step);
+        const run = b.addRunArtifact(exe);
+        run.step.dependOn(&install.step);
+        b.step(b.fmt("run-{s}", .{ex.name}), ex.desc).dependOn(&run.step);
     }
 }

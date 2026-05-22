@@ -57,6 +57,11 @@ const DEFAULT_RING_ENTRIES: u16 = 256;
 const POLLIN: u32 = 0x0001;
 const POLLOUT: u32 = 0x0004;
 
+// eventfd constants — matches reactor_epoll.zig.
+const EFD_NONBLOCK: c_int = 0o4000;
+const EFD_CLOEXEC: c_int = 0o2000000;
+extern "c" fn eventfd(initval: c_uint, flags: c_int) c_int;
+
 // Shared POSIX helpers — same setNonblock / readAsync / writeAsync
 // / readFull / writeAll as kqueue + epoll. The reactor-facing
 // helpers take the reactor as `anytype`, so they bind to this
@@ -73,11 +78,18 @@ pub const writeAll = posix_helpers.writeAll;
 
 pub const Reactor = struct {
     ring: linux.IoUring,
+    /// eventfd used for cross-thread wake (`interrupt`). A
+    /// `POLL_ADD` SQE on this fd, carrying the `INTERRUPT_USER_DATA`
+    /// sentinel, is submitted at init and re-armed after each wake.
+    interrupt_fd: c_int = -1,
 
     /// In-flight registrations (one per coroutine parked on an SQE).
     /// Producers (waitFd / waitTimer) increment under `lock`; the
     /// poller decrements as it drains CQEs. Same role as kqueue's
     /// `pending`.
+    ///
+    /// The interrupt eventfd's POLL_ADD does NOT count here — it's
+    /// a reactor-internal wake channel, not a coroutine park.
     pending: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// TTAS spinlock around SQE production. The ring's SQ tail
@@ -93,8 +105,20 @@ pub const Reactor = struct {
         // coordination but require kernel ≥ 6.0 and a more careful
         // submission model (we'd have to route all production to
         // a single thread). Deferred until perf data justifies.
-        const ring = linux.IoUring.init(DEFAULT_RING_ENTRIES, 0) catch return error.IoUringInitFailed;
-        return .{ .ring = ring };
+        var ring = linux.IoUring.init(DEFAULT_RING_ENTRIES, 0) catch return error.IoUringInitFailed;
+        errdefer ring.deinit();
+
+        const efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (efd < 0) return error.IoUringInitFailed;
+        errdefer _ = posix_helpers.close(efd);
+
+        // Arm the interrupt POLL_ADD. Single-threaded here (init is
+        // called once, before any worker spawns), so no acquire/
+        // release needed.
+        _ = ring.poll_add(INTERRUPT_USER_DATA, efd, POLLIN) catch return error.IoUringInitFailed;
+        _ = ring.submit() catch return error.IoUringInitFailed;
+
+        return .{ .ring = ring, .interrupt_fd = efd };
     }
 
     pub fn deinit(self: *Reactor) void {
@@ -104,6 +128,8 @@ pub const Reactor = struct {
         // shutdown-ordering bug at the source instead of as a
         // mysterious crash later.
         std.debug.assert(self.pending.load(.acquire) == 0);
+        if (self.interrupt_fd >= 0) _ = posix_helpers.close(self.interrupt_fd);
+        self.interrupt_fd = -1;
         self.ring.deinit();
     }
 
@@ -169,6 +195,12 @@ pub const Reactor = struct {
     /// address (heap allocations are at least 8-byte aligned;
     /// 0x1 is reserved as our sentinel).
     const CANCEL_SQE_USER_DATA: u64 = 0x1;
+
+    /// Sentinel `user_data` for the interrupt-eventfd POLL_ADD SQE.
+    /// Distinct from `CANCEL_SQE_USER_DATA` so the poll loop can
+    /// distinguish "interrupt fired — drain + re-arm" from "cancel
+    /// SQE acknowledged — skip".
+    const INTERRUPT_USER_DATA: u64 = 0x2;
 
     /// Cancel this coro's in-flight io_uring op.
     ///
@@ -250,12 +282,22 @@ pub const Reactor = struct {
         if (n == 0) return 0;
         const count: usize = @intCast(n);
         var real_count: usize = 0;
+        var saw_interrupt = false;
         var i: usize = 0;
         while (i < count) : (i += 1) {
             // CANCEL SQE acknowledgements arrive with the sentinel
             // user_data — skip them (the cancelled op's own CQE
             // arrives separately and carries the real coro ptr).
             if (cqes[i].user_data == CANCEL_SQE_USER_DATA) continue;
+            // Interrupt POLL_ADD fired: drain the eventfd counter
+            // (clears its readable state) and flag for re-arm.
+            // Doesn't count toward `pending`.
+            if (cqes[i].user_data == INTERRUPT_USER_DATA) {
+                var drain_buf: [8]u8 = undefined;
+                _ = posix_helpers.read(self.interrupt_fd, &drain_buf, 8);
+                saw_interrupt = true;
+                continue;
+            }
             real_count += 1;
             // `user_data` for normal ops is the coroutine pointer
             // we set in waitFd/waitTimer. Cast back and unpark.
@@ -264,8 +306,29 @@ pub const Reactor = struct {
         }
         // Pending was incremented per real-op submit, not per
         // cancel SQE — only decrement by the real-op count.
-        _ = self.pending.fetchSub(@intCast(real_count), .acq_rel);
-        return count;
+        if (real_count > 0) _ = self.pending.fetchSub(@intCast(real_count), .acq_rel);
+
+        // Re-arm the interrupt POLL_ADD if it fired. POLL_ADD is
+        // single-shot in io_uring (unlike epoll's level-triggered
+        // mode), so each wake needs a fresh SQE.
+        if (saw_interrupt) {
+            self.acquire();
+            _ = self.ring.poll_add(INTERRUPT_USER_DATA, self.interrupt_fd, POLLIN) catch {};
+            _ = self.ring.submit() catch {};
+            self.release();
+        }
+        return real_count;
+    }
+
+    /// Wake a worker currently blocked in `poll(true)`. Safe to call
+    /// from any thread. The eventfd `write` is non-blocking; multiple
+    /// interrupts before the first drain coalesce in the kernel's
+    /// 8-byte counter.
+    pub fn interrupt(self: *Reactor) void {
+        const one: u64 = 1;
+        var bytes: [8]u8 = undefined;
+        @memcpy(&bytes, std.mem.asBytes(&one));
+        _ = posix_helpers.write(self.interrupt_fd, &bytes, 8);
     }
 
     inline fn acquire(self: *Reactor) void {

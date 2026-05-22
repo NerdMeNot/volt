@@ -57,8 +57,14 @@ const Waiter = struct {
     next: ?*Waiter = null,
 };
 
+/// Cache-line-aligned bucket. Without padding, multiple Buckets pack
+/// into the same cache line (Bucket is ~80 B; line is 64–128 B
+/// depending on arch). Two unrelated wait/wake operations on
+/// different buckets ping-pong the line. `align(std.atomic.cache_line)`
+/// on the first field forces each Bucket to start on a fresh line
+/// and rounds the struct size up to a multiple of that line.
 const Bucket = struct {
-    mutex: PthreadMutex,
+    mutex: PthreadMutex align(std.atomic.cache_line),
     head: ?*Waiter = null,
     tail: ?*Waiter = null,
 };
@@ -213,10 +219,9 @@ pub fn unparkAll(rt: *runtime_mod.Runtime, addr: *const anyopaque) usize {
 // Tests
 // ─────────────────────────────────────────────────────────────────────
 
-// See note in src/runtime.zig: std.testing.allocator's stack-trace
-// capture corrupts under multi-worker spawn. smp_allocator is the
-// thread-safe choice for runtime-touching tests.
-const test_allocator = std.heap.smp_allocator;
+// `volt.testing.allocator` — leak-detecting + multi-worker-safe.
+// See src/testing.zig for why std.testing.allocator doesn't fit.
+const test_allocator = @import("testing.zig").allocator;
 const Runtime = runtime_mod.Runtime;
 
 const STATE_INITIAL: u32 = 0;

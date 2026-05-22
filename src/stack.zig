@@ -64,15 +64,17 @@ pub const StackPtr = [*]align(std.heap.page_size_max) u8;
 /// top of the slot and grows down into this region first.
 pub const BODY_SIZE: usize = 16 * 1024;
 
-/// Per-slot virtual reservation. Growable budget (between guard and
-/// initial body) is `RESERVATION_SIZE - guardSize() - BODY_SIZE`
-/// ≈ 224 KiB on Darwin. Raise this to widen the recursion budget;
-/// lower it to fit more concurrent stacks in the same VA budget.
-pub const RESERVATION_SIZE: usize = 256 * 1024;
+/// Default per-slot virtual reservation. Growable budget (between
+/// guard and initial body) is `reservation - guardSize() - BODY_SIZE`
+/// ≈ 1008 KiB on Darwin / 1020 KiB on Linux at the 1 MiB default.
+/// Tune via `Runtime.Config.stack_reservation_size`: raise for
+/// deeper recursion budgets, lower to pack more concurrent stacks
+/// into the same VA budget. Must be a multiple of the page size.
+pub const DEFAULT_RESERVATION_SIZE: usize = 1024 * 1024;
 
 /// Default arena size — `Runtime.Config.max_concurrent_stacks` falls
-/// back to this if the caller doesn't set it. 16384 slots × 256 KiB
-/// = 4 GiB virtual reservation, no RSS until coroutines actually use
+/// back to this if the caller doesn't set it. 16384 slots × 1 MiB
+/// = 16 GiB virtual reservation, no RSS until coroutines actually use
 /// the slots.
 pub const DEFAULT_MAX_STACKS: usize = 16 * 1024;
 
@@ -80,19 +82,6 @@ pub const DEFAULT_MAX_STACKS: usize = 16 * 1024;
 /// (16 KiB Darwin arm64, 4 KiB Linux x86_64/arm64).
 pub inline fn guardSize() usize {
     return std.heap.pageSize();
-}
-
-/// Per-slot total size used by the arena. Must be a multiple of the
-/// page size so each slot's guard sits on a page boundary.
-pub inline fn slotSize() usize {
-    return RESERVATION_SIZE;
-}
-
-/// Offset within a slot of the first byte that's ever usable. The
-/// arena's free-list "next" pointer lives at this offset, inside the
-/// body region (which is committed once the slot has been used).
-pub inline fn usableOffset() usize {
-    return slotSize() - BODY_SIZE;
 }
 
 // Platform syscall bindings. On POSIX (Darwin / Linux / BSD) we use
@@ -205,6 +194,12 @@ pub const Arena = struct {
     mapping_base: StackPtr,
     mapping_total: usize,
     n_slots: usize,
+    /// Per-slot reservation in bytes. Set at init from
+    /// `Runtime.Config.stack_reservation_size` (or
+    /// `DEFAULT_RESERVATION_SIZE`). Must be a multiple of the page
+    /// size. Stored per-arena so each Runtime can pick its own
+    /// stack/VA tradeoff without recompilation.
+    slot_size: usize,
 
     /// Side-array stack of free slot indices. Capacity is `n_slots`.
     /// `free_top` is the count of entries currently free (= the next
@@ -224,20 +219,41 @@ pub const Arena = struct {
     /// warm-up is essentially zero on steady-state workloads.
     lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
-    /// Construct the arena. Reserves `n_slots * slotSize()` virtual
+    /// Per-slot total reservation in bytes. Equals `slot_size`; the
+    /// method shape makes call sites read as the conceptual "how big
+    /// is each slot" rather than a struct-field grab.
+    pub inline fn slotSize(self: *const Arena) usize {
+        return self.slot_size;
+    }
+
+    /// Offset within a slot of the first byte that's ever usable —
+    /// the start of the initial body region. The arena's free-list
+    /// "next" pointer lives here (the body is committed on first
+    /// allocation, so this offset is always writable for slots that
+    /// have ever been allocated).
+    pub inline fn usableOffset(self: *const Arena) usize {
+        return self.slot_size - BODY_SIZE;
+    }
+
+    /// Construct the arena. Reserves `n_slots * slot_size` virtual
     /// bytes as PROT_NONE, allocates the free-index stack + commit
     /// bitmap on the heap, and registers the arena range with the
     /// SIGSEGV handler so grow-on-demand works for any slot.
     ///
+    /// `slot_size` must be a multiple of the page size and strictly
+    /// greater than `guardSize() + BODY_SIZE` (so there's at least
+    /// one growable page between guard and body).
+    ///
     /// Bookkeeping memory (free_indices + committed) is owned by
     /// `allocator`; the slab itself is owned by `mmap`.
-    pub fn init(allocator: std.mem.Allocator, n_slots: usize) Error!Arena {
+    pub fn init(allocator: std.mem.Allocator, n_slots: usize, slot_size: usize) Error!Arena {
         std.debug.assert(n_slots > 0);
         std.debug.assert(n_slots <= std.math.maxInt(u32));
+        std.debug.assert(slot_size % std.heap.pageSize() == 0);
+        std.debug.assert(slot_size > guardSize() + BODY_SIZE);
 
         signal.ensureInstalled();
 
-        const slot_size = slotSize();
         const total = n_slots * slot_size;
 
         // Reserve the slab — same shape on every platform. Nothing
@@ -288,6 +304,7 @@ pub const Arena = struct {
             .mapping_base = base,
             .mapping_total = total,
             .n_slots = n_slots,
+            .slot_size = slot_size,
             .free_indices = free_indices,
             .free_top = n_slots,
             .committed = committed,
@@ -317,7 +334,7 @@ pub const Arena = struct {
         self.free_top -= 1;
         const idx = self.free_indices[self.free_top];
 
-        const slot_size = slotSize();
+        const slot_size = self.slot_size;
         const base: StackPtr = @alignCast(self.mapping_base + @as(usize, idx) * slot_size);
 
         const byte_idx = idx / 8;
@@ -361,7 +378,7 @@ pub const Arena = struct {
     /// slot's index back onto the free stack.
     pub fn free(self: *Arena, slot: StackPtr) void {
         const offset = @intFromPtr(slot) - @intFromPtr(self.mapping_base);
-        const idx: u32 = @intCast(offset / slotSize());
+        const idx: u32 = @intCast(offset / self.slot_size);
         std.debug.assert(idx < self.n_slots);
 
         self.acquire();
@@ -398,14 +415,14 @@ pub const Arena = struct {
 // ─────────────────────────────────────────────────────────────────────
 
 test "Arena.init/deinit round-trip" {
-    var a = try Arena.init(std.testing.allocator, 8);
+    var a = try Arena.init(std.testing.allocator, 8, DEFAULT_RESERVATION_SIZE);
     defer a.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 8), a.n_slots);
     try std.testing.expectEqual(@as(usize, 8), a.freeCount());
 }
 
 test "Arena.alloc returns distinct page-aligned slots" {
-    var a = try Arena.init(std.testing.allocator, 4);
+    var a = try Arena.init(std.testing.allocator, 4, DEFAULT_RESERVATION_SIZE);
     defer a.deinit(std.testing.allocator);
 
     const s0 = try a.alloc();
@@ -419,13 +436,13 @@ test "Arena.alloc returns distinct page-aligned slots" {
 }
 
 test "Arena: body region writable after alloc (mprotect fired)" {
-    var a = try Arena.init(std.testing.allocator, 4);
+    var a = try Arena.init(std.testing.allocator, 4, DEFAULT_RESERVATION_SIZE);
     defer a.deinit(std.testing.allocator);
 
     const s = try a.alloc();
     defer a.free(s);
 
-    const body_start = s + usableOffset();
+    const body_start = s + a.usableOffset();
     body_start[0] = 0xab;
     body_start[BODY_SIZE - 1] = 0xcd;
     try std.testing.expectEqual(@as(u8, 0xab), body_start[0]);
@@ -433,11 +450,11 @@ test "Arena: body region writable after alloc (mprotect fired)" {
 }
 
 test "Arena: slot reuse skips re-mprotect (commit bit sticky)" {
-    var a = try Arena.init(std.testing.allocator, 2);
+    var a = try Arena.init(std.testing.allocator, 2, DEFAULT_RESERVATION_SIZE);
     defer a.deinit(std.testing.allocator);
 
     const s1 = try a.alloc();
-    const body_start1 = s1 + usableOffset();
+    const body_start1 = s1 + a.usableOffset();
     body_start1[0] = 0x42;
     a.free(s1);
 
@@ -446,7 +463,7 @@ test "Arena: slot reuse skips re-mprotect (commit bit sticky)" {
     // out for security; we don't), but writes must still succeed.
     const s2 = try a.alloc();
     defer a.free(s2);
-    const body_start2 = s2 + usableOffset();
+    const body_start2 = s2 + a.usableOffset();
     body_start2[0] = 0x99;
     try std.testing.expectEqual(@as(u8, 0x99), body_start2[0]);
 }
@@ -455,7 +472,7 @@ test "Arena: grow-on-demand commits a deeper page on access" {
     // POSIX uses mprotect from the SIGSEGV handler; Windows uses
     // VirtualAlloc(MEM_COMMIT) from a Vectored Exception Handler.
     // The test exercises both paths identically.
-    var a = try Arena.init(std.testing.allocator, 2);
+    var a = try Arena.init(std.testing.allocator, 2, DEFAULT_RESERVATION_SIZE);
     defer a.deinit(std.testing.allocator);
 
     const s = try a.alloc();
@@ -464,13 +481,13 @@ test "Arena: grow-on-demand commits a deeper page on access" {
     const ps = std.heap.pageSize();
     // Page one below the initial body — PROT_NONE on alloc. Writing
     // triggers the SIGSEGV handler which mprotects it RW.
-    const grow_addr = s + usableOffset() - ps;
+    const grow_addr = s + a.usableOffset() - ps;
     grow_addr[0] = 0xee;
     try std.testing.expectEqual(@as(u8, 0xee), grow_addr[0]);
 }
 
 test "Arena.alloc returns ArenaExhausted when full" {
-    var a = try Arena.init(std.testing.allocator, 2);
+    var a = try Arena.init(std.testing.allocator, 2, DEFAULT_RESERVATION_SIZE);
     defer a.deinit(std.testing.allocator);
 
     const s0 = try a.alloc();
@@ -482,7 +499,7 @@ test "Arena.alloc returns ArenaExhausted when full" {
 }
 
 test "Arena: free returns slots to the free list (alloc succeeds again)" {
-    var a = try Arena.init(std.testing.allocator, 2);
+    var a = try Arena.init(std.testing.allocator, 2, DEFAULT_RESERVATION_SIZE);
     defer a.deinit(std.testing.allocator);
 
     const s0 = try a.alloc();

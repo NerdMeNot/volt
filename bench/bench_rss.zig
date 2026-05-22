@@ -100,7 +100,8 @@ pub fn main() !void {
     std.debug.print("Notes:\n", .{});
     std.debug.print("  - macOS reports maxrss in bytes; Linux in KiB. Normalized to bytes here.\n", .{});
     std.debug.print("  - Per-coro overhead = initial body ({d} KiB) + Coroutine + Frame + Task.\n", .{volt.internal.STACK_SIZE / 1024});
-    std.debug.print("  - Stacks are grow-on-demand: 256 KiB virtual reservation per coro,\n", .{});
+    std.debug.print("  - Stacks are grow-on-demand: 1 MiB virtual reservation per coro by default\n", .{});
+    std.debug.print("    (tunable via Runtime.Config.stack_reservation_size),\n", .{});
     std.debug.print("    only the top {d} KiB committed at spawn. Deeper recursion mprotects\n", .{volt.internal.STACK_SIZE / 1024});
     std.debug.print("    pages on SIGSEGV (signal.zig handler). Idle RSS reported here is\n", .{});
     std.debug.print("    body-only; growable region is PROT_NONE and contributes zero RSS.\n", .{});

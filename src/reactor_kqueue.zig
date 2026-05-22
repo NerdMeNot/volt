@@ -34,6 +34,25 @@ const KEV_BATCH: usize = 32;
 const EVFILT_TIMER: i16 = -7;
 const NOTE_NSECONDS: u32 = 0x00000004;
 
+// EVFILT_USER — user-triggered events; no fd needed. Volt uses it
+// for the cross-thread reactor wakeup (`interrupt`). NOTE_TRIGGER
+// fires the registered user event from any thread, waking a poll
+// blocked in kevent without the self-pipe pattern.
+const EVFILT_USER: i16 = -10;
+const NOTE_TRIGGER: u32 = 0x01000000;
+
+// Sentinel ident for the EVFILT_USER interrupt registration. Picked
+// because no real fd is 0 in our usage (stdin would be, but we never
+// register stdin), and the kevent layout doesn't need ident
+// uniqueness across filters — `(ident, filter)` is the key.
+const INTERRUPT_IDENT: usize = 0;
+
+// Sentinel udata on the interrupt event. The poll loop distinguishes
+// interrupt completions from coroutine wakeups by checking
+// `udata == INTERRUPT_UDATA`. Zero is safe — coroutine pointers are
+// heap-allocated and never null.
+const INTERRUPT_UDATA: usize = 0;
+
 pub const Reactor = struct {
     kq: i32 = -1,
     /// In-flight kqueue registrations (one per coroutine parked on
@@ -54,6 +73,21 @@ pub const Reactor = struct {
     pub fn init() !Reactor {
         const kq = std.c.kqueue();
         if (kq < 0) return error.KqueueInitFailed;
+
+        // Register the EVFILT_USER interrupt event. EV_CLEAR makes it
+        // edge-triggered (the event auto-resets after each fire), so
+        // a single registration serves every subsequent interrupt.
+        var kev = std.mem.zeroes(posix.Kevent);
+        kev.ident = INTERRUPT_IDENT;
+        kev.filter = EVFILT_USER;
+        kev.flags = posix.system.EV.ADD | posix.system.EV.CLEAR;
+        kev.udata = INTERRUPT_UDATA;
+        var changes = [_]posix.Kevent{kev};
+        var dummy: [1]posix.Kevent = undefined;
+        if (posix.system.kevent(kq, &changes, 1, &dummy, 0, null) < 0) {
+            _ = std.c.close(kq);
+            return error.KqueueInitFailed;
+        }
         return .{ .kq = kq };
     }
 
@@ -233,13 +267,33 @@ pub const Reactor = struct {
         const n = posix.system.kevent(self.kq, &.{}, 0, &events, KEV_BATCH, timeout_ptr);
         if (n <= 0) return 0;
         const count: usize = @intCast(n);
-        _ = self.pending.fetchSub(@intCast(count), .acq_rel);
+        var real_count: usize = 0;
         var i: usize = 0;
         while (i < count) : (i += 1) {
+            // Interrupt events carry the sentinel udata and don't
+            // count toward `pending` — skip the unpark and the
+            // decrement. The kevent return itself was the wake.
+            if (events[i].udata == INTERRUPT_UDATA) continue;
+            real_count += 1;
             const coro: *coroutine.Coroutine = @ptrFromInt(events[i].udata);
             runtime.unpark(coro);
         }
-        return count;
+        if (real_count > 0) _ = self.pending.fetchSub(@intCast(real_count), .acq_rel);
+        return real_count;
+    }
+
+    /// Wake a worker currently blocked in `poll(true)`. Safe to call
+    /// from any thread. If no worker is in kevent, the trigger is
+    /// retained by EVFILT_USER (level-cleared on the next fire) so a
+    /// poll entered shortly after still observes the wake.
+    pub fn interrupt(self: *Reactor) void {
+        var kev = std.mem.zeroes(posix.Kevent);
+        kev.ident = INTERRUPT_IDENT;
+        kev.filter = EVFILT_USER;
+        kev.fflags = NOTE_TRIGGER;
+        var changes = [_]posix.Kevent{kev};
+        var dummy: [1]posix.Kevent = undefined;
+        _ = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
     }
 };
 
@@ -252,3 +306,41 @@ pub const readAsync = posix_helpers.readAsync;
 pub const writeAsync = posix_helpers.writeAsync;
 pub const readFull = posix_helpers.readFull;
 pub const writeAll = posix_helpers.writeAll;
+
+// ─────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────
+
+test "Reactor: interrupt wakes blocking poll" {
+    var rx = try Reactor.init();
+    // LIFO defer: pending reset runs before deinit's `pending == 0`
+    // assertion. Without the bump, poll() takes its early-return
+    // path and never enters kevent.
+    defer rx.deinit();
+    rx.pending.store(1, .release);
+    defer rx.pending.store(0, .release);
+
+    var done = std.atomic.Value(bool).init(false);
+
+    const Worker = struct {
+        fn run(reactor: *Reactor, flag: *std.atomic.Value(bool)) void {
+            _ = reactor.poll(true);
+            flag.store(true, .release);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Worker.run, .{ &rx, &done });
+
+    // Spin-interrupt until the worker observes the wake. EVFILT_USER
+    // with EV_CLEAR coalesces multiple triggers into one event, so
+    // repeated interrupts are safe — whichever lands while the
+    // worker is in (or about to enter) kevent will release it. The
+    // attempt cap converts a broken interrupt into a clean test
+    // failure rather than a hang.
+    var attempts: u32 = 0;
+    while (!done.load(.acquire)) : (attempts += 1) {
+        if (attempts > 1_000_000) return error.InterruptDidNotWake;
+        rx.interrupt();
+        std.atomic.spinLoopHint();
+    }
+    t.join();
+}

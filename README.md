@@ -109,6 +109,10 @@ the coordination cost. On any shape with actual parallel work
 
 The honest case for using Volt today: you want a stackful coroutine substrate for Zig on ARM64, you want the synchronous-shape ergonomics, you can live with the multi-worker spawn-heavy gap to Go, and you're OK being an early user on Linux (epoll + io_uring backends are written but not yet CI-validated) or willing to wait on Windows (cross-compiles cleanly; runtime validation pass pending).
 
+## Versioning
+
+Volt's version string format is `vX.Y.Z-zigA.B.C` — the version is **bound to the Zig minor it targets**. `1.0.0-zig0.16.0` means semver-1.0.0 against Zig 0.16.x. When Zig bumps minor (e.g. to 0.17), Volt resets to `1.0.0-zig0.17.0` — the substantive API is stable within a Zig minor, breaking changes track Zig itself. Patches (`1.0.1-zig0.16.0`) and minors (`1.1.0-zig0.16.0`) follow normal semver within a Zig minor: patches are bug fixes, minors add backwards-compatible features, majors break API. Pin your `build.zig.zon` to the exact tag if you need stability across Zig upgrades.
+
 ## Install
 
 ```zig

@@ -41,6 +41,12 @@ pub fn Task(comptime T: type) type {
     return struct {
         const Self = @This();
 
+        /// Public payload type — what `.join()` returns. Exposed so
+        /// helpers like `volt.joinAll` / `volt.joinFirst` can extract
+        /// the per-task type at comptime via `@TypeOf(task).Payload`
+        /// without unwrapping the pointer indirection by hand.
+        pub const Payload = T;
+
         coro: *coroutine.Coroutine,
         /// Pointer to the Frame's `result` field. Set by spawn.
         result_ptr: *T,

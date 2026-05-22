@@ -44,6 +44,9 @@ const p_mod = @import("p.zig");
 const parker_mod = @import("parker.zig");
 const park_mod = @import("park.zig");
 const stack_mod = @import("stack.zig");
+const blocking_pool_mod = @import("blocking_pool.zig");
+const signal_mod = @import("signal.zig");
+const builtin = @import("builtin");
 
 pub const Coroutine = coroutine.Coroutine;
 pub const Frame = coroutine.Frame;
@@ -59,14 +62,56 @@ pub const Parker = parker_mod.Parker;
 pub const STACK_SIZE: usize = stack_mod.BODY_SIZE;
 pub const MAX_WORKERS: usize = 64; // bitmap is u64
 
+/// Errors `Runtime.spawn` (and `volt.spawn`) can return. Explicit
+/// named set so library callers can `catch err switch` exhaustively
+/// — and so `scope`/`withTimeout`/`joinFirst` can union it with
+/// the body's error set instead of inheriting `anyerror`.
+///
+/// `OutOfMemory` comes from the per-spawn Frame+Task heap alloc and
+/// the coroutine-struct pool's allocator fallback. The other three
+/// come from the stack arena: `ArenaExhausted` (every slot in use),
+/// `MmapFailed` / `MprotectFailed` (kernel VM-space exhaustion or
+/// permission failure during lazy slot commit).
+pub const SpawnError = std.mem.Allocator.Error || stack_mod.Error;
+
+/// Minimalist runtime instrumentation hook. Set
+/// `Runtime.Config.observer = &my_observer` and the runtime fires
+/// these callbacks at the corresponding lifecycle points. When
+/// `observer == null`, every hook site folds to a dead branch at
+/// optimisation time — zero overhead.
+///
+/// Use this for: spawn/done counters, hung-coroutine investigators,
+/// per-coroutine timing profilers, custom tracing emitters
+/// (StatsD, JSON-lines, OpenTelemetry — whatever shape you want).
+/// Volt deliberately doesn't ship a tracing impl in v1; this is the
+/// hook layer downstream observers build on.
+///
+/// Async-signal-safety: callbacks run from the dispatching worker.
+/// They are NOT signal-handler safe. Keep callbacks fast — they
+/// fire on the hot scheduler path.
+pub const Observer = struct {
+    /// Fired after a new coroutine is constructed and queued by
+    /// `Runtime.spawn`. The coroutine has not yet started running.
+    onSpawn: ?*const fn (coro: *Coroutine) void = null,
+    /// Fired when a coroutine begins parking (after the primitive
+    /// has registered the waiter; just before the ctx swap).
+    onPark: ?*const fn (coro: *Coroutine) void = null,
+    /// Fired when `runtime.unpark` re-queues a parked coroutine.
+    onUnpark: ?*const fn (coro: *Coroutine) void = null,
+    /// Fired when a coroutine's trampoline returns (terminal state).
+    /// The `coro` pointer is about to be recycled — read fields
+    /// before returning from the callback.
+    onComplete: ?*const fn (coro: *Coroutine) void = null,
+};
+
 pub const Config = struct {
     allocator: std.mem.Allocator,
     /// Worker thread count. null = std.Thread.getCpuCount.
     workers: ?usize = null,
     /// Hard cap on concurrently-live coroutine stacks. The runtime
-    /// pre-reserves `max_concurrent_stacks * 256 KiB` of virtual
-    /// address space at init (PROT_NONE — zero RSS until used) and
-    /// hands slots out from a slab arena. Spawn returns
+    /// pre-reserves `max_concurrent_stacks * stack_reservation_size`
+    /// of virtual address space at init (PROT_NONE — zero RSS until
+    /// used) and hands slots out from a slab arena. Spawn returns
     /// `error.ArenaExhausted` once every slot is in use.
     ///
     /// The default covers typical interactive workloads and the full
@@ -74,11 +119,33 @@ pub const Config = struct {
     /// thousands of HTTP connections); lower to bound virtual address
     /// usage on tight 32-bit-style budgets.
     max_concurrent_stacks: usize = stack_mod.DEFAULT_MAX_STACKS,
+    /// Per-coroutine stack VA reservation. The effective stack ceiling
+    /// is `stack_reservation_size - guard_page - 0` (the top body is
+    /// committed lazily; deeper pages commit on SIGSEGV up to the
+    /// guard). Default 1 MiB → ~1008 KiB usable on Darwin, ~1020 KiB
+    /// on Linux. Raise for deep-recursion / heavy C-library callouts;
+    /// lower to pack more concurrent coroutines into the same VA
+    /// budget. Must be a multiple of the page size.
+    ///
+    /// RSS is unaffected — every coroutine starts with the same 16
+    /// KiB body commit; only this knob's *virtual* cost scales.
+    stack_reservation_size: usize = stack_mod.DEFAULT_RESERVATION_SIZE,
     /// **Linux only.** Chooses between epoll and io_uring backends.
     /// `.auto` probes for io_uring at init and falls back to epoll
     /// on older kernels (< 5.10) or sysctl-disabled environments.
     /// Ignored on Darwin (always kqueue) and Windows (always IOCP).
     io_backend: reactor_mod.IoBackend = .auto,
+    /// OS-thread pool used by `volt.spawnBlocking` to run sync /
+    /// CPU-bound code without pinning a worker. Lazy — no threads
+    /// spawn until the first `spawnBlocking` call. Default caps
+    /// concurrent sync work at 128 threads; raise for sync-IO-heavy
+    /// services. See `src/blocking_pool.zig`.
+    blocking: blocking_pool_mod.Config = .{},
+    /// Optional instrumentation hook. Set to `&my_observer` to
+    /// receive callbacks on spawn / park / unpark / complete.
+    /// Default `null` — every hook site folds away at optimisation
+    /// time, zero runtime cost.
+    observer: ?*const Observer = null,
 };
 
 /// Cooperative yield. Re-queues the current coroutine onto the
@@ -110,6 +177,8 @@ pub fn yield() void {
 /// race on the same stack.
 pub fn park() void {
     const c = current.require();
+    const rt: *Runtime = @ptrCast(@alignCast(c.runtime));
+    if (rt.observer) |o| if (o.onPark) |cb| cb(c);
     c.pending = .park;
     context.swap(&c.ctx, c.main_ctx);
 }
@@ -122,6 +191,10 @@ pub fn park() void {
 ///              branch and re-queues immediately — no double-dispatch.
 ///   NOTIFIED → no-op (already queued for self-wake by dispatch).
 pub fn unpark(c: *Coroutine) void {
+    {
+        const rt: *Runtime = @ptrCast(@alignCast(c.runtime));
+        if (rt.observer) |o| if (o.onUnpark) |cb| cb(c);
+    }
     while (true) {
         const s = c.park_state.load(.acquire);
         switch (s) {
@@ -208,6 +281,7 @@ pub fn tryDispatchInline(target: *Coroutine) bool {
             // Same cleanup as the M's dispatch `.done` branch. We
             // duplicate it here rather than calling into dispatch
             // because dispatch expects an M.main_ctx swap path.
+            if (rt.observer) |o| if (o.onComplete) |cb| cb(target);
             if (target.task_done) |done| {
                 done.store(task_mod.DONE, .release);
                 _ = park_mod.unparkOne(rt, done);
@@ -270,12 +344,16 @@ pub const Runtime = struct {
     reactor: Reactor,
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Bit i set ⇔ ms[i] is parked. M[0] is the driver thread.
-    parked_workers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Cache-line padded — every worker fetchOr/fetchAnd/cmpxchg's this
+    /// on every park/unpark cycle, and used to share a line with
+    /// `num_searching` (also hot on every find-work cycle). Splitting
+    /// removed the worst false-sharing hotspot in the runtime.
+    parked_workers: std.atomic.Value(u64) align(std.atomic.cache_line) = std.atomic.Value(u64).init(0),
     /// Count of workers currently in the find-work phase of the
     /// dispatch loop. Anti-herd: `wakeOneParked` skips when > 0.
-    num_searching: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    num_searching: std.atomic.Value(u32) align(std.atomic.cache_line) = std.atomic.Value(u32).init(0),
     /// CAS-claim "I am the current reactor poller".
-    reactor_poller_taken: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    reactor_poller_taken: std.atomic.Value(bool) align(std.atomic.cache_line) = std.atomic.Value(bool).init(false),
     /// Shared parking lot — one wait/wake mechanism for every
     /// coroutine-level sync primitive (Mutex, Notify, Semaphore,
     /// channel block paths, Task.join, etc.). See `src/park.zig`
@@ -285,6 +363,13 @@ pub const Runtime = struct {
     /// `init`, one `munmap` at `deinit`; per-P pools cache freed
     /// slots so the steady-state hot path is allocation-free.
     stack_arena: stack_mod.Arena,
+    /// OS-thread pool used by `volt.spawnBlocking`. Lazy — no
+    /// threads spawn until the first submit. See `src/blocking_pool.zig`.
+    blocking_pool: blocking_pool_mod.Pool,
+    /// Optional instrumentation hook — see `Observer` doc. Read by
+    /// the four hook sites (spawn, park, unpark, complete). Nullable
+    /// so the hot path stays branch-and-fold when no observer is set.
+    observer: ?*const Observer = null,
     // Diagnostic counters live per-P now (see `P.stat_*`) — they
     // were on Runtime as shared atomics, but every spawn / done /
     // unpark hit the same cache line, costing ~40 % of multi-worker
@@ -321,9 +406,12 @@ pub const Runtime = struct {
             .ps = ps,
             .reactor = reactor_inst,
             .parking_lot = park_mod.ParkingLot.init(),
-            .stack_arena = try stack_mod.Arena.init(cfg.allocator, cfg.max_concurrent_stacks),
+            .stack_arena = try stack_mod.Arena.init(cfg.allocator, cfg.max_concurrent_stacks, cfg.stack_reservation_size),
+            .blocking_pool = try blocking_pool_mod.Pool.init(cfg.allocator, cfg.blocking),
+            .observer = cfg.observer,
         };
         errdefer rt.stack_arena.deinit(cfg.allocator);
+        errdefer rt.blocking_pool.deinit();
         // Initialize each P, then bind each M to its P (1:1 in Phase 1).
         // Each P's stack pool cap = fair share of the arena across
         // workers, so asymmetric spawn (one driver, many workers)
@@ -332,6 +420,7 @@ pub const Runtime = struct {
         for (rt.ps, 0..) |*p, i| {
             p.init(i, rt);
             p.arena = &rt.stack_arena;
+            p.arena_usable_offset = rt.stack_arena.usableOffset();
             p.stack_pool_cap = fair_share;
         }
         for (rt.ms, 0..) |*m, i| m.init(&rt.ps[i]);
@@ -349,12 +438,29 @@ pub const Runtime = struct {
 
     pub fn deinit(self: *Runtime) void {
         self.shutdown.store(true, .release);
+        // Wake any spawned M currently blocked inside `reactor.poll(true)`.
+        // `parker.unpark` below only wakes Ms parked on their own parker;
+        // an M inside a blocking kevent / epoll_wait / submit_and_wait /
+        // GetQueuedCompletionStatusEx is in a syscall and won't observe
+        // the shutdown flag without this nudge. Combined with the
+        // `!shutdown` guard in `tryFindAndDispatch`, the woken M
+        // returns from poll, loops, and exits cleanly.
+        self.reactor.interrupt();
         // Wake every spawned M so it observes shutdown. M[0] is the
         // driver thread — by this point it has already returned from
         // run() and is on the deinit path, so it doesn't need an unpark.
         for (self.ms[1..]) |*m| m.parker.unpark();
         for (self.ms[1..]) |*m| m.thread.join();
         for (self.ms) |*m| m.deinit();
+        // Blocking pool teardown happens BEFORE reactor + parking_lot
+        // teardown: a pool thread completing a job calls
+        // `park.unparkOne(rt, ...)`, which touches the parking_lot.
+        // Draining the pool first guarantees no such call races the
+        // deinit. The pool itself blocks on in-flight jobs to
+        // complete — caller contract is "drain spawnBlocking before
+        // calling Runtime.deinit", same shape as the
+        // `reactor.deinit pending == 0` invariant.
+        self.blocking_pool.deinit();
         // Pools are quiescent now — every M has stopped dispatching,
         // so no further spawn/done can touch them. Drain coroutine
         // pools back to the allocator and stack pools back to the
@@ -382,7 +488,7 @@ pub const Runtime = struct {
         self: *Runtime,
         comptime user_fn: anytype,
         args: anytype,
-    ) !*Task(@typeInfo(@TypeOf(user_fn)).@"fn".return_type.?) {
+    ) SpawnError!*Task(@typeInfo(@TypeOf(user_fn)).@"fn".return_type.?) {
         const FWT = task_mod.FrameWithTask(user_fn, @TypeOf(args));
 
         const combined = try self.allocator.create(FWT);
@@ -422,7 +528,7 @@ pub const Runtime = struct {
         };
         // SP grows down from the top of the body region. The guard
         // page sits below — overflow walks into PROT_NONE and SIGSEGVs.
-        const stack_top: [*]u8 = stack + stack_mod.slotSize();
+        const stack_top: [*]u8 = stack + self.stack_arena.slotSize();
         context.initContext(&c.ctx, stack_top, &combined.frame);
 
         combined.task = .{
@@ -440,6 +546,7 @@ pub const Runtime = struct {
         } else {
             _ = self.ps[0].stat_spawned.fetchAdd(1, .monotonic);
         }
+        if (self.observer) |o| if (o.onSpawn) |cb| cb(c);
         self.pushNew(c);
         return &combined.task;
     }
@@ -570,7 +677,217 @@ pub const Runtime = struct {
         workerLoopUntilTaskDone(self, &self.ms[0], &task.done);
         return task.join();
     }
+
+    /// Spawn `user_fn(args)` as a root coroutine and return a
+    /// `*DetachedHandle(T)` without blocking the calling thread.
+    /// The runtime's spawned worker threads (M[1..N-1]) drive
+    /// dispatch; the caller's thread stays free to do other work
+    /// (event loops, CLI parsing, embedding scenarios).
+    ///
+    /// Call `handle.wait()` from any OS thread to block until the
+    /// root completes and consume its result. Requires
+    /// `Config.workers >= 2` because the calling thread isn't
+    /// available as M[0] — at least one spawned M must exist to
+    /// drive dispatch. Returns `error.NeedMultipleWorkers` if not.
+    ///
+    /// **Lifetime**: the returned handle's storage is owned by the
+    /// Runtime's allocator. `wait()` consumes the handle (don't use
+    /// it after). Do not call `Runtime.deinit` before `wait()`.
+    pub fn runDetached(
+        self: *Runtime,
+        comptime user_fn: anytype,
+        args: anytype,
+    ) (SpawnError || error{NeedMultipleWorkers})!*DetachedHandle(@typeInfo(@TypeOf(user_fn)).@"fn".return_type.?) {
+        if (self.ms.len < 2) return error.NeedMultipleWorkers;
+
+        const Ret = @typeInfo(@TypeOf(user_fn)).@"fn".return_type.?;
+        const Handle = DetachedHandle(Ret);
+
+        var task = try self.spawn(user_fn, args);
+        // Allocate handle; on failure roll back the spawn by aborting
+        // before the task ever observed — but we can't un-spawn, so
+        // err out of the allocation requires the caller to .wait()
+        // anyway. Simpler to error here as SpawnError.OutOfMemory.
+        const handle = try self.allocator.create(Handle);
+        handle.* = .{ .task = task, .parker = .{}, .allocator = self.allocator };
+        // When dispatch sees the root coroutine complete, it unparks
+        // this parker — same mechanism `run` uses for M[0]'s parker.
+        task.coro.task_thread_parker = &handle.parker;
+        return handle;
+    }
+
+    /// Run `body(*Cancel, args...)` as the root coroutine. Installs
+    /// a SIGINT handler (POSIX) that fires the `*Cancel` on signal.
+    /// When the handler fires, every cancel-aware blocking call in
+    /// the body's coroutine tree wakes with `error.Cancelled` and
+    /// the body unwinds for graceful shutdown.
+    ///
+    /// **POSIX-only for v1.** On Windows this falls back to plain
+    /// `run` with a no-op Cancel (Wave 2.5 will wire
+    /// `SetConsoleCtrlHandler`).
+    ///
+    /// Body shape: `fn(*Cancel, ...args) E!T`. On natural body
+    /// completion the cancel fires anyway (to release the internal
+    /// signal-poller); the body's return value still surfaces.
+    ///
+    /// Caller contract: do not call concurrently from multiple
+    /// runtimes in the same process — the signal handler dispatches
+    /// via a single process-global fd.
+    pub fn runWithSignals(
+        self: *Runtime,
+        comptime body: anytype,
+        args: anytype,
+    ) !@typeInfo(@typeInfo(@TypeOf(body)).@"fn".return_type.?).error_union.payload {
+        if (comptime is_windows_rt) {
+            return self.runWithSignalsNoOpWindows(body, args);
+        }
+
+        var pipe_fds: [2]c_int = undefined;
+        if (posix_pipe(&pipe_fds) != 0) return error.PipeCreateFailed;
+        defer _ = posix_close(pipe_fds[0]);
+        defer _ = posix_close(pipe_fds[1]);
+
+        // Non-blocking on both ends. The handler's `write` is in a
+        // signal context and must not block; the poller drives reads
+        // through the reactor's wait-readable path.
+        reactor_mod.setNonblock(pipe_fds[0]) catch {};
+        reactor_mod.setNonblock(pipe_fds[1]) catch {};
+
+        sigint_pipe_write_fd.store(pipe_fds[1], .release);
+        defer sigint_pipe_write_fd.store(-1, .release);
+
+        const SIGINT: c_int = 2;
+        var old_action: signal_mod.Sigaction = undefined;
+        var new_action: signal_mod.Sigaction = std.mem.zeroes(signal_mod.Sigaction);
+        new_action.sa_sigaction = @ptrCast(&sigintHandler);
+        new_action.sa_flags = signal_mod.SA_SIGINFO;
+        _ = signal_mod.sigaction_fn(SIGINT, &new_action, &old_action);
+        defer _ = signal_mod.sigaction_fn(SIGINT, &old_action, null);
+
+        const ArgsT = @TypeOf(args);
+        const Internal = struct {
+            fn run(read_fd: c_int, user_args: ArgsT) !@typeInfo(@typeInfo(@TypeOf(body)).@"fn".return_type.?).error_union.payload {
+                var c = @import("cancel.zig").Cancel.init(@ptrCast(@alignCast(current.require().runtime)));
+                defer c.deinit();
+
+                const Poller = struct {
+                    fn run(cn: *@import("cancel.zig").Cancel, fd: c_int) void {
+                        const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+                        rt.reactor.waitReadableCancel(fd, cn) catch return;
+                        cn.fire();
+                    }
+                };
+                var poller = try (@import("lib.zig").spawn(Poller.run, .{ &c, read_fd }));
+
+                const body_args = .{&c} ++ user_args;
+                const result = @call(.auto, body, body_args);
+
+                // Body done — fire cancel (idempotent if already
+                // fired by the signal handler) so the poller wakes
+                // and exits.
+                c.fire();
+                _ = poller.join();
+                return result;
+            }
+        };
+
+        return try self.run(Internal.run, .{ pipe_fds[0], args });
+    }
+
+    /// Windows fallback for `runWithSignals` — provides the Cancel
+    /// to the body but doesn't install any signal handler. The body
+    /// must fire the cancel itself (e.g. via custom Win32 console
+    /// control handler) for graceful shutdown.
+    fn runWithSignalsNoOpWindows(
+        self: *Runtime,
+        comptime body: anytype,
+        args: anytype,
+    ) !@typeInfo(@typeInfo(@TypeOf(body)).@"fn".return_type.?).error_union.payload {
+        const ArgsT = @TypeOf(args);
+        const Internal = struct {
+            fn run(user_args: ArgsT) !@typeInfo(@typeInfo(@TypeOf(body)).@"fn".return_type.?).error_union.payload {
+                var c = @import("cancel.zig").Cancel.init(@ptrCast(@alignCast(current.require().runtime)));
+                defer c.deinit();
+                const body_args = .{&c} ++ user_args;
+                return @call(.auto, body, body_args);
+            }
+        };
+        return try self.run(Internal.run, .{args});
+    }
 };
+
+// ─── runWithSignals — graceful-shutdown infrastructure ─────────────
+//
+// File-scope helpers used by Runtime.runWithSignals (which lives on
+// Runtime as a method, below). SIGINT (and on POSIX SIGTERM) wire to
+// a Cancel the user's root owns. The mechanism is the classic POSIX
+// self-pipe: signal handler writes one byte; a poller coroutine waits
+// on the read end via the reactor; on wake, fires the cancel.
+//
+// Async-signal-safety: the handler only does `write(fd, &byte, 1)`.
+// One global pipe fd — signals are process-wide, so multi-runtime
+// graceful-shutdown isn't supported in v1 (it'd race on this slot).
+
+const is_windows_rt = builtin.os.tag == .windows;
+const posix_pipe = if (is_windows_rt) {} else @extern(
+    *const fn (fds: *[2]c_int) callconv(.c) c_int,
+    .{ .name = "pipe" },
+);
+const posix_close = if (is_windows_rt) {} else @extern(
+    *const fn (fd: c_int) callconv(.c) c_int,
+    .{ .name = "close" },
+);
+const posix_write = if (is_windows_rt) {} else @extern(
+    *const fn (fd: c_int, buf: [*]const u8, count: usize) callconv(.c) isize,
+    .{ .name = "write" },
+);
+
+var sigint_pipe_write_fd: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(-1);
+
+fn sigintHandler(sig: c_int, info: *anyopaque, ctx: ?*anyopaque) callconv(.c) void {
+    _ = sig;
+    _ = info;
+    _ = ctx;
+    const fd = sigint_pipe_write_fd.load(.acquire);
+    if (fd < 0) return;
+    const byte: u8 = 1;
+    _ = posix_write(fd, @ptrCast(&byte), 1);
+}
+
+/// Handle returned by `Runtime.runDetached`. The OS-thread parker
+/// equivalent of `Task.join`: `wait()` blocks the calling thread
+/// (not a coroutine) until the root completes.
+pub fn DetachedHandle(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        task: *Task(T),
+        parker: parker_mod.Parker,
+        allocator: std.mem.Allocator,
+
+        /// Block the calling OS thread until the root completes,
+        /// return its result, free the task and the handle. Safe to
+        /// call from any OS thread (NOT a coroutine — for that, use
+        /// `Task.join`). The handle is consumed by this call.
+        pub fn wait(self: *Self) T {
+            // Park OS thread until dispatch's `.done` branch unparks
+            // our parker. Loop in case of spurious wakes.
+            while (self.task.done.load(.acquire) == task_mod.NOT_DONE) {
+                self.parker.park();
+            }
+            const result = self.task.result_ptr.*;
+            const allocator = self.allocator;
+            self.task.frame_destroy(self.task.frame_ptr, self.task.allocator);
+            allocator.destroy(self);
+            return result;
+        }
+
+        /// Non-consuming completion check. Safe to call from any
+        /// thread. Useful for polling instead of blocking.
+        pub fn isDone(self: *const Self) bool {
+            return self.task.done.load(.acquire) == task_mod.DONE;
+        }
+    };
+}
 
 /// Entry point for pthread-spawned Ms (M[1..N-1]).
 /// Runs the dispatch loop until shutdown.
@@ -587,17 +904,8 @@ fn workerLoopUntilTaskDone(rt: *Runtime, m: *M, target_done: *std.atomic.Value(u
     worker_mod.currentMSet(@ptrCast(m));
     defer worker_mod.currentMSet(null);
     while (target_done.load(.acquire) == task_mod.NOT_DONE) {
-        // Enter find-work phase: count this M as searching.
-        // Anti-herd: pushers see num_searching > 0 and skip the
-        // bitmap CAS + ulock_wake, knowing we'll pick up their push.
         _ = rt.num_searching.fetchAdd(1, .acq_rel);
-        if (tryFindAndDispatch(rt, m)) {
-            // tryFindAndDispatch decrements num_searching on hit
-            // before swapping into the coroutine. We're back from
-            // the swap now; loop iterates and fetchAdds again.
-            continue;
-        }
-        // No work found. Leave find-work phase and park.
+        if (tryFindAndDispatch(rt, m)) continue;
         _ = rt.num_searching.fetchSub(1, .acq_rel);
         if (target_done.load(.acquire) == task_mod.DONE) return;
         parkWorker(rt, m);
@@ -662,6 +970,16 @@ fn tryFindAndDispatch(rt: *Runtime, m: *M) bool {
         return true;
     }
     if (rt.reactor.pendingCount() > 0 and rt.tryClaimPoller()) {
+        // Don't enter the blocking poll if shutdown has fired: we'd
+        // immediately be woken by `reactor.interrupt()` (deinit
+        // always fires one), but a worker re-checking pending after
+        // shutdown could otherwise spin entering+exiting poll. Just
+        // surrender the claim; caller decrements num_searching and
+        // re-checks shutdown.
+        if (rt.shutdown.load(.acquire)) {
+            rt.releasePoller();
+            return false;
+        }
         // Drop searching count while inside the blocking kevent —
         // this thread can't pick up other work while in the syscall,
         // and pushers should be able to wake parked siblings.
@@ -679,6 +997,18 @@ fn tryFindAndDispatch(rt: *Runtime, m: *M) bool {
 ///
 /// Called from a non-searching state — the caller has already
 /// fetchSub'd num_searching when it decided not to find more work.
+/// Pre-park spin budget. When find-work returns nothing, retry the
+/// cheap arrival checks this many times before committing to a real
+/// `parker.park()` syscall. Saves a park+unpark roundtrip (~600 ns
+/// on Darwin) when bursty spawners push work into our mailbox
+/// within a few microseconds of us idling out.
+///
+/// Tunable per workload: high values hurt idle-CPU; low values miss
+/// the burst window. 64 is the Tokio default analog and matches
+/// micro-bench measurements on Apple Silicon (work arrival window
+/// 200ns – 5us in spawn-heavy shapes).
+const SPIN_BEFORE_PARK: u32 = 64;
+
 fn parkWorker(rt: *Runtime, m: *M) void {
     rt.markParked(m);
     defer rt.unmarkParked(m);
@@ -690,6 +1020,21 @@ fn parkWorker(rt: *Runtime, m: *M) void {
     // on the next loop iteration if we get woken.
     if (rt.reactor.pendingCount() > 0) return;
     if (rt.shutdown.load(.acquire)) return;
+
+    // Spin briefly before committing to a real park. Bursty spawn
+    // patterns push work into our mailbox within microseconds; the
+    // park + later unpark syscall pair costs ~600 ns on Darwin,
+    // dwarfing the cost of a few hundred ns of spin-checks.
+    var spins: u32 = 0;
+    while (spins < SPIN_BEFORE_PARK) : (spins += 1) {
+        std.atomic.spinLoopHint();
+        if (m.p.lifo_slot.load(.acquire) != null) return;
+        if (!m.p.mailbox.isEmpty()) return;
+        if (!m.p.local.isEmpty()) return;
+        if (rt.reactor.pendingCount() > 0) return;
+        if (rt.shutdown.load(.acquire)) return;
+    }
+
     m.parker.park();
 }
 
@@ -697,11 +1042,23 @@ fn parkWorker(rt: *Runtime, m: *M) void {
 /// local queue first (preserves the work-stealing protocol); if
 /// that fails, peeks at the sibling's mailbox (single-pop fallback,
 /// since mailbox is MPMC). Returns one coroutine to dispatch.
+///
+/// Attempts capped to `⌈log₂(N)⌉ + 1` siblings per call (with a
+/// floor of 4 to keep small-N coverage). With a random start per
+/// call, different searching workers cover different subsets, so
+/// the collective coverage is still ~N siblings per few cycles.
+/// Capping reduces CAS contention on hot siblings at high worker
+/// counts; if work was missed, the next worker's wakeOneParked
+/// (always fired on push) gives us another chance with a fresh
+/// random start.
 fn stealFromSiblings(rt: *Runtime, self: *M) ?*Coroutine {
     if (rt.ps.len <= 1) return null;
     const start: usize = self.p.rng.random().uintLessThan(usize, rt.ps.len);
+    const log_n = std.math.log2_int_ceil(usize, rt.ps.len);
+    const max_attempts = @max(@as(usize, 4), log_n + 1);
+    const cap = @min(max_attempts, rt.ps.len);
     var attempts: usize = 0;
-    while (attempts < rt.ps.len) : (attempts += 1) {
+    while (attempts < cap) : (attempts += 1) {
         const idx = (start + attempts) % rt.ps.len;
         if (idx == self.p.id) continue;
         const sibling = &rt.ps[idx];
@@ -738,6 +1095,7 @@ fn dispatch(rt: *Runtime, m: *M, c: *Coroutine) void {
             }
         },
         .done => {
+            if (rt.observer) |o| if (o.onComplete) |cb| cb(c);
             // Signal the joiner. The parking-lot's validator-under-
             // lock guarantees no register-then-park race here: a
             // joiner that observes `done == DONE` in its validator
@@ -750,7 +1108,18 @@ fn dispatch(rt: *Runtime, m: *M, c: *Coroutine) void {
             // The driver thread (worker 0) parks via its Parker,
             // not via the parking lot. The root task carries a
             // direct Parker pointer; wake it here.
-            if (c.task_thread_parker) |p| p.unpark();
+            //
+            // ALSO fire reactor.interrupt() — the driver may be
+            // blocked in reactor.poll(true) via tryFindAndDispatch
+            // rather than in parker.park(); the parker.unpark stores
+            // NOTIFIED but the driver is waiting on kqueue, not the
+            // parker. Without the interrupt, the driver hangs on
+            // kqueue waiting for an event that may never come.
+            // See https://github.com/NerdMeNot/volt/issues/1.
+            if (c.task_thread_parker) |p| {
+                p.unpark();
+                rt.reactor.interrupt();
+            }
             if (!c.has_task) {
                 if (c.frame_destroy) |destroy_fn| destroy_fn(c.frame_ptr, rt.allocator);
             }
@@ -768,15 +1137,14 @@ fn dispatch(rt: *Runtime, m: *M, c: *Coroutine) void {
 // Tests
 // ─────────────────────────────────────────────────────────────────────
 
-// Tests use the smp_allocator (thread-safe, no stack-trace cache).
-// `std.testing.allocator` is a GeneralPurposeAllocator with stack-trace
-// capture for leak detection — but the trace capture walks
-// `debug.SelfInfo`'s module hash map without synchronization. Under
-// multi-worker spawn, several workers call `allocator.create(Coroutine)`
-// concurrently; the unwinder corrupts the module map and crashes with
-// EXC_BAD_ACCESS. The smp_allocator is fast, thread-safe, and what
-// production workloads use.
-const test_allocator = std.heap.smp_allocator;
+// `volt.testing.allocator` — leak-detecting + multi-worker-safe.
+// `std.testing.allocator`'s DebugAllocator captures stack traces via
+// `debug.SelfInfo`'s module map, which the unwinder walks without
+// synchronization. Multi-worker spawn corrupts that map and crashes
+// with EXC_BAD_ACCESS. Our wrapper sets `stack_trace_frames = 0`
+// (kills the unwinder race) and `thread_safe = true` (DebugAllocator's
+// own bookkeeping mutex).
+const test_allocator = @import("testing.zig").allocator;
 
 fn returnInt(x: u32) u32 {
     return x * 2;
@@ -967,4 +1335,185 @@ test "runtime: tryDispatchInline returns false when target parks, target complet
     var out: u32 = 0;
     try (try rt.run(inlineParkRoot, .{&out}));
     try std.testing.expectEqual(@as(u32, 99), out);
+}
+
+fn noopRoot() void {}
+
+test "runtime: deinit unblocks a worker stuck inside reactor.poll" {
+    // Provokes the race the Phase 6 follow-up fixes: a worker is
+    // inside `reactor.poll(true)` when deinit is called. Before
+    // the fix, `parker.unpark` doesn't reach a thread inside a
+    // syscall, so deinit hangs forever on `m.thread.join()`.
+    //
+    // Darwin-only because Linux's `Reactor` is a tagged union over
+    // {epoll, io_uring} and doesn't expose `pending` at the top
+    // level. The deinit wire-up + tryFindAndDispatch guard tested
+    // here run on every platform; the interrupt() mechanism each
+    // backend dispatches to is covered in its respective unit test
+    // (reactor_kqueue.zig has one; epoll/io_uring/iocp gated by
+    // the cross-compile + their own future direct tests).
+    if (comptime @import("builtin").os.tag != .macos) return error.SkipZigTest;
+
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+
+    // run() exits when the root coro returns; spawned Ms remain in
+    // workerLoopUntilShutdown. With pending bumped artificially,
+    // any worker that enters tryFindAndDispatch's "claim poller"
+    // branch will enter poll(true). The dispatcher's reactor-poll
+    // branch fires only on pendingCount > 0.
+    try rt.run(noopRoot, .{});
+
+    rt.reactor.pending.store(1, .release);
+
+    // Brief spin so at least one of the two workers actually enters
+    // poll. The spin doesn't need to be tight — if no worker is in
+    // poll when interrupt fires, the test still passes (interrupt
+    // becomes a no-op and the parker.unpark path drives shutdown).
+    // The 1M iterations gives plenty of opportunity to enter kevent
+    // without depending on a wall-clock sleep API.
+    var i: u32 = 0;
+    while (i < 1_000_000) : (i += 1) std.atomic.spinLoopHint();
+
+    // Reset pending so reactor.deinit's `pending == 0` assertion
+    // holds — we only bumped it to provoke the race, not because
+    // any real coroutine is parked.
+    rt.reactor.pending.store(0, .release);
+
+    // Test passes if deinit returns; it hangs forever if the fix
+    // is missing.
+    rt.deinit();
+}
+
+// ─── runDetached tests ──────────────────────────────────────────────
+
+fn detachedAdd(a: u32, b: u32) u32 {
+    return a + b;
+}
+
+test "runDetached: caller thread doesn't block; wait() retrieves result" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+
+    // Spawning detached returns immediately to the caller's OS thread —
+    // the spawned M[1] picks up the root and runs it. The caller does
+    // unrelated work (here: a brief atomic spin) before blocking on
+    // wait(). Whether the task completed before, during, or after the
+    // spin, wait() returns the result either way.
+    const handle = try rt.runDetached(detachedAdd, .{ @as(u32, 19), @as(u32, 23) });
+    var i: u32 = 0;
+    while (i < 1_000_000) : (i += 1) std.atomic.spinLoopHint();
+    const result = handle.wait();
+    try std.testing.expectEqual(@as(u32, 42), result);
+}
+
+test "runDetached: workers=1 returns error.NeedMultipleWorkers" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 1 });
+    defer rt.deinit();
+    const r = rt.runDetached(detachedAdd, .{ @as(u32, 1), @as(u32, 2) });
+    try std.testing.expectError(error.NeedMultipleWorkers, r);
+}
+
+// ─── Observer hook test ────────────────────────────────────────────
+
+// Process-global counters — the Observer hooks are bare function
+// pointers (no per-callback context capability in v1), so we have
+// to use file-scope state to communicate from the callbacks back to
+// the test.
+var test_obs_spawn: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+var test_obs_complete: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+fn testObsOnSpawn(c: *Coroutine) void {
+    _ = c;
+    _ = test_obs_spawn.fetchAdd(1, .acq_rel);
+}
+fn testObsOnComplete(c: *Coroutine) void {
+    _ = c;
+    _ = test_obs_complete.fetchAdd(1, .acq_rel);
+}
+
+fn observerTinyTask() void {}
+
+fn observerRoot() !void {
+    // Spawn five trivial tasks; each fires onSpawn at queue time
+    // and onComplete at dispatch's `.done` branch.
+    var tasks: [5]*Task(void) = undefined;
+    for (&tasks) |*t| t.* = try @import("lib.zig").spawn(observerTinyTask, .{});
+    for (tasks) |t| _ = t.join();
+}
+
+test "Observer: onSpawn + onComplete fire once per task" {
+    test_obs_spawn.store(0, .release);
+    test_obs_complete.store(0, .release);
+    var obs = Observer{
+        .onSpawn = &testObsOnSpawn,
+        .onComplete = &testObsOnComplete,
+    };
+    var rt = try Runtime.init(.{
+        .allocator = test_allocator,
+        .workers = 2,
+        .observer = &obs,
+    });
+    defer rt.deinit();
+    try (try rt.run(observerRoot, .{}));
+    // 5 user tasks + 1 root = 6 onSpawn / 6 onComplete.
+    try std.testing.expectEqual(@as(u32, 6), test_obs_spawn.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 6), test_obs_complete.load(.acquire));
+}
+
+// ─── runWithSignals tests ──────────────────────────────────────────
+
+fn runWithSignalsNoSigBody(c: *@import("cancel.zig").Cancel) !void {
+    _ = c;
+    // Body returns immediately — exercises the setup/teardown path
+    // without ever needing a real signal.
+}
+
+test "runWithSignals: clean setup + teardown when body returns" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+    try rt.runWithSignals(runWithSignalsNoSigBody, .{});
+}
+
+const SignalCtx = struct {
+    cancelled_observed: bool = false,
+};
+
+// Body that parks on a long sleep via the shared Cancel. When the
+// SIGINT handler fires the cancel, sleepCancel returns
+// error.Cancelled and the body sets a flag we assert on.
+fn runWithSignalsCancelBody(
+    c: *@import("cancel.zig").Cancel,
+    ctx: *SignalCtx,
+) !void {
+    const lib = @import("lib.zig");
+    // Spawn a side coro that raise()s SIGINT after yielding a few
+    // times — that gives the poller time to install + park.
+    const Raiser = struct {
+        fn run() void {
+            var i: u32 = 0;
+            while (i < 100) : (i += 1) lib.yield();
+            const raise_fn = @extern(*const fn (sig: c_int) callconv(.c) c_int, .{ .name = "raise" });
+            _ = raise_fn(2); // SIGINT
+        }
+    };
+    const raiser = lib.spawn(Raiser.run, .{}) catch return;
+
+    // Park on sleepCancel for far longer than the test could
+    // possibly need — the signal-driven cancel.fire is the only
+    // way this completes within reasonable time.
+    lib.sleepCancel(lib.Duration.fromSecs(60), c) catch |e| switch (e) {
+        error.Cancelled => ctx.cancelled_observed = true,
+        else => {},
+    };
+
+    _ = raiser.join();
+}
+
+test "runWithSignals: SIGINT fires Cancel; body unwinds gracefully" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+    var ctx = SignalCtx{};
+    try rt.runWithSignals(runWithSignalsCancelBody, .{&ctx});
+    try std.testing.expect(ctx.cancelled_observed);
 }

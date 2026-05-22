@@ -63,7 +63,18 @@ inline fn currentCancelFired() bool {
 
 pub fn Spsc(comptime T: type, comptime cap: usize) type {
     comptime {
-        std.debug.assert(cap > 0 and (cap & (cap - 1)) == 0);
+        if (T == void) @compileError(
+            \\Spsc(void) doesn't make sense — there are no values to pass.
+            \\Use `volt.Notify` for signal-only wakeups, or
+            \\`volt.Semaphore` for counted signals.
+        );
+        if (cap == 0) @compileError(
+            "Spsc capacity must be > 0",
+        );
+        if ((cap & (cap - 1)) != 0) @compileError(std.fmt.comptimePrint(
+            "Spsc capacity must be a power of 2; got {d}. Did you mean {d}?",
+            .{ cap, std.math.ceilPowerOfTwoAssert(usize, cap) },
+        ));
     }
     return struct {
         const Self = @This();
@@ -256,7 +267,16 @@ pub fn Spsc(comptime T: type, comptime cap: usize) type {
 /// Cells are initialised so `ring[i].seq == i` — comptime-baked.
 pub fn Mpmc(comptime T: type, comptime cap: usize) type {
     comptime {
-        std.debug.assert(cap > 0 and (cap & (cap - 1)) == 0);
+        if (T == void) @compileError(
+            \\Mpmc(void) doesn't make sense — there are no values to pass.
+            \\Use `volt.Notify` for signal-only wakeups, or
+            \\`volt.Semaphore` for counted signals.
+        );
+        if (cap == 0) @compileError("Mpmc capacity must be > 0");
+        if ((cap & (cap - 1)) != 0) @compileError(std.fmt.comptimePrint(
+            "Mpmc capacity must be a power of 2; got {d}. Did you mean {d}?",
+            .{ cap, std.math.ceilPowerOfTwoAssert(usize, cap) },
+        ));
     }
     return struct {
         const Self = @This();
@@ -722,7 +742,11 @@ pub fn Watch(comptime T: type) type {
 /// either reads (if seq == c+1) or detects lag (if seq > c+1+cap).
 pub fn Broadcast(comptime T: type, comptime cap: usize) type {
     comptime {
-        std.debug.assert(cap > 0 and (cap & (cap - 1)) == 0);
+        if (cap == 0) @compileError("Broadcast capacity must be > 0");
+        if ((cap & (cap - 1)) != 0) @compileError(std.fmt.comptimePrint(
+            "Broadcast capacity must be a power of 2; got {d}. Did you mean {d}?",
+            .{ cap, std.math.ceilPowerOfTwoAssert(usize, cap) },
+        ));
     }
     return struct {
         const Self = @This();
@@ -829,10 +853,9 @@ pub fn Broadcast(comptime T: type, comptime cap: usize) type {
 // Tests
 // ─────────────────────────────────────────────────────────────────────
 
-// See note in src/runtime.zig: std.testing.allocator's stack-trace
-// capture corrupts under multi-worker spawn. smp_allocator is the
-// thread-safe choice for runtime-touching tests.
-const test_allocator = std.heap.smp_allocator;
+// `volt.testing.allocator` — leak-detecting + multi-worker-safe.
+// See src/testing.zig for why std.testing.allocator doesn't fit.
+const test_allocator = @import("testing.zig").allocator;
 const Runtime = runtime.Runtime;
 
 const TestCtxCap4 = struct {

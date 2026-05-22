@@ -261,6 +261,12 @@ const WSA_DATA_BYTES: usize = 400;
 
 const WSA_IO_PENDING: c_int = 997;
 
+// Sentinel `CompletionKey` for the cross-thread interrupt
+// completion. Coroutine pointers are heap-allocated and never null,
+// so `0` is a safe sentinel; timer completions and I/O completions
+// both carry a real coroutine ptr.
+const INTERRUPT_KEY: usize = 0;
+
 // ─── Reactor ─────────────────────────────────────────────────────
 
 pub const Reactor = struct {
@@ -458,6 +464,64 @@ pub const Reactor = struct {
         context.swap(&me.ctx, me.main_ctx);
     }
 
+    /// Cancel-aware variant of `submitAcceptEx`. Same `CancelIoEx`
+    /// mechanism as `submitReadinessCancel`: the kernel posts a
+    /// `STATUS_CANCELLED` completion for the cancelled OVERLAPPED,
+    /// the poll loop unparks via the normal path, and the caller
+    /// observes `error.Cancelled` because `Cancel.isFired()` is true.
+    pub fn submitAcceptExCancel(
+        self: *Reactor,
+        listen_sock: SOCKET,
+        accept_sock: SOCKET,
+        out_buf: []u8,
+        addr_len: win.DWORD,
+        c: *cancel_mod.Cancel,
+    ) (ReactorWaitError || cancel_mod.Error)!void {
+        const raw = try self.loadExtensionFn(listen_sock, &WSAID_ACCEPTEX, &self.acceptex_fn_raw);
+        const accept_ex: AcceptExFn = @ptrFromInt(raw);
+
+        const me = current.require();
+        try c.checkpoint();
+
+        var ovl: OVERLAPPED = std.mem.zeroes(OVERLAPPED);
+        ovl.DUMMYUNIONNAME = .{ .Pointer = @ptrFromInt(@intFromPtr(me)) };
+        var bytes_received: win.DWORD = 0;
+        const rc = accept_ex(
+            listen_sock,
+            accept_sock,
+            out_buf.ptr,
+            0,
+            addr_len,
+            addr_len,
+            &bytes_received,
+            &ovl,
+        );
+        if (rc == win.BOOL.FALSE) {
+            const e = WSAGetLastError();
+            if (e != WSA_IO_PENDING) return wsaToSetupError(e);
+        }
+
+        // CancelIoEx targets the OVERLAPPED on the listener handle —
+        // AcceptEx is bound to listen_sock, not the pre-created
+        // accept_sock.
+        var op = WaitOp{ .io = .{ .sock = listen_sock, .overlapped = &ovl } };
+        me.reactor_wait_op = &op;
+        defer me.reactor_wait_op = null;
+
+        var w = cancel_mod.Waiter{};
+        const already_fired = c.registerReactor(&w, me);
+        defer c.deregister(&w);
+        if (already_fired) {
+            _ = CancelIoEx(@ptrFromInt(listen_sock), &ovl);
+        }
+
+        _ = self.pending.fetchAdd(1, .acq_rel);
+        me.pending = .park;
+        context.swap(&me.ctx, me.main_ctx);
+
+        if (c.isFired()) return error.Cancelled;
+    }
+
     /// Submit `ConnectEx` on `sock`, parking the current coroutine
     /// until the connection completes.
     ///
@@ -495,6 +559,58 @@ pub const Reactor = struct {
         _ = self.pending.fetchAdd(1, .acq_rel);
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
+    }
+
+    /// Cancel-aware variant of `submitConnectEx`. Same mechanism as
+    /// `submitAcceptExCancel`: `CancelIoEx` against the connecting
+    /// socket's OVERLAPPED, completion path unparks via the normal
+    /// route.
+    pub fn submitConnectExCancel(
+        self: *Reactor,
+        sock: SOCKET,
+        sa: *const anyopaque,
+        sa_len: c_int,
+        c: *cancel_mod.Cancel,
+    ) (ReactorWaitError || cancel_mod.Error)!void {
+        const raw = try self.loadExtensionFn(sock, &WSAID_CONNECTEX, &self.connectex_fn_raw);
+        const connect_ex: ConnectExFn = @ptrFromInt(raw);
+
+        const me = current.require();
+        try c.checkpoint();
+
+        var ovl: OVERLAPPED = std.mem.zeroes(OVERLAPPED);
+        ovl.DUMMYUNIONNAME = .{ .Pointer = @ptrFromInt(@intFromPtr(me)) };
+        var bytes_sent: win.DWORD = 0;
+        const rc = connect_ex(
+            sock,
+            sa,
+            sa_len,
+            null,
+            0,
+            &bytes_sent,
+            &ovl,
+        );
+        if (rc == win.BOOL.FALSE) {
+            const e = WSAGetLastError();
+            if (e != WSA_IO_PENDING) return wsaToSetupError(e);
+        }
+
+        var op = WaitOp{ .io = .{ .sock = sock, .overlapped = &ovl } };
+        me.reactor_wait_op = &op;
+        defer me.reactor_wait_op = null;
+
+        var w = cancel_mod.Waiter{};
+        const already_fired = c.registerReactor(&w, me);
+        defer c.deregister(&w);
+        if (already_fired) {
+            _ = CancelIoEx(@ptrFromInt(sock), &ovl);
+        }
+
+        _ = self.pending.fetchAdd(1, .acq_rel);
+        me.pending = .park;
+        context.swap(&me.ctx, me.main_ctx);
+
+        if (c.isFired()) return error.Cancelled;
     }
 
     /// Timer callback context — the threadpool fires this on a pool
@@ -718,18 +834,25 @@ pub const Reactor = struct {
         if (ok == win.BOOL.FALSE) return 0;
 
         const count: usize = @intCast(removed);
-        _ = self.pending.fetchSub(@intCast(count), .acq_rel);
+        var real_count: usize = 0;
         var i: usize = 0;
         while (i < count) : (i += 1) {
             const e = &entries[i];
-            // Two completion shapes:
+            // Three completion shapes:
             //   1. I/O completion (WSARecv/WSASend/AcceptEx/ConnectEx)
             //      — OVERLAPPED is non-null; coroutine ptr is in
             //      OVERLAPPED.Pointer (the union field, unused for
             //      socket I/O — see note in submit paths).
-            //   2. Timer completion (PostQueuedCompletionStatus) —
-            //      OVERLAPPED is null; coroutine ptr is in
-            //      CompletionKey.
+            //   2. Timer completion (PostQueuedCompletionStatus from
+            //      the threadpool callback) — OVERLAPPED is null;
+            //      coroutine ptr is in CompletionKey.
+            //   3. Interrupt completion (PostQueuedCompletionStatus
+            //      from `interrupt()`) — OVERLAPPED is null;
+            //      CompletionKey == INTERRUPT_KEY (the sentinel).
+            //      Doesn't count toward `pending` — skip the unpark.
+            if (e.lpOverlapped == null and e.lpCompletionKey == INTERRUPT_KEY) continue;
+
+            real_count += 1;
             const coro_ptr: usize = if (e.lpOverlapped) |ovl|
                 @intFromPtr(ovl.DUMMYUNIONNAME.Pointer)
             else
@@ -738,7 +861,21 @@ pub const Reactor = struct {
             const coro: *coroutine.Coroutine = @ptrFromInt(coro_ptr);
             runtime.unpark(coro);
         }
-        return count;
+        if (real_count > 0) _ = self.pending.fetchSub(@intCast(real_count), .acq_rel);
+        return real_count;
+    }
+
+    /// Wake a worker currently blocked in `poll(true)`. Safe to call
+    /// from any thread. The posted completion carries the
+    /// `INTERRUPT_KEY` sentinel; the poll loop recognises and
+    /// discards it without unparking any coroutine.
+    pub fn interrupt(self: *Reactor) void {
+        _ = PostQueuedCompletionStatus(
+            self.iocp,
+            0,
+            INTERRUPT_KEY,
+            null,
+        );
     }
 };
 
