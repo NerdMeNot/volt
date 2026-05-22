@@ -344,16 +344,12 @@ pub const Runtime = struct {
     reactor: Reactor,
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Bit i set ⇔ ms[i] is parked. M[0] is the driver thread.
-    /// Cache-line padded — every worker fetchOr/fetchAnd/cmpxchg's this
-    /// on every park/unpark cycle, and used to share a line with
-    /// `num_searching` (also hot on every find-work cycle). Splitting
-    /// removed the worst false-sharing hotspot in the runtime.
-    parked_workers: std.atomic.Value(u64) align(std.atomic.cache_line) = std.atomic.Value(u64).init(0),
+    parked_workers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Count of workers currently in the find-work phase of the
     /// dispatch loop. Anti-herd: `wakeOneParked` skips when > 0.
-    num_searching: std.atomic.Value(u32) align(std.atomic.cache_line) = std.atomic.Value(u32).init(0),
+    num_searching: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// CAS-claim "I am the current reactor poller".
-    reactor_poller_taken: std.atomic.Value(bool) align(std.atomic.cache_line) = std.atomic.Value(bool).init(false),
+    reactor_poller_taken: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Shared parking lot — one wait/wake mechanism for every
     /// coroutine-level sync primitive (Mutex, Notify, Semaphore,
     /// channel block paths, Task.join, etc.). See `src/park.zig`
