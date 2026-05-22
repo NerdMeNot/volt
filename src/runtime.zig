@@ -1038,11 +1038,23 @@ fn parkWorker(rt: *Runtime, m: *M) void {
 /// local queue first (preserves the work-stealing protocol); if
 /// that fails, peeks at the sibling's mailbox (single-pop fallback,
 /// since mailbox is MPMC). Returns one coroutine to dispatch.
+///
+/// Attempts capped to `⌈log₂(N)⌉ + 1` siblings per call (with a
+/// floor of 4 to keep small-N coverage). With a random start per
+/// call, different searching workers cover different subsets, so
+/// the collective coverage is still ~N siblings per few cycles.
+/// Capping reduces CAS contention on hot siblings at high worker
+/// counts; if work was missed, the next worker's wakeOneParked
+/// (always fired on push) gives us another chance with a fresh
+/// random start.
 fn stealFromSiblings(rt: *Runtime, self: *M) ?*Coroutine {
     if (rt.ps.len <= 1) return null;
     const start: usize = self.p.rng.random().uintLessThan(usize, rt.ps.len);
+    const log_n = std.math.log2_int_ceil(usize, rt.ps.len);
+    const max_attempts = @max(@as(usize, 4), log_n + 1);
+    const cap = @min(max_attempts, rt.ps.len);
     var attempts: usize = 0;
-    while (attempts < rt.ps.len) : (attempts += 1) {
+    while (attempts < cap) : (attempts += 1) {
         const idx = (start + attempts) % rt.ps.len;
         if (idx == self.p.id) continue;
         const sibling = &rt.ps[idx];
