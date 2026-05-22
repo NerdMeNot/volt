@@ -42,6 +42,12 @@ pub const MmapAdvice = @import("fs/mmap.zig").Advice;
 pub const mapFile = @import("fs/mmap.zig").mapFile;
 pub const mapAnonymous = @import("fs/mmap.zig").mapAnonymous;
 
+pub const Watcher = @import("fs/watcher.zig").Watcher;
+pub const WatchEvent = @import("fs/watcher.zig").Event;
+pub const WatchEventKind = @import("fs/watcher.zig").EventKind;
+pub const WatcherOptions = @import("fs/watcher.zig").Options;
+pub const WatcherWatchOptions = @import("fs/watcher.zig").WatchOptions;
+
 pub const FsError = fs_error.FsError;
 pub const FileError = fs_error.FileError;
 
@@ -54,7 +60,8 @@ pub const FileError = fs_error.FileError;
 /// `FsError.AccessDenied` on a component without search permission.
 pub fn stat(file_path: []const u8) FsError!Metadata {
     if (is_windows) @compileError("Windows stat: pending (Phase B.2)");
-    var z = try pathZ(file_path);
+    var z: PathZ = undefined;
+    try pathZInto(file_path, &z);
     var buf: std.c.Stat = undefined;
     if (syscall.stat(&z.buf, &buf) != 0) return fs_error.fromErrno(fs_error.currentErrno());
     return Metadata.fromStat(buf);
@@ -64,7 +71,8 @@ pub fn stat(file_path: []const u8) FsError!Metadata {
 /// info about the symlink itself.
 pub fn lstat(file_path: []const u8) FsError!Metadata {
     if (is_windows) @compileError("Windows lstat: pending (Phase B.2)");
-    var z = try pathZ(file_path);
+    var z: PathZ = undefined;
+    try pathZInto(file_path, &z);
     var buf: std.c.Stat = undefined;
     if (syscall.lstat(&z.buf, &buf) != 0) return fs_error.fromErrno(fs_error.currentErrno());
     return Metadata.fromStat(buf);
@@ -94,7 +102,8 @@ pub fn exists(file_path: []const u8) bool {
 /// doesn't exist" from "couldn't tell" (e.g. ACL on a parent dir).
 pub fn tryExists(file_path: []const u8) FsError!bool {
     if (is_windows) @compileError("Windows tryExists: pending (Phase B.2)");
-    var z = try pathZ(file_path);
+    var z: PathZ = undefined;
+    try pathZInto(file_path, &z);
     var buf: std.c.Stat = undefined;
     if (syscall.lstat(&z.buf, &buf) == 0) return true;
     const e = fs_error.fromErrno(fs_error.currentErrno());
@@ -118,7 +127,8 @@ pub const AccessMode = struct {
 /// subsequent open, permissions can change.
 pub fn access(file_path: []const u8, mode: AccessMode) bool {
     if (is_windows) @compileError("Windows access: pending (Phase B.2)");
-    var z = pathZ(file_path) catch return false;
+    var z: PathZ = undefined;
+    pathZInto(file_path, &z) catch return false;
     var bits: c_uint = syscall.F_OK;
     if (mode.read) bits |= syscall.R_OK;
     if (mode.write) bits |= syscall.W_OK;
@@ -133,7 +143,8 @@ pub fn access(file_path: []const u8, mode: AccessMode) bool {
 /// permissions, mutate, then `chmod` back.
 pub fn chmod(file_path: []const u8, perms: Permissions) FsError!void {
     if (is_windows) @compileError("Windows chmod: pending (Phase B.2)");
-    var z = try pathZ(file_path);
+    var z: PathZ = undefined;
+    try pathZInto(file_path, &z);
     const mode: std.c.mode_t = @intCast(perms.getMode());
     if (syscall.chmod(&z.buf, mode) != 0) return fs_error.fromErrno(fs_error.currentErrno());
 }
@@ -142,7 +153,8 @@ pub fn chmod(file_path: []const u8, perms: Permissions) FsError!void {
 /// this to succeed; the typical use case is install scripts.
 pub fn chown(file_path: []const u8, uid: u32, gid: u32) FsError!void {
     if (is_windows) @compileError("Windows chown: pending (Phase B.2)");
-    var z = try pathZ(file_path);
+    var z: PathZ = undefined;
+    try pathZInto(file_path, &z);
     if (syscall.chown(&z.buf, @intCast(uid), @intCast(gid)) != 0) {
         return fs_error.fromErrno(fs_error.currentErrno());
     }
@@ -153,7 +165,8 @@ pub fn chown(file_path: []const u8, uid: u32, gid: u32) FsError!void {
 /// resolution (commonly 1µs on ext4, 1s on FAT).
 pub fn setTimes(file_path: []const u8, atime: SystemTime, mtime: SystemTime) FsError!void {
     if (is_windows) @compileError("Windows setTimes: pending (Phase B.2)");
-    var z = try pathZ(file_path);
+    var z: PathZ = undefined;
+    try pathZInto(file_path, &z);
     const times = [2]std.c.timespec{ atime.toTimespec(), mtime.toTimespec() };
     if (syscall.utimensat(syscall.AT_FDCWD, &z.buf, &times, 0) != 0) {
         return fs_error.fromErrno(fs_error.currentErrno());
@@ -167,7 +180,8 @@ pub fn setTimes(file_path: []const u8, atime: SystemTime, mtime: SystemTime) FsE
 /// missing or unreadable).
 pub fn canonicalize(allocator: std.mem.Allocator, file_path: []const u8) (FsError || error{OutOfMemory})![]u8 {
     if (is_windows) @compileError("Windows canonicalize: pending (Phase B.2)");
-    var z = try pathZ(file_path);
+    var z: PathZ = undefined;
+    try pathZInto(file_path, &z);
     // realpath wants a PATH_MAX buffer. Stack-allocate, then dup
     // into the caller's allocator.
     var buf: [syscall.PATH_MAX]u8 = undefined;
@@ -183,16 +197,16 @@ const PathZ = struct {
     buf: [syscall.PATH_MAX:0]u8,
 };
 
-/// Copy `p` into a stack buffer with a trailing NUL for handing to
-/// libc. Errors if `p` is too long or contains an embedded NUL
-/// (libc would silently truncate).
-fn pathZ(p: []const u8) FsError!PathZ {
+/// Fill an out-buffer with `p` followed by a NUL sentinel. We
+/// don't return PathZ by value — that copies 4 KiB through the
+/// caller's stack and crashes coroutine frames where the size
+/// stresses Zig's return-value-by-hidden-pointer codegen on macOS
+/// arm64.
+fn pathZInto(p: []const u8, out: *PathZ) FsError!void {
     if (p.len >= syscall.PATH_MAX) return error.NameTooLong;
     if (std.mem.indexOfScalar(u8, p, 0) != null) return error.InvalidPath;
-    var z: PathZ = undefined;
-    @memcpy(z.buf[0..p.len], p);
-    z.buf[p.len] = 0;
-    return z;
+    @memcpy(out.buf[0..p.len], p);
+    out.buf[p.len] = 0;
 }
 
 // ─── Test discovery anchors ──────────────────────────────────────
@@ -205,6 +219,7 @@ test {
     _ = @import("fs/file.zig");
     _ = @import("fs/dir.zig");
     _ = @import("fs/mmap.zig");
+    _ = @import("fs/watcher.zig");
 }
 
 // ─── Tests ───────────────────────────────────────────────────────
