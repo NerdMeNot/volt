@@ -166,6 +166,10 @@ pub fn build(b: *std.Build) void {
         .{ .name = "udp-echo", .src = "examples/udp_echo.zig", .desc = "UDP echo round-trip (4 messages)" },
         .{ .name = "ticker-heartbeat", .src = "examples/ticker_heartbeat.zig", .desc = "Ticker firing every 100ms × 10" },
         .{ .name = "dns-lookup", .src = "examples/dns_lookup.zig", .desc = "DNS lookup via spawnBlocking" },
+        .{ .name = "file-copy", .src = "examples/file_copy.zig", .desc = "Copy a file via volt.fs.copyFile" },
+        .{ .name = "dir-walk", .src = "examples/dir_walk.zig", .desc = "Walk a directory tree printing each entry" },
+        .{ .name = "mmap-count", .src = "examples/mmap_count.zig", .desc = "Count newlines via mmap (zero-copy)" },
+        .{ .name = "file-watcher", .src = "examples/file_watcher.zig", .desc = "Watch a dir + print events (Ctrl-C to stop)" },
     };
     const examples_step = b.step("examples", "Build every example program");
     for (examples) |ex| {

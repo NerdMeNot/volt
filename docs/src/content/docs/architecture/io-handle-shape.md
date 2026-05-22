@@ -3,14 +3,17 @@ title: I/O handle conformance shape
 description: The standard shape every Volt async byte source exposes — fd field, sync read/write/readFull/writeAll methods, std.Io.Reader / std.Io.Writer adapter pair. Downstream volt-fs / volt-net libraries mirror this so std-library code composes cleanly.
 ---
 
-Volt's core ships TCP, UDP, and Unix sockets — TcpStream, TcpListener,
-UdpSocket, UnixStream, UnixListener, UnixDatagram (the last three
-POSIX-only). File I/O,
-UDP, Unix sockets, DNS, and TLS live in downstream libraries
-(`volt-fs`, `volt-net`, `volt-tls`). For std-library code (formatters,
-parsers, anything that takes `*std.Io.Reader`) to compose across
-those libraries, every Volt async byte source must expose the same
-handle shape.
+Volt's core ships the following I/O-handle types — every one
+conforms to the shape described below, so std-library code
+(formatters, parsers, anything that takes `*std.Io.Reader`)
+composes across the whole surface:
+
+- **Networking**: TcpStream, TcpListener, UdpSocket, UnixStream,
+  UnixListener, UnixDatagram (the last three POSIX-only)
+- **Filesystem**: File
+
+DNS / TLS live downstream (`volt-tls`); their handle types follow
+the same shape so consumers don't see a difference.
 
 This page defines that shape. If you're authoring a Volt-adjacent
 library that exposes an async byte source, conform to this shape —

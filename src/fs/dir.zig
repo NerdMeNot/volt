@@ -595,7 +595,7 @@ const CountVisitor = struct {
     files: u32 = 0,
     dirs: u32 = 0,
 
-    fn visit(self: *CountVisitor, entry: Entry, depth: u32) WalkAction {
+    pub fn visit(self: *CountVisitor, entry: Entry, depth: u32) WalkAction {
         _ = depth;
         switch (entry.kind) {
             .file => self.files += 1,
@@ -641,7 +641,7 @@ test "Dir.walk: counts entries across a small tree" {
 const FirstStopVisitor = struct {
     seen: u32 = 0,
 
-    fn visit(self: *FirstStopVisitor, entry: Entry, depth: u32) WalkAction {
+    pub fn visit(self: *FirstStopVisitor, entry: Entry, depth: u32) WalkAction {
         _ = entry;
         _ = depth;
         self.seen += 1;

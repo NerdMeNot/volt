@@ -1,11 +1,22 @@
-//! Filesystem namespace facade — `volt.fs.{path, Metadata, ...}`.
+//! Filesystem namespace facade — `volt.fs.{path, File, Dir, ...}`.
 //!
 //! Volt's fs surface targets Node.js / Go-scale exhaustiveness with
-//! a stackful-coroutine ergonomic. Today (Phase B.1) exposes the
-//! metadata vocabulary + path-only stat / access / chmod helpers.
-//! Subsequent Phase B waves add `File` (B.2), `Dir` (B.3),
-//! `MappedFile` (B.4), `Watcher` (B.5), and the streaming
-//! convenience facade (B.6: `readFile`, `copyFile`, `tempFile`, …).
+//! a stackful-coroutine ergonomic. Exposes:
+//!
+//! * **path** (`volt.fs.path`) — pure-string path utilities
+//! * **Metadata vocabulary** — Metadata, Permissions, SystemTime,
+//!   FileType, plus stat / lstat / fstat / exists / access / chmod /
+//!   chown / setTimes / canonicalize
+//! * **File** — async-by-default file handle with std.Io.Reader /
+//!   Writer adapters, cancel-aware variants
+//! * **Dir** — opendir-style iterator + create / remove (with
+//!   recursive variants) + walk + glob
+//! * **MappedFile** — mmap / madvise / mlock / mprotect / msync
+//! * **Watcher** — polling-based file-change watcher (native inotify
+//!   / FSEvents / RDC backends land later)
+//! * **Convenience facade** — readFile / writeFile / appendFile /
+//!   copyFile / rename / hardLink / symlink / readLink / unlink /
+//!   tempDir / tempFile
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -31,6 +42,12 @@ pub const Dir = @import("fs/dir.zig").Dir;
 pub const DirEntry = @import("fs/dir.zig").Entry;
 pub const WalkAction = @import("fs/dir.zig").WalkAction;
 pub const WalkOptions = @import("fs/dir.zig").WalkOptions;
+pub const DirCreateOptions = @import("fs/dir.zig").CreateOptions;
+pub const DirRemoveOptions = @import("fs/dir.zig").RemoveOptions;
+pub const makeDir = @import("fs/dir.zig").create;
+pub const removeDir = @import("fs/dir.zig").remove;
+pub const dirEntries = @import("fs/dir.zig").entries;
+pub const freeDirEntries = @import("fs/dir.zig").freeEntries;
 pub const glob = @import("fs/dir.zig").glob;
 
 pub const MappedFile = @import("fs/mmap.zig").MappedFile;
@@ -190,6 +207,174 @@ pub fn canonicalize(allocator: std.mem.Allocator, file_path: []const u8) (FsErro
     const len = std.mem.len(result.?);
     return try allocator.dupe(u8, result.?[0..len]);
 }
+
+// ─── Convenience: read/write/copy/rename/link/temp ───────────────
+
+/// Read the whole file into a freshly-allocated buffer. Caller
+/// frees with the same allocator. Bridges through `spawnBlocking`
+/// per File's normal behaviour.
+pub fn readFile(allocator: std.mem.Allocator, file_path: []const u8) (FileError || error{OutOfMemory})![]u8 {
+    var f = try File.open(file_path);
+    defer f.close();
+    const m = try f.metadata();
+    const size: usize = @intCast(m.size());
+    const buf = try allocator.alloc(u8, size);
+    errdefer allocator.free(buf);
+    const n = try f.readFull(buf);
+    if (n != size) return allocator.realloc(buf, n);
+    return buf;
+}
+
+/// Like `readFile` but validates UTF-8 — useful when the file is
+/// supposed to be text and you don't want to silently accept binary.
+pub fn readFileString(allocator: std.mem.Allocator, file_path: []const u8) (FileError || error{ OutOfMemory, InvalidUtf8 })![]u8 {
+    const bytes = try readFile(allocator, file_path);
+    errdefer allocator.free(bytes);
+    if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
+    return bytes;
+}
+
+/// Create-or-truncate `file_path` and write `data`. Atomic from the
+/// reader's perspective only with respect to write boundaries — for
+/// truly atomic write (no partial-content visibility), write to a
+/// sibling temp file + rename.
+pub fn writeFile(file_path: []const u8, data: []const u8) FileError!void {
+    var f = try File.create(file_path);
+    defer f.close();
+    try f.writeAll(data);
+}
+
+/// Append `data` to `file_path`. Creates the file if missing.
+pub fn appendFile(file_path: []const u8, data: []const u8) FileError!void {
+    var f = try File.openOptions(file_path, .{ .write = true, .create = true, .append = true });
+    defer f.close();
+    try f.writeAll(data);
+}
+
+/// Copy `src` to `dst`, byte-for-byte. Streams in 4 KiB chunks
+/// (keeps the function's stack frame coroutine-friendly). `dst`'s
+/// mode mirrors `src`'s.
+pub fn copyFile(src: []const u8, dst: []const u8) FileError!void {
+    return copyFileImpl(src, dst);
+}
+
+fn copyFileImpl(src: []const u8, dst: []const u8) FileError!void {
+    var sf = try File.open(src);
+    defer sf.close();
+    const src_meta = try sf.metadata();
+
+    var df = try File.openOptions(dst, .{
+        .write = true,
+        .create = true,
+        .truncate = true,
+        .mode = src_meta.permissions().getMode(),
+    });
+    defer df.close();
+
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = try sf.read(&chunk);
+        if (n == 0) break;
+        try df.writeAll(chunk[0..n]);
+    }
+}
+
+/// Rename or move `old_path` to `new_path`. Atomic if both live on
+/// the same filesystem; cross-device renames surface
+/// `FsError.CrossDevice` (caller can fall back to copy + delete).
+pub fn rename(old_path: []const u8, new_path: []const u8) FsError!void {
+    if (is_windows) @compileError("Windows rename: pending");
+    var z_old: PathZ = undefined;
+    try pathZInto(old_path, &z_old);
+    var z_new: PathZ = undefined;
+    try pathZInto(new_path, &z_new);
+    if (c_rename(&z_old.buf, &z_new.buf) != 0) return fs_error.fromErrno(fs_error.currentErrno());
+}
+
+/// Make a hard link from `link_path` to `target`. Both must live
+/// on the same filesystem (POSIX hard-link constraint).
+pub fn hardLink(target: []const u8, link_path: []const u8) FsError!void {
+    if (is_windows) @compileError("Windows hardlink: pending");
+    var z_t: PathZ = undefined;
+    try pathZInto(target, &z_t);
+    var z_l: PathZ = undefined;
+    try pathZInto(link_path, &z_l);
+    if (c_link(&z_t.buf, &z_l.buf) != 0) return fs_error.fromErrno(fs_error.currentErrno());
+}
+
+/// Create a symbolic link `link_path` pointing at `target`. Unlike
+/// `hardLink`, `target` need not exist when the link is created.
+pub fn symlink(target: []const u8, link_path: []const u8) FsError!void {
+    if (is_windows) @compileError("Windows symlink: pending");
+    var z_t: PathZ = undefined;
+    try pathZInto(target, &z_t);
+    var z_l: PathZ = undefined;
+    try pathZInto(link_path, &z_l);
+    if (syscall.c_symlink(&z_t.buf, &z_l.buf) != 0) return fs_error.fromErrno(fs_error.currentErrno());
+}
+
+/// Read the target of a symbolic link. Returns owned slice.
+pub fn readLink(allocator: std.mem.Allocator, link_path: []const u8) (FsError || error{OutOfMemory})![]u8 {
+    if (is_windows) @compileError("Windows readlink: pending");
+    var z: PathZ = undefined;
+    try pathZInto(link_path, &z);
+    var buf: [syscall.PATH_MAX]u8 = undefined;
+    const n = syscall.c_readlink(&z.buf, &buf, buf.len);
+    if (n < 0) return fs_error.fromErrno(fs_error.currentErrno());
+    return try allocator.dupe(u8, buf[0..@intCast(n)]);
+}
+
+/// Unlink a file (regular or symbolic link). For directories, use
+/// `Dir.remove`.
+pub fn unlink(file_path: []const u8) FsError!void {
+    if (is_windows) @compileError("Windows unlink: pending");
+    var z: PathZ = undefined;
+    try pathZInto(file_path, &z);
+    if (syscall.c_unlink(&z.buf) != 0) return fs_error.fromErrno(fs_error.currentErrno());
+}
+
+/// The system temp directory (`TMPDIR` env var on POSIX with a
+/// `/tmp` fallback). Returned slice is owned by `allocator`.
+pub fn tempDir(allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
+    if (is_windows) @compileError("Windows TEMP: pending");
+    if (std.c.getenv("TMPDIR")) |t| {
+        const len = std.mem.len(t);
+        const slice = t[0..len];
+        const trimmed = std.mem.trimEnd(u8, slice, "/");
+        return try allocator.dupe(u8, if (trimmed.len > 0) trimmed else "/tmp");
+    }
+    return try allocator.dupe(u8, "/tmp");
+}
+
+/// Create a uniquely-named temp file. Returns the open file +
+/// the allocated path; caller closes the file + frees the path.
+/// Caller should also `unlink` the path when done (this fn doesn't
+/// auto-clean — explicit lifetimes only).
+pub fn tempFile(allocator: std.mem.Allocator, prefix: []const u8) (FileError || error{OutOfMemory})!struct { path: []u8, file: File } {
+    if (is_windows) @compileError("Windows tempFile: pending");
+    const dir = try tempDir(allocator);
+    defer allocator.free(dir);
+
+    const template = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}-XXXXXX", .{ dir, prefix }, 0);
+    errdefer allocator.free(template);
+    const fd = syscall.c_mkstemp(template.ptr);
+    if (fd < 0) return fs_error.fromErrno(fs_error.currentErrno());
+
+    // Convert from [:0]u8 back to a regular []u8 so the caller
+    // doesn't have to deal with sentinel-slice typing.
+    const path_owned = try allocator.dupe(u8, template);
+    allocator.free(template);
+    return .{ .path = path_owned, .file = .{ .fd = fd, .append = false } };
+}
+
+const c_rename = if (is_windows) {} else @extern(
+    *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) c_int,
+    .{ .name = "rename" },
+);
+const c_link = if (is_windows) {} else @extern(
+    *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) c_int,
+    .{ .name = "link" },
+);
 
 // ─── Internal: NUL-terminate a path on the stack ─────────────────
 
@@ -389,6 +574,110 @@ test "fs.setTimes: round-trip preserves mtime" {
 
     const m = try stat(fp);
     try testing.expectEqual(@as(i64, 1_700_000_001), m.modified().secs);
+}
+
+const RT = @import("lib.zig");
+
+const FacadeState = struct {
+    tmp: [:0]const u8,
+    ok: bool = false,
+};
+
+fn facadeReadWriteCopy(state: *FacadeState) !void {
+    const allocator = @import("testing.zig").allocator;
+    var path_buf: [256:0]u8 = undefined;
+    const src = try std.fmt.bufPrintZ(&path_buf, "{s}/src.txt", .{state.tmp});
+
+    try writeFile(src, "facade payload");
+
+    const content = try readFile(allocator, src);
+    defer allocator.free(content);
+    if (!std.mem.eql(u8, content, "facade payload")) return error.WrongRead;
+
+    var dst_buf: [256:0]u8 = undefined;
+    const dst = try std.fmt.bufPrintZ(&dst_buf, "{s}/dst.txt", .{state.tmp});
+    try copyFile(src, dst);
+
+    const dst_content = try readFile(allocator, dst);
+    defer allocator.free(dst_content);
+    if (!std.mem.eql(u8, dst_content, "facade payload")) return error.WrongCopy;
+
+    try appendFile(dst, " + more");
+    const final = try readFile(allocator, dst);
+    defer allocator.free(final);
+    if (!std.mem.eql(u8, final, "facade payload + more")) return error.WrongAppend;
+
+    state.ok = true;
+}
+
+test "fs facade: readFile / writeFile / copyFile / appendFile round-trip" {
+    if (is_windows) return error.SkipZigTest;
+    var tmpl = "/tmp/volt-facade-XXXXXX\x00".*;
+    if (syscall.c_mkdtemp(@ptrCast(&tmpl)) == null) return error.MkdtempFailed;
+    const tmp: [:0]const u8 = tmpl[0 .. tmpl.len - 1 :0];
+    defer {
+        for ([_][]const u8{ "src.txt", "dst.txt" }) |name| {
+            var p: [256:0]u8 = undefined;
+            const z = std.fmt.bufPrintZ(&p, "{s}/{s}", .{ tmp, name }) catch continue;
+            _ = syscall.c_unlink(z.ptr);
+        }
+        _ = syscall.c_rmdir(tmp.ptr);
+    }
+
+    var rt = try RT.Runtime.init(.{ .allocator = @import("testing.zig").allocator });
+    defer rt.deinit();
+    var state = FacadeState{ .tmp = tmp };
+    try (try rt.run(facadeReadWriteCopy, .{&state}));
+    try testing.expect(state.ok);
+}
+
+test "fs.tempDir: returns an existing directory" {
+    if (is_windows) return error.SkipZigTest;
+    const t = try tempDir(testing.allocator);
+    defer testing.allocator.free(t);
+    try testing.expect(exists(t));
+}
+
+test "fs.symlink + readLink: round-trip the target" {
+    if (is_windows) return error.SkipZigTest;
+    var tmpl = "/tmp/volt-facade-XXXXXX\x00".*;
+    if (syscall.c_mkdtemp(@ptrCast(&tmpl)) == null) return error.MkdtempFailed;
+    const tmp: [:0]const u8 = tmpl[0 .. tmpl.len - 1 :0];
+    defer _ = syscall.c_rmdir(tmp.ptr);
+
+    var target_buf: [256:0]u8 = undefined;
+    const target = try std.fmt.bufPrintZ(&target_buf, "{s}/target.txt", .{tmp});
+    try writeFile(target, "");
+    defer _ = syscall.c_unlink(target.ptr);
+
+    var link_buf: [256:0]u8 = undefined;
+    const link = try std.fmt.bufPrintZ(&link_buf, "{s}/link.txt", .{tmp});
+    try symlink(target, link);
+    defer _ = syscall.c_unlink(link.ptr);
+
+    const got = try readLink(testing.allocator, link);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(target, got);
+}
+
+test "fs.rename: moves a file under the same dir" {
+    if (is_windows) return error.SkipZigTest;
+    var tmpl = "/tmp/volt-facade-XXXXXX\x00".*;
+    if (syscall.c_mkdtemp(@ptrCast(&tmpl)) == null) return error.MkdtempFailed;
+    const tmp: [:0]const u8 = tmpl[0 .. tmpl.len - 1 :0];
+    defer _ = syscall.c_rmdir(tmp.ptr);
+
+    var src_buf: [256:0]u8 = undefined;
+    const src = try std.fmt.bufPrintZ(&src_buf, "{s}/a.txt", .{tmp});
+    try writeFile(src, "X");
+
+    var dst_buf: [256:0]u8 = undefined;
+    const dst = try std.fmt.bufPrintZ(&dst_buf, "{s}/b.txt", .{tmp});
+    try rename(src, dst);
+    defer _ = syscall.c_unlink(dst.ptr);
+
+    try testing.expect(!exists(src));
+    try testing.expect(exists(dst));
 }
 
 test "fs.lstat: symlink reports itself, not target" {
