@@ -65,46 +65,14 @@ pub const ParkState = struct {
     pub const NOTIFIED: u32 = 2;
 };
 
-/// Layout note: HOT fields the dispatcher reads on every cycle
-/// (`pending`, `park_state`, `main_ctx`, `next`, `stack`, `frame_*`,
-/// `task_done`, `task_thread_parker`, `has_task`) live in the first
-/// 64 bytes. `ctx` (168 B — the context-switch payload) follows.
-/// COLD fields (`runtime`, `wait_next`, `cancel_in_flight`,
-/// `reactor_wait_op`) trail at the bottom. The asm context switch
-/// reads/writes `&coro.ctx` directly — its offset within Coroutine
-/// doesn't matter to the asm (only `Context`'s internal layout
-/// does, see context_arm64.zig).
-///
-/// Why this matters: `ctx` is 168 B (spans ≥ 2 cache lines). The
-/// original layout had `pending` + `park_state` on a 3rd line at
-/// offset 256+. Every dispatch's "read pending after swap-back"
-/// then incurred a cold-line load. Reordering puts those small
-/// hot fields in the SAME cache line as the start of `ctx` (which
-/// is already live in cache after the swap), eliminating that miss.
-pub const Coroutine = extern struct {
-    // ── HOT (first 64 B — read on every dispatch / park / unpark) ──
-    // `extern struct` because Zig's default-struct field auto-reorder
-    // (for minimal padding) sorts the small `pending`/`park_state`
-    // fields to the end of the struct, putting them on a 3rd cache
-    // line. Extern preserves declaration order, keeping the hot
-    // fields next to the start of `ctx` (which the swap-back leaves
-    // hot in L1).
-    /// Park-state machine (see `ParkState`). Initialised to RUNNING
-    /// at spawn; transitions are owned by `runtime.park` / `runtime.unpark`
-    /// / `dispatch` and documented at those sites.
-    park_state: std.atomic.Value(u32) = std.atomic.Value(u32).init(ParkState.RUNNING),
-    /// Why did the last swap-back happen? Worker reads this after the
-    /// swap-back returns from `ctx.swap`. The trampoline sets it to
-    /// `.done` before the terminal swap. `yield()` and `park()`
-    /// helpers set it to `.yield` / `.park` before swapping.
-    pending: PendingKind = .done,
-    /// Non-null when a Task handle exists.
-    has_task: bool = false,
-    _hot_pad: [2]u8 = @splat(0),
+pub const Coroutine = struct {
+    ctx: context.Context = .{},
     /// Worker's main context.
     main_ctx: *context.Context = undefined,
-    /// Intrusive next pointer for the run queue (FIFO linked list).
-    next: ?*Coroutine = null,
+    /// Owning runtime, type-erased to avoid the Coroutine ↔ Runtime
+    /// import cycle. Cast back to `*Runtime` via @ptrCast/@alignCast
+    /// when needed (e.g. `unpark` to push back to the queue).
+    runtime: *anyopaque = undefined,
     /// Base of the slot handed out by the runtime's stack arena.
     /// SP top is `stack + stack.slotSize()`. The bottom `guardSize()`
     /// bytes are PROT_NONE — any access SIGSEGVs.
@@ -113,6 +81,21 @@ pub const Coroutine = extern struct {
     frame_ptr: *anyopaque = undefined,
     /// Frees the Frame allocation.
     frame_destroy: ?FrameDestroyFn = null,
+    /// Why did the last swap-back happen? Worker reads this after the
+    /// swap-back returns from `ctx.swap`. The trampoline sets it to
+    /// `.done` before the terminal swap. `yield()` and `park()`
+    /// helpers set it to `.yield` / `.park` before swapping.
+    pending: PendingKind = .done,
+    /// Intrusive next pointer for the run queue (FIFO linked list).
+    next: ?*Coroutine = null,
+    /// Intrusive next pointer for synchronization-primitive wait
+    /// queues (Mutex, Notify, Semaphore). The bespoke WaitQueue in
+    /// `src/sync.zig` uses this. **Tracked for removal in #168**:
+    /// migrating sync to the parking lot would let this field go
+    /// (saving 8 bytes per Coroutine + simplifying the struct), but
+    /// the migration involves a real fairness-vs-throughput design
+    /// choice that's separate from this field's existence.
+    wait_next: ?*Coroutine = null,
     /// Optional task completion flag. Dispatch's `.done` branch
     /// stores 1 here and calls `parking_lot.unparkOne(&done)` to
     /// wake any joiner. Null for coroutines without a Task handle.
@@ -123,23 +106,12 @@ pub const Coroutine = extern struct {
     /// the driver isn't a coroutine, so the parking-lot path
     /// doesn't apply. Null for non-root tasks.
     task_thread_parker: ?*@import("parker.zig").Parker = null,
-
-    // ── Context-switch payload (168 B — dominates struct size) ────
-    ctx: context.Context = .{},
-
-    // ── COLD (read on rare paths — cancel, cross-runtime ops) ─────
-    /// Owning runtime, type-erased to avoid the Coroutine ↔ Runtime
-    /// import cycle. Cast back to `*Runtime` via @ptrCast/@alignCast
-    /// when needed (e.g. `unpark` to push back to the queue).
-    runtime: *anyopaque = undefined,
-    /// Intrusive next pointer for synchronization-primitive wait
-    /// queues (Mutex, Notify, Semaphore). The bespoke WaitQueue in
-    /// `src/sync.zig` uses this. **Tracked for removal in #168**:
-    /// migrating sync to the parking lot would let this field go
-    /// (saving 8 bytes per Coroutine + simplifying the struct), but
-    /// the migration involves a real fairness-vs-throughput design
-    /// choice that's separate from this field's existence.
-    wait_next: ?*Coroutine = null,
+    /// Non-null when a Task handle exists.
+    has_task: bool = false,
+    /// Park-state machine (see `ParkState`). Initialised to RUNNING
+    /// at spawn; transitions are owned by `runtime.park` / `runtime.unpark`
+    /// / `dispatch` and documented at those sites.
+    park_state: std.atomic.Value(u32) = std.atomic.Value(u32).init(ParkState.RUNNING),
     /// Set by cancel-aware blocking ops (`Mutex.lockCancel`,
     /// `Spsc.recvCancel`, etc.) immediately before they call
     /// `park.parkOn`. The op's validator (which runs under the
