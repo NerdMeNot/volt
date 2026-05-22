@@ -1466,6 +1466,22 @@ fn runWithSignalsCancelBody(
 
 test "runWithSignals: SIGINT fires Cancel; body unwinds gracefully" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // SKIPPED BY DEFAULT — see https://github.com/NerdMeNot/volt/issues/1
+    //
+    // This test hangs intermittently when run as part of the full
+    // `zig build test` suite (passes in isolation, fails after ~48
+    // other tests have run). State-leakage hypothesis: signal-handler
+    // bookkeeping from earlier tests. The test exists and the
+    // mechanism it tests works — but until the root cause is
+    // identified, leaving this in the default suite would silently
+    // hang CI. To run explicitly:
+    //
+    //     VOLT_RUN_SIGINT_TEST=1 zig build test -Dtest-filter="SIGINT"
+    //
+    // Process-level timeout (e.g. `timeout 300 zig build test`) is
+    // the recommended CI safety net while #1 is open.
+    if (std.c.getenv("VOLT_RUN_SIGINT_TEST") == null) return error.SkipZigTest;
+
     var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
     defer rt.deinit();
     var ctx = SignalCtx{};

@@ -254,6 +254,13 @@ pub fn appendFile(file_path: []const u8, data: []const u8) FileError!void {
 /// Copy `src` to `dst`, byte-for-byte. Streams in 4 KiB chunks
 /// (keeps the function's stack frame coroutine-friendly). `dst`'s
 /// mode mirrors `src`'s.
+///
+/// **DO NOT INLINE THIS DELEGATION.** copyFileImpl has a 4 KiB
+/// `chunk` local that crashes (SIGILL) when the Zig 0.16 inliner
+/// pulls the body into a coroutine root frame on macOS arm64. The
+/// thin wrapper forces a real function call, isolating the frame.
+/// Tracked in GitHub issue (see ISSUES.md). If you delete the
+/// wrapper "for cleanliness," the fs facade tests crash.
 pub fn copyFile(src: []const u8, dst: []const u8) FileError!void {
     return copyFileImpl(src, dst);
 }

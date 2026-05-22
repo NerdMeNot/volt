@@ -81,6 +81,83 @@ pub fn expect(
     }
 }
 
+/// Wall-clock deadline guard for tests that risk hanging the runner
+/// (e.g. signal-handling tests, deadlock-detection tests). Uses
+/// `setitimer(ITIMER_REAL)` + `SIGALRM` — the kernel manages the
+/// timer; no watchdog OS thread is created. That matters because a
+/// helper thread can change signal-mask politics on POSIX and break
+/// tests that rely on specific signal delivery (e.g. raise(SIGINT)).
+///
+/// Usage:
+///
+/// ```zig
+/// test "hang-prone test" {
+///     const guard = volt.testing.deadlineGuard(15, "my test");
+///     defer guard.disarm();
+///     // ... test body that should complete in under 15s ...
+/// }
+/// ```
+///
+/// If the test exceeds the deadline, SIGALRM fires, our handler
+/// prints a clear label, and `abort()` kills the process. The Zig
+/// test runner reports the test as crashed (signal ABRT) — which
+/// is the entire point: hangs become VISIBLE failures.
+///
+/// Limitation: tests that themselves install a SIGALRM handler will
+/// conflict. None of Volt's tests do today; if one ever does,
+/// switch its deadline mechanism.
+pub const DeadlineGuard = struct {
+    pub fn disarm(_: DeadlineGuard) void {
+        // Clear the timer + restore default SIGALRM handler.
+        var off = std.mem.zeroes(itimerval);
+        _ = c_setitimer(ITIMER_REAL, &off, null);
+        deadline_label = null;
+    }
+};
+
+const itimerval = extern struct {
+    it_interval: std.c.timeval = .{ .sec = 0, .usec = 0 },
+    it_value: std.c.timeval = .{ .sec = 0, .usec = 0 },
+};
+
+const ITIMER_REAL: c_int = 0;
+const SIGALRM: c_int = 14;
+
+const c_setitimer = @extern(
+    *const fn (c_int, *const itimerval, ?*itimerval) callconv(.c) c_int,
+    .{ .name = "setitimer" },
+);
+
+var deadline_label: ?[]const u8 = null;
+
+// Match SigactionFn shape from signal.zig — the 3-arg form.
+fn deadlineSigalrmHandler(_: c_int, _: *anyopaque, _: ?*anyopaque) callconv(.c) void {
+    const label = deadline_label orelse "(unlabeled)";
+    const prefix = "\n!!! test exceeded deadline: ";
+    _ = c_write_fd2(2, prefix.ptr, prefix.len);
+    _ = c_write_fd2(2, label.ptr, label.len);
+    _ = c_write_fd2(2, "\n", 1);
+    @import("std").process.abort();
+}
+
+const c_write_fd2 = @extern(
+    *const fn (c_int, [*]const u8, usize) callconv(.c) isize,
+    .{ .name = "write" },
+);
+
+pub fn deadlineGuard(seconds: u32, comptime label: []const u8) DeadlineGuard {
+    deadline_label = label;
+    const signal_mod = @import("signal.zig");
+    var act: signal_mod.Sigaction = std.mem.zeroes(signal_mod.Sigaction);
+    act.sa_sigaction = @ptrCast(&deadlineSigalrmHandler);
+    _ = signal_mod.sigaction_fn(SIGALRM, &act, null);
+
+    var it: itimerval = .{};
+    it.it_value.sec = @intCast(seconds);
+    _ = c_setitimer(ITIMER_REAL, &it, null);
+    return .{};
+}
+
 /// Spawn-then-race assertion. Calls `joinFirst(c, tasks)` and asserts
 /// the winner is the variant named by `expected_winner`. Fails the
 /// test if a different task won.
