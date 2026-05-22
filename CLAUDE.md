@@ -66,21 +66,22 @@ methodology + receipts.
 | Workload | Volt | Go | Volt/Go |
 |---|---|---|---|
 | yield (one-way ctx switch) | 9 ns | 42 ns | 0.21× |
-| Mutex contended (8 × 50k) | 11 ns | 81 ns | 0.14× |
+| Mutex contended (8 × 50k) | 10 ns | 81 ns | 0.12× |
 | Spsc send+recv (cap=16) | 12 ns | 33 ns | 0.36× |
 | TCP echo (64 × 16 RTT × 1 KB) | ~9,500 ns | 9,050 ns | ~1.0× |
 | spawn+join workers=1 | 78 ns | 136 ns | 0.57× |
 | fan-out scaling workers=4 | 64 ns | — | — |
-| fan-out scaling workers=11 | 115 ns | 107 ns | 1.07× |
+| fan-out scaling workers=11 | 113 ns | 107 ns | 1.06× |
 | parallel-compute (8 workers) | 6.5× speedup | — | near-ideal |
 | stress (mixed, 45 s) | ~850 M ops | — | green |
-| spawn+join workers=11 (synthetic) | 438 ns | 213 ns | 2.06× |
+| spawn+join workers=11 (synthetic) | 421 ns | 213 ns | 1.97× |
 
-Numbers reflect the 2026-05 perf cycle (scheduler spin-before-park,
-log-N stealing cap, runtime cache-line padding, kqueue + driver-
-poll-wakeup fix). Range on spawn-hot tightened from ±32 % variance
-to ±5 % at the same median. See `git log perf/runtime` for the
-commit trail.
+Numbers reflect the 2026-05 perf cycle (driver-poll-wakeup fix,
+spin-before-park, log-N stealing cap, runtime cache-line padding,
+Coroutine extern-struct field reorder for cache locality). Range
+on spawn-hot tightened from ±32 % variance to ±10 % at a 25 % lower
+median. The synthetic-shape Volt/Go gap dropped under 2× for the
+first time. See `git log` for the commit trail.
 
 The single workers=11 outlier is a synthetic spawn-heavy shape (one
 driver feeding 11 workers trivial tasks) where adding workers can
