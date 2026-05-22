@@ -58,11 +58,16 @@ pub const P = struct {
     runtime: *anyopaque, // *Runtime; opaque to avoid cycle
     local: LocalQueue,
     /// Single-slot LIFO cache for the just-pushed continuation.
-    lifo_slot: std.atomic.Value(?*Coroutine) = std.atomic.Value(?*Coroutine).init(null),
+    /// Cache-line padded — owner reads/writes constantly via swap/
+    /// CAS, must not share a line with `mailbox.head` (cross-P
+    /// written on every unpark).
+    lifo_slot: std.atomic.Value(?*Coroutine) align(std.atomic.cache_line) = std.atomic.Value(?*Coroutine).init(null),
     /// Per-P MPMC mailbox. Cross-P pushes target a specific P's
     /// mailbox instead of one shared global queue, partitioning the
-    /// cache-line contention.
-    mailbox: Mailbox = .{},
+    /// cache-line contention. Padded so the owner's adjacent
+    /// owner-only fields (dispatch_count, rng, coro_pool) don't
+    /// share a line with the cross-P-written head pointer.
+    mailbox: Mailbox align(std.atomic.cache_line) = .{},
     /// Per-dispatch counter for periodic mailbox/injection fairness.
     dispatch_count: u32 = 0,
     rng: std.Random.DefaultPrng,
@@ -87,7 +92,11 @@ pub const P = struct {
     stat_spawned: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stat_done: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stat_fairness_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    stat_unparks_to_inject: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Cross-P-written: a worker pushing to THIS P's mailbox
+    /// increments. Separated from the owner-only stats so cross-P
+    /// writes don't bounce the cache line that the owner is
+    /// continuously updating.
+    stat_unparks_to_inject: std.atomic.Value(u64) align(std.atomic.cache_line) = std.atomic.Value(u64).init(0),
     /// Owner-only LIFO free list of recycled stack slots. Capped at
     /// `stack_pool_cap` to prevent one P from pinning the arena
     /// under asymmetric spawn patterns. The intrusive next-pointer
