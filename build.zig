@@ -41,7 +41,10 @@ pub fn build(b: *std.Build) void {
     volt_mod.link_libc = true;
     link_x86_64_ctx(volt_mod, b, target);
 
-    // Unit tests.
+    // Unit tests. `-Dtest-filter=substr` narrows the run to tests
+    // whose name contains the substring — useful for working on a
+    // single subsystem (e.g. `-Dtest-filter=fs.`) or for dodging
+    // a known-hanging test while developing.
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
@@ -49,7 +52,14 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.link_libc = true;
     link_x86_64_ctx(test_mod, b, target);
-    const unit_tests = b.addTest(.{ .root_module = test_mod });
+    const test_filter = b.option([]const u8, "test-filter", "Only run tests matching this substring");
+    var test_opts: std.Build.TestOptions = .{ .root_module = test_mod };
+    if (test_filter) |f| {
+        const filters = b.allocator.alloc([]const u8, 1) catch @panic("OOM");
+        filters[0] = f;
+        test_opts.filters = filters;
+    }
+    const unit_tests = b.addTest(test_opts);
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(unit_tests).step);
 
     // Documentation.
