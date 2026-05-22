@@ -79,7 +79,7 @@ pub fn stat(file_path: []const u8) FsError!Metadata {
     if (is_windows) @compileError("Windows stat: pending (Phase B.2)");
     var z: PathZ = undefined;
     try pathZInto(file_path, &z);
-    var buf: std.c.Stat = undefined;
+    var buf: PlatformStat = undefined;
     if (syscall.stat(&z.buf, &buf) != 0) return fs_error.fromErrno(fs_error.currentErrno());
     return Metadata.fromStat(buf);
 }
@@ -90,7 +90,7 @@ pub fn lstat(file_path: []const u8) FsError!Metadata {
     if (is_windows) @compileError("Windows lstat: pending (Phase B.2)");
     var z: PathZ = undefined;
     try pathZInto(file_path, &z);
-    var buf: std.c.Stat = undefined;
+    var buf: PlatformStat = undefined;
     if (syscall.lstat(&z.buf, &buf) != 0) return fs_error.fromErrno(fs_error.currentErrno());
     return Metadata.fromStat(buf);
 }
@@ -100,7 +100,7 @@ pub fn lstat(file_path: []const u8) FsError!Metadata {
 /// file, directory, socket).
 pub fn fstat(fd: c_int) FsError!Metadata {
     if (is_windows) @compileError("Windows fstat: pending (Phase B.2)");
-    var buf: std.c.Stat = undefined;
+    var buf: PlatformStat = undefined;
     if (syscall.fstat(fd, &buf) != 0) return fs_error.fromErrno(fs_error.currentErrno());
     return Metadata.fromStat(buf);
 }
@@ -121,7 +121,7 @@ pub fn tryExists(file_path: []const u8) FsError!bool {
     if (is_windows) @compileError("Windows tryExists: pending (Phase B.2)");
     var z: PathZ = undefined;
     try pathZInto(file_path, &z);
-    var buf: std.c.Stat = undefined;
+    var buf: PlatformStat = undefined;
     if (syscall.lstat(&z.buf, &buf) == 0) return true;
     const e = fs_error.fromErrno(fs_error.currentErrno());
     if (e == error.NotFound) return false;

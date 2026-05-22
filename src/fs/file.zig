@@ -275,7 +275,7 @@ pub const File = struct {
 
     /// Stat by fd.
     pub fn metadata(self: *File) FsError!Metadata {
-        var buf: std.c.Stat = undefined;
+        var buf: metadata_mod.PlatformStat = undefined;
         if (syscall.fstat(self.fd, &buf) != 0) return fs_error.fromErrno(fs_error.currentErrno());
         return Metadata.fromStat(buf);
     }

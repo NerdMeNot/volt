@@ -15,6 +15,7 @@ const builtin = @import("builtin");
 
 const syscall = @import("syscall.zig");
 const fs_error = @import("error.zig");
+const PlatformStat = @import("metadata.zig").PlatformStat;
 
 const is_windows = builtin.os.tag == .windows;
 const page_size = std.heap.page_size_min;
@@ -161,9 +162,9 @@ pub fn mapFile(fd: c_int, opts: MapOptions) FsError!MappedFile {
 
     var actual_len = opts.length;
     if (actual_len == 0) {
-        var st: std.c.Stat = undefined;
+        var st: PlatformStat = undefined;
         if (syscall.fstat(fd, &st) != 0) return fs_error.fromErrno(fs_error.currentErrno());
-        const file_size: u64 = @intCast(st.size);
+        const file_size: u64 = st.size();
         if (file_size <= opts.offset) return error.InvalidPath;
         actual_len = @intCast(file_size - opts.offset);
     }
