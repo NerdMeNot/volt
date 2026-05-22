@@ -133,6 +133,17 @@ const ipv6_mreq = extern struct {
 
 // ─── libc extern bindings ────────────────────────────────────────────
 
+// Winsock's `recv/send/recvfrom/sendto` take `int` lengths and return
+// `int` — POSIX uses `size_t` / `ssize_t`. Declaring the wrong width
+// is silently wrong on Microsoft x64: the lower 32 bits of RAX hold
+// the actual return; the upper 32 are caller-poisoned. A successful
+// `recv` of 2 bytes then shows up as 0x????????00000002 in the
+// `isize`-typed return, and even 0 in the high bits can flip to a
+// large positive `usize` after `@intCast` — surfaced as the
+// "index 4294967295, len 16" panic in `buf[0..r.len]`.
+const SockSSize = if (builtin.os.tag == .windows) c_int else isize;
+const SockSize = if (builtin.os.tag == .windows) c_int else usize;
+
 const c_socket = @extern(
     *const fn (c_int, c_int, c_int) callconv(.c) c_int,
     .{ .name = "socket" },
@@ -150,19 +161,19 @@ const c_close = @extern(
     .{ .name = "close" },
 );
 const c_sendto = @extern(
-    *const fn (c_int, *const anyopaque, usize, c_int, ?*const anyopaque, c_uint) callconv(.c) isize,
+    *const fn (c_int, *const anyopaque, SockSize, c_int, ?*const anyopaque, c_uint) callconv(.c) SockSSize,
     .{ .name = "sendto" },
 );
 const c_recvfrom = @extern(
-    *const fn (c_int, *anyopaque, usize, c_int, ?*anyopaque, ?*c_uint) callconv(.c) isize,
+    *const fn (c_int, *anyopaque, SockSize, c_int, ?*anyopaque, ?*c_uint) callconv(.c) SockSSize,
     .{ .name = "recvfrom" },
 );
 const c_send = @extern(
-    *const fn (c_int, *const anyopaque, usize, c_int) callconv(.c) isize,
+    *const fn (c_int, *const anyopaque, SockSize, c_int) callconv(.c) SockSSize,
     .{ .name = "send" },
 );
 const c_recv = @extern(
-    *const fn (c_int, *anyopaque, usize, c_int) callconv(.c) isize,
+    *const fn (c_int, *anyopaque, SockSize, c_int) callconv(.c) SockSSize,
     .{ .name = "recv" },
 );
 const getsockname = @extern(
@@ -274,7 +285,7 @@ pub const UdpSocket = struct {
     pub fn send(self: *UdpSocket, buf: []const u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         while (true) {
-            const n = c_send(@intCast(self.fd), buf.ptr, buf.len, 0);
+            const n = c_send(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
@@ -290,7 +301,7 @@ pub const UdpSocket = struct {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         while (true) {
             try c.checkpoint();
-            const n = c_send(@intCast(self.fd), buf.ptr, buf.len, 0);
+            const n = c_send(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
@@ -308,7 +319,7 @@ pub const UdpSocket = struct {
     pub fn recv(self: *UdpSocket, buf: []u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         while (true) {
-            const n = c_recv(@intCast(self.fd), buf.ptr, buf.len, 0);
+            const n = c_recv(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
@@ -324,7 +335,7 @@ pub const UdpSocket = struct {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         while (true) {
             try c.checkpoint();
-            const n = c_recv(@intCast(self.fd), buf.ptr, buf.len, 0);
+            const n = c_recv(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
@@ -341,7 +352,7 @@ pub const UdpSocket = struct {
     pub fn sendTo(self: *UdpSocket, buf: []const u8, addr: Address) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         while (true) {
-            const n = c_sendto(@intCast(self.fd), buf.ptr, buf.len, 0, addr.sockaddr(), addr.len);
+            const n = c_sendto(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0, addr.sockaddr(), addr.len);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
@@ -357,7 +368,7 @@ pub const UdpSocket = struct {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         while (true) {
             try c.checkpoint();
-            const n = c_sendto(@intCast(self.fd), buf.ptr, buf.len, 0, addr.sockaddr(), addr.len);
+            const n = c_sendto(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0, addr.sockaddr(), addr.len);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
@@ -374,7 +385,7 @@ pub const UdpSocket = struct {
         while (true) {
             var storage: posix.sockaddr.storage = undefined;
             var sa_len: c_uint = @sizeOf(posix.sockaddr.storage);
-            const n = c_recvfrom(@intCast(self.fd), buf.ptr, buf.len, 0, &storage, &sa_len);
+            const n = c_recvfrom(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0, &storage, &sa_len);
             if (n >= 0) {
                 return .{
                     .len = @intCast(n),
@@ -397,7 +408,7 @@ pub const UdpSocket = struct {
             try c.checkpoint();
             var storage: posix.sockaddr.storage = undefined;
             var sa_len: c_uint = @sizeOf(posix.sockaddr.storage);
-            const n = c_recvfrom(@intCast(self.fd), buf.ptr, buf.len, 0, &storage, &sa_len);
+            const n = c_recvfrom(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0, &storage, &sa_len);
             if (n >= 0) {
                 return .{
                     .len = @intCast(n),
@@ -424,7 +435,7 @@ pub const UdpSocket = struct {
         while (true) {
             var storage: posix.sockaddr.storage = undefined;
             var sa_len: c_uint = @sizeOf(posix.sockaddr.storage);
-            const n = c_recvfrom(@intCast(self.fd), buf.ptr, buf.len, MSG_PEEK, &storage, &sa_len);
+            const n = c_recvfrom(@intCast(self.fd), buf.ptr, @intCast(buf.len), MSG_PEEK, &storage, &sa_len);
             if (n >= 0) {
                 return .{
                     .len = @intCast(n),
