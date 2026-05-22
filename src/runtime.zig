@@ -900,17 +900,8 @@ fn workerLoopUntilTaskDone(rt: *Runtime, m: *M, target_done: *std.atomic.Value(u
     worker_mod.currentMSet(@ptrCast(m));
     defer worker_mod.currentMSet(null);
     while (target_done.load(.acquire) == task_mod.NOT_DONE) {
-        // Enter find-work phase: count this M as searching.
-        // Anti-herd: pushers see num_searching > 0 and skip the
-        // bitmap CAS + ulock_wake, knowing we'll pick up their push.
         _ = rt.num_searching.fetchAdd(1, .acq_rel);
-        if (tryFindAndDispatch(rt, m)) {
-            // tryFindAndDispatch decrements num_searching on hit
-            // before swapping into the coroutine. We're back from
-            // the swap now; loop iterates and fetchAdds again.
-            continue;
-        }
-        // No work found. Leave find-work phase and park.
+        if (tryFindAndDispatch(rt, m)) continue;
         _ = rt.num_searching.fetchSub(1, .acq_rel);
         if (target_done.load(.acquire) == task_mod.DONE) return;
         parkWorker(rt, m);
@@ -1074,7 +1065,18 @@ fn dispatch(rt: *Runtime, m: *M, c: *Coroutine) void {
             // The driver thread (worker 0) parks via its Parker,
             // not via the parking lot. The root task carries a
             // direct Parker pointer; wake it here.
-            if (c.task_thread_parker) |p| p.unpark();
+            //
+            // ALSO fire reactor.interrupt() — the driver may be
+            // blocked in reactor.poll(true) via tryFindAndDispatch
+            // rather than in parker.park(); the parker.unpark stores
+            // NOTIFIED but the driver is waiting on kqueue, not the
+            // parker. Without the interrupt, the driver hangs on
+            // kqueue waiting for an event that may never come.
+            // See https://github.com/NerdMeNot/volt/issues/1.
+            if (c.task_thread_parker) |p| {
+                p.unpark();
+                rt.reactor.interrupt();
+            }
             if (!c.has_task) {
                 if (c.frame_destroy) |destroy_fn| destroy_fn(c.frame_ptr, rt.allocator);
             }
@@ -1466,22 +1468,6 @@ fn runWithSignalsCancelBody(
 
 test "runWithSignals: SIGINT fires Cancel; body unwinds gracefully" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    // SKIPPED BY DEFAULT — see https://github.com/NerdMeNot/volt/issues/1
-    //
-    // This test hangs intermittently when run as part of the full
-    // `zig build test` suite (passes in isolation, fails after ~48
-    // other tests have run). State-leakage hypothesis: signal-handler
-    // bookkeeping from earlier tests. The test exists and the
-    // mechanism it tests works — but until the root cause is
-    // identified, leaving this in the default suite would silently
-    // hang CI. To run explicitly:
-    //
-    //     VOLT_RUN_SIGINT_TEST=1 zig build test -Dtest-filter="SIGINT"
-    //
-    // Process-level timeout (e.g. `timeout 300 zig build test`) is
-    // the recommended CI safety net while #1 is open.
-    if (std.c.getenv("VOLT_RUN_SIGINT_TEST") == null) return error.SkipZigTest;
-
     var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
     defer rt.deinit();
     var ctx = SignalCtx{};
