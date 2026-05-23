@@ -166,10 +166,12 @@ pub const Reactor = struct {
     pub fn closeFd(self: *Reactor, fd: i32) void {
         if (self.removeWaiter(fd)) |c| {
             self.acquire();
-            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(c), 0) catch blk: {
-                _ = self.ring.submit() catch {};
-                break :blk self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(c), 0) catch null;
-            };
+            // Submit-then-cancel-then-submit, same rationale as in
+            // cancelCoro — the target poll_add must reach the kernel
+            // before the cancel SQE.
+            _ = self.ring.submit() catch {};
+            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(c), 0) catch {};
+            _ = self.ring.submit() catch {};
             self.release();
         }
         _ = posix_helpers.close(fd);
@@ -294,11 +296,31 @@ pub const Reactor = struct {
     /// the poll loop discards its own completion.
     pub fn cancelCoro(self: *Reactor, c: *coroutine.Coroutine) void {
         self.acquire();
-        _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(c), 0) catch blk: {
+        defer self.release();
+        // Drain pending SQEs FIRST so the target user_data is visible
+        // to the kernel before our cancel SQE goes in. Without this
+        // submit, a cancel batched with a not-yet-submitted poll_add
+        // it targets can race: the kernel may process the cancel
+        // before the poll_add is registered, the cancel hits -ENOENT,
+        // and the coro then parks on the poll_add forever. Per
+        // io_uring_prep_cancel(3): submit the target in one batch,
+        // then submit the cancel in a separate batch. This is the
+        // root cause of the Linux CI recvCancel stress hang that
+        // local Mac kqueue + un-loaded podman never exposed; it
+        // surfaces under contention where the firer coroutine reaches
+        // cancelCoro before any worker has called submit_and_wait.
+        _ = self.ring.submit() catch {};
+        _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(c), 0) catch {
+            // SQ full even after the proactive submit — extremely
+            // rare. Drain once more and retry; if that fails too,
+            // silently return — the original op will eventually
+            // complete via the normal CQE path (fd close, hangup, or
+            // peer activity), and the cancel waiter's `c.isFired()`
+            // check will surface error.Cancelled when the coro wakes.
             _ = self.ring.submit() catch {};
-            break :blk self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(c), 0) catch null;
+            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(c), 0) catch {};
         };
-        self.release();
+        _ = self.ring.submit() catch {};
     }
 
     pub fn waitReadableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
@@ -352,11 +374,13 @@ pub const Reactor = struct {
             // be delivered to poll() and runtime.unpark'd, which
             // (since we never park) just transitions park_state
             // RUNNING → NOTIFIED — harmless once we return.
+            // Submit the poll_add FIRST so the kernel has it before
+            // the cancel SQE goes in (see cancelCoro for the
+            // io_uring batching race rationale).
             self.acquire();
-            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(me), 0) catch blk: {
-                _ = self.ring.submit() catch {};
-                break :blk self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(me), 0) catch null;
-            };
+            _ = self.ring.submit() catch {};
+            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(me), 0) catch {};
+            _ = self.ring.submit() catch {};
             self.release();
             return error.Cancelled;
         }
@@ -400,11 +424,13 @@ pub const Reactor = struct {
 
         var w = cancel_mod.Waiter{};
         if (c.registerReactor(&w, me)) {
+            // Submit-then-cancel-then-submit, same rationale as in
+            // cancelCoro — the target SQE must reach the kernel
+            // before the cancel SQE.
             self.acquire();
-            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(me), 0) catch blk: {
-                _ = self.ring.submit() catch {};
-                break :blk self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(me), 0) catch null;
-            };
+            _ = self.ring.submit() catch {};
+            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(me), 0) catch {};
+            _ = self.ring.submit() catch {};
             self.release();
             return error.Cancelled;
         }
