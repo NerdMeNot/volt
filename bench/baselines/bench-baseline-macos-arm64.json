@@ -1,0 +1,192 @@
+{
+  "platform": "macos-arm64",
+  "captured_at": "2026-05-23T13:51:34.745593+00:00",
+  "benches": {
+    "yield": {
+      "yield_ns_per_op": 10,
+      "yield_ns_per_op_samples": [
+        11,
+        10,
+        10
+      ]
+    },
+    "spsc": {
+      "spsc_ns_per_op": 14,
+      "spsc_ns_per_op_samples": [
+        16,
+        14,
+        14
+      ]
+    },
+    "mpmc": {
+      "mpmc_1p1c_ns_per_op": 23,
+      "mpmc_1p1c_ns_per_op_samples": [
+        23,
+        23,
+        24
+      ],
+      "mpmc_2p2c_ns_per_op": 32,
+      "mpmc_2p2c_ns_per_op_samples": [
+        32,
+        37,
+        30
+      ],
+      "mpmc_4p4c_ns_per_op": 98,
+      "mpmc_4p4c_ns_per_op_samples": [
+        113,
+        98,
+        95
+      ]
+    },
+    "mutex": {
+      "mutex_ns_per_op": 23,
+      "mutex_ns_per_op_samples": [
+        24,
+        23,
+        17
+      ]
+    },
+    "spawn-hot": {
+      "spawn_hot_ns_per_op": 570,
+      "spawn_hot_ns_per_op_samples": [
+        611,
+        572,
+        570,
+        478,
+        508
+      ]
+    },
+    "scaling": {
+      "scaling_w1": 94,
+      "scaling_w1_samples": [
+        99,
+        94,
+        94
+      ],
+      "scaling_w2": 292,
+      "scaling_w2_samples": [
+        301,
+        292,
+        290
+      ],
+      "scaling_w4": 422,
+      "scaling_w4_samples": [
+        427,
+        422,
+        415
+      ],
+      "scaling_w8": 610,
+      "scaling_w8_samples": [
+        610,
+        683,
+        488
+      ],
+      "scaling_w11": 733,
+      "scaling_w11_samples": [
+        733,
+        757,
+        671
+      ]
+    },
+    "fanout-scaling": {
+      "fanout_w1": 87,
+      "fanout_w1_samples": [
+        74,
+        87,
+        118
+      ],
+      "fanout_w2": 99,
+      "fanout_w2_samples": [
+        96,
+        109,
+        99
+      ],
+      "fanout_w4": 111,
+      "fanout_w4_samples": [
+        113,
+        111,
+        111
+      ],
+      "fanout_w8": 115,
+      "fanout_w8_samples": [
+        115,
+        115,
+        114
+      ],
+      "fanout_w11": 113,
+      "fanout_w11_samples": [
+        113,
+        110,
+        114
+      ]
+    },
+    "parallel-compute": {
+      "parallel_w1": 91,
+      "parallel_w1_samples": [
+        93,
+        90,
+        91
+      ],
+      "parallel_w2": 48,
+      "parallel_w2_samples": [
+        49,
+        48,
+        48
+      ],
+      "parallel_w4": 27,
+      "parallel_w4_samples": [
+        25,
+        27,
+        28
+      ],
+      "parallel_w8": 19,
+      "parallel_w8_samples": [
+        19,
+        20,
+        19
+      ]
+    },
+    "tcp-echo": {
+      "tcp_echo_ns_per_rtt": 16130,
+      "tcp_echo_ns_per_rtt_samples": [
+        14758,
+        16130,
+        19360
+      ]
+    },
+    "reactor-throughput": {
+      "reactor_wake_ns": 11977,
+      "reactor_wake_ns_samples": [
+        11712,
+        12157,
+        11977
+      ]
+    },
+    "reactor-fanout": {
+      "reactor_fanout_ns_per_rtt": 13363,
+      "reactor_fanout_ns_per_rtt_samples": [
+        12232,
+        14128,
+        13363
+      ]
+    },
+    "rss": {
+      "rss_w100": 36700,
+      "rss_w100_samples": [
+        36700
+      ],
+      "rss_w1000": 18989,
+      "rss_w1000_samples": [
+        18989
+      ],
+      "rss_w5000": 17406,
+      "rss_w5000_samples": [
+        17406
+      ],
+      "rss_w10000": 17219,
+      "rss_w10000_samples": [
+        17219
+      ]
+    }
+  }
+}
