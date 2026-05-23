@@ -383,13 +383,12 @@ test "conformance: recvCancel stress — 200 iterations, no hang" {
 const builtin = @import("builtin");
 
 // Phase 3d backend coverage:
-//   * kqueue (Darwin)  — full closeFd impl
-//   * epoll  (Linux)   — full closeFd impl
-//   * io_uring (Linux) — full closeFd impl (via IORING_OP_ASYNC_CANCEL)
-//   * IOCP (Windows)   — stub; tests SkipZigTest on Windows
-const has_full_closeFd = builtin.os.tag.isDarwin() or builtin.os.tag == .linux;
-// .auto on every platform that has the impl — io_uring or epoll,
-// whichever the runtime picks at init.
+//   * kqueue   (Darwin)  — full closeFd impl
+//   * epoll    (Linux)   — full closeFd impl
+//   * io_uring (Linux)   — full closeFd impl (via IORING_OP_ASYNC_CANCEL)
+//   * IOCP     (Windows) — full closeFd impl (via CancelIoEx)
+const has_full_closeFd = true;
+// .auto on every platform — the runtime picks the right backend.
 const closeFd_test_io_backend: @import("reactor.zig").IoBackend = .auto;
 
 const ListenerCloseCtx = struct {

@@ -287,8 +287,18 @@ pub const Reactor = struct {
     acceptex_fn_raw: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     connectex_fn_raw: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
-    /// See reactor_epoll.zig's allocator note — Phase 3d landed
-    /// kqueue's closeFd first; IOCP's is a stub today.
+    /// Reverse lookup `socket → parked coro`. closeFd uses it to
+    /// find the parked waiter and call `CancelIoEx(handle, NULL)`
+    /// before `closesocket()` — the Boost.Asio
+    /// win_iocp_socket_service_base.ipp pattern. CancelIoEx aborts
+    /// any pending overlapped op on the handle; the kernel posts a
+    /// completion with ERROR_OPERATION_ABORTED to the IOCP, and the
+    /// poll loop dispatches the parked coro normally. Like io_uring
+    /// (async-cancel model), no `op.closed` flag is needed — the
+    /// post-close libc recv/send gets EBADF and surfaces as
+    /// BadDescriptor via the existing wsaToIoError mapping.
+    fd_waiters: std.AutoHashMapUnmanaged(i32, *coroutine.Coroutine) = .{},
+    fd_waiters_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     allocator: std.mem.Allocator,
 
     /// `WSAStartup` is per-process; ensure it's called once across
@@ -318,17 +328,51 @@ pub const Reactor = struct {
         return .{ .iocp = iocp, .allocator = allocator };
     }
 
-    /// Phase 3d stub — full impl pending. IOCP's correct closeFd
-    /// requires CancelIoEx(handle, NULL) BEFORE closesocket() to
-    /// abort pending IOCP ops (Boost.Asio pattern, see
-    /// reactor-reference-map.md). Today this just closes — same
-    /// orphan-waiter gap as POSIX backends; the SkipZigTest cases
-    /// keep it visible.
+    inline fn lockWaiters(self: *Reactor) void {
+        while (self.fd_waiters_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+    inline fn unlockWaiters(self: *Reactor) void {
+        self.fd_waiters_lock.store(0, .release);
+    }
+    fn insertWaiter(self: *Reactor, fd: i32, c: *coroutine.Coroutine) std.mem.Allocator.Error!void {
+        self.lockWaiters();
+        defer self.unlockWaiters();
+        try self.fd_waiters.put(self.allocator, fd, c);
+    }
+    fn removeWaiter(self: *Reactor, fd: i32) ?*coroutine.Coroutine {
+        self.lockWaiters();
+        defer self.unlockWaiters();
+        if (self.fd_waiters.fetchRemove(fd)) |kv| return kv.value;
+        return null;
+    }
+
+    /// Close a socket whose IOCP-pended overlapped op may have a
+    /// parked coroutine waiting on it. Mirrors reactor_kqueue.zig
+    /// closeFd in spirit but uses the Boost.Asio CancelIoEx-before-
+    /// closesocket pattern (see reactor-reference-map.md):
+    ///
+    ///   1. Look up the parked coro via the side-table.
+    ///   2. CancelIoEx(handle, NULL) aborts ALL pending overlapped
+    ///      ops on the handle. The kernel posts an
+    ///      ERROR_OPERATION_ABORTED completion to the IOCP for each
+    ///      one; the poll loop dispatches the coro normally.
+    ///   3. closesocket(handle) releases the socket.
+    ///
+    /// Order is CancelIoEx FIRST, closesocket SECOND. If close
+    /// races first, CancelIoEx returns ERROR_NOT_FOUND and the
+    /// pending op's completion never fires (or fires with stale
+    /// handle state) — the parked coro hangs forever. The Asio
+    /// `win_iocp_socket_service_base.ipp::close` notes this is the
+    /// only safe order.
+    ///
+    /// `op.closed` flag isn't needed (unlike kqueue/epoll) because
+    /// the CancelIoEx delivery is deterministic via the completion
+    /// port, and the post-close libc recv/send retry gets WSAEBADF
+    /// (mapped to BadDescriptor by wsaToIoError).
     pub fn closeFd(self: *Reactor, fd: i32) void {
-        _ = self;
-        // closesocket on Windows is in ws2_32, not the CRT close.
-        // Use the same path Volt's net types currently use until the
-        // full closeFd lands.
+        _ = self.removeWaiter(fd); // drop side-table entry
+        const handle: win.HANDLE = @ptrFromInt(@as(usize, @intCast(fd)));
+        _ = CancelIoEx(handle, null); // ignore ERROR_NOT_FOUND
         _ = closesocket(@intCast(fd));
     }
 
@@ -339,6 +383,8 @@ pub const Reactor = struct {
         // coroutines first — the assertion fails loudly in debug
         // if it didn't.
         std.debug.assert(self.pending.load(.acquire) == 0);
+        std.debug.assert(self.fd_waiters.count() == 0);
+        self.fd_waiters.deinit(self.allocator);
         _ = CloseHandle(self.iocp);
         // WSACleanup is intentionally not called; matches the
         // single-Runtime-per-process common case. A future
@@ -409,6 +455,21 @@ pub const Reactor = struct {
         }
 
         _ = self.pending.fetchAdd(1, .acq_rel);
+
+        // Side-table insert so a peer's closeFd can find this coro
+        // and CancelIoEx the pending overlapped op.
+        self.insertWaiter(@intCast(sock), me) catch {
+            // On allocation failure, cancel the pending overlapped
+            // op so the parked-op count stays consistent. The
+            // completion will fire on the IOCP and poll() will
+            // discard it (no coro associated since we never parked).
+            const handle: win.HANDLE = @ptrFromInt(sock);
+            _ = CancelIoEx(handle, &ovl);
+            _ = self.pending.fetchSub(1, .acq_rel);
+            return error.SystemResources;
+        };
+        defer _ = self.removeWaiter(@intCast(sock));
+
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
         // On resume: poll() has unparked us. The OVERLAPPED on our
