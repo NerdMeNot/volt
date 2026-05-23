@@ -283,7 +283,17 @@ pub const UdpSocket = struct {
     }
 
     pub fn close(self: *UdpSocket) void {
-        _ = c_close(@intCast(self.fd));
+        // Route through reactor.closeFd when in a coroutine so any
+        // parked peer (recvFrom blocked on this socket) gets
+        // dispatched. Outside a coroutine, no peer can be parked —
+        // bare libc close is correct. See net.zig closeFdDispatch
+        // for the full rationale.
+        if (current.get()) |c| {
+            const rt: *runtime.Runtime = @ptrCast(@alignCast(c.runtime));
+            rt.reactor.closeFd(self.fd);
+        } else {
+            _ = c_close(@intCast(self.fd));
+        }
     }
 
     /// Windows: associate `self.fd` with the runtime's IOCP on first

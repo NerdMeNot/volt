@@ -171,8 +171,16 @@ pub const Reactor = struct {
     /// The eventfd interrupt registration is excluded — it's a
     /// reactor-internal wake channel, not a coroutine park.
     pending: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Allocator stash for the eventual fd→coro side-table mirroring
+    /// the kqueue closeFd implementation. Phase 3d landed kqueue
+    /// first; epoll's closeFd is a stub today (just libc close — no
+    /// side-table lookup), so a parked coroutine on a closed fd still
+    /// hangs on Linux. Tracked in the close-while-parked SkipZigTest
+    /// guards in src/reactor_conformance_test.zig (the Darwin path is
+    /// un-skipped; Linux remains skipped pending the full impl).
+    allocator: std.mem.Allocator,
 
-    pub fn init() !Reactor {
+    pub fn init(allocator: std.mem.Allocator) !Reactor {
         const ep = epoll_create1(EPOLL_CLOEXEC);
         if (ep < 0) return error.EpollCreateFailed;
         errdefer _ = posix_helpers.close(ep);
@@ -190,7 +198,17 @@ pub const Reactor = struct {
         };
         if (epoll_ctl(ep, EPOLL_CTL_ADD, efd, &ev) < 0) return error.EpollCreateFailed;
 
-        return .{ .epfd = ep, .interrupt_fd = efd };
+        return .{ .epfd = ep, .interrupt_fd = efd, .allocator = allocator };
+    }
+
+    /// Phase 3d stub — full impl pending. Today this is just `close()`
+    /// so the orphan-waiter-on-fd-close gap on epoll remains; the
+    /// two SkipZigTest conformance cases keep it visible. Will gain
+    /// the fd→coro side-table (matching reactor_kqueue.zig) in the
+    /// next pass.
+    pub fn closeFd(self: *Reactor, fd: i32) void {
+        _ = self;
+        _ = posix_helpers.close(fd);
     }
 
     pub fn deinit(self: *Reactor) void {

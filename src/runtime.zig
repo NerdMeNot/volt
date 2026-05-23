@@ -393,12 +393,12 @@ pub const Runtime = struct {
         // accepted but ignored — kqueue or IOCP is fixed.
         const reactor_inst = if (@import("builtin").os.tag == .linux)
             switch (cfg.io_backend) {
-                .auto => try Reactor.init(),
-                .epoll => try Reactor.initBackend(.epoll),
-                .io_uring => try Reactor.initBackend(.io_uring),
+                .auto => try Reactor.init(cfg.allocator),
+                .epoll => try Reactor.initBackend(cfg.allocator, .epoll),
+                .io_uring => try Reactor.initBackend(cfg.allocator, .io_uring),
             }
         else
-            try Reactor.init();
+            try Reactor.init(cfg.allocator);
 
         rt.* = .{
             .allocator = cfg.allocator,

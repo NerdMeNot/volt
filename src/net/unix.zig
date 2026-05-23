@@ -202,7 +202,12 @@ const StreamImpl = if (is_windows) void else struct {
     }
 
     pub fn close(self: *StreamImpl) void {
-        _ = c_close(@intCast(self.fd));
+        if (current.get()) |c| {
+            const rt: *runtime.Runtime = @ptrCast(@alignCast(c.runtime));
+            rt.reactor.closeFd(self.fd);
+        } else {
+            _ = c_close(@intCast(self.fd));
+        }
     }
 
     pub fn read(self: *StreamImpl, buf: []u8) !usize {
@@ -256,7 +261,12 @@ const ListenerImpl = if (is_windows) void else struct {
     }
 
     pub fn close(self: *ListenerImpl) void {
-        _ = c_close(@intCast(self.fd));
+        if (current.get()) |c| {
+            const rt: *runtime.Runtime = @ptrCast(@alignCast(c.runtime));
+            rt.reactor.closeFd(self.fd);
+        } else {
+            _ = c_close(@intCast(self.fd));
+        }
         // Path-bound sockets leave a file behind; unlink it so
         // re-binding to the same path doesn't EADDRINUSE on the
         // next test / process restart. Abstract sockets have no
@@ -339,7 +349,12 @@ const DatagramImpl = if (is_windows) void else struct {
     }
 
     pub fn close(self: *DatagramImpl) void {
-        _ = c_close(@intCast(self.fd));
+        if (current.get()) |c| {
+            const rt: *runtime.Runtime = @ptrCast(@alignCast(c.runtime));
+            rt.reactor.closeFd(self.fd);
+        } else {
+            _ = c_close(@intCast(self.fd));
+        }
         if (self.bound_path) |p| {
             var buf: [256]u8 = undefined;
             if (p.len < buf.len) {

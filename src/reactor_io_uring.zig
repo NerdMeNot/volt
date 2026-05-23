@@ -98,8 +98,11 @@ pub const Reactor = struct {
     /// Submission and CQE consumption are single-threaded by the
     /// poller-claim in `runtime.zig`.
     lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// See reactor_epoll.zig's allocator comment — Phase 3d landed
+    /// kqueue's closeFd first; io_uring's is a stub.
+    allocator: std.mem.Allocator,
 
-    pub fn init() !Reactor {
+    pub fn init(allocator: std.mem.Allocator) !Reactor {
         // `flags = 0`: vanilla setup. `IORING_SETUP_SINGLE_ISSUER`
         // + `IORING_SETUP_DEFER_TASKRUN` would reduce kernel
         // coordination but require kernel ≥ 6.0 and a more careful
@@ -118,7 +121,14 @@ pub const Reactor = struct {
         _ = ring.poll_add(INTERRUPT_USER_DATA, efd, POLLIN) catch return error.IoUringInitFailed;
         _ = ring.submit() catch return error.IoUringInitFailed;
 
-        return .{ .ring = ring, .interrupt_fd = efd };
+        return .{ .ring = ring, .interrupt_fd = efd, .allocator = allocator };
+    }
+
+    /// Phase 3d stub — full impl pending. See reactor_epoll.zig's
+    /// closeFd note.
+    pub fn closeFd(self: *Reactor, fd: i32) void {
+        _ = self;
+        _ = posix_helpers.close(fd);
     }
 
     pub fn deinit(self: *Reactor) void {

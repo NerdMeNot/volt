@@ -53,6 +53,10 @@ const INTERRUPT_IDENT: usize = 0;
 // heap-allocated and never null.
 const INTERRUPT_UDATA: usize = 0;
 
+/// (fd, filter) — identifies a parked-waiter entry in the side-table.
+/// Same composite key kqueue uses internally for kevent identity.
+pub const FdWaiterKey = struct { fd: i32, filter: i16 };
+
 pub const Reactor = struct {
     kq: i32 = -1,
     /// In-flight kqueue registrations (one per coroutine parked on
@@ -69,8 +73,28 @@ pub const Reactor = struct {
     /// is carried by the kernel's kqueue, not by this counter — the
     /// counter only gates "should we bother calling kevent at all".
     pending: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Reverse lookup `(fd, filter) → parked coro`. Required so that
+    /// `closeFd(fd)` can find and dispatch any coroutine parked on
+    /// the fd before the close orphans the kernel registration.
+    ///
+    /// Insert: `waitFd` / `waitFdCancel` after the kevent ADD
+    /// returns success.
+    /// Remove: `poll` after delivering the event, `cancelCoro` after
+    /// EV_DELETE, `closeFd` after EV_DELETE, or by the coroutine
+    /// itself when `waitFd` returns (covers the rare "kevent failed
+    /// post-insert" path).
+    /// Guarded by `fd_waiters_lock`; ops are short — a plain
+    /// std.Thread.Mutex is fine.
+    fd_waiters: std.AutoHashMapUnmanaged(FdWaiterKey, *coroutine.Coroutine) = .{},
+    /// TTAS spinlock — ops are O(few-instructions) hashmap mutations.
+    /// std.Thread.Mutex was removed in Zig 0.16; Volt uses raw atomic
+    /// spinlocks for short critical sections (see blocking_pool.zig).
+    fd_waiters_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Allocator for `fd_waiters`. Passed at init so the Reactor
+    /// doesn't need to reach back into the runtime for one.
+    allocator: std.mem.Allocator,
 
-    pub fn init() !Reactor {
+    pub fn init(allocator: std.mem.Allocator) !Reactor {
         const kq = std.c.kqueue();
         if (kq < 0) return error.KqueueInitFailed;
 
@@ -88,7 +112,7 @@ pub const Reactor = struct {
             _ = std.c.close(kq);
             return error.KqueueInitFailed;
         }
-        return .{ .kq = kq };
+        return .{ .kq = kq, .allocator = allocator };
     }
 
     pub fn deinit(self: *Reactor) void {
@@ -98,8 +122,37 @@ pub const Reactor = struct {
         // debug builds; in release we close the kq anyway and the
         // kernel cleans up the registrations on file-handle close.
         std.debug.assert(self.pending.load(.acquire) == 0);
+        std.debug.assert(self.fd_waiters.count() == 0);
+        self.fd_waiters.deinit(self.allocator);
         if (self.kq >= 0) _ = std.c.close(self.kq);
         self.kq = -1;
+    }
+
+    inline fn lockWaiters(self: *Reactor) void {
+        while (self.fd_waiters_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+    inline fn unlockWaiters(self: *Reactor) void {
+        self.fd_waiters_lock.store(0, .release);
+    }
+
+    /// Insert a parked-waiter entry. Returns the previous entry if
+    /// any (caller should typically expect null — having two coros
+    /// parked on the same (fd, filter) is a usage bug). Allocates on
+    /// growth via `self.allocator`.
+    fn insertWaiter(self: *Reactor, key: FdWaiterKey, c: *coroutine.Coroutine) std.mem.Allocator.Error!void {
+        self.lockWaiters();
+        defer self.unlockWaiters();
+        try self.fd_waiters.put(self.allocator, key, c);
+    }
+
+    /// Remove a parked-waiter entry. Returns the coro that was
+    /// registered (or null if no entry — `closeFd` racing with a
+    /// normal wake leaves the entry already removed).
+    fn removeWaiter(self: *Reactor, key: FdWaiterKey) ?*coroutine.Coroutine {
+        self.lockWaiters();
+        defer self.unlockWaiters();
+        if (self.fd_waiters.fetchRemove(key)) |kv| return kv.value;
+        return null;
     }
 
     /// Park the current coroutine until `fd` is readable.
@@ -146,6 +199,15 @@ pub const Reactor = struct {
 
     fn waitFd(self: *Reactor, fd: i32, filter: i16) ReactorWaitError!void {
         const me = current.require();
+        // Stack-allocate a WaitOp so closeFd / cancelCoro can find
+        // (ident, filter) for EV_DELETE. The non-cancel path used to
+        // skip the WaitOp because cancelCoro wasn't possible without
+        // a Cancel — but closeFd is the same kind of cross-coroutine
+        // dispatch and needs the same plumbing.
+        var op = WaitOp{ .ident = @intCast(fd), .filter = filter };
+        me.reactor_wait_op = &op;
+        defer me.reactor_wait_op = null;
+
         var kev = std.mem.zeroes(posix.Kevent);
         kev.ident = @intCast(fd);
         kev.filter = filter;
@@ -156,9 +218,25 @@ pub const Reactor = struct {
         const n = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
         if (n < 0) return registerError(posix_helpers.errnoVal());
         _ = self.pending.fetchAdd(1, .acq_rel);
+
+        // Side-table insert AFTER kevent ADD: if ADD fails we never
+        // insert, so we don't need a cleanup path on the failure
+        // branch. Allocation failure here means OOM — surface as
+        // SystemResources after rolling back the kevent.
+        self.insertWaiter(.{ .fd = fd, .filter = filter }, me) catch {
+            deregisterKevent(self, @intCast(fd), filter);
+            _ = self.pending.fetchSub(1, .acq_rel);
+            return error.SystemResources;
+        };
+        defer _ = self.removeWaiter(.{ .fd = fd, .filter = filter });
+
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
         // Resume: pending decremented by poll() before unpark.
+        // closeFd raced + won? `op.closed` was set; surface as
+        // BadDescriptor so the next libc-level retry mirrors what
+        // the kernel would have returned anyway.
+        if (op.closed) return error.BadDescriptor;
     }
 
     /// Map a `kevent` registration errno into the categorical
@@ -188,6 +266,12 @@ pub const Reactor = struct {
     pub const WaitOp = struct {
         ident: usize,
         filter: i16,
+        /// Set true by `closeFd` when it dispatches this waiter
+        /// because the fd was closed under the parked op. Checked
+        /// by `waitFd` / `waitFdCancel` after the swap-back; if set,
+        /// the wait returns `error.BadDescriptor` rather than
+        /// continuing into a libc retry that would EBADF anyway.
+        closed: bool = false,
     };
 
     /// Cancel this coro's in-flight kqueue registration.
@@ -211,6 +295,61 @@ pub const Reactor = struct {
         if (rc < 0) return; // ENOENT — poll() owns the unpark.
         _ = self.pending.fetchSub(1, .acq_rel);
         runtime.unpark(c);
+    }
+
+    /// Close a fd whose registration may have a parked coroutine
+    /// waiting on it. Without this, the parked waiter hangs forever
+    /// because kqueue silently drops the kevent when the fd closes
+    /// (and so does epoll via EPOLL_CTL_DEL semantics, and io_uring's
+    /// POLL_ADD becomes orphaned). Per the libuv test-tcp-close-accept
+    /// regression test (and Volt's own SkipZigTest conformance cases
+    /// at src/reactor_conformance_test.zig).
+    ///
+    /// The dispatch path:
+    ///   1. Pop the (fd, filter) entry from the side-table. If two
+    ///      coros raced on the same fd, only one closeFd succeeds in
+    ///      the dispatch per filter — the other reads a null table
+    ///      entry and falls through to the libc close.
+    ///   2. Issue EV_DELETE. If 0, the kernel hadn't pulled the event
+    ///      yet — we own the unpark; set `op.closed = true` so the
+    ///      waiter returns `BadDescriptor` instead of retrying recv,
+    ///      and unpark the coro.
+    ///   3. ENOENT — poll() already pulled the event. The coro will
+    ///      resume normally and the next libc recv/send after our
+    ///      close below gets EBADF; the existing `errnoToIoError`
+    ///      path surfaces it as `BadDescriptor` cleanly. Don't write
+    ///      to op.closed in this branch — the coro may already be
+    ///      running, and the stack is not stable for cross-thread
+    ///      writes once it has resumed.
+    ///   4. libc close(fd).
+    ///
+    /// Caller must ensure no further reactor registrations land on
+    /// this fd after the call — typically by closing it from the
+    /// fd-owner type's `close()` method.
+    pub fn closeFd(self: *Reactor, fd: i32) void {
+        for ([_]i16{ posix.system.EVFILT.READ, posix.system.EVFILT.WRITE }) |filter| {
+            const coro = self.removeWaiter(.{ .fd = fd, .filter = filter }) orelse continue;
+            var kev = std.mem.zeroes(posix.Kevent);
+            kev.ident = @intCast(fd);
+            kev.filter = filter;
+            kev.flags = posix.system.EV.DELETE;
+            var changes = [_]posix.Kevent{kev};
+            var dummy: [1]posix.Kevent = undefined;
+            const rc = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
+            if (rc >= 0) {
+                // We won the EV_DELETE race against poll(); coro is
+                // still parked, stack is stable.
+                if (coro.reactor_wait_op) |op_ptr| {
+                    const op: *WaitOp = @ptrCast(@alignCast(op_ptr));
+                    op.closed = true;
+                }
+                _ = self.pending.fetchSub(1, .acq_rel);
+                runtime.unpark(coro);
+            }
+            // ENOENT: poll owns unpark; falls through to natural libc
+            // EBADF path.
+        }
+        _ = posix_helpers.close(fd);
     }
 
     /// Cancel-aware variant of `waitReadable`. Returns
@@ -255,6 +394,14 @@ pub const Reactor = struct {
         if (n < 0) return registerError(posix_helpers.errnoVal());
         _ = self.pending.fetchAdd(1, .acq_rel);
 
+        // ─── Side-table insert (same role as in waitFd) ─────────────────
+        self.insertWaiter(.{ .fd = fd, .filter = filter }, me) catch {
+            deregisterKevent(self, @intCast(fd), filter);
+            _ = self.pending.fetchSub(1, .acq_rel);
+            return error.SystemResources;
+        };
+        defer _ = self.removeWaiter(.{ .fd = fd, .filter = filter });
+
         // ─── Cancel-list registration ───────────────────────────────────
         var w = cancel_mod.Waiter{};
         if (c.registerReactor(&w, me)) {
@@ -271,6 +418,7 @@ pub const Reactor = struct {
         // Wake source is one of:
         //   * poll() pulled the event → normal unpark path
         //   * cancelCoro from a later fire() → kevent DEL + unpark
+        //   * closeFd from a peer coroutine → kevent DEL + unpark
         // If fire() happens between registerReactor returning and
         // the swap below, runtime.unpark transitions park_state
         // RUNNING → NOTIFIED. Dispatch's `.park` branch then
@@ -280,6 +428,7 @@ pub const Reactor = struct {
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
 
+        if (op.closed) return error.BadDescriptor;
         if (c.isFired()) return error.Cancelled;
     }
 
@@ -402,7 +551,7 @@ pub const writeAll = posix_helpers.writeAll;
 // ─────────────────────────────────────────────────────────────────────
 
 test "Reactor: interrupt wakes blocking poll" {
-    var rx = try Reactor.init();
+    var rx = try Reactor.init(std.testing.allocator);
     // LIFO defer: pending reset runs before deinit's `pending == 0`
     // assertion. Without the bump, poll() takes its early-return
     // path and never enters kevent.

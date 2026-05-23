@@ -371,29 +371,17 @@ test "conformance: recvCancel stress — 200 iterations, no hang" {
 // downstream lib authors. Tightening the error contract is a
 // separate follow-up.
 //
-// FIXME(close-while-parked): both tests below are currently
-// SkipZigTest. Volt's TcpListener.close / TcpStream.close /
-// UdpSocket.close call libc close() directly — kqueue silently
-// drops the kevent registration on fd close and never fires an
-// event, so the parked accepter/receiver waits forever. Epoll
-// has the equivalent gap: EPOLL_CTL_DEL on close-without-deregister
-// orphans the parked coroutine.
-//
-// The fix is a reactor change, not a net-type one: each backend
-// needs `closeFd(fd)` that looks up any parked waiter for that
-// fd (via a new fd→coro side-table) and dispatches it with the
-// next syscall returning EBADF. EV_DELETE / EPOLL_CTL_DEL return
-// codes resolve the race with `poll()`, exactly the same pattern
-// `cancelCoro` already uses.
-//
-// Scope of that change touches every reactor backend
-// (reactor_kqueue, reactor_epoll, reactor_io_uring) plus the
-// `close()` method on each net type. Per CLAUDE.md's phase-
-// landing protocol, anything in the reactor needs the full bench
-// suite green before landing. The tests stay here, skipped with
-// this comment, so the gap is visible in `zig build test` output
-// rather than hidden behind a deferred TODO list.
+// Phase 3d landed the kqueue closeFd implementation: fd→coro
+// side-table + EV_DELETE-claim against poll(). On Darwin both
+// tests now run. On Linux (epoll / io_uring) and Windows (IOCP)
+// the closeFd is still a stub — the tests stay SkipZigTest there
+// pending the full per-backend implementations. The
+// platform-conditional skip keeps the gap visible in CI output
+// rather than buried in a TODO list.
 // ─────────────────────────────────────────────────────────────────
+
+const builtin = @import("builtin");
+const has_full_closeFd = builtin.os.tag.isDarwin();
 
 const ListenerCloseCtx = struct {
     listener: *TcpListener,
@@ -432,8 +420,8 @@ fn listenerCloseRoot(ctx: *ListenerCloseCtx) !void {
 }
 
 test "conformance: TcpListener.close while accept() is parked — no hang" {
-    // See FIXME(close-while-parked) above.
-    if (true) return error.SkipZigTest;
+    // Phase 3d: kqueue has full closeFd; epoll/io_uring/IOCP are stubs.
+    if (!has_full_closeFd) return error.SkipZigTest;
 
     var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 2 });
     defer rt.deinit();
@@ -480,8 +468,8 @@ fn udpCloseRoot(ctx: *UdpCloseCtx) !void {
 }
 
 test "conformance: UdpSocket.close while recvFrom() is parked — no hang" {
-    // See FIXME(close-while-parked) above.
-    if (true) return error.SkipZigTest;
+    // Phase 3d: kqueue has full closeFd; epoll/io_uring/IOCP are stubs.
+    if (!has_full_closeFd) return error.SkipZigTest;
 
     var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 2 });
     defer rt.deinit();

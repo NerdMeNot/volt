@@ -120,6 +120,31 @@ inline fn errnoVal() c_int {
 // platform's backend). The duplicate that used to live here was
 // consolidated as part of the L1 reactor refactor.
 
+/// Dispatch a socket close through the reactor's `closeFd` when we
+/// have a runtime in scope (any coroutine context), falling back to
+/// the bare libc close otherwise (test cleanup, `defer s.close()`
+/// outside a coroutine).
+///
+/// Why this matters: a peer coroutine calling `close()` on a fd that
+/// another coroutine is parked on must dispatch the parked waiter,
+/// not just orphan the kernel registration. The reactor's `closeFd`
+/// owns that dispatch logic — see `src/reactor_kqueue.zig` for the
+/// full kqueue implementation. The epoll / io_uring / IOCP backends
+/// today have stub closeFd implementations that just call libc
+/// close; the two SkipZigTest cases in
+/// `src/reactor_conformance_test.zig` keep those gaps visible.
+///
+/// Outside coroutine context (test cleanup after rt.deinit, etc.),
+/// no coroutine can be parked, so a plain libc close is correct.
+fn closeFdDispatch(fd: i32) void {
+    if (current.get()) |c| {
+        const rt: *runtime.Runtime = @ptrCast(@alignCast(c.runtime));
+        rt.reactor.closeFd(fd);
+    } else {
+        _ = c_close(@intCast(fd));
+    }
+}
+
 /// Re-exported from `src/net/address.zig` — full IPv4 + IPv6
 /// support, posix.sockaddr.storage-backed. See that file for the
 /// complete public surface.
@@ -196,7 +221,7 @@ pub const TcpListener = struct {
     }
 
     pub fn close(self: *TcpListener) void {
-        _ = c_close(@intCast(self.fd));
+        closeFdDispatch(self.fd);
     }
 
     // ─── Socket options on the listener ──────────────────────────
@@ -316,7 +341,7 @@ pub const TcpStream = struct {
     }
 
     pub fn close(self: *TcpStream) void {
-        _ = c_close(@intCast(self.fd));
+        closeFdDispatch(self.fd);
     }
 
     // Windows connect via `ConnectEx`: same reason as AcceptEx —

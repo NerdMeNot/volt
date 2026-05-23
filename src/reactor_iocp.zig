@@ -135,6 +135,7 @@ extern "kernel32" fn PostQueuedCompletionStatus(
 ) callconv(.winapi) win.BOOL;
 
 extern "kernel32" fn CloseHandle(hObject: win.HANDLE) callconv(.winapi) win.BOOL;
+extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) c_int;
 extern "kernel32" fn GetLastError() callconv(.winapi) win.DWORD;
 extern "kernel32" fn CancelIoEx(
     hFile: win.HANDLE,
@@ -286,13 +287,17 @@ pub const Reactor = struct {
     acceptex_fn_raw: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     connectex_fn_raw: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
+    /// See reactor_epoll.zig's allocator note — Phase 3d landed
+    /// kqueue's closeFd first; IOCP's is a stub today.
+    allocator: std.mem.Allocator,
+
     /// `WSAStartup` is per-process; ensure it's called once across
     /// any number of Runtime instances. Idempotent in spirit;
     /// reference-counted via `WSACleanup` symmetry would be
     /// proper-but-overkill for the runtime's lifetime model.
     var wsa_started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
-    pub fn init() !Reactor {
+    pub fn init(allocator: std.mem.Allocator) !Reactor {
         if (!wsa_started.swap(true, .acq_rel)) {
             var wsa_data: [WSA_DATA_BYTES]u8 align(8) = undefined;
             // MAKEWORD(2, 2) — Winsock 2.2.
@@ -310,7 +315,21 @@ pub const Reactor = struct {
             0,
             0,
         ) orelse return error.IocpCreateFailed;
-        return .{ .iocp = iocp };
+        return .{ .iocp = iocp, .allocator = allocator };
+    }
+
+    /// Phase 3d stub — full impl pending. IOCP's correct closeFd
+    /// requires CancelIoEx(handle, NULL) BEFORE closesocket() to
+    /// abort pending IOCP ops (Boost.Asio pattern, see
+    /// reactor-reference-map.md). Today this just closes — same
+    /// orphan-waiter gap as POSIX backends; the SkipZigTest cases
+    /// keep it visible.
+    pub fn closeFd(self: *Reactor, fd: i32) void {
+        _ = self;
+        // closesocket on Windows is in ws2_32, not the CRT close.
+        // Use the same path Volt's net types currently use until the
+        // full closeFd lands.
+        _ = closesocket(@intCast(fd));
     }
 
     pub fn deinit(self: *Reactor) void {

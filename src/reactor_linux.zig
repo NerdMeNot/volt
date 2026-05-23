@@ -51,20 +51,20 @@ pub const Reactor = union(Backend) {
     /// `initBackend(backend)` directly when it wants to override.
     /// Silently falls back to epoll if io_uring is unavailable;
     /// callers wanting the failure reason use `probeIoUring`.
-    pub fn init() !Reactor {
+    pub fn init(allocator: std.mem.Allocator) !Reactor {
         if (probeIoUring()) {
-            return initBackend(.io_uring);
+            return initBackend(allocator, .io_uring);
         } else |_| {
-            return initBackend(.epoll);
+            return initBackend(allocator, .epoll);
         }
     }
 
     /// Explicit-backend constructor. Used by `Runtime.init` when
     /// `Config.io_backend != .auto`.
-    pub fn initBackend(b: Backend) !Reactor {
+    pub fn initBackend(allocator: std.mem.Allocator, b: Backend) !Reactor {
         return switch (b) {
-            .epoll => Reactor{ .epoll = try epoll.Reactor.init() },
-            .io_uring => Reactor{ .io_uring = try io_uring.Reactor.init() },
+            .epoll => Reactor{ .epoll = try epoll.Reactor.init(allocator) },
+            .io_uring => Reactor{ .io_uring = try io_uring.Reactor.init(allocator) },
         };
     }
 
@@ -121,6 +121,13 @@ pub const Reactor = union(Backend) {
         switch (self.*) {
             .epoll => |*r| r.cancelCoro(c),
             .io_uring => |*r| r.cancelCoro(c),
+        }
+    }
+
+    pub fn closeFd(self: *Reactor, fd: i32) void {
+        switch (self.*) {
+            .epoll => |*r| r.closeFd(fd),
+            .io_uring => |*r| r.closeFd(fd),
         }
     }
 
