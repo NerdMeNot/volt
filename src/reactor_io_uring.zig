@@ -164,6 +164,11 @@ pub const Reactor = struct {
     }
 
     pub fn waitTimer(self: *Reactor, ns: u64) ReactorWaitError!void {
+        // ns=0 is a no-op. IORING_OP_TIMEOUT with an all-zero
+        // timespec has historically had ambiguous behaviour across
+        // io_uring versions — fail closed by short-circuiting.
+        if (ns == 0) return;
+
         const me = current.require();
         const ts = linux.kernel_timespec{
             .sec = @intCast(ns / std.time.ns_per_s),
