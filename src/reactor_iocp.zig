@@ -640,6 +640,13 @@ pub const Reactor = struct {
     }
 
     pub fn waitTimer(self: *Reactor, ns: u64) ReactorWaitError!void {
+        // ns=0 mirrors POSIX backends — the contract is the same on
+        // every reactor. SetThreadpoolTimer with an expired due time
+        // is ambiguous: the timer can fire before the park completes,
+        // or be coalesced by the threadpool. Short-circuit at the
+        // entry to match Darwin/Linux semantics.
+        if (ns == 0) return;
+
         const me = current.require();
 
         // Per-sleep allocation. A future per-P pool of pre-created
@@ -676,6 +683,9 @@ pub const Reactor = struct {
     pub fn waitTimerCancel(self: *Reactor, ns: u64, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
         const me = current.require();
         try c.checkpoint();
+        // ns=0 mirrors waitTimer — early return AFTER the checkpoint
+        // so a pre-fired cancel still surfaces error.Cancelled.
+        if (ns == 0) return;
 
         var ctx = TimerCtx{ .reactor = self, .coro = me };
         const timer = CreateThreadpoolTimer(&timerCallback, &ctx, null) orelse

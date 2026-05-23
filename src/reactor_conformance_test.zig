@@ -198,6 +198,40 @@ test "conformance: sleep(0) returns immediately" {
     try (try rt.run(sleepZeroRoot, .{}));
 }
 
+// Cancel-variant counterpart. The bc4685a fix added the
+// `if (ns == 0) return;` guard at `waitTimer` on the three POSIX
+// backends, but missed `waitTimerCancel` on epoll and both IOCP
+// timer variants entirely. The 2026-05-23 audit caught it; this
+// test pins the contract that sleepCancel(0, c) is a yield-like
+// no-op on every backend, AFTER the cancel checkpoint (so a pre-
+// fired cancel still surfaces error.Cancelled).
+fn sleepZeroCancelRoot() !void {
+    const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var c = Cancel.init(rt);
+    defer c.deinit();
+    try lib.sleepCancel(lib.Duration.fromNanos(0), &c);
+}
+
+test "conformance: sleepCancel(0) returns immediately" {
+    var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 1 });
+    defer rt.deinit();
+    try (try rt.run(sleepZeroCancelRoot, .{}));
+}
+
+fn sleepZeroCancelPreFiredRoot() !void {
+    const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var c = Cancel.init(rt);
+    defer c.deinit();
+    c.fire();
+    try testing.expectError(error.Cancelled, lib.sleepCancel(lib.Duration.fromNanos(0), &c));
+}
+
+test "conformance: sleepCancel(0) with pre-fired cancel returns Cancelled" {
+    var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 1 });
+    defer rt.deinit();
+    try (try rt.run(sleepZeroCancelPreFiredRoot, .{}));
+}
+
 // ─────────────────────────────────────────────────────────────────
 // recvCancel race stress — register-then-park window
 //

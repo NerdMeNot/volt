@@ -378,6 +378,12 @@ pub const Reactor = struct {
     pub fn waitTimerCancel(self: *Reactor, ns: u64, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
         const me = current.require();
         try c.checkpoint();
+        // ns=0 mirrors waitTimer — early return AFTER the checkpoint
+        // so a pre-fired cancel still surfaces error.Cancelled.
+        // timerfd_settime with an all-zero it_value disarms the timer
+        // (same gap as waitTimer, which bc4685a fixed only on the
+        // non-cancel variant).
+        if (ns == 0) return;
 
         const tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
         if (tfd < 0) return registerError(errnoVal());
