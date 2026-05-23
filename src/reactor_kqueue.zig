@@ -224,20 +224,76 @@ pub const Reactor = struct {
     }
 
     fn waitFdCancel(self: *Reactor, fd: i32, filter: i16, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        const me = current.require();
         try c.checkpoint();
+        const me = current.require();
 
         var op = WaitOp{ .ident = @intCast(fd), .filter = filter };
         me.reactor_wait_op = &op;
         defer me.reactor_wait_op = null;
 
+        // ─── Kernel registration FIRST (closes register-then-fire race) ──
+        //
+        // Old order — registerReactor then waitFd — opened a window
+        // where fire() could call cancelCoro before this coroutine
+        // had registered with the kernel. The kevent DEL would
+        // return ENOENT (nothing to delete), cancelCoro's "ENOENT
+        // means poll() owns the unpark" heuristic would silently
+        // return, and the coroutine would then register and park
+        // forever. New order: register kernel side first so any
+        // later cancelCoro finds a real kevent.
+        var kev = std.mem.zeroes(posix.Kevent);
+        kev.ident = @intCast(fd);
+        kev.filter = filter;
+        kev.flags = posix.system.EV.ADD | posix.system.EV.ONESHOT;
+        kev.udata = @intFromPtr(me);
+        var changes = [_]posix.Kevent{kev};
+        var dummy: [1]posix.Kevent = undefined;
+        const n = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
+        if (n < 0) return registerError(posix_helpers.errnoVal());
+        _ = self.pending.fetchAdd(1, .acq_rel);
+
+        // ─── Cancel-list registration ───────────────────────────────────
         var w = cancel_mod.Waiter{};
-        if (c.registerReactor(&w, me)) return error.Cancelled;
+        if (c.registerReactor(&w, me)) {
+            // Fired before our register. cancelCoro was not called
+            // for us (we weren't in the list) — own the kevent
+            // cleanup.
+            deregisterKevent(self, kev.ident, filter);
+            return error.Cancelled;
+        }
         defer c.deregister(&w);
 
-        try self.waitFd(fd, filter);
+        // ─── Park ───────────────────────────────────────────────────────
+        //
+        // Wake source is one of:
+        //   * poll() pulled the event → normal unpark path
+        //   * cancelCoro from a later fire() → kevent DEL + unpark
+        // If fire() happens between registerReactor returning and
+        // the swap below, runtime.unpark transitions park_state
+        // RUNNING → NOTIFIED. Dispatch's `.park` branch then
+        // re-queues immediately instead of leaving us stranded.
+        // That's the race the park_state machine exists to close
+        // (see runtime.zig:160).
+        me.pending = .park;
+        context.swap(&me.ctx, me.main_ctx);
 
         if (c.isFired()) return error.Cancelled;
+    }
+
+    /// Issue EV_DELETE for a (ident, filter) registration this
+    /// coroutine owns. Used by the cancel-aware wait functions'
+    /// "fired before register" cleanup path. ENOENT means poll()
+    /// or cancelCoro already removed it; only the successful
+    /// path decrements `pending`.
+    fn deregisterKevent(self: *Reactor, ident: usize, filter: i16) void {
+        var kev = std.mem.zeroes(posix.Kevent);
+        kev.ident = ident;
+        kev.filter = filter;
+        kev.flags = posix.system.EV.DELETE;
+        var changes = [_]posix.Kevent{kev};
+        var dummy: [1]posix.Kevent = undefined;
+        const rc = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
+        if (rc >= 0) _ = self.pending.fetchSub(1, .acq_rel);
     }
 
     /// Cancel-aware variant of `waitTimer`. The kqueue timer
@@ -245,18 +301,42 @@ pub const Reactor = struct {
     /// same `WaitOp` mechanism + `EV_DELETE` deregister carries
     /// through unchanged from the fd cancel path.
     pub fn waitTimerCancel(self: *Reactor, ns: u64, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        const me = current.require();
+        // ns=0 mirrors waitTimer — the early-return contract is the
+        // same on every reactor (see waitTimer's comment). A zero-
+        // duration cancellable sleep should still respect a fire
+        // that happened before the call.
         try c.checkpoint();
+        if (ns == 0) return;
 
+        const me = current.require();
         var op = WaitOp{ .ident = @intFromPtr(me), .filter = EVFILT_TIMER };
         me.reactor_wait_op = &op;
         defer me.reactor_wait_op = null;
 
+        // Kernel registration FIRST — see waitFdCancel for the
+        // register-then-fire race this ordering closes.
+        var kev = std.mem.zeroes(posix.Kevent);
+        kev.ident = @intFromPtr(me);
+        kev.filter = EVFILT_TIMER;
+        kev.flags = posix.system.EV.ADD | posix.system.EV.ONESHOT;
+        kev.fflags = NOTE_NSECONDS;
+        kev.data = @intCast(ns);
+        kev.udata = @intFromPtr(me);
+        var changes = [_]posix.Kevent{kev};
+        var dummy: [1]posix.Kevent = undefined;
+        const n = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
+        if (n < 0) return registerError(posix_helpers.errnoVal());
+        _ = self.pending.fetchAdd(1, .acq_rel);
+
         var w = cancel_mod.Waiter{};
-        if (c.registerReactor(&w, me)) return error.Cancelled;
+        if (c.registerReactor(&w, me)) {
+            deregisterKevent(self, kev.ident, EVFILT_TIMER);
+            return error.Cancelled;
+        }
         defer c.deregister(&w);
 
-        try self.waitTimer(ns);
+        me.pending = .park;
+        context.swap(&me.ctx, me.main_ctx);
 
         if (c.isFired()) return error.Cancelled;
     }

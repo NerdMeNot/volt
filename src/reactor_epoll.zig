@@ -320,18 +320,52 @@ pub const Reactor = struct {
     }
 
     fn waitFdCancel(self: *Reactor, fd: c_int, filter: u32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        const me = current.require();
         try c.checkpoint();
+        const me = current.require();
 
         var op = WaitOp{ .fd = fd };
         me.reactor_wait_op = &op;
         defer me.reactor_wait_op = null;
 
+        // ─── Kernel registration FIRST (closes register-then-fire race) ──
+        //
+        // Old order — registerReactor then waitFd — opened a window
+        // where fire() could call cancelCoro before this coroutine
+        // had registered with the kernel. EPOLL_CTL_DEL then returned
+        // ENOENT (nothing to delete); cancelCoro's "ENOENT means
+        // poll() owns the unpark" heuristic silently returned, and
+        // the coroutine then registered and parked forever.
+        var ev = epoll_event{
+            .events = filter | EPOLLONESHOT,
+            .data = @intFromPtr(me),
+        };
+        var rc = epoll_ctl(self.epfd, EPOLL_CTL_ADD, fd, &ev);
+        if (rc < 0 and errnoVal() == EEXIST) {
+            rc = epoll_ctl(self.epfd, EPOLL_CTL_MOD, fd, &ev);
+        }
+        if (rc < 0) return registerError(errnoVal());
+        _ = self.pending.fetchAdd(1, .acq_rel);
+
+        // ─── Cancel-list registration ───────────────────────────────────
         var w = cancel_mod.Waiter{};
-        if (c.registerReactor(&w, me)) return error.Cancelled;
+        if (c.registerReactor(&w, me)) {
+            // Fire happened before our register. cancelCoro was not
+            // called for us (we weren't in the list) — own cleanup.
+            if (epoll_ctl(self.epfd, EPOLL_CTL_DEL, fd, null) >= 0) {
+                _ = self.pending.fetchSub(1, .acq_rel);
+            }
+            return error.Cancelled;
+        }
         defer c.deregister(&w);
 
-        try self.waitFd(fd, filter);
+        // ─── Park ───────────────────────────────────────────────────────
+        //
+        // park_state RUNNING → NOTIFIED handles fire() landing in
+        // the window between registerReactor returning and the swap
+        // below: dispatch sees NOTIFIED and re-queues us immediately
+        // (runtime.zig:160 documents the machine).
+        me.pending = .park;
+        context.swap(&me.ctx, me.main_ctx);
 
         if (c.isFired()) return error.Cancelled;
     }

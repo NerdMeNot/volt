@@ -241,11 +241,52 @@ pub const Reactor = struct {
         try c.checkpoint();
         const me = current.require();
 
+        // ─── SQE submission FIRST (closes register-then-fire race) ──────
+        //
+        // Old order — registerReactor then waitFd — opened a window
+        // where fire() could call cancelCoro before this coroutine's
+        // poll_add SQE was queued. The cancel SQE would land in the
+        // ring before the target op SQE; the kernel processes them
+        // in submission order so the cancel hits -ENOENT, the
+        // poll_add then registers, and the coroutine parks forever.
+        // Queueing the poll_add SQE first guarantees the kernel
+        // sees it before any later cancel SQE from cancelCoro
+        // (the lock around .acquire()/.release() serialises queue
+        // order across threads).
+        self.acquire();
+        const submitted = (self.ring.poll_add(@intFromPtr(me), fd, mask) catch blk: {
+            _ = self.ring.submit() catch {};
+            break :blk self.ring.poll_add(@intFromPtr(me), fd, mask) catch null;
+        }) != null;
+        self.release();
+        if (!submitted) return error.SystemResources;
+        _ = self.pending.fetchAdd(1, .acq_rel);
+
+        // ─── Cancel-list registration ───────────────────────────────────
         var w = cancel_mod.Waiter{};
-        if (c.registerReactor(&w, me)) return error.Cancelled;
+        if (c.registerReactor(&w, me)) {
+            // Fired before our register. Issue a CANCEL SQE
+            // ourselves to retire the orphan poll_add; its CQE will
+            // be delivered to poll() and runtime.unpark'd, which
+            // (since we never park) just transitions park_state
+            // RUNNING → NOTIFIED — harmless once we return.
+            self.acquire();
+            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(me), 0) catch blk: {
+                _ = self.ring.submit() catch {};
+                break :blk self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(me), 0) catch null;
+            };
+            self.release();
+            return error.Cancelled;
+        }
         defer c.deregister(&w);
 
-        try self.waitFd(fd, mask);
+        // ─── Park ───────────────────────────────────────────────────────
+        //
+        // park_state RUNNING → NOTIFIED handles fire() landing in
+        // the window between registerReactor returning and the swap
+        // below. See runtime.zig:160 for the machine's contract.
+        me.pending = .park;
+        context.swap(&me.ctx, me.main_ctx);
 
         if (c.isFired()) return error.Cancelled;
     }
@@ -256,13 +297,38 @@ pub const Reactor = struct {
     /// `cancelCoro` matches it without any new bookkeeping.
     pub fn waitTimerCancel(self: *Reactor, ns: u64, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
         try c.checkpoint();
+        if (ns == 0) return;
+
         const me = current.require();
+        const ts = linux.kernel_timespec{
+            .sec = @intCast(ns / std.time.ns_per_s),
+            .nsec = @intCast(ns % std.time.ns_per_s),
+        };
+
+        // Timeout SQE FIRST — same race rationale as waitFdCancel.
+        self.acquire();
+        const submitted = (self.ring.timeout(@intFromPtr(me), &ts, 0, 0) catch blk: {
+            _ = self.ring.submit() catch {};
+            break :blk self.ring.timeout(@intFromPtr(me), &ts, 0, 0) catch null;
+        }) != null;
+        self.release();
+        if (!submitted) return error.SystemResources;
+        _ = self.pending.fetchAdd(1, .acq_rel);
 
         var w = cancel_mod.Waiter{};
-        if (c.registerReactor(&w, me)) return error.Cancelled;
+        if (c.registerReactor(&w, me)) {
+            self.acquire();
+            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(me), 0) catch blk: {
+                _ = self.ring.submit() catch {};
+                break :blk self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(me), 0) catch null;
+            };
+            self.release();
+            return error.Cancelled;
+        }
         defer c.deregister(&w);
 
-        try self.waitTimer(ns);
+        me.pending = .park;
+        context.swap(&me.ctx, me.main_ctx);
 
         if (c.isFired()) return error.Cancelled;
     }

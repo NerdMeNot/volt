@@ -49,6 +49,7 @@ const Address = net.Address;
 const TcpListener = net.TcpListener;
 const TcpStream = net.TcpStream;
 const UdpSocket = net.UdpSocket;
+const Cancel = lib.Cancel;
 
 // ─────────────────────────────────────────────────────────────────
 // UDP IPv6 loopback round-trip
@@ -195,4 +196,75 @@ test "conformance: sleep(0) returns immediately" {
     var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 1 });
     defer rt.deinit();
     try (try rt.run(sleepZeroRoot, .{}));
+}
+
+// ─────────────────────────────────────────────────────────────────
+// recvCancel race stress — register-then-park window
+//
+// The hypothesis under test: `waitFdCancel` (each cancel-aware
+// reactor) adds the coroutine to the Cancel's waiter list BEFORE
+// registering the kernel-side wait (kevent ADD / EPOLL_CTL_ADD /
+// io_uring SQE). If `cancel.fire()` runs in that window,
+// `cancelCoro` calls the kernel deregister on a registration that
+// doesn't exist yet (ENOENT). The code interprets ENOENT as
+// "poll() owns the unpark" and silently returns — but nobody
+// owns the unpark. The coroutine then registers + parks → hangs.
+//
+// This stress runs the recvCancel pattern N times with a small,
+// jittered delay before fire(). The fire is scheduled to land
+// near the recv coroutine's register-then-park window with high
+// probability under contention. A single hang means the bug
+// reproduces; passing N iterations under cancel_timeout means the
+// invariant holds. Started flaky on Linux CI (issue forthcoming).
+// ─────────────────────────────────────────────────────────────────
+
+const RecvCancelIterCtx = struct {
+    c: *Cancel,
+    yield_count: u32,
+};
+
+fn recvCancelOneIter(ctx: *RecvCancelIterCtx) !void {
+    var server = try UdpSocket.bind(Address.loopback4(0));
+    defer server.close();
+    var buf: [16]u8 = undefined;
+    const r = server.recvCancel(&buf, ctx.c);
+    // We send no packets, so the only legal result is Cancelled.
+    try testing.expectError(error.Cancelled, r);
+}
+
+fn recvCancelOneIterFirer(ctx: *RecvCancelIterCtx) void {
+    // Tunable yield count — different values exercise different
+    // points in the recv's register-then-park window.
+    //  0  yields → fire before recv even runs
+    //  1-2       → fire likely during registerReactor / waitFd race
+    //  3-10      → fire after recv is parked (the "easy" path)
+    var i: u32 = 0;
+    while (i < ctx.yield_count) : (i += 1) lib.yield();
+    ctx.c.fire();
+}
+
+fn recvCancelStressBody() !void {
+    const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+
+    // Sweep yield counts so each iteration hits a different point
+    // in the race window. 200 iterations × ~8 distinct timings.
+    var i: u32 = 0;
+    while (i < 200) : (i += 1) {
+        var c = Cancel.init(rt);
+        defer c.deinit();
+        var ctx = RecvCancelIterCtx{ .c = &c, .yield_count = i % 8 };
+        var recv_task = try rt.spawn(recvCancelOneIter, .{&ctx});
+        var firer_task = try rt.spawn(recvCancelOneIterFirer, .{&ctx});
+        // Recv must complete with Cancelled. If the race triggers,
+        // this join blocks forever and the test hangs — surface via
+        // zig's per-test budget.
+        _ = recv_task.join() catch |e| return e;
+        _ = firer_task.join();
+    }
+}
+
+test "conformance: recvCancel stress — 200 iterations, no hang" {
+    var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 4 });
+    defer rt.deinit();
+    try (try rt.run(recvCancelStressBody, .{}));
 }
