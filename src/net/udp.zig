@@ -185,17 +185,37 @@ const getsockname = @extern(
 const MSG_PEEK: c_int = 0x2;
 
 // errnoVal helper — mirrors the pattern in src/net.zig.
+// On Windows, recv/send/sendto/recvfrom set the Winsock-thread-local
+// error (retrieved via WSAGetLastError), NOT the CRT errno. Reading
+// CRT errno on Windows returns stale or zero values and breaks the
+// "is this EAGAIN / WSAEWOULDBLOCK" check that decides whether to
+// park on the reactor. Caught by the UDP IPv6 conformance test on
+// PR #16 (would surface as either silent infinite-error-loop or
+// a stale errno collapsing to a wrong IoError variant).
 inline fn errnoVal() c_int {
+    if (comptime builtin.os.tag == .windows) return wsaGetLastError();
     return std.c._errno().*;
 }
 
+extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
+inline fn wsaGetLastError() c_int {
+    return WSAGetLastError();
+}
+
+// EAGAIN on POSIX, WSAEWOULDBLOCK on Windows. EAGAIN and EWOULDBLOCK
+// alias on Linux but differ in numeric value on Darwin / BSD — keep
+// per-OS so the comparison matches what the kernel actually sets.
 const EAGAIN: c_int = switch (builtin.os.tag) {
     .linux, .freebsd, .openbsd, .netbsd, .dragonfly => 11,
     .macos, .ios, .tvos, .watchos => 35,
+    .windows => 10035, // WSAEWOULDBLOCK
     else => 11,
 };
 const EWOULDBLOCK: c_int = EAGAIN;
-const EINTR: c_int = 4;
+const EINTR: c_int = switch (builtin.os.tag) {
+    .windows => 10004, // WSAEINTR
+    else => 4,
+};
 
 // ─── UdpSocket ───────────────────────────────────────────────────────
 
@@ -562,13 +582,25 @@ pub const UdpSocket = struct {
     }
 };
 
-/// Map an errno code to the categorical `IoError` set.
+/// Map an errno code to the categorical `IoError` set. On Windows
+/// the input is a WSA* error from `WSAGetLastError()`; on POSIX it
+/// is a libc `errno` value. The two namespaces don't overlap (POSIX
+/// errnos are <200, Winsock errors are 10000+), so a single switch
+/// can dispatch without an OS branch.
 fn errnoToIoError(e: c_int) reactor_mod.IoError {
-    // Reuse mappings already defined in reactor_posix. Inline here
-    // for the common UDP cases; rare fall through to Unexpected.
     return switch (e) {
+        // POSIX
         9, 88 => error.BadDescriptor, // EBADF, ENOTSOCK
         103, 104 => error.ConnectionAborted, // EPIPE/ECONNRESET on send to disconnected
+        // Winsock (WSA*)
+        10009, 10038 => error.BadDescriptor, // WSAEBADF, WSAENOTSOCK
+        10053, 10054 => error.ConnectionReset, // WSAECONNABORTED, WSAECONNRESET
+        10057 => error.NotConnected, // WSAENOTCONN
+        10058 => error.BrokenPipe, // WSAESHUTDOWN
+        10060 => error.Timeout, // WSAETIMEDOUT
+        10061 => error.ConnectionRefused, // WSAECONNREFUSED
+        10024 => error.OutOfDescriptors, // WSAEMFILE
+        10055 => error.SystemResources, // WSAENOBUFS
         else => error.Unexpected,
     };
 }
