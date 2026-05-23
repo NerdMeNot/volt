@@ -381,7 +381,19 @@ test "conformance: recvCancel stress — 200 iterations, no hang" {
 // ─────────────────────────────────────────────────────────────────
 
 const builtin = @import("builtin");
-const has_full_closeFd = builtin.os.tag.isDarwin();
+
+// Phase 3d backend coverage:
+//   * kqueue (Darwin)  — full closeFd impl
+//   * epoll  (Linux)   — full closeFd impl (forced via io_backend below)
+//   * io_uring (Linux) — stub; tests force .epoll on Linux until done
+//   * IOCP (Windows)   — stub; tests SkipZigTest on Windows
+const has_full_closeFd = builtin.os.tag.isDarwin() or builtin.os.tag == .linux;
+// On Linux Volt defaults to io_uring (if the kernel supports it) and
+// falls back to epoll. The io_uring closeFd is still a stub, so these
+// tests force the .epoll backend to exercise the implemented path.
+// IoBackend lives in src/reactor.zig.
+const closeFd_test_io_backend: @import("reactor.zig").IoBackend =
+    if (builtin.os.tag == .linux) .epoll else .auto;
 
 const ListenerCloseCtx = struct {
     listener: *TcpListener,
@@ -420,10 +432,10 @@ fn listenerCloseRoot(ctx: *ListenerCloseCtx) !void {
 }
 
 test "conformance: TcpListener.close while accept() is parked — no hang" {
-    // Phase 3d: kqueue has full closeFd; epoll/io_uring/IOCP are stubs.
+    // Phase 3d: kqueue + epoll have full closeFd; io_uring + IOCP are stubs.
     if (!has_full_closeFd) return error.SkipZigTest;
 
-    var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 2 });
+    var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 2, .io_backend = closeFd_test_io_backend });
     defer rt.deinit();
 
     var listener = try TcpListener.bind(Address.loopback4(0));
@@ -468,10 +480,10 @@ fn udpCloseRoot(ctx: *UdpCloseCtx) !void {
 }
 
 test "conformance: UdpSocket.close while recvFrom() is parked — no hang" {
-    // Phase 3d: kqueue has full closeFd; epoll/io_uring/IOCP are stubs.
+    // Phase 3d: kqueue + epoll have full closeFd; io_uring + IOCP are stubs.
     if (!has_full_closeFd) return error.SkipZigTest;
 
-    var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 2 });
+    var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 2, .io_backend = closeFd_test_io_backend });
     defer rt.deinit();
 
     var socket = try UdpSocket.bind(Address.loopback4(0));

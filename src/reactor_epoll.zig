@@ -171,13 +171,16 @@ pub const Reactor = struct {
     /// The eventfd interrupt registration is excluded — it's a
     /// reactor-internal wake channel, not a coroutine park.
     pending: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    /// Allocator stash for the eventual fd→coro side-table mirroring
-    /// the kqueue closeFd implementation. Phase 3d landed kqueue
-    /// first; epoll's closeFd is a stub today (just libc close — no
-    /// side-table lookup), so a parked coroutine on a closed fd still
-    /// hangs on Linux. Tracked in the close-while-parked SkipZigTest
-    /// guards in src/reactor_conformance_test.zig (the Darwin path is
-    /// un-skipped; Linux remains skipped pending the full impl).
+    /// Reverse lookup `fd → parked coro`. Required so `closeFd(fd)`
+    /// can find and dispatch any coroutine parked on the fd before
+    /// the close orphans the EPOLL_CTL_DEL. Same pattern as kqueue's
+    /// FdWaiterKey table — but epoll's per-fd registration is
+    /// single-event (EPOLLONESHOT + EPOLL_CTL_MOD races between read
+    /// and write coroutines on the same fd, so only one waiter per fd
+    /// is supported by the existing backend; the side-table key is
+    /// just `fd`).
+    fd_waiters: std.AutoHashMapUnmanaged(c_int, *coroutine.Coroutine) = .{},
+    fd_waiters_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !Reactor {
@@ -201,13 +204,45 @@ pub const Reactor = struct {
         return .{ .epfd = ep, .interrupt_fd = efd, .allocator = allocator };
     }
 
-    /// Phase 3d stub — full impl pending. Today this is just `close()`
-    /// so the orphan-waiter-on-fd-close gap on epoll remains; the
-    /// two SkipZigTest conformance cases keep it visible. Will gain
-    /// the fd→coro side-table (matching reactor_kqueue.zig) in the
-    /// next pass.
+    inline fn lockWaiters(self: *Reactor) void {
+        while (self.fd_waiters_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+    inline fn unlockWaiters(self: *Reactor) void {
+        self.fd_waiters_lock.store(0, .release);
+    }
+    fn insertWaiter(self: *Reactor, fd: c_int, c: *coroutine.Coroutine) std.mem.Allocator.Error!void {
+        self.lockWaiters();
+        defer self.unlockWaiters();
+        try self.fd_waiters.put(self.allocator, fd, c);
+    }
+    fn removeWaiter(self: *Reactor, fd: c_int) ?*coroutine.Coroutine {
+        self.lockWaiters();
+        defer self.unlockWaiters();
+        if (self.fd_waiters.fetchRemove(fd)) |kv| return kv.value;
+        return null;
+    }
+
+    /// Close a fd whose epoll registration may have a parked
+    /// coroutine waiting on it. Mirrors reactor_kqueue.zig closeFd;
+    /// see that file for the full rationale.
     pub fn closeFd(self: *Reactor, fd: i32) void {
-        _ = self;
+        const coro = self.removeWaiter(@intCast(fd));
+        if (coro) |c| {
+            const rc = epoll_ctl(self.epfd, EPOLL_CTL_DEL, @intCast(fd), null);
+            if (rc >= 0) {
+                // Won the EPOLL_CTL_DEL race against poll(); coro is
+                // still parked, stack is stable.
+                if (c.reactor_wait_op) |op_ptr| {
+                    const op: *WaitOp = @ptrCast(@alignCast(op_ptr));
+                    op.closed = true;
+                }
+                _ = self.pending.fetchSub(1, .acq_rel);
+                runtime.unpark(c);
+            }
+            // ENOENT: poll() owns the unpark; coro will resume
+            // naturally; the next libc recv/send call after our
+            // close below gets EBADF → BadDescriptor.
+        }
         _ = posix_helpers.close(fd);
     }
 
@@ -216,6 +251,8 @@ pub const Reactor = struct {
         // contract. Caller is responsible for ensuring no coros
         // are parked in the kernel before tearing down.
         std.debug.assert(self.pending.load(.acquire) == 0);
+        std.debug.assert(self.fd_waiters.count() == 0);
+        self.fd_waiters.deinit(self.allocator);
         if (self.interrupt_fd >= 0) _ = posix_helpers.close(self.interrupt_fd);
         if (self.epfd >= 0) _ = posix_helpers.close(self.epfd);
         self.interrupt_fd = -1;
@@ -232,6 +269,12 @@ pub const Reactor = struct {
 
     fn waitFd(self: *Reactor, fd: c_int, filter: u32) ReactorWaitError!void {
         const me = current.require();
+        // Stack-allocate a WaitOp so closeFd has somewhere to write
+        // the `closed` flag (and cancelCoro has fd to deregister).
+        var op = WaitOp{ .fd = fd };
+        me.reactor_wait_op = &op;
+        defer me.reactor_wait_op = null;
+
         var ev = epoll_event{
             .events = filter | EPOLLONESHOT,
             .data = @intFromPtr(me),
@@ -246,9 +289,18 @@ pub const Reactor = struct {
         }
         if (rc < 0) return registerError(errnoVal());
         _ = self.pending.fetchAdd(1, .acq_rel);
+
+        self.insertWaiter(fd, me) catch {
+            _ = epoll_ctl(self.epfd, EPOLL_CTL_DEL, fd, null);
+            _ = self.pending.fetchSub(1, .acq_rel);
+            return error.SystemResources;
+        };
+        defer _ = self.removeWaiter(fd);
+
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
         // Resume: pending decremented by poll() before unpark.
+        if (op.closed) return error.BadDescriptor;
     }
 
     pub fn waitTimer(self: *Reactor, ns: u64) ReactorWaitError!void {
@@ -312,6 +364,9 @@ pub const Reactor = struct {
     pub const WaitOp = struct {
         fd: c_int,
         is_timer: bool = false,
+        /// Set by `closeFd` when the fd was closed under the parked
+        /// op. Checked by waitFd / waitFdCancel after the swap-back.
+        closed: bool = false,
     };
 
     /// Cancel this coro's in-flight epoll registration.
@@ -367,6 +422,14 @@ pub const Reactor = struct {
         if (rc < 0) return registerError(errnoVal());
         _ = self.pending.fetchAdd(1, .acq_rel);
 
+        // ─── Side-table insert (same role as in waitFd) ─────────────────
+        self.insertWaiter(fd, me) catch {
+            _ = epoll_ctl(self.epfd, EPOLL_CTL_DEL, fd, null);
+            _ = self.pending.fetchSub(1, .acq_rel);
+            return error.SystemResources;
+        };
+        defer _ = self.removeWaiter(fd);
+
         // ─── Cancel-list registration ───────────────────────────────────
         var w = cancel_mod.Waiter{};
         if (c.registerReactor(&w, me)) {
@@ -388,6 +451,7 @@ pub const Reactor = struct {
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
 
+        if (op.closed) return error.BadDescriptor;
         if (c.isFired()) return error.Cancelled;
     }
 
