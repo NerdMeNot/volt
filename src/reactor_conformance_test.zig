@@ -268,3 +268,143 @@ test "conformance: recvCancel stress — 200 iterations, no hang" {
     defer rt.deinit();
     try (try rt.run(recvCancelStressBody, .{}));
 }
+
+// ─────────────────────────────────────────────────────────────────
+// fd close while a peer coroutine is parked on accept/recv
+//
+// The class: a coroutine is blocked in a reactor wait (TcpListener
+// .accept / UdpSocket.recvFrom), then another coroutine closes
+// the underlying fd. The blocked coroutine MUST unblock — with
+// some categorical error (Closed / BadDescriptor / Unexpected) is
+// fine — but MUST NOT hang.
+//
+// Inspired by libuv's `test-tcp-close-accept.c` and `test-udp-
+// recv-cb-close-pollerr.c`. The libuv tests pin specific bug-
+// fix behaviour after their own iterations of this race (the
+// poll-close-doesnt-corrupt-stack family). These Volt ports
+// don't pin a specific error variant — they pin the absence of
+// hangs and segfaults, which is the load-bearing invariant for
+// downstream lib authors. Tightening the error contract is a
+// separate follow-up.
+//
+// FIXME(close-while-parked): both tests below are currently
+// SkipZigTest. Volt's TcpListener.close / TcpStream.close /
+// UdpSocket.close call libc close() directly — kqueue silently
+// drops the kevent registration on fd close and never fires an
+// event, so the parked accepter/receiver waits forever. Epoll
+// has the equivalent gap: EPOLL_CTL_DEL on close-without-deregister
+// orphans the parked coroutine.
+//
+// The fix is a reactor change, not a net-type one: each backend
+// needs `closeFd(fd)` that looks up any parked waiter for that
+// fd (via a new fd→coro side-table) and dispatches it with the
+// next syscall returning EBADF. EV_DELETE / EPOLL_CTL_DEL return
+// codes resolve the race with `poll()`, exactly the same pattern
+// `cancelCoro` already uses.
+//
+// Scope of that change touches every reactor backend
+// (reactor_kqueue, reactor_epoll, reactor_io_uring) plus the
+// `close()` method on each net type. Per CLAUDE.md's phase-
+// landing protocol, anything in the reactor needs the full bench
+// suite green before landing. The tests stay here, skipped with
+// this comment, so the gap is visible in `zig build test` output
+// rather than hidden behind a deferred TODO list.
+// ─────────────────────────────────────────────────────────────────
+
+const ListenerCloseCtx = struct {
+    listener: *TcpListener,
+    accept_result: anyerror!void = error.NeverRan,
+};
+
+fn listenerCloseAccepter(ctx: *ListenerCloseCtx) !void {
+    // accept() will park until either a connection arrives (which
+    // it won't — nothing connects) or the listener fd is closed
+    // out from under us.
+    var stream = ctx.listener.accept() catch |e| {
+        ctx.accept_result = e;
+        return;
+    };
+    // Unexpected: no connection should have arrived. Drain it so
+    // the test cleans up, then mark this as a non-error path.
+    stream.close();
+    ctx.accept_result = {};
+}
+
+fn listenerCloseCloser(ctx: *ListenerCloseCtx) void {
+    // Yield a handful of times to give the accepter time to reach
+    // the parked state, then close the listener out from under it.
+    var i: u32 = 0;
+    while (i < 20) : (i += 1) lib.yield();
+    ctx.listener.close();
+}
+
+fn listenerCloseRoot(ctx: *ListenerCloseCtx) !void {
+    const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var accepter = try rt.spawn(listenerCloseAccepter, .{ctx});
+    var closer = try rt.spawn(listenerCloseCloser, .{ctx});
+    // accepter must unblock; if it hangs, the test budget catches it.
+    _ = accepter.join() catch |e| return e;
+    _ = closer.join();
+}
+
+test "conformance: TcpListener.close while accept() is parked — no hang" {
+    // See FIXME(close-while-parked) above.
+    if (true) return error.SkipZigTest;
+
+    var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 2 });
+    defer rt.deinit();
+
+    var listener = try TcpListener.bind(Address.loopback4(0));
+    // Don't `defer listener.close()` — the closer coroutine owns it.
+    var ctx = ListenerCloseCtx{ .listener = &listener };
+    try (try rt.run(listenerCloseRoot, .{&ctx}));
+
+    // Result is informational — what matters is that accepter
+    // unblocked. Either an error or (unlikely) success means the
+    // reactor handled the fd-close correctly. The NeverRan
+    // sentinel would mean the accept fn never wrote a result —
+    // implies a hang past the test budget.
+    _ = ctx.accept_result catch |e| if (e == error.NeverRan) return error.AccepterNeverRan;
+}
+
+const UdpCloseCtx = struct {
+    socket: *UdpSocket,
+    recv_result: anyerror!usize = error.NeverRan,
+};
+
+fn udpCloseReceiver(ctx: *UdpCloseCtx) !void {
+    var buf: [16]u8 = undefined;
+    const r = ctx.socket.recvFrom(&buf) catch |e| {
+        ctx.recv_result = e;
+        return;
+    };
+    ctx.recv_result = r.len;
+}
+
+fn udpCloseCloser(ctx: *UdpCloseCtx) void {
+    var i: u32 = 0;
+    while (i < 20) : (i += 1) lib.yield();
+    ctx.socket.close();
+}
+
+fn udpCloseRoot(ctx: *UdpCloseCtx) !void {
+    const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var receiver = try rt.spawn(udpCloseReceiver, .{ctx});
+    var closer = try rt.spawn(udpCloseCloser, .{ctx});
+    _ = receiver.join() catch |e| return e;
+    _ = closer.join();
+}
+
+test "conformance: UdpSocket.close while recvFrom() is parked — no hang" {
+    // See FIXME(close-while-parked) above.
+    if (true) return error.SkipZigTest;
+
+    var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 2 });
+    defer rt.deinit();
+
+    var socket = try UdpSocket.bind(Address.loopback4(0));
+    var ctx = UdpCloseCtx{ .socket = &socket };
+    try (try rt.run(udpCloseRoot, .{&ctx}));
+
+    _ = ctx.recv_result catch |e| if (e == error.NeverRan) return error.ReceiverNeverRan;
+}
