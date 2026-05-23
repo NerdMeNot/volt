@@ -1,173 +1,173 @@
 {
   "platform": "macos-arm64",
-  "captured_at": "2026-05-23T13:51:34.745593+00:00",
+  "captured_at": "2026-05-23T16:06:41.607375+00:00",
   "benches": {
     "yield": {
-      "yield_ns_per_op": 10,
+      "yield_ns_per_op": 15,
       "yield_ns_per_op_samples": [
-        11,
-        10,
-        10
+        20,
+        15,
+        11
       ]
     },
     "spsc": {
       "spsc_ns_per_op": 14,
       "spsc_ns_per_op_samples": [
-        16,
+        14,
         14,
         14
       ]
     },
     "mpmc": {
-      "mpmc_1p1c_ns_per_op": 23,
+      "mpmc_1p1c_ns_per_op": 24,
       "mpmc_1p1c_ns_per_op_samples": [
-        23,
-        23,
-        24
+        24,
+        25,
+        23
       ],
-      "mpmc_2p2c_ns_per_op": 32,
+      "mpmc_2p2c_ns_per_op": 26,
       "mpmc_2p2c_ns_per_op_samples": [
-        32,
-        37,
-        30
+        26,
+        25,
+        27
       ],
-      "mpmc_4p4c_ns_per_op": 98,
+      "mpmc_4p4c_ns_per_op": 91,
       "mpmc_4p4c_ns_per_op_samples": [
-        113,
-        98,
-        95
+        87,
+        91,
+        92
       ]
     },
     "mutex": {
-      "mutex_ns_per_op": 23,
+      "mutex_ns_per_op": 17,
       "mutex_ns_per_op_samples": [
-        24,
-        23,
-        17
+        33,
+        17,
+        14
       ]
     },
     "spawn-hot": {
-      "spawn_hot_ns_per_op": 570,
+      "spawn_hot_ns_per_op": 339,
       "spawn_hot_ns_per_op_samples": [
-        611,
-        572,
-        570,
-        478,
-        508
+        348,
+        339,
+        342,
+        327,
+        331
       ]
     },
     "scaling": {
-      "scaling_w1": 94,
+      "scaling_w1": 101,
       "scaling_w1_samples": [
-        99,
-        94,
-        94
+        105,
+        101,
+        99
       ],
-      "scaling_w2": 292,
+      "scaling_w2": 297,
       "scaling_w2_samples": [
-        301,
-        292,
-        290
+        297,
+        291,
+        299
       ],
-      "scaling_w4": 422,
+      "scaling_w4": 386,
       "scaling_w4_samples": [
-        427,
-        422,
-        415
+        377,
+        386,
+        414
       ],
-      "scaling_w8": 610,
+      "scaling_w8": 441,
       "scaling_w8_samples": [
-        610,
-        683,
-        488
+        441,
+        468,
+        365
       ],
-      "scaling_w11": 733,
+      "scaling_w11": 508,
       "scaling_w11_samples": [
-        733,
-        757,
-        671
+        508,
+        500,
+        550
       ]
     },
     "fanout-scaling": {
-      "fanout_w1": 87,
+      "fanout_w1": 78,
       "fanout_w1_samples": [
-        74,
-        87,
-        118
+        78,
+        77,
+        895
       ],
-      "fanout_w2": 99,
+      "fanout_w2": 95,
       "fanout_w2_samples": [
-        96,
-        109,
-        99
+        89,
+        95,
+        626
       ],
-      "fanout_w4": 111,
+      "fanout_w4": 100,
       "fanout_w4_samples": [
-        113,
-        111,
-        111
+        98,
+        100,
+        242
       ],
-      "fanout_w8": 115,
+      "fanout_w8": 108,
       "fanout_w8_samples": [
-        115,
-        115,
-        114
+        108,
+        107,
+        178
       ],
-      "fanout_w11": 113,
+      "fanout_w11": 157,
       "fanout_w11_samples": [
-        113,
-        110,
-        114
+        109,
+        18655,
+        157
       ]
     },
     "parallel-compute": {
-      "parallel_w1": 91,
+      "parallel_w1": 109,
       "parallel_w1_samples": [
-        93,
-        90,
-        91
+        117,
+        109,
+        104
       ],
-      "parallel_w2": 48,
+      "parallel_w2": 54,
       "parallel_w2_samples": [
-        49,
-        48,
-        48
+        59,
+        54,
+        51
       ],
       "parallel_w4": 27,
       "parallel_w4_samples": [
-        25,
         27,
-        28
+        31,
+        26
       ],
-      "parallel_w8": 19,
+      "parallel_w8": 15,
       "parallel_w8_samples": [
-        19,
-        20,
-        19
+        14,
+        17,
+        15
       ]
     },
     "tcp-echo": {
-      "tcp_echo_ns_per_rtt": 16130,
+      "tcp_echo_ns_per_rtt": 16011,
       "tcp_echo_ns_per_rtt_samples": [
-        14758,
-        16130,
-        19360
+        18960,
+        16011,
+        15611
       ]
     },
     "reactor-throughput": {
-      "reactor_wake_ns": 11977,
+      "reactor_wake_ns": 13223,
       "reactor_wake_ns_samples": [
-        11712,
-        12157,
-        11977
+        12932,
+        13443,
+        13223
       ]
     },
     "reactor-fanout": {
-      "reactor_fanout_ns_per_rtt": 13363,
+      "reactor_fanout_ns_per_rtt": 13420,
       "reactor_fanout_ns_per_rtt_samples": [
-        12232,
-        14128,
-        13363
+        12309,
+        13420,
+        13636
       ]
     },
     "rss": {
