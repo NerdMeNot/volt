@@ -1,0 +1,46 @@
+# Volt — Linux test loop image.
+#
+# Mirrors what `.github/workflows/ci.yml` runs on `ubuntu-latest` /
+# `ubuntu-24.04-arm`, but locally via podman/OrbStack on macOS so
+# Linux-only bugs (epoll/io_uring path, statx, SysV ctx switch
+# on x86_64) get caught before pushing.
+#
+# The image bakes in Zig 0.16.0 + libc headers. The source tree
+# is bind-mounted at /work and `.zig-cache` lives in a named
+# volume so warm runs skip the rebuild.
+#
+# Build:   podman build -t volt-zig:0.16.0 -f scripts/Containerfile.linux scripts/
+# Run:     scripts/test-linux.sh
+
+FROM debian:trixie-slim
+
+ARG ZIG_VERSION=0.16.0
+
+# ca-certs + curl for the Zig tarball download, xz-utils to
+# extract it. libc6-dev gives us the glibc headers the runtime
+# needs (statx, io_uring, etc.).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates curl xz-utils libc6-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# Zig download URL is arch-os ordered: zig-{ARCH}-linux-{VER}.tar.xz.
+# `uname -m` inside the container reflects the container's
+# platform (set by `podman build --platform`), so the same
+# Containerfile produces both linux/arm64 and linux/amd64 images.
+RUN set -eux; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+        x86_64)  zig_arch=x86_64 ;; \
+        aarch64) zig_arch=aarch64 ;; \
+        *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    url="https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz"; \
+    curl -fsSL "$url" -o /tmp/zig.tar.xz; \
+    mkdir -p /opt/zig; \
+    tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1; \
+    rm /tmp/zig.tar.xz; \
+    ln -s /opt/zig/zig /usr/local/bin/zig; \
+    zig version
+
+WORKDIR /work
