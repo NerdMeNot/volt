@@ -73,19 +73,21 @@ BENCHES: List[Bench] = [
         "spawn_hot_ns_per_op": r"ns/op:\s+(\d+)",
     }),
     Bench("scaling", runs=3, spawn_heavy=True, patterns={
-        # Captures every "workers=N median M ns/op" row; the parser stores
-        # them under per-worker keys (scaling_w1, scaling_w2, ...).
-        "_multi_scaling": r"workers=\s*(\d+)\s+median\s+(\d+)\s+ns/op",
+        # Format: `  workers=  1  median    +89 ns/op   +11207674 ops/sec`
+        # The `+` prefix comes from Zig's `{d:>6}` right-alignment formatting.
+        "_multi_scaling": r"workers=\s*(\d+)\s+median\s+\+?(\d+)\s+ns/op",
     }),
     Bench("fanout-scaling", runs=3, spawn_heavy=True, patterns={
-        # Captures `<workers> <drivers> <total_ops> <ns_per_op_float> <ratio>×`
-        # Only the headline (workers=drivers) sweep produces these rows.
-        "_multi_fanout": r"^\s*(\d+)\s+(\d+)\s+\d+\s+(\d+(?:\.\d+)?)\s+\d+(?:\.\d+)?×",
+        # Format (matched-shape sweep, drivers=workers):
+        #   `        1          1       48497800       82.5      1.00×`
+        # Columns: workers, drivers, total_ops, ns/op, ratio×
+        # We key by workers (first group). Last group is the ns/op value.
+        "_multi_fanout": r"^\s*(\d+)\s+\d+\s+\d+\s+(\d+(?:\.\d+)?)\s+\d+(?:\.\d+)?×",
     }),
     Bench("parallel-compute", runs=3, spawn_heavy=True, patterns={
-        # Format: `  workers=N  us=X  per_task=Y  speedup=Zx`
-        # Approximate — see bench source for exact format.
-        "_multi_parallel": r"workers=(\d+).*?(\d+)\s+ns/op",
+        # Format: `  workers= 1  wall +25090 us  per-task  +98 us  speedup 1.00x`
+        # Key by workers, value = per-task us (lower=better, same direction as ns/op).
+        "_multi_parallel": r"workers=\s*(\d+)\s+wall\s+\+?\d+\s+us\s+per-task\s+\+?(\d+)\s+us",
     }),
     # Reactor-heavy.
     Bench("tcp-echo", runs=3, patterns={
@@ -149,11 +151,12 @@ def parse(outputs: List[str], patterns: Dict[str, str]) -> Dict[str, object]:
     for key, pat in patterns.items():
         if key.startswith("_multi_"):
             # Multi-shape: scan all matches across all runs, collapse by shape.
+            # Convention: group(1) = shape key, group(<last>) = value.
             shape_samples: Dict[str, List[float]] = {}
             for out in outputs:
                 for m in re.finditer(pat, out, re.MULTILINE):
                     shape = m.group(1)
-                    raw = m.group(2)
+                    raw = m.group(m.lastindex)
                     val = float(raw) if "." in raw else int(raw)
                     sub = key[len("_multi_"):]
                     shape_key = f"{sub}_w{shape}"
