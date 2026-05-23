@@ -646,6 +646,9 @@ pub const Reactor = struct {
         // or be coalesced by the threadpool. Short-circuit at the
         // entry to match Darwin/Linux semantics.
         if (ns == 0) return;
+        // ticks_100ns is `i64`; even `ns / 100` could overflow if ns is
+        // above i64_max. Match POSIX backends' bound for consistency.
+        if (ns > std.math.maxInt(i64)) return error.TimeoutOutOfRange;
 
         const me = current.require();
 
@@ -686,6 +689,7 @@ pub const Reactor = struct {
         // ns=0 mirrors waitTimer — early return AFTER the checkpoint
         // so a pre-fired cancel still surfaces error.Cancelled.
         if (ns == 0) return;
+        if (ns > std.math.maxInt(i64)) return error.TimeoutOutOfRange;
 
         var ctx = TimerCtx{ .reactor = self, .coro = me };
         const timer = CreateThreadpoolTimer(&timerCallback, &ctx, null) orelse

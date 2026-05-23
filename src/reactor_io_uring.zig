@@ -168,6 +168,8 @@ pub const Reactor = struct {
         // timespec has historically had ambiguous behaviour across
         // io_uring versions — fail closed by short-circuiting.
         if (ns == 0) return;
+        // __kernel_timespec.tv_sec is i64; ns > i64_max wraps after divide.
+        if (ns > std.math.maxInt(i64)) return error.TimeoutOutOfRange;
 
         const me = current.require();
         const ts = linux.kernel_timespec{
@@ -298,6 +300,7 @@ pub const Reactor = struct {
     pub fn waitTimerCancel(self: *Reactor, ns: u64, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
         try c.checkpoint();
         if (ns == 0) return;
+        if (ns > std.math.maxInt(i64)) return error.TimeoutOutOfRange;
 
         const me = current.require();
         const ts = linux.kernel_timespec{

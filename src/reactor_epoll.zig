@@ -239,6 +239,9 @@ pub const Reactor = struct {
         // coroutine parks forever waiting for a fire that never
         // comes. Caught by the sleep(0) reactor-conformance test.
         if (ns == 0) return;
+        // itimerspec.it_value.sec is `time_t` (i64 on Linux). ns > i64_max
+        // would wrap silently after the divide.
+        if (ns > std.math.maxInt(i64)) return error.TimeoutOutOfRange;
 
         const me = current.require();
 
@@ -384,6 +387,7 @@ pub const Reactor = struct {
         // (same gap as waitTimer, which bc4685a fixed only on the
         // non-cancel variant).
         if (ns == 0) return;
+        if (ns > std.math.maxInt(i64)) return error.TimeoutOutOfRange;
 
         const tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
         if (tfd < 0) return registerError(errnoVal());

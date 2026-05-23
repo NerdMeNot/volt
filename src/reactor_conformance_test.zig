@@ -233,6 +233,56 @@ test "conformance: sleepCancel(0) with pre-fired cancel returns Cancelled" {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Timer bounds — every backend's kernel timer type is signed i64,
+// so the upper bound is std.math.maxInt(i64) nanoseconds (~292
+// years). Inputs above that wrap silently into garbage timeouts
+// without the explicit guard.
+//
+// Pins the contract: `waitTimer(u64_max)` returns
+// error.TimeoutOutOfRange, NOT a hang or wrap. `waitTimer(i64_max)`
+// is accepted (though it parks for ~292 years if not cancelled —
+// the actual park is cancelled by the test runtime tearing down).
+// ─────────────────────────────────────────────────────────────────
+
+fn sleepU64MaxRoot() !void {
+    const r = lib.sleep(lib.Duration.fromNanos(std.math.maxInt(u64)));
+    try testing.expectError(error.TimeoutOutOfRange, r);
+}
+
+test "conformance: sleep(u64_max) returns TimeoutOutOfRange" {
+    var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 1 });
+    defer rt.deinit();
+    try (try rt.run(sleepU64MaxRoot, .{}));
+}
+
+fn sleepCancelU64MaxRoot() !void {
+    const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var c = Cancel.init(rt);
+    defer c.deinit();
+    const r = lib.sleepCancel(lib.Duration.fromNanos(std.math.maxInt(u64)), &c);
+    try testing.expectError(error.TimeoutOutOfRange, r);
+}
+
+test "conformance: sleepCancel(u64_max) returns TimeoutOutOfRange" {
+    var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 1 });
+    defer rt.deinit();
+    try (try rt.run(sleepCancelU64MaxRoot, .{}));
+}
+
+// i64_max + 1 is the smallest u64 that exceeds the bound. Pin
+// that the check is strict (>), not loose (>=).
+fn sleepJustOverBoundRoot() !void {
+    const r = lib.sleep(lib.Duration.fromNanos(@as(u64, std.math.maxInt(i64)) + 1));
+    try testing.expectError(error.TimeoutOutOfRange, r);
+}
+
+test "conformance: sleep(i64_max+1) returns TimeoutOutOfRange" {
+    var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 1 });
+    defer rt.deinit();
+    try (try rt.run(sleepJustOverBoundRoot, .{}));
+}
+
+// ─────────────────────────────────────────────────────────────────
 // recvCancel race stress — register-then-park window
 //
 // The hypothesis under test: `waitFdCancel` (each cancel-aware

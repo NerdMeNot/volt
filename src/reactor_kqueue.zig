@@ -123,6 +123,9 @@ pub const Reactor = struct {
         // other kqueue platforms (FreeBSD/NetBSD) differ — keep the
         // cross-reactor behaviour explicit at every impl site.
         if (ns == 0) return;
+        // EVFILT_TIMER's `data` field is `intptr_t` (i64 on 64-bit).
+        // ns > i64_max would wrap silently; surface explicitly.
+        if (ns > std.math.maxInt(i64)) return error.TimeoutOutOfRange;
 
         const me = current.require();
         var kev = std.mem.zeroes(posix.Kevent);
@@ -307,6 +310,7 @@ pub const Reactor = struct {
         // that happened before the call.
         try c.checkpoint();
         if (ns == 0) return;
+        if (ns > std.math.maxInt(i64)) return error.TimeoutOutOfRange;
 
         const me = current.require();
         var op = WaitOp{ .ident = @intFromPtr(me), .filter = EVFILT_TIMER };

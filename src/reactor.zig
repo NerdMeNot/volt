@@ -65,6 +65,13 @@ pub const ReactorWaitError = ReactorSetupError || error{
     /// The fd was closed (or never valid) before the registration
     /// landed — EBADF / WSAENOTSOCK.
     BadDescriptor,
+    /// Timer duration exceeds `std.math.maxInt(i64)` nanoseconds
+    /// (~292 years). All four backends' kernel timer types are
+    /// signed 64-bit; values above that would wrap silently. The
+    /// public timer API caps at i64_max ns so callers passing
+    /// `std.math.maxInt(u64)` as a sentinel get a clean error
+    /// rather than an unpredictable wrap.
+    TimeoutOutOfRange,
 };
 
 /// Errors from `readAsync` / `writeAsync` / `readFull` / `writeAll`.
