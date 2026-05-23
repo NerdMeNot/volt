@@ -334,9 +334,6 @@ fn recvCancelStressBody() !void {
     // in the race window. 200 iterations × ~8 distinct timings.
     var i: u32 = 0;
     while (i < 200) : (i += 1) {
-        // TEMPORARY: progress prints to locate the CI hang. Remove
-        // before merging if the underlying race is properly closed.
-        if (i % 10 == 0) std.debug.print("  recvCancel iter {d}/200 (yield_count={d})\n", .{ i, i % 8 });
         var c = Cancel.init(rt);
         defer c.deinit();
         var ctx = RecvCancelIterCtx{ .c = &c, .yield_count = i % 8 };
@@ -348,7 +345,6 @@ fn recvCancelStressBody() !void {
         _ = recv_task.join() catch |e| return e;
         _ = firer_task.join();
     }
-    std.debug.print("  recvCancel ALL 200 iterations passed\n", .{});
 }
 
 test "conformance: recvCancel stress — 200 iterations, no hang" {

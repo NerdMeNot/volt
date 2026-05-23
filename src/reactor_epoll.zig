@@ -275,6 +275,20 @@ pub const Reactor = struct {
         me.reactor_wait_op = &op;
         defer me.reactor_wait_op = null;
 
+        // ─── Side-table insert FIRST, EPOLL_CTL_ADD second ──────────────
+        //
+        // See reactor_kqueue.zig's waitFd for the rationale: if a
+        // peer's closeFd races between EPOLL_CTL_ADD and our
+        // side-table insert, close() silently orphans the kernel
+        // registration on fd close and we park forever. Side-table
+        // first means closeFd finds us; EPOLL_CTL_DEL returns ENOENT
+        // (not yet registered) so it doesn't unpark, but the
+        // subsequent libc close happens AFTER our removeWaiter so we
+        // get EBADF on the EPOLL_CTL_ADD attempt that follows —
+        // surfaces cleanly as BadDescriptor.
+        self.insertWaiter(fd, me) catch return error.SystemResources;
+        defer _ = self.removeWaiter(fd);
+
         var ev = epoll_event{
             .events = filter | EPOLLONESHOT,
             .data = @intFromPtr(me),
@@ -289,13 +303,6 @@ pub const Reactor = struct {
         }
         if (rc < 0) return registerError(errnoVal());
         _ = self.pending.fetchAdd(1, .acq_rel);
-
-        self.insertWaiter(fd, me) catch {
-            _ = epoll_ctl(self.epfd, EPOLL_CTL_DEL, fd, null);
-            _ = self.pending.fetchSub(1, .acq_rel);
-            return error.SystemResources;
-        };
-        defer _ = self.removeWaiter(fd);
 
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
@@ -403,14 +410,20 @@ pub const Reactor = struct {
         me.reactor_wait_op = &op;
         defer me.reactor_wait_op = null;
 
-        // ─── Kernel registration FIRST (closes register-then-fire race) ──
+        // ─── Side-table insert FIRST (closes close-vs-register race) ──────
         //
-        // Old order — registerReactor then waitFd — opened a window
-        // where fire() could call cancelCoro before this coroutine
-        // had registered with the kernel. EPOLL_CTL_DEL then returned
-        // ENOENT (nothing to delete); cancelCoro's "ENOENT means
-        // poll() owns the unpark" heuristic silently returned, and
-        // the coroutine then registered and parked forever.
+        // See waitFd for the rationale.
+        self.insertWaiter(fd, me) catch return error.SystemResources;
+        defer _ = self.removeWaiter(fd);
+
+        // ─── Kernel registration SECOND (closes register-then-fire race) ──
+        //
+        // Old order — registerReactor then kernel-register — opened a
+        // window where fire() could call cancelCoro before the kernel
+        // had the registration. EPOLL_CTL_DEL then returned ENOENT;
+        // cancelCoro's "ENOENT means poll() owns the unpark"
+        // heuristic silently returned, the coroutine registered and
+        // parked forever.
         var ev = epoll_event{
             .events = filter | EPOLLONESHOT,
             .data = @intFromPtr(me),
@@ -422,15 +435,7 @@ pub const Reactor = struct {
         if (rc < 0) return registerError(errnoVal());
         _ = self.pending.fetchAdd(1, .acq_rel);
 
-        // ─── Side-table insert (same role as in waitFd) ─────────────────
-        self.insertWaiter(fd, me) catch {
-            _ = epoll_ctl(self.epfd, EPOLL_CTL_DEL, fd, null);
-            _ = self.pending.fetchSub(1, .acq_rel);
-            return error.SystemResources;
-        };
-        defer _ = self.removeWaiter(fd);
-
-        // ─── Cancel-list registration ───────────────────────────────────
+        // ─── Cancel-list registration THIRD ─────────────────────────────
         var w = cancel_mod.Waiter{};
         if (c.registerReactor(&w, me)) {
             // Fire happened before our register. cancelCoro was not

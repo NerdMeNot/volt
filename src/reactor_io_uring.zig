@@ -202,6 +202,17 @@ pub const Reactor = struct {
     fn waitFd(self: *Reactor, fd: i32, mask: u32) ReactorWaitError!void {
         const me = current.require();
 
+        // ─── Side-table insert FIRST, poll_add SQE second ──────────────
+        //
+        // See reactor_kqueue.zig waitFd: a racing closeFd between
+        // SQE submission and side-table insert orphans the parked
+        // coroutine. Side-table first means closeFd finds us before
+        // it submits the cancel SQE; our subsequent poll_add either
+        // succeeds (closeFd's cancel will land on it) or fails with
+        // EBADF after the fd is closed (registerError-style surface).
+        self.insertWaiter(fd, me) catch return error.SystemResources;
+        errdefer _ = self.removeWaiter(fd);
+
         self.acquire();
         const submitted = (self.ring.poll_add(@intFromPtr(me), fd, mask) catch blk: {
             // SQ-full is recoverable: a submit hands queued SQEs to
@@ -218,17 +229,6 @@ pub const Reactor = struct {
         // is the whole perf win over epoll.
         _ = self.pending.fetchAdd(1, .acq_rel);
 
-        // Side-table insert so a peer's closeFd can find this coro
-        // and submit a targeted cancel SQE. On allocation failure
-        // we'd need a cancel-SQE rollback; mirror kqueue's path by
-        // surfacing SystemResources.
-        self.insertWaiter(fd, me) catch {
-            self.acquire();
-            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(me), 0) catch {};
-            self.release();
-            _ = self.pending.fetchSub(1, .acq_rel);
-            return error.SystemResources;
-        };
         defer _ = self.removeWaiter(fd);
 
         me.pending = .park;
@@ -335,7 +335,13 @@ pub const Reactor = struct {
         try c.checkpoint();
         const me = current.require();
 
-        // ─── SQE submission FIRST (closes register-then-fire race) ──────
+        // ─── Side-table insert FIRST (closes close-vs-register race) ──────
+        //
+        // See reactor_kqueue.zig waitFd for the rationale.
+        self.insertWaiter(fd, me) catch return error.SystemResources;
+        defer _ = self.removeWaiter(fd);
+
+        // ─── SQE submission SECOND (closes register-then-fire race) ──────
         //
         // Old order — registerReactor then waitFd — opened a window
         // where fire() could call cancelCoro before this coroutine's
@@ -343,10 +349,10 @@ pub const Reactor = struct {
         // ring before the target op SQE; the kernel processes them
         // in submission order so the cancel hits -ENOENT, the
         // poll_add then registers, and the coroutine parks forever.
-        // Queueing the poll_add SQE first guarantees the kernel
-        // sees it before any later cancel SQE from cancelCoro
-        // (the lock around .acquire()/.release() serialises queue
-        // order across threads).
+        // Queueing the poll_add SQE BEFORE registerReactor guarantees
+        // the kernel sees it before any later cancel SQE from
+        // cancelCoro (the lock around .acquire()/.release()
+        // serialises queue order across threads).
         self.acquire();
         const submitted = (self.ring.poll_add(@intFromPtr(me), fd, mask) catch blk: {
             _ = self.ring.submit() catch {};
@@ -356,17 +362,7 @@ pub const Reactor = struct {
         if (!submitted) return error.SystemResources;
         _ = self.pending.fetchAdd(1, .acq_rel);
 
-        // ─── Side-table insert (same role as in waitFd) ─────────────────
-        self.insertWaiter(fd, me) catch {
-            self.acquire();
-            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(me), 0) catch {};
-            self.release();
-            _ = self.pending.fetchSub(1, .acq_rel);
-            return error.SystemResources;
-        };
-        defer _ = self.removeWaiter(fd);
-
-        // ─── Cancel-list registration ───────────────────────────────────
+        // ─── Cancel-list registration THIRD ─────────────────────────────
         var w = cancel_mod.Waiter{};
         if (c.registerReactor(&w, me)) {
             // Fired before our register. Issue a CANCEL SQE

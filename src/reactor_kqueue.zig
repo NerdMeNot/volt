@@ -208,6 +208,26 @@ pub const Reactor = struct {
         me.reactor_wait_op = &op;
         defer me.reactor_wait_op = null;
 
+        // ─── Side-table insert FIRST, kevent ADD second ─────────────────
+        //
+        // The ordering matters: if a peer coroutine's `closeFd(fd)`
+        // races between our kevent ADD and our side-table insert,
+        // closeFd sees no waiter, calls libc close(), and the kernel
+        // silently auto-removes the kevent registration on fd close.
+        // The receiver then parks forever on a registration that no
+        // longer exists.
+        //
+        // Inserting in the side-table FIRST closes that window: a
+        // concurrent closeFd that runs between our insertWaiter and
+        // our kevent ADD will find the waiter, try EV_DELETE (which
+        // returns ENOENT — registration doesn't exist yet, so closeFd
+        // does not unpark), and call libc close(). Our subsequent
+        // kevent ADD on the closed fd returns EBADF, which
+        // registerError maps to error.BadDescriptor cleanly. The
+        // receiver returns the error without ever parking.
+        self.insertWaiter(.{ .fd = fd, .filter = filter }, me) catch return error.SystemResources;
+        defer _ = self.removeWaiter(.{ .fd = fd, .filter = filter });
+
         var kev = std.mem.zeroes(posix.Kevent);
         kev.ident = @intCast(fd);
         kev.filter = filter;
@@ -218,17 +238,6 @@ pub const Reactor = struct {
         const n = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
         if (n < 0) return registerError(posix_helpers.errnoVal());
         _ = self.pending.fetchAdd(1, .acq_rel);
-
-        // Side-table insert AFTER kevent ADD: if ADD fails we never
-        // insert, so we don't need a cleanup path on the failure
-        // branch. Allocation failure here means OOM — surface as
-        // SystemResources after rolling back the kevent.
-        self.insertWaiter(.{ .fd = fd, .filter = filter }, me) catch {
-            deregisterKevent(self, @intCast(fd), filter);
-            _ = self.pending.fetchSub(1, .acq_rel);
-            return error.SystemResources;
-        };
-        defer _ = self.removeWaiter(.{ .fd = fd, .filter = filter });
 
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
@@ -373,7 +382,15 @@ pub const Reactor = struct {
         me.reactor_wait_op = &op;
         defer me.reactor_wait_op = null;
 
-        // ─── Kernel registration FIRST (closes register-then-fire race) ──
+        // ─── Side-table insert FIRST (closes close-vs-register race) ──────
+        //
+        // See waitFd for the rationale. Must precede kernel registration
+        // so a racing closeFd finds the waiter rather than orphaning
+        // a kevent that the kernel will auto-clean on fd close.
+        self.insertWaiter(.{ .fd = fd, .filter = filter }, me) catch return error.SystemResources;
+        defer _ = self.removeWaiter(.{ .fd = fd, .filter = filter });
+
+        // ─── Kernel registration SECOND (closes register-then-fire race) ──
         //
         // Old order — registerReactor then waitFd — opened a window
         // where fire() could call cancelCoro before this coroutine
@@ -381,8 +398,8 @@ pub const Reactor = struct {
         // return ENOENT (nothing to delete), cancelCoro's "ENOENT
         // means poll() owns the unpark" heuristic would silently
         // return, and the coroutine would then register and park
-        // forever. New order: register kernel side first so any
-        // later cancelCoro finds a real kevent.
+        // forever. New order: register kernel side BEFORE cancel-list
+        // so any later cancelCoro finds a real kevent.
         var kev = std.mem.zeroes(posix.Kevent);
         kev.ident = @intCast(fd);
         kev.filter = filter;
@@ -394,15 +411,7 @@ pub const Reactor = struct {
         if (n < 0) return registerError(posix_helpers.errnoVal());
         _ = self.pending.fetchAdd(1, .acq_rel);
 
-        // ─── Side-table insert (same role as in waitFd) ─────────────────
-        self.insertWaiter(.{ .fd = fd, .filter = filter }, me) catch {
-            deregisterKevent(self, @intCast(fd), filter);
-            _ = self.pending.fetchSub(1, .acq_rel);
-            return error.SystemResources;
-        };
-        defer _ = self.removeWaiter(.{ .fd = fd, .filter = filter });
-
-        // ─── Cancel-list registration ───────────────────────────────────
+        // ─── Cancel-list registration THIRD ─────────────────────────────
         var w = cancel_mod.Waiter{};
         if (c.registerReactor(&w, me)) {
             // Fired before our register. cancelCoro was not called
