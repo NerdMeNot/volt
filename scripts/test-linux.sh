@@ -60,8 +60,10 @@ esac
 
 IMAGE="volt-zig:0.16.0-${ARCH}"
 # Per-arch cache so amd64-emitted artifacts don't poison the arm64
-# cache (different target triples).
-CACHE_VOLUME="volt-zig-cache-${ARCH}"
+# cache (different target triples). `-v2` bumps the volume after the
+# image switched to running as a non-root user — the old volume was
+# initialised root-owned and the new user can't write to it.
+CACHE_VOLUME="volt-zig-cache-${ARCH}-v2"
 
 # Pick a podman binary. The user's install lives in /opt/podman.
 PODMAN="${PODMAN:-$(command -v podman || echo /opt/podman/bin/podman)}"
@@ -101,7 +103,7 @@ TTY_ARG=""
 exec "$PODMAN" run --rm -i ${TTY_ARG} \
     --platform "$PLATFORM" \
     -v "$REPO_ROOT":/work:Z \
-    -v "$CACHE_VOLUME":/work/.zig-cache \
+    -v "$CACHE_VOLUME":/work/.zig-cache:U \
     -w /work \
     "$IMAGE" \
     "${ZIG_CMD[@]}"

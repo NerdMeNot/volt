@@ -43,4 +43,13 @@ RUN set -eux; \
     ln -s /opt/zig/zig /usr/local/bin/zig; \
     zig version
 
+# Non-root user matching GitHub Actions' `runner` (UID 1001).
+# Running as root inside the container makes CAP_DAC_OVERRIDE
+# bypass file mode bit checks, so tests like `fs.access`
+# spuriously pass/fail depending on which permission they're
+# probing. Matching CI's UID keeps the local loop's signal
+# identical to GitHub's.
+RUN useradd --create-home --uid 1001 volt
+USER volt
+
 WORKDIR /work
