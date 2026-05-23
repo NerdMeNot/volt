@@ -384,16 +384,13 @@ const builtin = @import("builtin");
 
 // Phase 3d backend coverage:
 //   * kqueue (Darwin)  — full closeFd impl
-//   * epoll  (Linux)   — full closeFd impl (forced via io_backend below)
-//   * io_uring (Linux) — stub; tests force .epoll on Linux until done
+//   * epoll  (Linux)   — full closeFd impl
+//   * io_uring (Linux) — full closeFd impl (via IORING_OP_ASYNC_CANCEL)
 //   * IOCP (Windows)   — stub; tests SkipZigTest on Windows
 const has_full_closeFd = builtin.os.tag.isDarwin() or builtin.os.tag == .linux;
-// On Linux Volt defaults to io_uring (if the kernel supports it) and
-// falls back to epoll. The io_uring closeFd is still a stub, so these
-// tests force the .epoll backend to exercise the implemented path.
-// IoBackend lives in src/reactor.zig.
-const closeFd_test_io_backend: @import("reactor.zig").IoBackend =
-    if (builtin.os.tag == .linux) .epoll else .auto;
+// .auto on every platform that has the impl — io_uring or epoll,
+// whichever the runtime picks at init.
+const closeFd_test_io_backend: @import("reactor.zig").IoBackend = .auto;
 
 const ListenerCloseCtx = struct {
     listener: *TcpListener,

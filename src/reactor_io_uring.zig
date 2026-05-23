@@ -98,8 +98,17 @@ pub const Reactor = struct {
     /// Submission and CQE consumption are single-threaded by the
     /// poller-claim in `runtime.zig`.
     lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    /// See reactor_epoll.zig's allocator comment — Phase 3d landed
-    /// kqueue's closeFd first; io_uring's is a stub.
+    /// Reverse lookup `fd → parked coro`. closeFd uses it to find
+    /// the parked waiter and submit a cancel SQE targeting its
+    /// user_data (== coro pointer). io_uring's cancellation model
+    /// is async — the cancel SQE eventually produces a CQE that the
+    /// poll loop dispatches — so unlike kqueue/epoll, no `op.closed`
+    /// flag is needed. The coro resumes via the normal CQE path
+    /// (with -ECANCELED) and the next libc recv after our close
+    /// surfaces EBADF, which `errnoToIoError` already maps to
+    /// BadDescriptor.
+    fd_waiters: std.AutoHashMapUnmanaged(i32, *coroutine.Coroutine) = .{},
+    fd_waiters_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !Reactor {
@@ -124,10 +133,45 @@ pub const Reactor = struct {
         return .{ .ring = ring, .interrupt_fd = efd, .allocator = allocator };
     }
 
-    /// Phase 3d stub — full impl pending. See reactor_epoll.zig's
-    /// closeFd note.
+    inline fn lockWaiters(self: *Reactor) void {
+        while (self.fd_waiters_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+    inline fn unlockWaiters(self: *Reactor) void {
+        self.fd_waiters_lock.store(0, .release);
+    }
+    fn insertWaiter(self: *Reactor, fd: i32, c: *coroutine.Coroutine) std.mem.Allocator.Error!void {
+        self.lockWaiters();
+        defer self.unlockWaiters();
+        try self.fd_waiters.put(self.allocator, fd, c);
+    }
+    fn removeWaiter(self: *Reactor, fd: i32) ?*coroutine.Coroutine {
+        self.lockWaiters();
+        defer self.unlockWaiters();
+        if (self.fd_waiters.fetchRemove(fd)) |kv| return kv.value;
+        return null;
+    }
+
+    /// Close a fd whose io_uring POLL_ADD may have a parked
+    /// coroutine waiting on it. Mirrors reactor_kqueue.zig closeFd
+    /// in spirit but uses io_uring's async-cancel model: submit a
+    /// cancel SQE targeting the parked coro's user_data, then close
+    /// the fd. The cancel CQE eventually delivers and the normal
+    /// poll-loop dispatch path wakes the coro with the (cancelled)
+    /// completion; the next libc recv/send after the close gets
+    /// EBADF, surfacing as BadDescriptor via errnoToIoError. No
+    /// `op.closed` flag is needed because the EBADF path is
+    /// deterministic — io_uring's POLL_ADD operates on the fd by
+    /// number, and the kernel returns -EBADF as soon as the fd is
+    /// gone.
     pub fn closeFd(self: *Reactor, fd: i32) void {
-        _ = self;
+        if (self.removeWaiter(fd)) |c| {
+            self.acquire();
+            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(c), 0) catch blk: {
+                _ = self.ring.submit() catch {};
+                break :blk self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(c), 0) catch null;
+            };
+            self.release();
+        }
         _ = posix_helpers.close(fd);
     }
 
@@ -138,6 +182,8 @@ pub const Reactor = struct {
         // shutdown-ordering bug at the source instead of as a
         // mysterious crash later.
         std.debug.assert(self.pending.load(.acquire) == 0);
+        std.debug.assert(self.fd_waiters.count() == 0);
+        self.fd_waiters.deinit(self.allocator);
         if (self.interrupt_fd >= 0) _ = posix_helpers.close(self.interrupt_fd);
         self.interrupt_fd = -1;
         self.ring.deinit();
@@ -169,6 +215,20 @@ pub const Reactor = struct {
         // poll() call will submit_and_wait — that batched syscall
         // is the whole perf win over epoll.
         _ = self.pending.fetchAdd(1, .acq_rel);
+
+        // Side-table insert so a peer's closeFd can find this coro
+        // and submit a targeted cancel SQE. On allocation failure
+        // we'd need a cancel-SQE rollback; mirror kqueue's path by
+        // surfacing SystemResources.
+        self.insertWaiter(fd, me) catch {
+            self.acquire();
+            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(me), 0) catch {};
+            self.release();
+            _ = self.pending.fetchSub(1, .acq_rel);
+            return error.SystemResources;
+        };
+        defer _ = self.removeWaiter(fd);
+
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
     }
@@ -273,6 +333,16 @@ pub const Reactor = struct {
         self.release();
         if (!submitted) return error.SystemResources;
         _ = self.pending.fetchAdd(1, .acq_rel);
+
+        // ─── Side-table insert (same role as in waitFd) ─────────────────
+        self.insertWaiter(fd, me) catch {
+            self.acquire();
+            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(me), 0) catch {};
+            self.release();
+            _ = self.pending.fetchSub(1, .acq_rel);
+            return error.SystemResources;
+        };
+        defer _ = self.removeWaiter(fd);
 
         // ─── Cancel-list registration ───────────────────────────────────
         var w = cancel_mod.Waiter{};
