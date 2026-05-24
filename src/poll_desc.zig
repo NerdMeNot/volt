@@ -54,6 +54,7 @@ const coroutine = @import("coroutine.zig");
 const current = @import("current.zig");
 const context = @import("context.zig");
 const runtime = @import("runtime.zig");
+const cancel_mod = @import("cancel.zig");
 
 const Coroutine = coroutine.Coroutine;
 
@@ -105,6 +106,19 @@ pub const PollDesc = struct {
     /// matches Go's special-case in runtime/netpoll.go:256.
     fdseq: u32 = 1,
 
+    /// Reference count for users of this PollDesc (parked waiters +
+    /// in-flight syscalls). Starts at 1 (the owner). Modelled on
+    /// Go's `internal/poll.fdMutex`. `evict()` callers wait on
+    /// `awaitClosed()` until this hits zero before freeing the
+    /// PollDesc — that's how Go avoids use-after-free when a parked
+    /// waiter is mid-post-wake-cleanup at close time.
+    refcount: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+
+    /// Coroutine waiting in `awaitClosed`. Set under `lock` so the
+    /// drop-to-zero path observes it consistently. At most one
+    /// closer per PollDesc (single-owner invariant).
+    close_waiter: ?*Coroutine = null,
+
     pub fn init(self: *PollDesc) void {
         self.* = .{};
         self.publishInfo();
@@ -112,10 +126,12 @@ pub const PollDesc = struct {
 
     pub fn deinit(self: *PollDesc) void {
         // No allocations to release. Asserts that the PollDesc was
-        // either evicted or never used (clean exit). A PollDesc with
-        // a parked waiter at deinit time would leak the waiter.
+        // either evicted+drained or never used (clean exit). A
+        // PollDesc with a parked waiter or live refs at deinit time
+        // would leak the waiter / UAF on the next wake.
         std.debug.assert(self.rg.load(.acquire) <= PD_WAIT);
         std.debug.assert(self.wg.load(.acquire) <= PD_WAIT);
+        std.debug.assert(self.refcount.load(.acquire) <= 1);
     }
 
     // ─── Lock-free info reads ───────────────────────────────────────
@@ -229,6 +245,72 @@ pub const PollDesc = struct {
         self.fdseq = next;
     }
 
+    // ─── Refcount (close coordination) ──────────────────────────────
+    //
+    // Refcount tracks "users that may still dereference this
+    // PollDesc": the owner (initial 1) plus any in-flight wait /
+    // waitCancel that has incref'd. `closeAndWait` is the lifecycle
+    // primitive — it drops the owner ref and parks until the count
+    // hits zero, at which point the caller may safely free the
+    // PollDesc.
+    //
+    // Modelled on Go's `internal/poll.fdMutex` close semaphore
+    // (internal/poll/fd_mutex.go:120-176), without the poisoning
+    // bit — Volt's wait()/waitCancel() see `closing` via the info
+    // word and bail with `.closing`, so we don't need fdmu's
+    // "fail new ops once closing" gate at the refcount layer.
+
+    pub fn incref(self: *PollDesc) void {
+        const prev = self.refcount.fetchAdd(1, .acq_rel);
+        std.debug.assert(prev > 0);
+    }
+
+    /// Drop a ref. If this was the last ref and a `closeAndWait` is
+    /// parked, wake it. Safe to call from any worker.
+    pub fn decref(self: *PollDesc) void {
+        const prev = self.refcount.fetchSub(1, .acq_rel);
+        std.debug.assert(prev > 0);
+        if (prev != 1) return;
+        // We took the count to zero. Pick up close_waiter under the
+        // lock (close_waiter is written under the lock).
+        self.acquireLock();
+        const w = self.close_waiter;
+        self.close_waiter = null;
+        self.releaseLock();
+        if (w) |c| runtime.unpark(c);
+    }
+
+    /// Mark the PollDesc closing, wake any parked waiters, drop the
+    /// owner's ref, and block until any in-flight wait/waitCancel
+    /// callers have dropped theirs. After return the refcount is
+    /// zero and it is safe to free the PollDesc.
+    ///
+    /// Single-shot: at most one closer per PollDesc.
+    pub fn closeAndWait(self: *PollDesc) void {
+        if (!self.isClosing()) self.evict();
+        const me = current.require();
+        // Register ourselves as the close_waiter BEFORE dropping
+        // the owner ref. The owner ref keeps refcount > 0, so no
+        // concurrent decref can drive it to zero between "we
+        // registered" and "we drop our ref" — only our own decref
+        // below can be the last one.
+        self.acquireLock();
+        std.debug.assert(self.close_waiter == null);
+        self.close_waiter = me;
+        self.releaseLock();
+        // Park-then-drop. Setting pending=.park first means that if
+        // our own decref takes us to zero and synchronously calls
+        // runtime.unpark(me), park_state goes RUNNING→NOTIFIED and
+        // dispatch re-queues us instead of stranding the coro. The
+        // dispatch.park branch handles this exactly (see
+        // docs/src/content/docs/internals/memory-model.md).
+        me.pending = .park;
+        self.decref();
+        context.swap(&me.ctx, me.main_ctx);
+        std.debug.assert(self.refcount.load(.acquire) == 0);
+        std.debug.assert(self.close_waiter == null);
+    }
+
     // ─── Wait (user-facing) ─────────────────────────────────────────
 
     /// Park the current coroutine until `mode` becomes ready or the
@@ -294,12 +376,108 @@ pub const PollDesc = struct {
         context.swap(&me.ctx, me.main_ctx);
 
         const old = gpp.swap(PD_NIL, .acq_rel);
-        if (old > PD_WAIT) {
-            std.debug.panic("PollDesc.wait: woke with stale coro ptr {x}", .{old});
+        if (old == PD_READY) return .ready;
+        if (old == PD_NIL) return .closing;
+        // `waitCancel` wakes us via `runtime.unpark` directly,
+        // without manipulating the slot — the slot still holds our
+        // own coro_ptr when we resume. Treat as `.closing` so
+        // `waitCancel` can translate to `Cancelled` on its post-
+        // wake `isFired` check. Any OTHER coro pointer would be
+        // memory corruption.
+        if (old == @intFromPtr(me)) return .closing;
+        std.debug.panic("PollDesc.wait: woke with stale coro ptr {x}", .{old});
+    }
+
+    /// Cancel-aware variant of `wait`. Returns `error.Cancelled` if
+    /// `c` fires before the wait resolves; otherwise behaves exactly
+    /// like `wait(mode)`.
+    ///
+    /// Caller MUST guarantee `self` outlives this call (typically by
+    /// holding a refcount themselves — see `incref` / `closeAndWait`
+    /// for the socket-level model). `waitCancel` takes one extra ref
+    /// internally to keep `self` alive across any out-of-lock callback
+    /// dispatch by `c.fire`.
+    pub fn waitCancel(
+        self: *PollDesc,
+        mode: Mode,
+        c: *cancel_mod.Cancel,
+    ) cancel_mod.Error!WaitResult {
+        if (c.isFired()) return error.Cancelled;
+
+        // The callback (if dispatched) unparks `me` directly and drops
+        // the ref we take below. We unpark the specific coro (rather
+        // than going through `deliverCancel(mode)`) because the slot
+        // may be in any state when fire races wait() — including
+        // PD_NIL if fire wins the race to step 1. `deliverCancel` on
+        // PD_NIL is a no-op and would lose the wake; `unpark` always
+        // works thanks to `park_state`'s NOTIFIED-before-park path.
+        // wait()'s post-wake epilogue treats `old == @intFromPtr(me)`
+        // as `.closing`, completing the round-trip.
+        self.incref();
+        const me = current.require();
+        var ctx = WaitCancelCtx{ .pd = self, .coro = me };
+        var w: cancel_mod.Waiter = .{};
+        const fired = c.registerCallback(&w, &ctx, waitCancelDeliver);
+        if (fired) {
+            // Register saw the fired flag after our isFired check —
+            // no callback will dispatch; the ref is ours to drop.
+            self.decref();
+            return error.Cancelled;
         }
-        return if (old == PD_READY) .ready else .closing;
+
+        const result = self.wait(mode);
+
+        // Race resolution. Either we unlink before fire snapshots,
+        // or fire snapshotted us and the callback is in-flight /
+        // about-to-run. If the callback is in-flight we MUST wait
+        // for it to complete before `ctx` (on our stack) goes out
+        // of scope. The completed flag bounds that wait to one
+        // unpark + decref + store; on the hot path (no cancel) the
+        // busy-wait branch never executes.
+        if (c.deregisterRemoved(&w)) {
+            self.decref();
+        } else {
+            while (!ctx.completed.load(.acquire)) std.atomic.spinLoopHint();
+        }
+
+        // wait() may have returned .ready via a kernel-driven wake
+        // (no cancel involvement); only translate to Cancelled if
+        // the cancel actually fired.
+        if (c.isFired()) return error.Cancelled;
+        return result;
     }
 };
+
+// ─── waitCancel deliver callback ─────────────────────────────────────
+//
+// One static fn that cancel.zig dispatches as `*const fn (*anyopaque)
+// void`. Interprets `ctx` as `*WaitCancelCtx` (lives on the calling
+// coro's stack — kept alive by waitCancel's busy-wait on `completed`
+// when the deregister race with fire goes our way).
+//
+// The callback does the minimum: unpark the parked coro and drop the
+// extra ref `waitCancel` took at register time. Slot manipulation is
+// deliberately left to wait()'s normal epilogue (which handles `old
+// == my_coro_ptr` as `.closing`); attempting `deliverCancel(mode)`
+// here would race with wait()'s early steps and lose the wake when
+// the slot happens to be PD_NIL.
+
+const WaitCancelCtx = struct {
+    pd: *PollDesc,
+    coro: *Coroutine,
+    completed: std.atomic.Value(bool) align(std.atomic.cache_line) =
+        std.atomic.Value(bool).init(false),
+};
+
+fn waitCancelDeliver(raw: *anyopaque) void {
+    const ctx: *WaitCancelCtx = @ptrCast(@alignCast(raw));
+    // Order: unpark first (touches the parked coro), then decref
+    // (may wake a closeAndWait parker that frees pd), then publish
+    // completion. After `completed` is observed, ctx may be freed.
+    runtime.unpark(ctx.coro);
+    ctx.pd.decref();
+    ctx.completed.store(true, .release);
+}
 
 // ────────────────────────────────────────────────────────────────────
 // Tests
@@ -583,4 +761,226 @@ test "PollDesc.evict: wakes both rg and wg waiters with .closing" {
     try (try rt.run(twoDirRoot, .{&ctx}));
     try testing.expectEqual(WaitResult.closing, ctx.r_result);
     try testing.expectEqual(WaitResult.closing, ctx.w_result);
+}
+
+// ─── Refcount + closeAndWait ────────────────────────────────────────
+
+const Cancel = cancel_mod.Cancel;
+
+test "PollDesc.incref/decref: count tracks balanced calls" {
+    var pd: PollDesc = undefined;
+    pd.init();
+    defer pd.deinit();
+    try testing.expectEqual(@as(u32, 1), pd.refcount.load(.acquire));
+    pd.incref();
+    pd.incref();
+    try testing.expectEqual(@as(u32, 3), pd.refcount.load(.acquire));
+    pd.decref();
+    pd.decref();
+    try testing.expectEqual(@as(u32, 1), pd.refcount.load(.acquire));
+}
+
+fn closeOnlyRoot(pd: *PollDesc) !void {
+    pd.closeAndWait();
+}
+
+test "PollDesc.closeAndWait: no in-flight refs returns immediately" {
+    var rt = try Runtime.init(.{ .allocator = test_alloc, .workers = 1 });
+    defer rt.deinit();
+    var pd: PollDesc = undefined;
+    pd.init();
+    defer pd.deinit();
+    try (try rt.run(closeOnlyRoot, .{&pd}));
+    try testing.expect(pd.isClosing());
+    try testing.expectEqual(@as(u32, 0), pd.refcount.load(.acquire));
+}
+
+const RefcountedWaitCtx = struct {
+    pd: *PollDesc,
+    result: WaitResult = .ready,
+};
+
+fn refcountedWaitBody(ctx: *RefcountedWaitCtx) void {
+    ctx.pd.incref();
+    defer ctx.pd.decref();
+    ctx.result = ctx.pd.wait(.read);
+}
+
+fn closeAndWaitRoot(pd: *PollDesc) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var wait_ctx = RefcountedWaitCtx{ .pd = pd };
+    var waiter = try rt.spawn(refcountedWaitBody, .{&wait_ctx});
+    // Yield enough for the waiter to incref and park.
+    var i: u32 = 0;
+    while (i < 6) : (i += 1) @import("lib.zig").yield();
+    pd.closeAndWait();
+    _ = waiter.join();
+    try testing.expectEqual(WaitResult.closing, wait_ctx.result);
+}
+
+test "PollDesc.closeAndWait: blocks until in-flight wait drains" {
+    var rt = try Runtime.init(.{ .allocator = test_alloc, .workers = 2 });
+    defer rt.deinit();
+    var pd: PollDesc = undefined;
+    pd.init();
+    defer pd.deinit();
+    try (try rt.run(closeAndWaitRoot, .{&pd}));
+    try testing.expectEqual(@as(u32, 0), pd.refcount.load(.acquire));
+    try testing.expect(pd.isClosing());
+}
+
+// ─── waitCancel ─────────────────────────────────────────────────────
+
+const TestWaitCancelCtx = struct {
+    pd: *PollDesc,
+    cancel: *Cancel,
+    mode: Mode,
+    yield_count: u32 = 0,
+    err: ?anyerror = null,
+    result: WaitResult = .ready,
+};
+
+fn waitCancelBody(ctx: *TestWaitCancelCtx) void {
+    if (ctx.pd.waitCancel(ctx.mode, ctx.cancel)) |r| {
+        ctx.result = r;
+    } else |e| {
+        ctx.err = e;
+    }
+}
+
+fn fireBody(ctx: *TestWaitCancelCtx) void {
+    var i: u32 = 0;
+    while (i < ctx.yield_count) : (i += 1) @import("lib.zig").yield();
+    ctx.cancel.fire();
+}
+
+fn deliverReadyAfterYields(ctx: *TestWaitCancelCtx) void {
+    var i: u32 = 0;
+    while (i < ctx.yield_count) : (i += 1) @import("lib.zig").yield();
+    if (ctx.pd.deliverReady(ctx.mode)) |c| runtime.unpark(c);
+}
+
+fn waitCancelFireRoot(ctx: *TestWaitCancelCtx) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var waiter = try rt.spawn(waitCancelBody, .{ctx});
+    var firer = try rt.spawn(fireBody, .{ctx});
+    _ = waiter.join();
+    _ = firer.join();
+}
+
+test "PollDesc.waitCancel: cancel.fire wakes the waiter with Cancelled" {
+    var rt = try Runtime.init(.{ .allocator = test_alloc, .workers = 2 });
+    defer rt.deinit();
+    var pd: PollDesc = undefined;
+    pd.init();
+    defer pd.deinit();
+    var c = Cancel.init(rt);
+    defer c.deinit();
+    var ctx = TestWaitCancelCtx{ .pd = &pd, .cancel = &c, .mode = .read, .yield_count = 4 };
+    try (try rt.run(waitCancelFireRoot, .{&ctx}));
+    try testing.expectEqual(@as(?anyerror, cancel_mod.Error.Cancelled), ctx.err);
+    // After waitCancel returns, both refs (the implicit owner's and
+    // any ref taken inside waitCancel) are accounted for.
+    try testing.expectEqual(@as(u32, 1), pd.refcount.load(.acquire));
+}
+
+fn waitCancelDeliverRoot(ctx: *TestWaitCancelCtx) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var waiter = try rt.spawn(waitCancelBody, .{ctx});
+    var deliverer = try rt.spawn(deliverReadyAfterYields, .{ctx});
+    _ = waiter.join();
+    _ = deliverer.join();
+}
+
+test "PollDesc.waitCancel: deliverReady wins → returns .ready, no Cancelled" {
+    var rt = try Runtime.init(.{ .allocator = test_alloc, .workers = 2 });
+    defer rt.deinit();
+    var pd: PollDesc = undefined;
+    pd.init();
+    defer pd.deinit();
+    var c = Cancel.init(rt);
+    defer c.deinit();
+    var ctx = TestWaitCancelCtx{ .pd = &pd, .cancel = &c, .mode = .read, .yield_count = 4 };
+    try (try rt.run(waitCancelDeliverRoot, .{&ctx}));
+    try testing.expectEqual(@as(?anyerror, null), ctx.err);
+    try testing.expectEqual(WaitResult.ready, ctx.result);
+    try testing.expectEqual(@as(u32, 1), pd.refcount.load(.acquire));
+}
+
+const PreFireCtx = struct { pd: *PollDesc, c: *Cancel };
+
+fn preFireBody(args: *PreFireCtx) !void {
+    try testing.expectError(
+        cancel_mod.Error.Cancelled,
+        args.pd.waitCancel(.read, args.c),
+    );
+}
+
+test "PollDesc.waitCancel: cancel pre-fired returns Cancelled without parking" {
+    var rt = try Runtime.init(.{ .allocator = test_alloc, .workers = 1 });
+    defer rt.deinit();
+    var pd: PollDesc = undefined;
+    pd.init();
+    defer pd.deinit();
+    var c = Cancel.init(rt);
+    defer c.deinit();
+    c.fire();
+    var args = PreFireCtx{ .pd = &pd, .c = &c };
+    try (try rt.run(preFireBody, .{&args}));
+    try testing.expectEqual(@as(u32, 1), pd.refcount.load(.acquire));
+}
+
+// ─── Stress: waitCancel vs fire races, vs deliverReady races ────────
+
+fn waitCancelFireStressRoot(_: *void) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var i: u32 = 0;
+    while (i < 200) : (i += 1) {
+        var pd: PollDesc = undefined;
+        pd.init();
+        defer pd.deinit();
+        var c = Cancel.init(rt);
+        defer c.deinit();
+        var ctx = TestWaitCancelCtx{ .pd = &pd, .cancel = &c, .mode = .read, .yield_count = i % 8 };
+        var waiter = try rt.spawn(waitCancelBody, .{&ctx});
+        var firer = try rt.spawn(fireBody, .{&ctx});
+        _ = waiter.join();
+        _ = firer.join();
+        try testing.expectEqual(@as(?anyerror, cancel_mod.Error.Cancelled), ctx.err);
+        try testing.expectEqual(@as(u32, 1), pd.refcount.load(.acquire));
+    }
+}
+
+test "PollDesc stress: 200 waitCancel vs fire races, all Cancelled, no refcount leaks" {
+    var rt = try Runtime.init(.{ .allocator = test_alloc, .workers = 4 });
+    defer rt.deinit();
+    var sentinel: void = {};
+    try (try rt.run(waitCancelFireStressRoot, .{&sentinel}));
+}
+
+fn waitCancelDeliverStressRoot(_: *void) !void {
+    const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
+    var i: u32 = 0;
+    while (i < 200) : (i += 1) {
+        var pd: PollDesc = undefined;
+        pd.init();
+        defer pd.deinit();
+        var c = Cancel.init(rt);
+        defer c.deinit();
+        var ctx = TestWaitCancelCtx{ .pd = &pd, .cancel = &c, .mode = .read, .yield_count = i % 8 };
+        var waiter = try rt.spawn(waitCancelBody, .{&ctx});
+        var deliverer = try rt.spawn(deliverReadyAfterYields, .{&ctx});
+        _ = waiter.join();
+        _ = deliverer.join();
+        try testing.expectEqual(@as(?anyerror, null), ctx.err);
+        try testing.expectEqual(WaitResult.ready, ctx.result);
+        try testing.expectEqual(@as(u32, 1), pd.refcount.load(.acquire));
+    }
+}
+
+test "PollDesc stress: 200 waitCancel vs deliverReady races, all .ready, no refcount leaks" {
+    var rt = try Runtime.init(.{ .allocator = test_alloc, .workers = 4 });
+    defer rt.deinit();
+    var sentinel: void = {};
+    try (try rt.run(waitCancelDeliverStressRoot, .{&sentinel}));
 }
