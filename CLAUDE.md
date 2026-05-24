@@ -3,9 +3,16 @@
 ## What is Volt?
 
 A **stackful coroutine runtime** for Zig. Kotlin-style ergonomics, native
-io_uring (Linux ≥ 5.1) / kqueue (Darwin) / IOCP (Windows) reactors, no GC.
-Designed as the substrate for NerdMeNot's async/IO libs (S3 client, HTTP
-client, PG pool, DataFrame I/O).
+io_uring (Linux ≥ 5.15, recommended ≥ 6.1) / kqueue (Darwin) / IOCP
+(Windows) reactors, no GC. Designed as the substrate for NerdMeNot's
+async/IO libs (S3 client, HTTP client, PG pool, DataFrame I/O).
+
+The Linux minimum is set by the io_uring features the reactor uses:
+`IORING_OP_POLL_ADD` (5.1), `IORING_OP_TIMEOUT` (5.4),
+`IORING_OP_ASYNC_CANCEL` (5.5), and post-restructure
+`IORING_POLL_ADD_MULTI` (5.13). 5.15 is Ubuntu 22.04 LTS's stock
+kernel — that's the floor. 6.1 unlocks `IORING_SETUP_SINGLE_ISSUER`
++ `IORING_SETUP_DEFER_TASKRUN`, which we runtime-detect and opt into.
 
 The pre-stackful tree (Future/Poll state machines) is preserved at git tag
 `pre-stackful-pivot`. An earlier stackful attempt was POC-validated against
