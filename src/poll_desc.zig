@@ -797,11 +797,23 @@ test "PollDesc.closeAndWait: no in-flight refs returns immediately" {
 
 const RefcountedWaitCtx = struct {
     pd: *PollDesc,
+    /// Set true AFTER incref so the closer can wait for the
+    /// in-flight ref to be visible before draining the owner ref.
+    /// Without this, a slow scheduler can let the closer drain
+    /// refcount to zero before the waiter even runs — then the
+    /// waiter's incref hits the prev>0 assert and panics. (Hit
+    /// once on macos-latest CI; reliably reproducible only under
+    /// the CI runner's scheduling.) Real production callers
+    /// (net.zig) will use an atomic refcount-or-closed transition;
+    /// the test just needs deterministic ordering.
+    ready: std.atomic.Value(bool) align(std.atomic.cache_line) =
+        std.atomic.Value(bool).init(false),
     result: WaitResult = .ready,
 };
 
 fn refcountedWaitBody(ctx: *RefcountedWaitCtx) void {
     ctx.pd.incref();
+    ctx.ready.store(true, .release);
     defer ctx.pd.decref();
     ctx.result = ctx.pd.wait(.read);
 }
@@ -810,7 +822,11 @@ fn closeAndWaitRoot(pd: *PollDesc) !void {
     const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
     var wait_ctx = RefcountedWaitCtx{ .pd = pd };
     var waiter = try rt.spawn(refcountedWaitBody, .{&wait_ctx});
-    // Yield enough for the waiter to incref and park.
+    while (!wait_ctx.ready.load(.acquire)) @import("lib.zig").yield();
+    // After the ready signal, yield a few more times so the waiter
+    // reaches wait()'s park before we evict — exercises the
+    // "evict wakes a parked waiter, then closeAndWait drains" path
+    // rather than the "evict beats the waiter to step 1" path.
     var i: u32 = 0;
     while (i < 6) : (i += 1) @import("lib.zig").yield();
     pd.closeAndWait();
