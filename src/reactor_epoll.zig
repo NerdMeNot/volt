@@ -46,6 +46,7 @@ const runtime = @import("runtime.zig");
 const current = @import("current.zig");
 const context = @import("context.zig");
 const cancel_mod = @import("cancel.zig");
+const poll_desc = @import("poll_desc.zig");
 
 const EPOLL_EVENTS_BATCH: usize = 32;
 
@@ -260,14 +261,59 @@ pub const Reactor = struct {
     }
 
     pub fn waitReadable(self: *Reactor, fd: i32) ReactorWaitError!void {
-        return self.waitFd(@intCast(fd), EPOLLIN);
+        return self.submitPoll(@intCast(fd), EPOLLIN);
     }
 
     pub fn waitWritable(self: *Reactor, fd: i32) ReactorWaitError!void {
-        return self.waitFd(@intCast(fd), EPOLLOUT);
+        return self.submitPoll(@intCast(fd), EPOLLOUT);
     }
 
-    fn waitFd(self: *Reactor, fd: c_int, filter: u32) ReactorWaitError!void {
+    // ─── PollDesc-aware interface (Step 2b shims) ──────────────────────
+    //
+    // Cross-backend interface that the post-restructure net.zig will
+    // call. Today these are no-op / delegate shims — see reactor_kqueue
+    // for the rationale. epoll's real migration is Step 2e+.
+
+    pub fn registerFd(self: *Reactor, fd: i32, pd: *poll_desc.PollDesc) ReactorWaitError!void {
+        _ = self;
+        _ = fd;
+        _ = pd;
+    }
+
+    pub fn unregisterFd(self: *Reactor, fd: i32, pd: *poll_desc.PollDesc) void {
+        _ = self;
+        _ = fd;
+        _ = pd;
+    }
+
+    pub fn waitFd(
+        self: *Reactor,
+        fd: i32,
+        pd: *poll_desc.PollDesc,
+        mode: poll_desc.Mode,
+    ) ReactorWaitError!void {
+        _ = pd;
+        return switch (mode) {
+            .read => self.waitReadable(fd),
+            .write => self.waitWritable(fd),
+        };
+    }
+
+    pub fn waitFdCancel(
+        self: *Reactor,
+        fd: i32,
+        pd: *poll_desc.PollDesc,
+        mode: poll_desc.Mode,
+        c: *cancel_mod.Cancel,
+    ) (ReactorWaitError || cancel_mod.Error)!void {
+        _ = pd;
+        return switch (mode) {
+            .read => self.waitReadableCancel(fd, c),
+            .write => self.waitWritableCancel(fd, c),
+        };
+    }
+
+    fn submitPoll(self: *Reactor, fd: c_int, filter: u32) ReactorWaitError!void {
         const me = current.require();
         // Stack-allocate a WaitOp so closeFd has somewhere to write
         // the `closed` flag (and cancelCoro has fd to deregister).
@@ -395,14 +441,14 @@ pub const Reactor = struct {
     }
 
     pub fn waitReadableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        return self.waitFdCancel(@intCast(fd), EPOLLIN, c);
+        return self.submitPollCancel(@intCast(fd), EPOLLIN, c);
     }
 
     pub fn waitWritableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        return self.waitFdCancel(@intCast(fd), EPOLLOUT, c);
+        return self.submitPollCancel(@intCast(fd), EPOLLOUT, c);
     }
 
-    fn waitFdCancel(self: *Reactor, fd: c_int, filter: u32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+    fn submitPollCancel(self: *Reactor, fd: c_int, filter: u32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
         try c.checkpoint();
         const me = current.require();
 

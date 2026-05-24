@@ -25,6 +25,7 @@ const runtime = @import("runtime.zig");
 const current = @import("current.zig");
 const context = @import("context.zig");
 const cancel_mod = @import("cancel.zig");
+const poll_desc = @import("poll_desc.zig");
 const posix_helpers = @import("reactor_posix.zig");
 const ReactorWaitError = posix_helpers.ReactorWaitError;
 
@@ -62,7 +63,7 @@ pub const Reactor = struct {
     /// In-flight kqueue registrations (one per coroutine parked on
     /// an fd). Read by every dispatcher (`tryFindAndDispatch` and
     /// `parkWorker`) to decide whether to claim the poller role;
-    /// incremented by `waitFd` from any worker; decremented by
+    /// incremented by `submitPoll` from any worker; decremented by
     /// `poll` from the worker that claimed the poller. Atomic
     /// because multiple threads write/read it concurrently.
     ///
@@ -77,11 +78,11 @@ pub const Reactor = struct {
     /// `closeFd(fd)` can find and dispatch any coroutine parked on
     /// the fd before the close orphans the kernel registration.
     ///
-    /// Insert: `waitFd` / `waitFdCancel` after the kevent ADD
+    /// Insert: `submitPoll` / `submitPollCancel` after the kevent ADD
     /// returns success.
     /// Remove: `poll` after delivering the event, `cancelCoro` after
     /// EV_DELETE, `closeFd` after EV_DELETE, or by the coroutine
-    /// itself when `waitFd` returns (covers the rare "kevent failed
+    /// itself when `submitPoll` returns (covers the rare "kevent failed
     /// post-insert" path).
     /// Guarded by `fd_waiters_lock`; ops are short — a plain
     /// std.Thread.Mutex is fine.
@@ -158,12 +159,70 @@ pub const Reactor = struct {
     /// Park the current coroutine until `fd` is readable.
     /// Caller is expected to retry the read after this returns.
     pub fn waitReadable(self: *Reactor, fd: i32) ReactorWaitError!void {
-        return self.waitFd(fd, posix.system.EVFILT.READ);
+        return self.submitPoll(fd, posix.system.EVFILT.READ);
     }
 
     /// Park the current coroutine until `fd` is writable.
     pub fn waitWritable(self: *Reactor, fd: i32) ReactorWaitError!void {
-        return self.waitFd(fd, posix.system.EVFILT.WRITE);
+        return self.submitPoll(fd, posix.system.EVFILT.WRITE);
+    }
+
+    // ─── PollDesc-aware interface (Step 2b shims) ──────────────────────
+    //
+    // Cross-backend interface that the post-restructure net.zig will
+    // call. Today these are no-op / delegate shims:
+    //   - registerFd / unregisterFd do nothing
+    //   - waitFd / waitFdCancel ignore the PollDesc and delegate to
+    //     the existing per-wait waitReadable / waitWritable path
+    // The kqueue migration to real persistent registration + state-
+    // machine dispatch happens in a later step; this shim keeps the
+    // interface stable for the net.zig switchover (Step 2c).
+
+    /// Register `pd` as the per-fd state machine for `fd`. After a
+    /// successful return, `waitFd(fd, pd, mode)` is valid until a
+    /// matching `unregisterFd(fd, pd)`.
+    pub fn registerFd(self: *Reactor, fd: i32, pd: *poll_desc.PollDesc) ReactorWaitError!void {
+        _ = self;
+        _ = fd;
+        _ = pd;
+    }
+
+    /// Reverse of `registerFd`. Idempotent / safe to call from close.
+    pub fn unregisterFd(self: *Reactor, fd: i32, pd: *poll_desc.PollDesc) void {
+        _ = self;
+        _ = fd;
+        _ = pd;
+    }
+
+    /// Park the current coroutine until `fd` is ready for `mode`.
+    /// In the shim era `pd` is ignored and the call delegates to the
+    /// existing per-wait registration path.
+    pub fn waitFd(
+        self: *Reactor,
+        fd: i32,
+        pd: *poll_desc.PollDesc,
+        mode: poll_desc.Mode,
+    ) ReactorWaitError!void {
+        _ = pd;
+        return switch (mode) {
+            .read => self.waitReadable(fd),
+            .write => self.waitWritable(fd),
+        };
+    }
+
+    /// Cancel-aware variant of `waitFd`.
+    pub fn waitFdCancel(
+        self: *Reactor,
+        fd: i32,
+        pd: *poll_desc.PollDesc,
+        mode: poll_desc.Mode,
+        c: *cancel_mod.Cancel,
+    ) (ReactorWaitError || cancel_mod.Error)!void {
+        _ = pd;
+        return switch (mode) {
+            .read => self.waitReadableCancel(fd, c),
+            .write => self.waitWritableCancel(fd, c),
+        };
     }
 
     /// Park the current coroutine for at least `ns` nanoseconds.
@@ -197,7 +256,7 @@ pub const Reactor = struct {
         context.swap(&me.ctx, me.main_ctx);
     }
 
-    fn waitFd(self: *Reactor, fd: i32, filter: i16) ReactorWaitError!void {
+    fn submitPoll(self: *Reactor, fd: i32, filter: i16) ReactorWaitError!void {
         const me = current.require();
         // Stack-allocate a WaitOp so closeFd / cancelCoro can find
         // (ident, filter) for EV_DELETE. The non-cancel path used to
@@ -277,7 +336,7 @@ pub const Reactor = struct {
         filter: i16,
         /// Set true by `closeFd` when it dispatches this waiter
         /// because the fd was closed under the parked op. Checked
-        /// by `waitFd` / `waitFdCancel` after the swap-back; if set,
+        /// by `submitPoll` / `submitPollCancel` after the swap-back; if set,
         /// the wait returns `error.BadDescriptor` rather than
         /// continuing into a libc retry that would EBADF anyway.
         closed: bool = false,
@@ -366,15 +425,15 @@ pub const Reactor = struct {
     /// park; otherwise behaves like `waitReadable` and returns
     /// `ReactorWaitError` on register failure.
     pub fn waitReadableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        return self.waitFdCancel(fd, posix.system.EVFILT.READ, c);
+        return self.submitPollCancel(fd, posix.system.EVFILT.READ, c);
     }
 
     /// Cancel-aware variant of `waitWritable`.
     pub fn waitWritableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        return self.waitFdCancel(fd, posix.system.EVFILT.WRITE, c);
+        return self.submitPollCancel(fd, posix.system.EVFILT.WRITE, c);
     }
 
-    fn waitFdCancel(self: *Reactor, fd: i32, filter: i16, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+    fn submitPollCancel(self: *Reactor, fd: i32, filter: i16, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
         try c.checkpoint();
         const me = current.require();
 
@@ -384,7 +443,7 @@ pub const Reactor = struct {
 
         // ─── Side-table insert FIRST (closes close-vs-register race) ──────
         //
-        // See waitFd for the rationale. Must precede kernel registration
+        // See submitPoll for the rationale. Must precede kernel registration
         // so a racing closeFd finds the waiter rather than orphaning
         // a kevent that the kernel will auto-clean on fd close.
         self.insertWaiter(.{ .fd = fd, .filter = filter }, me) catch return error.SystemResources;
@@ -392,7 +451,7 @@ pub const Reactor = struct {
 
         // ─── Kernel registration SECOND (closes register-then-fire race) ──
         //
-        // Old order — registerReactor then waitFd — opened a window
+        // Old order — registerReactor then submitPoll — opened a window
         // where fire() could call cancelCoro before this coroutine
         // had registered with the kernel. The kevent DEL would
         // return ENOENT (nothing to delete), cancelCoro's "ENOENT
@@ -475,7 +534,7 @@ pub const Reactor = struct {
         me.reactor_wait_op = &op;
         defer me.reactor_wait_op = null;
 
-        // Kernel registration FIRST — see waitFdCancel for the
+        // Kernel registration FIRST — see submitPollCancel for the
         // register-then-fire race this ordering closes.
         var kev = std.mem.zeroes(posix.Kevent);
         kev.ident = @intFromPtr(me);

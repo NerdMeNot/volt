@@ -12,7 +12,7 @@
 //!
 //! Even in poll mode, io_uring beats epoll on the syscall path:
 //!
-//! - **Batched submission.** Each `waitFd` / `waitTimer` enqueues a
+//! - **Batched submission.** Each `submitPoll` / `waitTimer` enqueues a
 //!   submission queue entry (SQE) without invoking a syscall. Only
 //!   when the dispatcher calls `poll(blocking=true)` do we
 //!   `submit_and_wait` — that single syscall submits the entire
@@ -55,6 +55,7 @@ const runtime = @import("runtime.zig");
 const current = @import("current.zig");
 const context = @import("context.zig");
 const cancel_mod = @import("cancel.zig");
+const poll_desc = @import("poll_desc.zig");
 
 const linux = std.os.linux;
 const CQE_BATCH: usize = 32;
@@ -91,7 +92,7 @@ pub const Reactor = struct {
     interrupt_fd: c_int = -1,
 
     /// In-flight registrations (one per coroutine parked on an SQE).
-    /// Producers (waitFd / waitTimer) increment under `lock`; the
+    /// Producers (submitPoll / waitTimer) increment under `lock`; the
     /// poller decrements as it drains CQEs. Same role as kqueue's
     /// `pending`.
     ///
@@ -101,7 +102,7 @@ pub const Reactor = struct {
 
     /// TTAS spinlock around SQE production. The ring's SQ tail
     /// counter is shared mutable state; multiple workers calling
-    /// `waitFd` need to be serialised on the producer side.
+    /// `submitPoll` need to be serialised on the producer side.
     /// Submission and CQE consumption are single-threaded by the
     /// poller-claim in `runtime.zig`.
     lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -199,19 +200,65 @@ pub const Reactor = struct {
     }
 
     pub fn waitReadable(self: *Reactor, fd: i32) ReactorWaitError!void {
-        return self.waitFd(@intCast(fd), POLLIN);
+        return self.submitPoll(@intCast(fd), POLLIN);
     }
 
     pub fn waitWritable(self: *Reactor, fd: i32) ReactorWaitError!void {
-        return self.waitFd(@intCast(fd), POLLOUT);
+        return self.submitPoll(@intCast(fd), POLLOUT);
     }
 
-    fn waitFd(self: *Reactor, fd: i32, mask: u32) ReactorWaitError!void {
+    // ─── PollDesc-aware interface (Step 2b shims) ──────────────────────
+    //
+    // Cross-backend interface that the post-restructure net.zig will
+    // call. Today these are no-op / delegate shims — see reactor_kqueue
+    // for the rationale. io_uring's real migration is Step 2f+ (will
+    // adopt IORING_POLL_ADD_MULTI for persistent registration).
+
+    pub fn registerFd(self: *Reactor, fd: i32, pd: *poll_desc.PollDesc) ReactorWaitError!void {
+        _ = self;
+        _ = fd;
+        _ = pd;
+    }
+
+    pub fn unregisterFd(self: *Reactor, fd: i32, pd: *poll_desc.PollDesc) void {
+        _ = self;
+        _ = fd;
+        _ = pd;
+    }
+
+    pub fn waitFd(
+        self: *Reactor,
+        fd: i32,
+        pd: *poll_desc.PollDesc,
+        mode: poll_desc.Mode,
+    ) ReactorWaitError!void {
+        _ = pd;
+        return switch (mode) {
+            .read => self.waitReadable(fd),
+            .write => self.waitWritable(fd),
+        };
+    }
+
+    pub fn waitFdCancel(
+        self: *Reactor,
+        fd: i32,
+        pd: *poll_desc.PollDesc,
+        mode: poll_desc.Mode,
+        c: *cancel_mod.Cancel,
+    ) (ReactorWaitError || cancel_mod.Error)!void {
+        _ = pd;
+        return switch (mode) {
+            .read => self.waitReadableCancel(fd, c),
+            .write => self.waitWritableCancel(fd, c),
+        };
+    }
+
+    fn submitPoll(self: *Reactor, fd: i32, mask: u32) ReactorWaitError!void {
         const me = current.require();
 
         // ─── Side-table insert FIRST, poll_add SQE second ──────────────
         //
-        // See reactor_kqueue.zig waitFd: a racing closeFd between
+        // See reactor_kqueue.zig submitPoll: a racing closeFd between
         // SQE submission and side-table insert orphans the parked
         // coroutine. Side-table first means closeFd finds us before
         // it submits the cancel SQE; our subsequent poll_add either
@@ -298,7 +345,7 @@ pub const Reactor = struct {
     /// is exactly one CQE per submitted op.
     ///
     /// `user_data` for the original op == `@intFromPtr(coro)`
-    /// (set in `waitFd`/`waitTimer`), so no per-coro stash needed.
+    /// (set in `submitPoll`/`waitTimer`), so no per-coro stash needed.
     /// The CANCEL SQE itself carries the sentinel `user_data` so
     /// the poll loop discards its own completion.
     pub fn cancelCoro(self: *Reactor, c: *coroutine.Coroutine) void {
@@ -331,26 +378,26 @@ pub const Reactor = struct {
     }
 
     pub fn waitReadableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        return self.waitFdCancel(@intCast(fd), POLLIN, c);
+        return self.submitPollCancel(@intCast(fd), POLLIN, c);
     }
 
     pub fn waitWritableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        return self.waitFdCancel(@intCast(fd), POLLOUT, c);
+        return self.submitPollCancel(@intCast(fd), POLLOUT, c);
     }
 
-    fn waitFdCancel(self: *Reactor, fd: i32, mask: u32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+    fn submitPollCancel(self: *Reactor, fd: i32, mask: u32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
         try c.checkpoint();
         const me = current.require();
 
         // ─── Side-table insert FIRST (closes close-vs-register race) ──────
         //
-        // See reactor_kqueue.zig waitFd for the rationale.
+        // See reactor_kqueue.zig submitPoll for the rationale.
         self.insertWaiter(fd, me) catch return error.SystemResources;
         defer _ = self.removeWaiter(fd);
 
         // ─── SQE submission SECOND (closes register-then-fire race) ──────
         //
-        // Old order — registerReactor then waitFd — opened a window
+        // Old order — registerReactor then submitPoll — opened a window
         // where fire() could call cancelCoro before this coroutine's
         // poll_add SQE was queued. The cancel SQE would land in the
         // ring before the target op SQE; the kernel processes them
@@ -415,7 +462,7 @@ pub const Reactor = struct {
             .nsec = @intCast(ns % std.time.ns_per_s),
         };
 
-        // Timeout SQE FIRST — same race rationale as waitFdCancel.
+        // Timeout SQE FIRST — same race rationale as submitPollCancel.
         self.acquire();
         const submitted = (self.ring.timeout(@intFromPtr(me), &ts, 0, 0) catch blk: {
             _ = self.ring.submit() catch {};
@@ -505,7 +552,7 @@ pub const Reactor = struct {
             }
             real_count += 1;
             // `user_data` for normal ops is the coroutine pointer
-            // we set in waitFd/waitTimer. Cast back and unpark.
+            // we set in submitPoll/waitTimer. Cast back and unpark.
             const coro: *coroutine.Coroutine = @ptrFromInt(cqes[i].user_data);
             runtime.unpark(coro);
         }

@@ -163,6 +163,55 @@ pub const Reactor = union(Backend) {
             .io_uring => |*r| r.waitTimerCancel(ns, c),
         };
     }
+
+    // ─── PollDesc-aware interface (Step 2b shims) ──────────────────────
+
+    pub fn registerFd(
+        self: *Reactor,
+        fd: i32,
+        pd: *@import("poll_desc.zig").PollDesc,
+    ) posix_helpers.ReactorWaitError!void {
+        return switch (self.*) {
+            .epoll => |*r| r.registerFd(fd, pd),
+            .io_uring => |*r| r.registerFd(fd, pd),
+        };
+    }
+
+    pub fn unregisterFd(
+        self: *Reactor,
+        fd: i32,
+        pd: *@import("poll_desc.zig").PollDesc,
+    ) void {
+        switch (self.*) {
+            .epoll => |*r| r.unregisterFd(fd, pd),
+            .io_uring => |*r| r.unregisterFd(fd, pd),
+        }
+    }
+
+    pub fn waitFd(
+        self: *Reactor,
+        fd: i32,
+        pd: *@import("poll_desc.zig").PollDesc,
+        mode: @import("poll_desc.zig").Mode,
+    ) posix_helpers.ReactorWaitError!void {
+        return switch (self.*) {
+            .epoll => |*r| r.waitFd(fd, pd, mode),
+            .io_uring => |*r| r.waitFd(fd, pd, mode),
+        };
+    }
+
+    pub fn waitFdCancel(
+        self: *Reactor,
+        fd: i32,
+        pd: *@import("poll_desc.zig").PollDesc,
+        mode: @import("poll_desc.zig").Mode,
+        c: *@import("cancel.zig").Cancel,
+    ) (posix_helpers.ReactorWaitError || @import("cancel.zig").Error)!void {
+        return switch (self.*) {
+            .epoll => |*r| r.waitFdCancel(fd, pd, mode, c),
+            .io_uring => |*r| r.waitFdCancel(fd, pd, mode, c),
+        };
+    }
 };
 
 // ─── I/O helpers ─────────────────────────────────────────────────

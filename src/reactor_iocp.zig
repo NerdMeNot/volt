@@ -62,6 +62,7 @@ const runtime = @import("runtime.zig");
 const current = @import("current.zig");
 const context = @import("context.zig");
 const cancel_mod = @import("cancel.zig");
+const poll_desc = @import("poll_desc.zig");
 
 const win = std.os.windows;
 const ws2_32 = win.ws2_32;
@@ -410,6 +411,53 @@ pub const Reactor = struct {
 
     pub fn waitWritable(self: *Reactor, fd: i32) ReactorWaitError!void {
         return self.submitReadiness(@intCast(fd), .write);
+    }
+
+    // ─── PollDesc-aware interface (Step 2b shims) ──────────────────────
+    //
+    // Cross-backend interface that the post-restructure net.zig will
+    // call. Today these are no-op / delegate shims — see reactor_kqueue
+    // for the rationale. IOCP's real migration is the biggest delta
+    // (flips Read/Write from readiness-emulation to completion-based)
+    // and lands in a later step.
+
+    pub fn registerFd(self: *Reactor, fd: i32, pd: *poll_desc.PollDesc) ReactorWaitError!void {
+        _ = self;
+        _ = fd;
+        _ = pd;
+    }
+
+    pub fn unregisterFd(self: *Reactor, fd: i32, pd: *poll_desc.PollDesc) void {
+        _ = self;
+        _ = fd;
+        _ = pd;
+    }
+
+    pub fn waitFd(
+        self: *Reactor,
+        fd: i32,
+        pd: *poll_desc.PollDesc,
+        mode: poll_desc.Mode,
+    ) ReactorWaitError!void {
+        _ = pd;
+        return switch (mode) {
+            .read => self.waitReadable(fd),
+            .write => self.waitWritable(fd),
+        };
+    }
+
+    pub fn waitFdCancel(
+        self: *Reactor,
+        fd: i32,
+        pd: *poll_desc.PollDesc,
+        mode: poll_desc.Mode,
+        c: *cancel_mod.Cancel,
+    ) (ReactorWaitError || cancel_mod.Error)!void {
+        _ = pd;
+        return switch (mode) {
+            .read => self.waitReadableCancel(fd, c),
+            .write => self.waitWritableCancel(fd, c),
+        };
     }
 
     const Direction = enum { read, write };
