@@ -28,6 +28,7 @@ const current = @import("../current.zig");
 const runtime = @import("../runtime.zig");
 const reactor_mod = @import("../reactor.zig");
 const cancel_mod = @import("../cancel.zig");
+const poll_desc = @import("../poll_desc.zig");
 const options = @import("options.zig");
 const address_mod = @import("address.zig");
 
@@ -343,7 +344,7 @@ pub const UdpSocket = struct {
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitWritable(self.fd);
+                try rt.reactor.waitFd(self.fd, &poll_desc.shim_dummy, .write);
                 continue;
             }
             if (e == EINTR) continue;
@@ -360,7 +361,7 @@ pub const UdpSocket = struct {
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitWritableCancel(self.fd, c);
+                try rt.reactor.waitFdCancel(self.fd, &poll_desc.shim_dummy, .write, c);
                 continue;
             }
             if (e == EINTR) continue;
@@ -379,7 +380,7 @@ pub const UdpSocket = struct {
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitReadable(self.fd);
+                try rt.reactor.waitFd(self.fd, &poll_desc.shim_dummy, .read);
                 continue;
             }
             if (e == EINTR) continue;
@@ -396,7 +397,7 @@ pub const UdpSocket = struct {
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitReadableCancel(self.fd, c);
+                try rt.reactor.waitFdCancel(self.fd, &poll_desc.shim_dummy, .read, c);
                 continue;
             }
             if (e == EINTR) continue;
@@ -414,7 +415,7 @@ pub const UdpSocket = struct {
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitWritable(self.fd);
+                try rt.reactor.waitFd(self.fd, &poll_desc.shim_dummy, .write);
                 continue;
             }
             if (e == EINTR) continue;
@@ -431,7 +432,7 @@ pub const UdpSocket = struct {
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitWritableCancel(self.fd, c);
+                try rt.reactor.waitFdCancel(self.fd, &poll_desc.shim_dummy, .write, c);
                 continue;
             }
             if (e == EINTR) continue;
@@ -454,7 +455,7 @@ pub const UdpSocket = struct {
             }
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitReadable(self.fd);
+                try rt.reactor.waitFd(self.fd, &poll_desc.shim_dummy, .read);
                 continue;
             }
             if (e == EINTR) continue;
@@ -478,7 +479,7 @@ pub const UdpSocket = struct {
             }
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitReadableCancel(self.fd, c);
+                try rt.reactor.waitFdCancel(self.fd, &poll_desc.shim_dummy, .read, c);
                 continue;
             }
             if (e == EINTR) continue;
@@ -506,7 +507,7 @@ pub const UdpSocket = struct {
             }
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitReadable(self.fd);
+                try rt.reactor.waitFd(self.fd, &poll_desc.shim_dummy, .read);
                 continue;
             }
             if (e == EINTR) continue;

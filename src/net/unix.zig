@@ -27,6 +27,7 @@ const current = @import("../current.zig");
 const runtime = @import("../runtime.zig");
 const reactor_mod = @import("../reactor.zig");
 const cancel_mod = @import("../cancel.zig");
+const poll_desc = @import("../poll_desc.zig");
 const options = @import("options.zig");
 
 const is_windows = builtin.os.tag == .windows;
@@ -196,7 +197,7 @@ const StreamImpl = if (is_windows) void else struct {
             if (e != EINPROGRESS) return error.ConnectFailed;
             // Wait for writable = connect completed.
             const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
-            try rt.reactor.waitWritable(fd);
+            try rt.reactor.waitFd(fd, &poll_desc.shim_dummy, .write);
         }
         return .{ .fd = @intCast(fd) };
     }
@@ -291,7 +292,7 @@ const ListenerImpl = if (is_windows) void else struct {
             }
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitReadable(self.fd);
+                try rt.reactor.waitFd(self.fd, &poll_desc.shim_dummy, .read);
                 continue;
             }
             if (e == EINTR) continue;
@@ -310,7 +311,7 @@ const ListenerImpl = if (is_windows) void else struct {
             }
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitReadableCancel(self.fd, c);
+                try rt.reactor.waitFdCancel(self.fd, &poll_desc.shim_dummy, .read, c);
                 continue;
             }
             if (e == EINTR) continue;
@@ -372,7 +373,7 @@ const DatagramImpl = if (is_windows) void else struct {
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitWritable(self.fd);
+                try rt.reactor.waitFd(self.fd, &poll_desc.shim_dummy, .write);
                 continue;
             }
             if (e == EINTR) continue;
@@ -394,7 +395,7 @@ const DatagramImpl = if (is_windows) void else struct {
             }
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitReadable(self.fd);
+                try rt.reactor.waitFd(self.fd, &poll_desc.shim_dummy, .read);
                 continue;
             }
             if (e == EINTR) continue;

@@ -448,6 +448,19 @@ pub const PollDesc = struct {
     }
 };
 
+// ─── Shim-era placeholder ────────────────────────────────────────────
+//
+// The Step 2b PollDesc-aware reactor methods (`waitFd`, `waitFdCancel`)
+// ignore their `pd` argument — they delegate to the existing per-wait
+// `waitReadable` / `waitWritable` path. Callers that don't yet hold a
+// real per-fd PollDesc pass `&shim_dummy` to satisfy the signature.
+//
+// Once all backends migrate to real PollDesc-based dispatch (Steps
+// 2d–2g) and net.zig allocates a PollDesc per socket, this dummy
+// disappears along with the shim paths. Until then it's harmless
+// shared state — the shims do not read or mutate it.
+pub var shim_dummy: PollDesc align(std.atomic.cache_line) = .{};
+
 // ─── waitCancel deliver callback ─────────────────────────────────────
 //
 // One static fn that cancel.zig dispatches as `*const fn (*anyopaque)

@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const reactor_mod = @import("reactor.zig");
+const poll_desc = @import("poll_desc.zig");
 const runtime = @import("runtime.zig");
 const current = @import("current.zig");
 
@@ -266,7 +267,7 @@ pub const TcpListener = struct {
                 return .{ .fd = @intCast(new_fd) };
             }
             if (errnoVal() != EAGAIN) return error.AcceptFailed;
-            try rt.reactor.waitReadable(self.fd);
+            try rt.reactor.waitFd(self.fd, &poll_desc.shim_dummy, .read);
         }
     }
 };
@@ -335,7 +336,7 @@ pub const TcpStream = struct {
             if (e != EINPROGRESS) return error.ConnectFailed;
             // Wait for writable = connect completed.
             const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
-            try rt.reactor.waitWritable(fd);
+            try rt.reactor.waitFd(fd, &poll_desc.shim_dummy, .write);
         }
         return .{ .fd = @intCast(fd) };
     }
@@ -742,7 +743,7 @@ fn cancelAcceptServer(ctx: *CancelAcceptCtx) !void {
     const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
     // Direct reactor path: we want to test the cancel hook,
     // not the higher-level accept wrapper.
-    const result = rt.reactor.waitReadableCancel(ctx.listener.fd, ctx.cancel);
+    const result = rt.reactor.waitFdCancel(ctx.listener.fd, &poll_desc.shim_dummy, .read, ctx.cancel);
     ctx.got = if (result) |_| null else |e| e;
 }
 

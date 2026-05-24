@@ -16,6 +16,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const reactor_mod = @import("reactor.zig");
+const poll_desc = @import("poll_desc.zig");
 
 pub const IoError = reactor_mod.IoError;
 pub const ReactorSetupError = reactor_mod.ReactorSetupError;
@@ -140,7 +141,13 @@ pub fn setNonblock(fd: i32) ReactorSetupError!void {
 /// Read up to `buf.len` bytes from `fd`, yielding to `rx` on
 /// `EAGAIN`. `rx` is taken as `anytype` so each reactor backend can
 /// supply its own concrete type without a shared base class — the
-/// only requirement is a `waitReadable(fd: i32) !void` method.
+/// only requirement is a `waitFd(fd, *PollDesc, Mode) !void` method
+/// (the Step 2b PollDesc-aware reactor interface).
+///
+/// In the shim era this routes through `&poll_desc.shim_dummy`; the
+/// shim backends ignore the pd and dispatch to their per-wait
+/// registration path. Once per-fd PollDescs are wired in net.zig
+/// (Step 2d+), this helper will take the pd as a parameter.
 ///
 /// Non-EAGAIN errnos map through `errnoToIoError` into the typed
 /// `IoError` set. Library callers can match on `error.ConnectionReset`
@@ -152,7 +159,7 @@ pub fn readAsync(rx: anytype, fd: i32, buf: []u8) IoError!usize {
         if (r >= 0) return @intCast(r);
         const e = errnoVal();
         if (e == EAGAIN) {
-            try rx.waitReadable(fd);
+            try rx.waitFd(fd, &poll_desc.shim_dummy, .read);
             continue;
         }
         if (e == Errno.EINTR) continue; // retry transparently
@@ -166,7 +173,7 @@ pub fn writeAsync(rx: anytype, fd: i32, buf: []const u8) IoError!usize {
         if (w >= 0) return @intCast(w);
         const e = errnoVal();
         if (e == EAGAIN) {
-            try rx.waitWritable(fd);
+            try rx.waitFd(fd, &poll_desc.shim_dummy, .write);
             continue;
         }
         if (e == Errno.EINTR) continue;
