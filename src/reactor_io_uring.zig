@@ -32,9 +32,16 @@
 //! `IoUring`'s SQE production is **not** thread-safe by default —
 //! producers race on the SQ tail counter. Volt has multiple workers
 //! concurrently parking coroutines on I/O, so SQE production needs
-//! a lock. Submission and CQE consumption stay on the single
-//! claimed poller worker (`runtime.tryClaimPoller`), so no
-//! additional sync there.
+//! a lock. CQE consumption stays on the single claimed poller
+//! worker (`runtime.tryClaimPoller`), so no additional sync there.
+//!
+//! Critical invariant: the SQ lock MUST NOT be held across the
+//! blocking `io_uring_enter(GETEVENTS)` call in `poll()`. A peer
+//! coroutine's `cancelCoro` / `closeFd` needs the lock to push the
+//! cancel SQE that generates the CQE we're waiting for — if we hold
+//! it through the kernel wait, the firer can't submit and we never
+//! wake. `poll()` is two-phase: flush the SQ under the lock, then
+//! wait outside it.
 //!
 //! A future optimisation could use `IORING_SETUP_SINGLE_ISSUER` to
 //! shard production per-worker via a fan-in ring; for now the
@@ -441,18 +448,40 @@ pub const Reactor = struct {
     pub fn poll(self: *Reactor, blocking: bool) usize {
         if (self.pending.load(.acquire) == 0) return 0;
 
-        // Submit any queued SQEs (the batched accumulation from
-        // every waitFd / waitTimer since the last poll) and wait
-        // for ≥ 1 completion if blocking.
+        // Two-phase: flush the SQ under the lock, then block in the
+        // kernel WITHOUT the lock. Holding the SQ spinlock across a
+        // blocking `io_uring_enter` deadlocks the firing path: a peer
+        // coroutine's `cancelCoro` (or `closeFd`) needs the same lock
+        // to push the cancel SQE that would generate the CQE we're
+        // waiting for. macOS kqueue doesn't expose this because its
+        // `kevent` syscall is kernel-side thread-safe and needs no
+        // userspace lock — that's why the recvCancel stress test
+        // passes on Darwin but hung on Linux CI for the entire phase.
         const wait_nr: u32 = if (blocking) 1 else 0;
 
+        // Phase 1: push queued SQEs to the kernel under the lock.
+        // `submit()` is non-blocking (wait_nr = 0 internally) — it
+        // only flushes the SQ tail and tells the kernel via a short
+        // `io_uring_enter` how many SQEs to consume.
         self.acquire();
-        _ = self.ring.submit_and_wait(wait_nr) catch {
+        _ = self.ring.submit() catch {
             self.release();
             return 0;
         };
         self.release();
 
+        // Phase 2: block waiting for ≥ wait_nr completions outside
+        // the lock. `enter(0, wait_nr, GETEVENTS)` submits nothing
+        // new — it just asks the kernel to wait for completions on
+        // the already-submitted SQEs. Concurrent producers can now
+        // acquire the lock, flush their own SQEs, and the kernel
+        // can complete them while we wait on the same CQ.
+        if (blocking) {
+            _ = self.ring.enter(0, wait_nr, linux.IORING_ENTER_GETEVENTS) catch return 0;
+        }
+
+        // CQE consumption is single-threaded by the
+        // `reactor_poller_taken` claim in runtime.zig — no lock needed.
         var cqes: [CQE_BATCH]linux.io_uring_cqe = undefined;
         const n = self.ring.copy_cqes(&cqes, 0) catch return 0;
         if (n == 0) return 0;
