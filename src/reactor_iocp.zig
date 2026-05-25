@@ -1,59 +1,98 @@
-//! Windows IOCP reactor — **IOCP polyfilled as readiness**.
+//! Windows IOCP reactor — **PollDesc-integrated, IOCP-as-readiness**.
 //!
-//! IOCP is fundamentally completion-based: you submit an I/O
-//! operation with a buffer, the kernel completes it asynchronously,
-//! and your code reads the result. Volt's `net.zig` is
-//! readiness-based — coroutines do their own `read`/`write` after
-//! a wake. To bridge, we use Go's `netpoll_windows.go` pattern:
+//! Step 2e migration: structural parity with `reactor_kqueue.zig`'s
+//! Step 2d.2 persistent-registration model. The user-visible wait
+//! path runs the `PollDesc` state machine in user space; the
+//! IOCP-side machinery is reduced to "submit a zero-byte probe and
+//! call `pd.deliverReady(mode)` on completion".
 //!
-//!   * **Readiness via zero-byte `WSARecv` / `WSASend`.** Submit
-//!     a zero-byte I/O op with `WSARecv` (for read-ready) or
-//!     `WSASend` (for write-ready). The completion fires when the
-//!     socket is readable/writable; the parked coroutine then does
-//!     its real read/write via the normal `net.zig` path.
-//!   * **Coroutine pointer = `OVERLAPPED.Pointer`.** Each parked
-//!     I/O stack-allocates an `OVERLAPPED`. Because Volt's stackful
-//!     coroutines have stable mmap'd stacks, the `OVERLAPPED`
-//!     pointer is valid until the coroutine resumes — same shape
-//!     as kqueue's `udata` or epoll's `data.ptr`.
-//!   * **Timers via `CreateThreadpoolTimer`.** The Windows thread
-//!     pool fires a callback on a pool thread; the callback
-//!     `PostQueuedCompletionStatus`'s a completion to the IOCP
-//!     with the coroutine pointer as the completion key. Same
-//!     wake path as fd readiness.
-//!   * **Batch harvest via `GetQueuedCompletionStatusEx`.** The
-//!     plural form (Vista+) drains up to N completions per call;
-//!     same shape as kqueue's `kevent`-with-batch or epoll's
-//!     `epoll_wait`.
+//! ## Why readiness emulation (not native completion)
 //!
-//! ## Trade-offs vs native IOCP
+//! IOCP is fundamentally completion-based — the standard pattern is
+//! a real `WSARecv` with the user's buffer, kernel-initiated DMA
+//! into it, completion delivers data + length. Volt's `net.zig`
+//! is readiness-based across platforms (kqueue, epoll, io_uring's
+//! poll mode). To keep one code path, we submit **zero-byte**
+//! `WSARecv`/`WSASend` as readiness probes — completion fires when
+//! the socket is readable/writable, the parked coroutine then
+//! retries the real syscall through the existing non-blocking
+//! path. Go's `runtime/netpoll_windows.go` ships this design.
 //!
-//! The zero-byte polyfill loses IOCP's main perf win — kernel-
-//! initiated DMA into application buffers. We pay an extra `recv`
-//! / `send` syscall per real I/O op. Justification:
+//! Trade-off: extra `recv`/`send` syscall per real I/O. Native
+//! completion mode could be layered on later without disrupting
+//! the readiness path.
 //!
-//!   - `net.zig` stays uniform across all platforms (one code path).
-//!   - Go shipped this design for 15+ years; it works.
-//!   - If perf data ever justifies it, a buffer-ownership Windows
-//!     path can be added without disrupting POSIX.
+//! ## Mapping to Volt's PollDesc state machine
+//!
+//! Each registered fd has a heap-allocated `WinPdBackend` (stored
+//! in `pd.backend_data`) holding two `PollOp`s — one each for
+//! `.read` / `.write`. A `PollOp` is an `extern struct` with
+//! `OVERLAPPED` at offset 0 (the standard Win32 "extend OVERLAPPED"
+//! pattern, exactly Go's `pollOperation` shape — see
+//! `runtime/netpoll_windows.go:58-66`):
+//!
+//! ```
+//! PollOp = { overlapped: OVERLAPPED, pd: *PollDesc, mode: Mode }
+//! ```
+//!
+//! The OVERLAPPED at offset 0 means the kernel's `lpOverlapped`
+//! pointer on completion casts directly to `*PollOp`. We then read
+//! `op.pd` and `op.mode` to drive the state machine.
+//!
+//! ### Why per-PD (not per-wait) OVERLAPPED
+//!
+//! Volt's `pd.wait` can fast-path (consume a cached `PD_READY`)
+//! without parking. If the OVERLAPPED were stack-allocated on the
+//! waiter's coroutine stack and the wait fast-pathed while a
+//! previous zero-byte probe was still in flight, the kernel would
+//! write to memory that the next stack frame may overwrite — UAF.
+//! Tying lifetime to the PD (refcount-managed via `pd.incref` /
+//! `closeAndWait`) avoids this entirely. Same memory-safety
+//! discipline as the `in_poll` barrier on `unregisterFd`.
+//!
+//! ## Wake/dispatch flow
+//!
+//! 1. `waitFd(fd, pd, mode)` → `ensureArmed(pd, mode)` CASes the
+//!    direction's `armed` flag and submits a zero-byte probe if it
+//!    wins. Then `pd.wait(mode)` runs the state machine — may
+//!    fast-path on a cached READY or park.
+//! 2. Kernel posts completion to the IOCP when ready.
+//! 3. `poll()` drains via `GetQueuedCompletionStatusEx`, casts
+//!    `lpOverlapped` to `*PollOp`, clears `armed`, calls
+//!    `pd.deliverReady(mode)` → pops parked coroutine (if any) →
+//!    `runtime.unpark`.
+//! 4. Timers + interrupt continue to ride the legacy
+//!    `lpOverlapped == null` channel (coroutine ptr in
+//!    `CompletionKey` for timers, `INTERRUPT_KEY` sentinel for
+//!    interrupts). The poll loop's first dispatch check
+//!    distinguishes timer/interrupt from I/O completions before
+//!    casting to `*PollOp`.
+//!
+//! `AcceptEx` / `ConnectEx` completions keep their existing
+//! pattern (coroutine ptr in `OVERLAPPED.DUMMYUNIONNAME.Pointer`)
+//! because they're inherently completion-based, not readiness.
+//! The poll loop distinguishes them from `PollOp` by checking
+//! `OVERLAPPED.Pointer != null`: PollOp leaves it null (pd is in
+//! the separate field), Accept/Connect set it to the coroutine.
+//!
+//! ## Lifecycle safety (`in_poll` barrier)
+//!
+//! Mirrors `reactor_kqueue.zig:96` exactly: `unregisterFd` issues
+//! `CancelIoEx(handle, NULL)` to abort all in-flight ops on the
+//! fd, then `interrupt()` + spin until `in_poll == false` so any
+//! poller mid-dispatch with a stale `OVERLAPPED` entry has
+//! finished reading the now-defunct memory before we free the
+//! `WinPdBackend`.
 //!
 //! ## Runtime verification status
 //!
-//! Volt's primary dev platform is Darwin; the implementation here
-//! is best-effort based on Win32 / Winsock documentation and Go's
-//! `netpoll_windows.go` reference. **The cross-compile gate
-//! (`zig build-lib -target x86_64-windows-gnu -lc -fno-emit-bin`)
-//! passes; runtime behaviour on Windows is unverified at the time
-//! of this commit.** Production-grade Windows support requires:
-//!
-//!   1. A Windows VM or CI runner.
-//!   2. Running the full bench gate + stress test.
-//!   3. Any bug fixes that surface (especially around `OVERLAPPED`
-//!      lifetime, WSAStartup ordering, and the threadpool timer
-//!      cleanup path).
-//!
-//! Anyone with a Windows dev environment is welcome to contribute
-//! the runtime validation pass.
+//! Volt's primary dev platform is Darwin; this implementation is
+//! validated by the cross-compile gate
+//! (`zig build-lib -target x86_64-windows-gnu -lc -fno-emit-bin`).
+//! Production-grade Windows support requires runtime validation
+//! on a Windows host (CI runner or VM) with the full bench gate +
+//! stress test. Anyone with a Windows dev environment is welcome
+//! to contribute the runtime validation pass.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -269,6 +308,48 @@ const WSA_IO_PENDING: c_int = 997;
 // both carry a real coroutine ptr.
 const INTERRUPT_KEY: usize = 0;
 
+// ─── Per-PollDesc backend state ──────────────────────────────────
+//
+// `PollOp` is the Win32 "extend OVERLAPPED" pattern — OVERLAPPED at
+// offset 0 lets the kernel's completion pointer cast directly to
+// `*PollOp`. Exactly Go's `pollOperation` shape
+// (runtime/netpoll_windows.go:58-66).
+
+const PollOp = extern struct {
+    overlapped: OVERLAPPED,
+    pd: *poll_desc.PollDesc,
+    mode_u32: u32, // 'r' or 'w' — keep as u32 for extern-struct safety
+};
+
+/// Per-fd backend state held in `pd.backend_data`. Allocated by
+/// `registerFd`, freed by `unregisterFd` after the in_poll barrier
+/// drains any in-flight dispatch.
+const WinPdBackend = struct {
+    read_op: PollOp,
+    write_op: PollOp,
+    /// "Is there an outstanding zero-byte probe in this direction?"
+    /// CAS-flipped 0→1 by the wait path before submitting; reset to
+    /// 0 by the poll loop AFTER reading the PollOp but BEFORE
+    /// `pd.deliverReady`. The ordering ensures a new wait racing in
+    /// after the clear can submit a fresh probe, while a wait racing
+    /// in before sees armed=1 and just runs `pd.wait` (the existing
+    /// probe will eventually fire).
+    read_armed: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    write_armed: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// The socket handle. Stored so the cancel-aware path can issue
+    /// `CancelIoEx(handle, &op.overlapped)` without re-threading the
+    /// fd through every call.
+    sock: SOCKET,
+};
+
+inline fn opFor(b: *WinPdBackend, mode: poll_desc.Mode) *PollOp {
+    return if (mode == .read) &b.read_op else &b.write_op;
+}
+
+inline fn armedFor(b: *WinPdBackend, mode: poll_desc.Mode) *std.atomic.Value(u32) {
+    return if (mode == .read) &b.read_armed else &b.write_armed;
+}
+
 // ─── Reactor ─────────────────────────────────────────────────────
 
 pub const Reactor = struct {
@@ -280,6 +361,15 @@ pub const Reactor = struct {
     /// In-flight I/O ops. Same role as kqueue's `pending`.
     pending: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
+    /// True while the poller is iterating the events[] buffer
+    /// returned by `GetQueuedCompletionStatusEx`. Closers that have
+    /// just issued `CancelIoEx` on an fd MUST wait for this to clear
+    /// before freeing the backend memory: the kernel may have already
+    /// transferred a completion entry into the poller's buffer (a
+    /// `*PollOp` pointer pointing into our backend struct). Same
+    /// barrier as `reactor_kqueue.zig:95`.
+    in_poll: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     /// `AcceptEx` / `ConnectEx` are dynamically loaded via WSAIoctl
     /// (Winsock extension funcs aren't standard DLL exports). 0 means
     /// "not loaded yet"; first caller loads and publishes via .release.
@@ -288,18 +378,6 @@ pub const Reactor = struct {
     acceptex_fn_raw: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     connectex_fn_raw: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
-    /// Reverse lookup `socket → parked coro`. closeFd uses it to
-    /// find the parked waiter and call `CancelIoEx(handle, NULL)`
-    /// before `closesocket()` — the Boost.Asio
-    /// win_iocp_socket_service_base.ipp pattern. CancelIoEx aborts
-    /// any pending overlapped op on the handle; the kernel posts a
-    /// completion with ERROR_OPERATION_ABORTED to the IOCP, and the
-    /// poll loop dispatches the parked coro normally. Like io_uring
-    /// (async-cancel model), no `op.closed` flag is needed — the
-    /// post-close libc recv/send gets EBADF and surfaces as
-    /// BadDescriptor via the existing wsaToIoError mapping.
-    fd_waiters: std.AutoHashMapUnmanaged(i32, *coroutine.Coroutine) = .{},
-    fd_waiters_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     allocator: std.mem.Allocator,
 
     /// `WSAStartup` is per-process; ensure it's called once across
@@ -329,51 +407,12 @@ pub const Reactor = struct {
         return .{ .iocp = iocp, .allocator = allocator };
     }
 
-    inline fn lockWaiters(self: *Reactor) void {
-        while (self.fd_waiters_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
-    }
-    inline fn unlockWaiters(self: *Reactor) void {
-        self.fd_waiters_lock.store(0, .release);
-    }
-    fn insertWaiter(self: *Reactor, fd: i32, c: *coroutine.Coroutine) std.mem.Allocator.Error!void {
-        self.lockWaiters();
-        defer self.unlockWaiters();
-        try self.fd_waiters.put(self.allocator, fd, c);
-    }
-    fn removeWaiter(self: *Reactor, fd: i32) ?*coroutine.Coroutine {
-        self.lockWaiters();
-        defer self.unlockWaiters();
-        if (self.fd_waiters.fetchRemove(fd)) |kv| return kv.value;
-        return null;
-    }
-
-    /// Close a socket whose IOCP-pended overlapped op may have a
-    /// parked coroutine waiting on it. Mirrors reactor_kqueue.zig
-    /// closeFd in spirit but uses the Boost.Asio CancelIoEx-before-
-    /// closesocket pattern (see reactor-reference-map.md):
-    ///
-    ///   1. Look up the parked coro via the side-table.
-    ///   2. CancelIoEx(handle, NULL) aborts ALL pending overlapped
-    ///      ops on the handle. The kernel posts an
-    ///      ERROR_OPERATION_ABORTED completion to the IOCP for each
-    ///      one; the poll loop dispatches the coro normally.
-    ///   3. closesocket(handle) releases the socket.
-    ///
-    /// Order is CancelIoEx FIRST, closesocket SECOND. If close
-    /// races first, CancelIoEx returns ERROR_NOT_FOUND and the
-    /// pending op's completion never fires (or fires with stale
-    /// handle state) — the parked coro hangs forever. The Asio
-    /// `win_iocp_socket_service_base.ipp::close` notes this is the
-    /// only safe order.
-    ///
-    /// `op.closed` flag isn't needed (unlike kqueue/epoll) because
-    /// the CancelIoEx delivery is deterministic via the completion
-    /// port, and the post-close libc recv/send retry gets WSAEBADF
-    /// (mapped to BadDescriptor by wsaToIoError).
+    /// Close a socket. In the PollDesc-integrated model PD lifecycle
+    /// (evict + closeAndWait + unregisterFd + free) is owned by the
+    /// socket type via `pd_handle.release`, called BEFORE this fn.
+    /// All this needs to do is the libc close — same as kqueue.
     pub fn closeFd(self: *Reactor, fd: i32) void {
-        _ = self.removeWaiter(fd); // drop side-table entry
-        const handle: win.HANDLE = @ptrFromInt(@as(usize, @intCast(fd)));
-        _ = CancelIoEx(handle, null); // ignore ERROR_NOT_FOUND
+        _ = self;
         _ = closesocket(@intCast(fd));
     }
 
@@ -384,8 +423,7 @@ pub const Reactor = struct {
         // coroutines first — the assertion fails loudly in debug
         // if it didn't.
         std.debug.assert(self.pending.load(.acquire) == 0);
-        std.debug.assert(self.fd_waiters.count() == 0);
-        self.fd_waiters.deinit(self.allocator);
+        std.debug.assert(!self.in_poll.load(.acquire));
         _ = CloseHandle(self.iocp);
         // WSACleanup is intentionally not called; matches the
         // single-Runtime-per-process common case. A future
@@ -405,47 +443,121 @@ pub const Reactor = struct {
         if (ret == null) return error.IocpAssociateFailed;
     }
 
-    pub fn waitReadable(self: *Reactor, fd: i32) ReactorWaitError!void {
-        return self.submitReadiness(@intCast(fd), .read);
-    }
+    // ─── PollDesc-aware interface ──────────────────────────────────
 
-    pub fn waitWritable(self: *Reactor, fd: i32) ReactorWaitError!void {
-        return self.submitReadiness(@intCast(fd), .write);
-    }
-
-    // ─── PollDesc-aware interface (Step 2b shims) ──────────────────────
-    //
-    // Cross-backend interface that the post-restructure net.zig will
-    // call. Today these are no-op / delegate shims — see reactor_kqueue
-    // for the rationale. IOCP's real migration is the biggest delta
-    // (flips Read/Write from readiness-emulation to completion-based)
-    // and lands in a later step.
-
+    /// Register a per-fd PollDesc. Allocates the backend state and
+    /// installs it in `pd.backend_data`. The fd must already be
+    /// IOCP-associated (callers do this via `associate` at accept /
+    /// connect time — see `net.zig`'s `acceptWindows` and
+    /// `connectWindows`).
+    ///
+    /// Unlike kqueue, no kernel registration happens here — IOCP
+    /// arming is per-submission (a zero-byte WSARecv/WSASend), not
+    /// per-fd. `pending` is bumped per probe, not per register.
     pub fn registerFd(self: *Reactor, fd: i32, pd: *poll_desc.PollDesc) ReactorWaitError!void {
-        _ = self;
-        _ = fd;
-        _ = pd;
+        const backend = self.allocator.create(WinPdBackend) catch
+            return error.SystemResources;
+        backend.* = .{
+            .sock = @intCast(fd),
+            .read_op = .{
+                .overlapped = std.mem.zeroes(OVERLAPPED),
+                .pd = pd,
+                .mode_u32 = @intFromEnum(poll_desc.Mode.read),
+            },
+            .write_op = .{
+                .overlapped = std.mem.zeroes(OVERLAPPED),
+                .pd = pd,
+                .mode_u32 = @intFromEnum(poll_desc.Mode.write),
+            },
+        };
+        pd.backend_data = backend;
     }
 
+    /// Reverse of `registerFd`. Cancels any in-flight probes, waits
+    /// for the poll loop to drain entries that may reference our
+    /// backend, then frees it.
+    ///
+    /// `CancelIoEx(handle, NULL)` aborts all overlapped ops on the
+    /// handle — the kernel posts `STATUS_CANCELLED` completions to
+    /// our IOCP for each. The poll loop dispatches them via the
+    /// PollOp pointer, which drops back to `pd.deliverReady` (the
+    /// caller's `pd_handle.release` has already evicted, so any
+    /// waiter sees `.closing` and exits).
+    ///
+    /// The `interrupt()` + spin-until-`in_poll == false` is the same
+    /// barrier as `reactor_kqueue.zig:96` — events the kernel has
+    /// already transferred into a poller's user-space buffer must
+    /// be drained before we free the backend they point into.
     pub fn unregisterFd(self: *Reactor, fd: i32, pd: *poll_desc.PollDesc) void {
-        _ = self;
-        _ = fd;
-        _ = pd;
+        const backend_ptr = pd.backend_data orelse return;
+        const backend: *WinPdBackend = @ptrCast(@alignCast(backend_ptr));
+
+        // Cancel any in-flight zero-byte probes. The kernel posts a
+        // STATUS_CANCELLED completion for each to the IOCP. ERROR_NOT_FOUND
+        // (no in-flight ops) is the common case — silently ignored.
+        const handle: win.HANDLE = @ptrFromInt(@as(usize, @intCast(fd)));
+        _ = CancelIoEx(handle, null);
+
+        // Drain the cancellation completions before freeing the
+        // backend. `pd_handle.release` has already run `evict` +
+        // `closeAndWait`, so the PD's refcount is zero and no
+        // waiter can call `ensureArmed` to submit a new probe.
+        // What's left: the cancellation completions queued by
+        // the kernel, which the poll loop will process by reading
+        // `*PollOp` from `lpOverlapped` (pointing into our backend).
+        //
+        // Each loop iteration:
+        //   1. `poll(false)` — pull any visible completions into
+        //      our thread and dispatch (clears armed → no-op
+        //      deliverReady since slot is PD_NIL post-evict).
+        //   2. `interrupt()` + spin until `in_poll == false` —
+        //      catches a concurrent worker that pulled a completion
+        //      for our backend into its `entries[]` buffer before
+        //      we did. The barrier guarantees that worker has
+        //      finished dispatching before we free.
+        //   3. If both armed flags are still 0 after the in_poll
+        //      barrier clears, we're done — no more completions
+        //      can reference our backend.
+        //
+        // Bounded by 10,000 iterations as a safety net; in practice
+        // STATUS_CANCELLED arrives within a handful of polls.
+        var spins: u32 = 0;
+        while (spins < 10_000) : (spins += 1) {
+            _ = self.poll(false);
+            self.interrupt();
+            while (self.in_poll.load(.acquire)) std.atomic.spinLoopHint();
+            if (armedFor(backend, .read).load(.acquire) == 0 and
+                armedFor(backend, .write).load(.acquire) == 0)
+            {
+                break;
+            }
+            std.atomic.spinLoopHint();
+        }
+
+        pd.backend_data = null;
+        self.allocator.destroy(backend);
     }
 
+    /// Park the current coroutine until `fd` is ready in `mode`.
+    /// Runs the `pd.wait` state machine after ensuring a zero-byte
+    /// readiness probe is in flight.
     pub fn waitFd(
         self: *Reactor,
         fd: i32,
         pd: *poll_desc.PollDesc,
         mode: poll_desc.Mode,
     ) ReactorWaitError!void {
-        _ = pd;
-        return switch (mode) {
-            .read => self.waitReadable(fd),
-            .write => self.waitWritable(fd),
+        _ = fd;
+        pd.incref();
+        defer pd.decref();
+        try self.ensureArmed(pd, mode);
+        return switch (pd.wait(mode)) {
+            .ready => {},
+            .closing => error.BadDescriptor,
         };
     }
 
+    /// Cancel-aware variant of `waitFd`.
     pub fn waitFdCancel(
         self: *Reactor,
         fd: i32,
@@ -453,76 +565,50 @@ pub const Reactor = struct {
         mode: poll_desc.Mode,
         c: *cancel_mod.Cancel,
     ) (ReactorWaitError || cancel_mod.Error)!void {
-        _ = pd;
-        return switch (mode) {
-            .read => self.waitReadableCancel(fd, c),
-            .write => self.waitWritableCancel(fd, c),
+        _ = fd;
+        try self.ensureArmed(pd, mode);
+        const result = try pd.waitCancel(mode, c);
+        return switch (result) {
+            .ready => {},
+            .closing => error.BadDescriptor,
         };
     }
 
-    const Direction = enum { read, write };
+    /// Submit a zero-byte WSARecv/WSASend probe if none is in flight
+    /// for `mode`. CAS-flips `armed[mode]` 0→1; the poll loop CAS-
+    /// flips it back to 0 on completion (BEFORE calling deliverReady,
+    /// so a waiter racing in after sees armed=0 and submits fresh).
+    fn ensureArmed(self: *Reactor, pd: *poll_desc.PollDesc, mode: poll_desc.Mode) ReactorWaitError!void {
+        const backend: *WinPdBackend = @ptrCast(@alignCast(pd.backend_data.?));
+        const armed = armedFor(backend, mode);
+        if (armed.cmpxchgStrong(0, 1, .acq_rel, .acquire)) |_| {
+            // Already armed — another wait submitted; we'll catch
+            // the completion via `pd.wait`'s state machine.
+            return;
+        }
 
-    fn submitReadiness(self: *Reactor, sock: usize, dir: Direction) ReactorWaitError!void {
-        const me = current.require();
-
-        // Stack-allocate OVERLAPPED. Volt's stacks are mmap'd
-        // and stable; the kernel can write to this address up
-        // until we resume.
-        var ovl: OVERLAPPED = std.mem.zeroes(OVERLAPPED);
-        // Stash the coroutine pointer in OVERLAPPED.Pointer. The
-        // union field is unused for socket I/O (it's only the file
-        // seek offset for file I/O). We can't reuse hEvent for
-        // this: mswsock's AcceptEx / ConnectEx validate hEvent as
-        // a real Win32 event-handle and fail with
-        // ERROR_INVALID_HANDLE when it isn't. WSARecv / WSASend
-        // happen to be more lenient, but using one consistent slot
-        // is cleaner than relying on per-API leniency.
-        ovl.DUMMYUNIONNAME = .{ .Pointer = @ptrFromInt(@intFromPtr(me)) };
+        const op = opFor(backend, mode);
+        op.overlapped = std.mem.zeroes(OVERLAPPED);
 
         var dummy_buf: [1]u8 = .{0};
-        var wsabuf = WSABUF{
-            .len = 0,
-            .buf = &dummy_buf,
-        };
+        var wsabuf = WSABUF{ .len = 0, .buf = &dummy_buf };
         var bytes_transferred: win.DWORD = 0;
         var flags: win.DWORD = 0;
 
-        const rc = switch (dir) {
-            .read => WSARecv(@intCast(sock), @ptrCast(&wsabuf), 1, &bytes_transferred, &flags, &ovl, null),
-            .write => WSASend(@intCast(sock), @ptrCast(&wsabuf), 1, &bytes_transferred, 0, &ovl, null),
+        const rc = switch (mode) {
+            .read => WSARecv(backend.sock, @ptrCast(&wsabuf), 1, &bytes_transferred, &flags, &op.overlapped, null),
+            .write => WSASend(backend.sock, @ptrCast(&wsabuf), 1, &bytes_transferred, 0, &op.overlapped, null),
         };
-
-        // WSARecv/Send returns 0 on immediate completion (rare for
-        // zero-byte readiness probe — only happens if the socket
-        // is already in the desired state). Returns SOCKET_ERROR
-        // (-1) for both errors and async-in-progress; WSAGetLastError
-        // == WSA_IO_PENDING is the normal path.
         if (rc != 0) {
             const e = WSAGetLastError();
-            if (e != WSA_IO_PENDING) return wsaToSetupError(e);
+            if (e != WSA_IO_PENDING) {
+                // Submit failed synchronously — no completion will
+                // fire, clear armed so the next wait can retry.
+                armed.store(0, .release);
+                return wsaToSetupError(e);
+            }
         }
-
         _ = self.pending.fetchAdd(1, .acq_rel);
-
-        // Side-table insert so a peer's closeFd can find this coro
-        // and CancelIoEx the pending overlapped op.
-        self.insertWaiter(@intCast(sock), me) catch {
-            // On allocation failure, cancel the pending overlapped
-            // op so the parked-op count stays consistent. The
-            // completion will fire on the IOCP and poll() will
-            // discard it (no coro associated since we never parked).
-            const handle: win.HANDLE = @ptrFromInt(sock);
-            _ = CancelIoEx(handle, &ovl);
-            _ = self.pending.fetchSub(1, .acq_rel);
-            return error.SystemResources;
-        };
-        defer _ = self.removeWaiter(@intCast(sock));
-
-        me.pending = .park;
-        context.swap(&me.ctx, me.main_ctx);
-        // On resume: poll() has unparked us. The OVERLAPPED on our
-        // stack is no longer in use by the kernel. Return — caller
-        // retries the real read/write.
     }
 
     fn loadExtensionFn(self: *Reactor, sock: SOCKET, guid: *const GUID, cache: *std.atomic.Value(usize)) !usize {
@@ -593,7 +679,7 @@ pub const Reactor = struct {
     }
 
     /// Cancel-aware variant of `submitAcceptEx`. Same `CancelIoEx`
-    /// mechanism as `submitReadinessCancel`: the kernel posts a
+    /// mechanism as `submitAcceptExCancel`: the kernel posts a
     /// `STATUS_CANCELLED` completion for the cancelled OVERLAPPED,
     /// the poll loop unparks via the normal path, and the caller
     /// observes `error.Cancelled` because `Cancel.isFired()` is true.
@@ -908,62 +994,21 @@ pub const Reactor = struct {
         }
     }
 
-    pub fn waitReadableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        return self.submitReadinessCancel(@intCast(fd), .read, c);
-    }
-
-    pub fn waitWritableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        return self.submitReadinessCancel(@intCast(fd), .write, c);
-    }
-
-    fn submitReadinessCancel(self: *Reactor, sock: usize, dir: Direction, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        const me = current.require();
-        try c.checkpoint();
-
-        var ovl: OVERLAPPED = std.mem.zeroes(OVERLAPPED);
-        ovl.DUMMYUNIONNAME = .{ .Pointer = @ptrFromInt(@intFromPtr(me)) };
-
-        var dummy_buf: [1]u8 = .{0};
-        var wsabuf = WSABUF{ .len = 0, .buf = &dummy_buf };
-        var bytes_transferred: win.DWORD = 0;
-        var flags: win.DWORD = 0;
-
-        const rc = switch (dir) {
-            .read => WSARecv(@intCast(sock), @ptrCast(&wsabuf), 1, &bytes_transferred, &flags, &ovl, null),
-            .write => WSASend(@intCast(sock), @ptrCast(&wsabuf), 1, &bytes_transferred, 0, &ovl, null),
-        };
-        if (rc != 0) {
-            const e = WSAGetLastError();
-            if (e != WSA_IO_PENDING) return wsaToSetupError(e);
-        }
-
-        var op = WaitOp{ .io = .{ .sock = sock, .overlapped = &ovl } };
-        me.reactor_wait_op = &op;
-        defer me.reactor_wait_op = null;
-
-        var w = cancel_mod.Waiter{};
-        const already_fired = c.registerReactor(&w, me);
-        defer c.deregister(&w);
-        if (already_fired) {
-            // Cancel fired between checkpoint and register —
-            // issue CancelIoEx now so the kernel's completion path
-            // wakes us with `STATUS_CANCELLED`.
-            _ = CancelIoEx(@ptrFromInt(sock), &ovl);
-        }
-
-        _ = self.pending.fetchAdd(1, .acq_rel);
-        me.pending = .park;
-        context.swap(&me.ctx, me.main_ctx);
-
-        if (c.isFired()) return error.Cancelled;
-    }
-
     pub fn poll(self: *Reactor, blocking: bool) usize {
         if (self.pending.load(.acquire) == 0) return 0;
 
         var entries: [COMPLETION_BATCH]OVERLAPPED_ENTRY = undefined;
         var removed: win.ULONG = 0;
         const timeout_ms: win.DWORD = if (blocking) INFINITE else 0;
+
+        // Set `in_poll` BEFORE `GetQueuedCompletionStatusEx`. Same
+        // barrier as kqueue: a concurrent `unregisterFd` about to
+        // free a backend whose PollOp pointer the kernel will
+        // transfer into our `entries[]` MUST observe `in_poll == true`
+        // for the entire window the buffer is live. See
+        // `reactor_kqueue.zig:396` for the full rationale.
+        self.in_poll.store(true, .release);
+        defer self.in_poll.store(false, .release);
 
         const ok = GetQueuedCompletionStatusEx(
             self.iocp,
@@ -980,28 +1025,56 @@ pub const Reactor = struct {
         var i: usize = 0;
         while (i < count) : (i += 1) {
             const e = &entries[i];
-            // Three completion shapes:
-            //   1. I/O completion (WSARecv/WSASend/AcceptEx/ConnectEx)
-            //      — OVERLAPPED is non-null; coroutine ptr is in
-            //      OVERLAPPED.Pointer (the union field, unused for
-            //      socket I/O — see note in submit paths).
-            //   2. Timer completion (PostQueuedCompletionStatus from
-            //      the threadpool callback) — OVERLAPPED is null;
-            //      coroutine ptr is in CompletionKey.
-            //   3. Interrupt completion (PostQueuedCompletionStatus
-            //      from `interrupt()`) — OVERLAPPED is null;
-            //      CompletionKey == INTERRUPT_KEY (the sentinel).
-            //      Doesn't count toward `pending` — skip the unpark.
-            if (e.lpOverlapped == null and e.lpCompletionKey == INTERRUPT_KEY) continue;
-
+            // Four completion shapes:
+            //   1. Interrupt — lpOverlapped == null, CompletionKey
+            //      == INTERRUPT_KEY. Skip without unparking.
+            //   2. Timer — lpOverlapped == null, CompletionKey ==
+            //      *Coroutine. Unpark directly.
+            //   3. AcceptEx/ConnectEx — lpOverlapped != null, AND
+            //      OVERLAPPED.Pointer != null (== *Coroutine). The
+            //      completion-based path inherits the legacy shape.
+            //   4. PollOp readiness probe — lpOverlapped != null AND
+            //      OVERLAPPED.Pointer == null (PollOp.overlapped is
+            //      zero-initialised by `ensureArmed`). Cast
+            //      lpOverlapped to *PollOp, clear armed, deliver
+            //      readiness through `pd.deliverReady`.
+            if (e.lpOverlapped == null) {
+                if (e.lpCompletionKey == INTERRUPT_KEY) continue;
+                // Timer completion.
+                const coro: *coroutine.Coroutine = @ptrFromInt(e.lpCompletionKey);
+                runtime.unpark(coro);
+                real_count += 1;
+                continue;
+            }
+            const ovl = e.lpOverlapped.?;
+            if (ovl.DUMMYUNIONNAME.Pointer) |coro_raw| {
+                // AcceptEx / ConnectEx completion — coroutine ptr in
+                // OVERLAPPED.Pointer.
+                const coro: *coroutine.Coroutine = @ptrCast(@alignCast(coro_raw));
+                runtime.unpark(coro);
+                real_count += 1;
+                continue;
+            }
+            // PollOp readiness completion. OVERLAPPED at offset 0 of
+            // PollOp means the kernel's `lpOverlapped` pointer is the
+            // address of `op.overlapped` — `@fieldParentPtr` recovers
+            // the enclosing PollOp.
+            const op: *PollOp = @fieldParentPtr("overlapped", ovl);
+            const pd = op.pd;
+            const mode: poll_desc.Mode = @enumFromInt(op.mode_u32);
+            const backend: *WinPdBackend = @ptrCast(@alignCast(pd.backend_data.?));
+            // Clear armed BEFORE deliverReady. A wait racing in
+            // before this would see armed=1, skip submit, and wait
+            // for the in-flight probe (us) — fine. A wait racing in
+            // after sees armed=0, submits fresh — also fine. If we
+            // cleared armed AFTER deliverReady and a wait sneaked
+            // in between deliverReady and the clear, that wait
+            // would see armed=1 and skip submit while pd had
+            // already cached PD_READY; the wait would fast-path,
+            // armed stays at 1, the next wait would deadlock.
+            armedFor(backend, mode).store(0, .release);
+            if (pd.deliverReady(mode)) |coro| runtime.unpark(coro);
             real_count += 1;
-            const coro_ptr: usize = if (e.lpOverlapped) |ovl|
-                @intFromPtr(ovl.DUMMYUNIONNAME.Pointer)
-            else
-                e.lpCompletionKey;
-
-            const coro: *coroutine.Coroutine = @ptrFromInt(coro_ptr);
-            runtime.unpark(coro);
         }
         if (real_count > 0) _ = self.pending.fetchSub(@intCast(real_count), .acq_rel);
         return real_count;
@@ -1100,13 +1173,13 @@ pub fn setNonblock(fd: i32) ReactorSetupError!void {
     if (ioctlsocket(@intCast(fd), FIONBIO, &mode) != 0) return wsaToSetupError(WSAGetLastError());
 }
 
-pub fn readAsync(rx: *Reactor, fd: i32, buf: []u8) IoError!usize {
+pub fn readAsync(rx: *Reactor, fd: i32, pd: *poll_desc.PollDesc, buf: []u8) IoError!usize {
     while (true) {
         const r = recv_zig(@intCast(fd), buf.ptr, @intCast(buf.len), 0);
         if (r >= 0) return @intCast(r);
         const e = WSAGetLastError();
         if (e == WSAEWOULDBLOCK) {
-            try rx.waitReadable(fd);
+            try rx.waitFd(fd, pd, .read);
             continue;
         }
         if (e == WSAEINTR) continue;
@@ -1114,13 +1187,13 @@ pub fn readAsync(rx: *Reactor, fd: i32, buf: []u8) IoError!usize {
     }
 }
 
-pub fn writeAsync(rx: *Reactor, fd: i32, buf: []const u8) IoError!usize {
+pub fn writeAsync(rx: *Reactor, fd: i32, pd: *poll_desc.PollDesc, buf: []const u8) IoError!usize {
     while (true) {
         const w = send_zig(@intCast(fd), buf.ptr, @intCast(buf.len), 0);
         if (w >= 0) return @intCast(w);
         const e = WSAGetLastError();
         if (e == WSAEWOULDBLOCK) {
-            try rx.waitWritable(fd);
+            try rx.waitFd(fd, pd, .write);
             continue;
         }
         if (e == WSAEINTR) continue;
@@ -1128,20 +1201,20 @@ pub fn writeAsync(rx: *Reactor, fd: i32, buf: []const u8) IoError!usize {
     }
 }
 
-pub fn readFull(rx: *Reactor, fd: i32, buf: []u8) IoError!usize {
+pub fn readFull(rx: *Reactor, fd: i32, pd: *poll_desc.PollDesc, buf: []u8) IoError!usize {
     var total: usize = 0;
     while (total < buf.len) {
-        const got = try readAsync(rx, fd, buf[total..]);
+        const got = try readAsync(rx, fd, pd, buf[total..]);
         if (got == 0) return total;
         total += got;
     }
     return total;
 }
 
-pub fn writeAll(rx: *Reactor, fd: i32, buf: []const u8) IoError!void {
+pub fn writeAll(rx: *Reactor, fd: i32, pd: *poll_desc.PollDesc, buf: []const u8) IoError!void {
     var total: usize = 0;
     while (total < buf.len) {
-        const w = try writeAsync(rx, fd, buf[total..]);
+        const w = try writeAsync(rx, fd, pd, buf[total..]);
         total += w;
     }
 }

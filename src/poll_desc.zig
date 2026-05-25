@@ -119,6 +119,16 @@ pub const PollDesc = struct {
     /// closer per PollDesc (single-owner invariant).
     close_waiter: ?*Coroutine = null,
 
+    /// Backend-specific per-PD state. Owned by the reactor:
+    /// `Reactor.registerFd` allocates, `Reactor.unregisterFd`
+    /// frees. Null when the backend keeps no per-PD state
+    /// (kqueue/epoll/io_uring — all per-fd state lives in the
+    /// kernel registration). Windows IOCP uses this to hold the
+    /// `PollOp` structs whose lifetime must outlive any single
+    /// waiter's stack frame (zero-byte readiness probes may still
+    /// be in flight when `wait` fast-paths on a cached READY).
+    backend_data: ?*anyopaque = null,
+
     pub fn init(self: *PollDesc) void {
         self.* = .{};
         self.publishInfo();
