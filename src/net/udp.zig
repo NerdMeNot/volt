@@ -223,7 +223,7 @@ const EINTR: c_int = switch (builtin.os.tag) {
 
 pub const UdpSocket = struct {
     fd: i32,
-    pd: pd_handle.Atomic = .{ .raw = null },
+    pd: pd_handle.Atomic = .{},
     /// Tracks whether `.connect(addr)` was called. Influences which
     /// of `.send/recv` vs `.sendTo/recvFrom` is correct to use; not
     /// enforced — calling the wrong one returns the kernel's error
@@ -343,6 +343,7 @@ pub const UdpSocket = struct {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         while (true) {
             const n = c_send(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0);
             if (n >= 0) return @intCast(n);
@@ -360,6 +361,7 @@ pub const UdpSocket = struct {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         while (true) {
             try c.checkpoint();
             const n = c_send(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0);
@@ -381,6 +383,7 @@ pub const UdpSocket = struct {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         while (true) {
             const n = c_recv(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0);
             if (n >= 0) return @intCast(n);
@@ -398,6 +401,7 @@ pub const UdpSocket = struct {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         while (true) {
             try c.checkpoint();
             const n = c_recv(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0);
@@ -418,6 +422,7 @@ pub const UdpSocket = struct {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         while (true) {
             const n = c_sendto(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0, addr.sockaddr(), addr.len);
             if (n >= 0) return @intCast(n);
@@ -435,6 +440,7 @@ pub const UdpSocket = struct {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         while (true) {
             try c.checkpoint();
             const n = c_sendto(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0, addr.sockaddr(), addr.len);
@@ -453,6 +459,7 @@ pub const UdpSocket = struct {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         while (true) {
             var storage: posix.sockaddr.storage = undefined;
             var sa_len: c_uint = @sizeOf(posix.sockaddr.storage);
@@ -477,6 +484,7 @@ pub const UdpSocket = struct {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         while (true) {
             try c.checkpoint();
             var storage: posix.sockaddr.storage = undefined;
@@ -507,6 +515,7 @@ pub const UdpSocket = struct {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         while (true) {
             var storage: posix.sockaddr.storage = undefined;
             var sa_len: c_uint = @sizeOf(posix.sockaddr.storage);

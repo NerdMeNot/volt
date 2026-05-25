@@ -194,7 +194,7 @@ pub const TcpListener = struct {
     /// `bind` is callable before `rt.run()` with no coroutine
     /// context to access the allocator). Owned by this listener:
     /// closed and freed in `close`.
-    pd: pd_handle.Atomic = .{ .raw = null },
+    pd: pd_handle.Atomic = .{},
     /// Windows-only: tracks whether `fd` has been associated with
     /// the reactor's IOCP yet. CreateIoCompletionPort is one-shot
     /// per handle (calling it twice fails), so we set this flag on
@@ -268,6 +268,7 @@ pub const TcpListener = struct {
             return acceptWindows(self, rt);
         }
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         while (true) {
             const new_fd = c_accept(@intCast(self.fd), null, null);
             if (new_fd >= 0) {
@@ -326,7 +327,7 @@ pub const TcpStream = struct {
     fd: i32,
     /// Per-fd PollDesc — symmetric with TcpListener; lazy-init at
     /// first wait, closed and freed in `close`.
-    pd: pd_handle.Atomic = .{ .raw = null },
+    pd: pd_handle.Atomic = .{},
 
     pub fn connect(addr: Address) !TcpStream {
         const af: c_int = if (addr.isIpv6()) AF_INET6 else AF_INET;
@@ -349,6 +350,7 @@ pub const TcpStream = struct {
             const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
             var stream: TcpStream = .{ .fd = @intCast(fd) };
             const pd = try pd_handle.ensure(&stream.pd, rt, stream.fd);
+            defer pd.decref();
             try rt.reactor.waitFd(stream.fd, pd, .write);
             return stream;
         }
@@ -386,24 +388,28 @@ pub const TcpStream = struct {
     pub fn read(self: *TcpStream, buf: []u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         return reactor_mod.readAsync(&rt.reactor, self.fd, pd, buf);
     }
 
     pub fn write(self: *TcpStream, buf: []const u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         return reactor_mod.writeAsync(&rt.reactor, self.fd, pd, buf);
     }
 
     pub fn writeAll(self: *TcpStream, buf: []const u8) !void {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         return reactor_mod.writeAll(&rt.reactor, self.fd, pd, buf);
     }
 
     pub fn readFull(self: *TcpStream, buf: []u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         return reactor_mod.readFull(&rt.reactor, self.fd, pd, buf);
     }
 
@@ -553,6 +559,7 @@ pub const TcpStream = struct {
                 self.err = error.SystemResources;
                 return error.ReadFailed;
             };
+            defer pd.decref();
             const n = reactor_mod.readAsync(&rt.reactor, self.stream.fd, pd, dest) catch |err| {
                 self.err = err;
                 return error.ReadFailed;
@@ -587,6 +594,7 @@ pub const TcpStream = struct {
                 self.err = error.SystemResources;
                 return error.WriteFailed;
             };
+            defer pd.decref();
 
             // First, drain the writer's internal buffer.
             const buffered = io_w.buffer[0..io_w.end];
@@ -771,6 +779,7 @@ fn cancelAcceptServer(ctx: *CancelAcceptCtx) !void {
     // Direct reactor path: we want to test the cancel hook,
     // not the higher-level accept wrapper.
     const pd = try pd_handle.ensure(&ctx.listener.pd, rt, ctx.listener.fd);
+    defer pd.decref();
     const result = rt.reactor.waitFdCancel(ctx.listener.fd, pd, .read, ctx.cancel);
     ctx.got = if (result) |_| null else |e| e;
 }

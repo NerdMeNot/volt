@@ -181,7 +181,7 @@ const EINPROGRESS: c_int = switch (builtin.os.tag) {
 
 const StreamImpl = if (is_windows) void else struct {
     fd: i32,
-    pd: pd_handle.Atomic = .{ .raw = null },
+    pd: pd_handle.Atomic = .{},
 
     pub fn connect(path: []const u8) !StreamImpl {
         const addr = try AddrImpl.fromPath(path);
@@ -201,6 +201,7 @@ const StreamImpl = if (is_windows) void else struct {
             const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
             var stream: StreamImpl = .{ .fd = @intCast(fd) };
             const pd = try pd_handle.ensure(&stream.pd, rt, stream.fd);
+            defer pd.decref();
             try rt.reactor.waitFd(stream.fd, pd, .write);
             return stream;
         }
@@ -220,24 +221,28 @@ const StreamImpl = if (is_windows) void else struct {
     pub fn read(self: *StreamImpl, buf: []u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         return reactor_mod.readAsync(&rt.reactor, self.fd, pd, buf);
     }
 
     pub fn write(self: *StreamImpl, buf: []const u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         return reactor_mod.writeAsync(&rt.reactor, self.fd, pd, buf);
     }
 
     pub fn writeAll(self: *StreamImpl, buf: []const u8) !void {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         return reactor_mod.writeAll(&rt.reactor, self.fd, pd, buf);
     }
 
     pub fn readFull(self: *StreamImpl, buf: []u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         return reactor_mod.readFull(&rt.reactor, self.fd, pd, buf);
     }
 };
@@ -246,7 +251,7 @@ const StreamImpl = if (is_windows) void else struct {
 
 const ListenerImpl = if (is_windows) void else struct {
     fd: i32,
-    pd: pd_handle.Atomic = .{ .raw = null },
+    pd: pd_handle.Atomic = .{},
     /// Stored so `close()` can remove the socket file. Empty for
     /// abstract Linux sockets.
     bound_path: ?[]const u8 = null,
@@ -297,6 +302,7 @@ const ListenerImpl = if (is_windows) void else struct {
     pub fn accept(self: *ListenerImpl) !StreamImpl {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         while (true) {
             const new_fd = c_accept(@intCast(self.fd), null, null);
             if (new_fd >= 0) {
@@ -316,6 +322,7 @@ const ListenerImpl = if (is_windows) void else struct {
     pub fn acceptCancel(self: *ListenerImpl, c: *cancel_mod.Cancel) (reactor_mod.IoError || cancel_mod.Error)!StreamImpl {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         while (true) {
             try c.checkpoint();
             const new_fd = c_accept(@intCast(self.fd), null, null);
@@ -338,7 +345,7 @@ const ListenerImpl = if (is_windows) void else struct {
 
 const DatagramImpl = if (is_windows) void else struct {
     fd: i32,
-    pd: pd_handle.Atomic = .{ .raw = null },
+    pd: pd_handle.Atomic = .{},
     bound_path: ?[]const u8 = null,
 
     pub const RecvFromResult = struct {
@@ -385,6 +392,7 @@ const DatagramImpl = if (is_windows) void else struct {
     pub fn sendTo(self: *DatagramImpl, buf: []const u8, addr: AddrImpl) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         while (true) {
             const n = c_sendto(@intCast(self.fd), buf.ptr, buf.len, 0, addr.sockaddr(), addr.len);
             if (n >= 0) return @intCast(n);
@@ -401,6 +409,7 @@ const DatagramImpl = if (is_windows) void else struct {
     pub fn recvFrom(self: *DatagramImpl, buf: []u8) !RecvFromResult {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         while (true) {
             var sa: posix.sockaddr.un = undefined;
             var sa_len: c_uint = @sizeOf(posix.sockaddr.un);

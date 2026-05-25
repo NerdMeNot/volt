@@ -1,22 +1,40 @@
-//! kqueue reactor (Darwin / BSD).
+//! kqueue reactor (Darwin / BSD) — persistent registration model.
 //!
-//! Inline-poll design: when the dispatch loop has no runnable work
-//! and `reactor.pending > 0`, the worker claims the single poller
-//! role and calls `reactor.poll(blocking=true)`. kevent returns the
-//! ready set; each event's `udata` is the parked coroutine's pointer,
-//! which the reactor unparks back onto the run queue.
+//! Each socket's `PollDesc` is registered with kqueue ONCE at socket
+//! creation (via `registerFd`) for both `EVFILT_READ` and
+//! `EVFILT_WRITE`, with the `*PollDesc` pointer carried in `udata`
+//! and `EV_CLEAR` for edge-triggered semantics. The registration
+//! lives for the socket's lifetime and is auto-removed by the kernel
+//! when the fd is closed — no per-wait kevent submissions.
 //!
-//! `waitReadable(fd)` / `waitWritable(fd)`, called from inside a
-//! coroutine waiting on `fd`:
-//!   1. Submit `EV_ADD | EV_ONESHOT` with the coro's pointer as udata.
-//!   2. Set `current.pending = .park`.
-//!   3. Swap to main_ctx.
-//!   4. Worker observes `.park`; coroutine sits idle in kqueue's hands.
-//!   5. fd ready → kevent → `poll` → `runtime.unpark(coro)`.
+//! `waitFd(fd, pd, mode)`:
+//!   1. Run `pd.wait(mode)` — pure user-space state machine.
+//!   2. On `.ready`, return; caller retries the syscall.
+//!   3. On `.closing`, return `error.BadDescriptor`.
 //!
-//! ONESHOT means each wait re-registers — keeps the registration set
-//! tight (no leftover stale entries) and matches the wait-once-then-
-//! resume usage pattern.
+//! `poll(blocking)`:
+//!   1. `kevent` drains ready events into a batch buffer.
+//!   2. For each event: extract `*PollDesc` from `udata`, call
+//!      `pd.deliverReady(mode)` — the state-machine CAS either pops
+//!      a parked coro (we `runtime.unpark`) or caches PD_READY for
+//!      the next wait.
+//!
+//! Why this design eliminates the per-wait registration races:
+//!   * **close-vs-register**: no per-wait register, so a peer closing
+//!     the fd while we're "between insertWaiter and kevent ADD" is
+//!     no longer a thing. The registration was made at socket open,
+//!     before any peer could see the fd.
+//!   * **cancel-vs-register**: same. Cancel-aware wait is purely
+//!     user-space — `pd.waitCancel` registers a `cancel.Waiter` that
+//!     wakes via `pd.deliverCancel` (state-machine CAS), no kernel
+//!     deregister.
+//!   * **kevent silent-error swallowing on closed fd**: there's no
+//!     kevent ADD during wait, so the "kernel accepts ADD on a just-
+//!     closed fd, reports success, never fires" footgun is gone too.
+//!
+//! Timers (`waitTimer` / `waitTimerCancel`) keep per-wait
+//! registration since they're inherently per-call. `cancelCoro` and
+//! the `WaitOp` it consumes are timer-only in this model.
 
 const std = @import("std");
 const posix = std.posix;
@@ -50,52 +68,34 @@ const INTERRUPT_IDENT: usize = 0;
 
 // Sentinel udata on the interrupt event. The poll loop distinguishes
 // interrupt completions from coroutine wakeups by checking
-// `udata == INTERRUPT_UDATA`. Zero is safe — coroutine pointers are
-// heap-allocated and never null.
+// `udata == INTERRUPT_UDATA`. Zero is safe — coroutine pointers and
+// PollDesc pointers are heap-allocated and never null.
 const INTERRUPT_UDATA: usize = 0;
-
-/// (fd, filter) — identifies a parked-waiter entry in the side-table.
-/// Same composite key kqueue uses internally for kevent identity.
-pub const FdWaiterKey = struct { fd: i32, filter: i16 };
 
 pub const Reactor = struct {
     kq: i32 = -1,
-    /// In-flight kqueue registrations (one per coroutine parked on
-    /// an fd). Read by every dispatcher (`tryFindAndDispatch` and
-    /// `parkWorker`) to decide whether to claim the poller role;
-    /// incremented by `submitPoll` from any worker; decremented by
-    /// `poll` from the worker that claimed the poller. Atomic
-    /// because multiple threads write/read it concurrently.
-    ///
-    /// Ordering rationale: `.acq_rel` on the RMW pairs the increment
-    /// (which happens before the kevent registration is observable
-    /// to the kernel) with the dispatcher's `.acquire` load that
-    /// decides to poll. The actual happens-before for fd readiness
-    /// is carried by the kernel's kqueue, not by this counter — the
-    /// counter only gates "should we bother calling kevent at all".
+    /// Sum of currently-registered kernel events (per-fd registrations
+    /// count as 2 — one each for READ and WRITE — plus one per
+    /// in-flight timer). Read by the dispatcher to decide whether to
+    /// claim the poller role; incremented at `registerFd` /
+    /// `waitTimer*`, decremented at `unregisterFd` / `poll` (timer
+    /// fires only).
     pending: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    /// Reverse lookup `(fd, filter) → parked coro`. Required so that
-    /// `closeFd(fd)` can find and dispatch any coroutine parked on
-    /// the fd before the close orphans the kernel registration.
-    ///
-    /// Insert: `submitPoll` / `submitPollCancel` after the kevent ADD
-    /// returns success.
-    /// Remove: `poll` after delivering the event, `cancelCoro` after
-    /// EV_DELETE, `closeFd` after EV_DELETE, or by the coroutine
-    /// itself when `submitPoll` returns (covers the rare "kevent failed
-    /// post-insert" path).
-    /// Guarded by `fd_waiters_lock`; ops are short — a plain
-    /// std.Thread.Mutex is fine.
-    fd_waiters: std.AutoHashMapUnmanaged(FdWaiterKey, *coroutine.Coroutine) = .{},
-    /// TTAS spinlock — ops are O(few-instructions) hashmap mutations.
-    /// std.Thread.Mutex was removed in Zig 0.16; Volt uses raw atomic
-    /// spinlocks for short critical sections (see blocking_pool.zig).
-    fd_waiters_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    /// Allocator for `fd_waiters`. Passed at init so the Reactor
-    /// doesn't need to reach back into the runtime for one.
-    allocator: std.mem.Allocator,
+
+    /// True while the poller is iterating the events[] buffer returned
+    /// by a `kevent()` call. Closers that have just issued EV_DELETE
+    /// on an fd MUST wait for this to clear before freeing the PD:
+    /// EV_DELETE removes the kernel registration synchronously, but
+    /// events already pulled into a poller's user-space `events[]`
+    /// (via a prior `kevent()`) are NOT flushed — that buffer is owned
+    /// by the poller, the kernel can't reach into it. The dispatch
+    /// loop then dereferences `udata` as `*PollDesc`, and if the
+    /// closer has already `destroy`d the PD, that's a use-after-free.
+    /// See `unregisterFd`'s wait spin.
+    in_poll: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(allocator: std.mem.Allocator) !Reactor {
+        _ = allocator; // no per-reactor allocation needed in the persistent-registration model
         const kq = std.c.kqueue();
         if (kq < 0) return error.KqueueInitFailed;
 
@@ -103,12 +103,9 @@ pub const Reactor = struct {
         // edge-triggered (the event auto-resets after each fire), so
         // a single registration serves every subsequent interrupt.
         //
-        // EV_RECEIPT — request per-change acknowledgement in the
-        // eventlist. Without it, kevent silently drops EV_ADD errors
-        // when nevents=0 AND can consume an already-fired event when
-        // nevents>0 (treating it as our changelist success). RECEIPT
-        // sidesteps both: every changelist entry yields exactly one
-        // EV_ERROR entry with `data` = 0 (success) or errno (failure).
+        // EV_RECEIPT — request per-change acknowledgement; nevents=0
+        // would silently drop ADD errors. See `submitOneChange` for
+        // the full rationale on this pattern.
         var kev = std.mem.zeroes(posix.Kevent);
         kev.ident = INTERRUPT_IDENT;
         kev.filter = EVFILT_USER;
@@ -121,7 +118,7 @@ pub const Reactor = struct {
             _ = std.c.close(kq);
             return error.KqueueInitFailed;
         }
-        return .{ .kq = kq, .allocator = allocator };
+        return .{ .kq = kq };
     }
 
     pub fn deinit(self: *Reactor) void {
@@ -131,94 +128,120 @@ pub const Reactor = struct {
         // debug builds; in release we close the kq anyway and the
         // kernel cleans up the registrations on file-handle close.
         std.debug.assert(self.pending.load(.acquire) == 0);
-        std.debug.assert(self.fd_waiters.count() == 0);
-        self.fd_waiters.deinit(self.allocator);
+        std.debug.assert(!self.in_poll.load(.acquire));
         if (self.kq >= 0) _ = std.c.close(self.kq);
         self.kq = -1;
     }
 
-    inline fn lockWaiters(self: *Reactor) void {
-        while (self.fd_waiters_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
-    }
-    inline fn unlockWaiters(self: *Reactor) void {
-        self.fd_waiters_lock.store(0, .release);
-    }
+    // ─── PollDesc-aware interface (Step 2d real implementation) ─────
 
-    /// Insert a parked-waiter entry. Returns the previous entry if
-    /// any (caller should typically expect null — having two coros
-    /// parked on the same (fd, filter) is a usage bug). Allocates on
-    /// growth via `self.allocator`.
-    fn insertWaiter(self: *Reactor, key: FdWaiterKey, c: *coroutine.Coroutine) std.mem.Allocator.Error!void {
-        self.lockWaiters();
-        defer self.unlockWaiters();
-        try self.fd_waiters.put(self.allocator, key, c);
-    }
-
-    /// Remove a parked-waiter entry. Returns the coro that was
-    /// registered (or null if no entry — `closeFd` racing with a
-    /// normal wake leaves the entry already removed).
-    fn removeWaiter(self: *Reactor, key: FdWaiterKey) ?*coroutine.Coroutine {
-        self.lockWaiters();
-        defer self.unlockWaiters();
-        if (self.fd_waiters.fetchRemove(key)) |kv| return kv.value;
-        return null;
-    }
-
-    /// Park the current coroutine until `fd` is readable.
-    /// Caller is expected to retry the read after this returns.
-    pub fn waitReadable(self: *Reactor, fd: i32) ReactorWaitError!void {
-        return self.submitPoll(fd, posix.system.EVFILT.READ);
-    }
-
-    /// Park the current coroutine until `fd` is writable.
-    pub fn waitWritable(self: *Reactor, fd: i32) ReactorWaitError!void {
-        return self.submitPoll(fd, posix.system.EVFILT.WRITE);
-    }
-
-    // ─── PollDesc-aware interface (Step 2b shims) ──────────────────────
-    //
-    // Cross-backend interface that the post-restructure net.zig will
-    // call. Today these are no-op / delegate shims:
-    //   - registerFd / unregisterFd do nothing
-    //   - waitFd / waitFdCancel ignore the PollDesc and delegate to
-    //     the existing per-wait waitReadable / waitWritable path
-    // The kqueue migration to real persistent registration + state-
-    // machine dispatch happens in a later step; this shim keeps the
-    // interface stable for the net.zig switchover (Step 2c).
-
-    /// Register `pd` as the per-fd state machine for `fd`. After a
-    /// successful return, `waitFd(fd, pd, mode)` is valid until a
-    /// matching `unregisterFd(fd, pd)`.
+    /// Register `pd` as the per-fd state machine for `fd`. Submits
+    /// `EV_ADD | EV_CLEAR | EV_RECEIPT` for both `EVFILT_READ` and
+    /// `EVFILT_WRITE` with `udata = ptr(pd)`. EV_CLEAR is edge-
+    /// triggered: poll() sees an event each time the fd transitions
+    /// to ready, and `pd.deliverReady` either pops a parked waiter
+    /// or caches PD_READY for the next wait.
+    ///
+    /// Failure (e.g. EBADF on a stale fd) returns the categorised
+    /// error and the registration is unwound — `pending` is not
+    /// touched and no waiters can possibly be parked yet.
     pub fn registerFd(self: *Reactor, fd: i32, pd: *poll_desc.PollDesc) ReactorWaitError!void {
-        _ = self;
-        _ = fd;
-        _ = pd;
+        const udata = @intFromPtr(pd);
+        const add_flags = posix.system.EV.ADD | posix.system.EV.CLEAR | posix.system.EV.RECEIPT;
+        var changes = [_]posix.Kevent{
+            .{ .ident = @intCast(fd), .filter = posix.system.EVFILT.READ, .flags = add_flags, .fflags = 0, .data = 0, .udata = udata },
+            .{ .ident = @intCast(fd), .filter = posix.system.EVFILT.WRITE, .flags = add_flags, .fflags = 0, .data = 0, .udata = udata },
+        };
+        var receipt: [2]posix.Kevent = undefined;
+        const n = posix.system.kevent(self.kq, &changes, 2, &receipt, 2, null);
+        if (n < 0) return registerError(posix_helpers.errnoVal());
+        if (n != 2) return error.Unexpected;
+        // Both receipts must report success. If either failed, undo
+        // the other — kqueue applies changelist entries in order and
+        // a partial success leaves the first registration live.
+        const r0 = if (receipt[0].data == 0) true else false;
+        const r1 = if (receipt[1].data == 0) true else false;
+        if (!r0 or !r1) {
+            // Best-effort cleanup of the half that succeeded.
+            if (r0) issueDelete(self.kq, @intCast(fd), posix.system.EVFILT.READ);
+            if (r1) issueDelete(self.kq, @intCast(fd), posix.system.EVFILT.WRITE);
+            return registerError(@intCast(if (!r0) receipt[0].data else receipt[1].data));
+        }
+        _ = self.pending.fetchAdd(2, .acq_rel);
     }
 
-    /// Reverse of `registerFd`. Idempotent / safe to call from close.
+    /// Reverse of `registerFd`. Issues `EV_DELETE` for both filters,
+    /// decrements `pending` by 2, then synchronizes with any in-flight
+    /// poll dispatch so the caller may safely free `pd`.
+    ///
+    /// The synchronization is what makes this `…Safe`. EV_DELETE
+    /// removes the kernel registration AND (per macOS man kevent)
+    /// discards any events triggered-but-not-yet-delivered to user
+    /// space. What it does NOT do is reach into a poller's existing
+    /// `events[]` buffer that was already populated by a prior
+    /// `kevent()`. If a poller is mid-dispatch with an entry whose
+    /// `udata` is our PD, and we destroy the PD before the dispatch
+    /// loop reads it, that's a use-after-free (signal BUS / scribbled
+    /// reads on macOS DebugAllocator).
+    ///
+    /// Fix: `interrupt()` to wake any poller blocked in `kevent()`
+    /// (so it can complete its current dispatch and release `in_poll`),
+    /// then spin until `in_poll == false`. The spin is short — the
+    /// dispatch loop is non-blocking — and only contends with the
+    /// (at-most-one) active poller.
     pub fn unregisterFd(self: *Reactor, fd: i32, pd: *poll_desc.PollDesc) void {
-        _ = self;
-        _ = fd;
         _ = pd;
+        issueDelete(self.kq, @intCast(fd), posix.system.EVFILT.READ);
+        issueDelete(self.kq, @intCast(fd), posix.system.EVFILT.WRITE);
+        _ = self.pending.fetchSub(2, .acq_rel);
+        // Synchronize with any in-flight poll dispatch. EV_DELETE
+        // removes the kernel registration AND discards events that
+        // were triggered-but-not-yet-delivered (per macOS man kevent).
+        // What it does NOT do is flush events that the kernel already
+        // transferred into a poller's user-space `events[]` buffer
+        // via a prior `kevent()`. If a poller is mid-dispatch with
+        // such an entry whose udata is our PD, and the caller frees
+        // `pd` once we return, dispatch reads freed memory — signal
+        // BUS on macOS DebugAllocator, or "double free" / "second
+        // free" depending on which CAS lands in the freed slot.
+        //
+        // Fix: interrupt any poller blocked in `kevent()` so it
+        // completes its current dispatch (which may include a stale
+        // entry for our fd, but the PD is still alive — we haven't
+        // returned to the caller yet), then spin until `in_poll`
+        // clears. The dispatch loop is non-blocking; the spin is
+        // typically a handful of cache-line bounces.
+        self.interrupt();
+        while (self.in_poll.load(.acquire)) std.atomic.spinLoopHint();
     }
 
-    /// Park the current coroutine until `fd` is ready for `mode`.
-    /// In the shim era `pd` is ignored and the call delegates to the
-    /// existing per-wait registration path.
+    /// Park the current coroutine until `fd` is ready in `mode`.
+    /// Runs the per-fd state machine on `pd`; the kernel side stays
+    /// armed across the call (persistent registration).
+    ///
+    /// incref/decref around `pd.wait` so a concurrent socket-close
+    /// (which calls `pd.closeAndWait` and frees the PD) can't free
+    /// the PD while we're in the post-wake epilogue still touching
+    /// its slot. `waitCancel` does its own incref; `wait` doesn't,
+    /// so this is the wrapper's job.
     pub fn waitFd(
         self: *Reactor,
         fd: i32,
         pd: *poll_desc.PollDesc,
         mode: poll_desc.Mode,
     ) ReactorWaitError!void {
-        _ = pd;
-        return switch (mode) {
-            .read => self.waitReadable(fd),
-            .write => self.waitWritable(fd),
+        _ = self;
+        _ = fd;
+        pd.incref();
+        defer pd.decref();
+        return switch (pd.wait(mode)) {
+            .ready => {},
+            .closing => error.BadDescriptor,
         };
     }
 
-    /// Cancel-aware variant of `waitFd`.
+    /// Cancel-aware variant of `waitFd`. Returns `error.Cancelled`
+    /// if `c` fires before readiness; otherwise behaves like `waitFd`.
     pub fn waitFdCancel(
         self: *Reactor,
         fd: i32,
@@ -226,12 +249,16 @@ pub const Reactor = struct {
         mode: poll_desc.Mode,
         c: *cancel_mod.Cancel,
     ) (ReactorWaitError || cancel_mod.Error)!void {
-        _ = pd;
-        return switch (mode) {
-            .read => self.waitReadableCancel(fd, c),
-            .write => self.waitWritableCancel(fd, c),
+        _ = self;
+        _ = fd;
+        const result = try pd.waitCancel(mode, c);
+        return switch (result) {
+            .ready => {},
+            .closing => error.BadDescriptor,
         };
     }
+
+    // ─── Timer (kept per-wait — timers are inherently single-shot) ──
 
     /// Park the current coroutine for at least `ns` nanoseconds.
     /// Single-shot kqueue timer keyed on the coroutine's pointer
@@ -256,8 +283,6 @@ pub const Reactor = struct {
         kev.data = @intCast(ns);
         kev.udata = @intFromPtr(me);
         var changes = [_]posix.Kevent{kev};
-        // EV_RECEIPT — see `init` and `submitPoll` for why every
-        // changelist needs explicit acknowledgement.
         var receipt: [1]posix.Kevent = undefined;
         const n = posix.system.kevent(self.kq, &changes, 1, &receipt, 1, null);
         if (n < 0) return registerError(posix_helpers.errnoVal());
@@ -269,55 +294,29 @@ pub const Reactor = struct {
         context.swap(&me.ctx, me.main_ctx);
     }
 
-    fn submitPoll(self: *Reactor, fd: i32, filter: i16) ReactorWaitError!void {
+    /// Cancel-aware variant of `waitTimer`.
+    pub fn waitTimerCancel(self: *Reactor, ns: u64, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+        try c.checkpoint();
+        if (ns == 0) return;
+        if (ns > std.math.maxInt(i64)) return error.TimeoutOutOfRange;
+
         const me = current.require();
-        // Stack-allocate a WaitOp so closeFd / cancelCoro can find
-        // (ident, filter) for EV_DELETE. The non-cancel path used to
-        // skip the WaitOp because cancelCoro wasn't possible without
-        // a Cancel — but closeFd is the same kind of cross-coroutine
-        // dispatch and needs the same plumbing.
-        var op = WaitOp{ .ident = @intCast(fd), .filter = filter };
+        var op = WaitOp{ .ident = @intFromPtr(me), .filter = EVFILT_TIMER };
         me.reactor_wait_op = &op;
         defer me.reactor_wait_op = null;
 
-        // ─── Side-table insert FIRST, kevent ADD second ─────────────────
-        //
-        // The ordering matters: if a peer coroutine's `closeFd(fd)`
-        // races between our kevent ADD and our side-table insert,
-        // closeFd sees no waiter, calls libc close(), and the kernel
-        // silently auto-removes the kevent registration on fd close.
-        // The receiver then parks forever on a registration that no
-        // longer exists.
-        //
-        // Inserting in the side-table FIRST closes that window: a
-        // concurrent closeFd that runs between our insertWaiter and
-        // our kevent ADD will find the waiter, try EV_DELETE (which
-        // returns ENOENT — registration doesn't exist yet, so closeFd
-        // does not unpark), and call libc close(). Our subsequent
-        // kevent ADD on the closed fd returns EBADF, which
-        // registerError maps to error.BadDescriptor cleanly. The
-        // receiver returns the error without ever parking.
-        self.insertWaiter(.{ .fd = fd, .filter = filter }, me) catch return error.SystemResources;
-        defer _ = self.removeWaiter(.{ .fd = fd, .filter = filter });
-
+        // Kernel registration FIRST — same register-then-fire race
+        // closure as the old submitPollCancel. fire() between
+        // registerReactor and our context.swap would otherwise call
+        // cancelCoro on a coro with no kevent to EV_DELETE.
         var kev = std.mem.zeroes(posix.Kevent);
-        kev.ident = @intCast(fd);
-        kev.filter = filter;
+        kev.ident = @intFromPtr(me);
+        kev.filter = EVFILT_TIMER;
         kev.flags = posix.system.EV.ADD | posix.system.EV.ONESHOT | posix.system.EV.RECEIPT;
+        kev.fflags = NOTE_NSECONDS;
+        kev.data = @intCast(ns);
         kev.udata = @intFromPtr(me);
         var changes = [_]posix.Kevent{kev};
-        // EV_RECEIPT — request per-change acknowledgement. Without
-        // this, two failure modes:
-        //   * nevents=0 path: EV_ADD errors (e.g., EBADF on a fd a
-        //     peer just closed between our removeWaiter and our ADD)
-        //     are silently dropped — we'd park forever on a phantom
-        //     registration.
-        //   * nevents=1 path: an already-ready event for an unrelated
-        //     registration gets consumed as if it were our changelist
-        //     ack — that registration's parked coro starves.
-        // RECEIPT sidesteps both: kevent returns exactly one entry
-        // per changelist entry, EV_ERROR flag set, data=0 for success
-        // or data=errno for failure. No unrelated events touched.
         var receipt: [1]posix.Kevent = undefined;
         const n = posix.system.kevent(self.kq, &changes, 1, &receipt, 1, null);
         if (n < 0) return registerError(posix_helpers.errnoVal());
@@ -326,54 +325,33 @@ pub const Reactor = struct {
         }
         _ = self.pending.fetchAdd(1, .acq_rel);
 
+        var w = cancel_mod.Waiter{};
+        if (c.registerReactor(&w, me)) {
+            deregisterTimer(self, kev.ident);
+            return error.Cancelled;
+        }
+        defer c.deregister(&w);
+
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
-        if (op.closed) return error.BadDescriptor;
+
+        if (c.isFired()) return error.Cancelled;
     }
 
-    /// Map a `kevent` registration errno into the categorical
-    /// `ReactorWaitError` set. EBADF means the fd was closed under
-    /// us; resource-exhaustion variants are the common
-    /// retry-and-back-off targets for downstream libraries.
-    fn registerError(e: c_int) ReactorWaitError {
-        return switch (e) {
-            posix_helpers.Errno.EBADF, posix_helpers.Errno.ENOTSOCK => error.BadDescriptor,
-            posix_helpers.Errno.EMFILE, posix_helpers.Errno.ENFILE => error.OutOfDescriptors,
-            posix_helpers.Errno.ENOMEM, posix_helpers.Errno.ENOBUFS => error.SystemResources,
-            else => error.Unexpected,
-        };
-    }
-
-    /// Number of in-flight registrations. Used by the dispatcher to
-    /// decide whether to claim the poller role.
-    pub fn pendingCount(self: *const Reactor) u32 {
-        return self.pending.load(.acquire);
-    }
-
-    /// Per-call stash for cancel-aware waits: carries the (ident,
-    /// filter) key needed to issue `EV_DELETE` for this coro's
-    /// in-flight registration. Lives on the waiter's stack and is
-    /// pointed at by `Coroutine.reactor_wait_op` for the lifetime
-    /// of the park.
+    /// Per-call stash for cancel-aware waits — now only used by the
+    /// timer path. Lives on the waiter's stack and is pointed at by
+    /// `Coroutine.reactor_wait_op` for the lifetime of the park.
     pub const WaitOp = struct {
         ident: usize,
         filter: i16,
-        /// Set true by `closeFd` when it dispatches this waiter
-        /// because the fd was closed under the parked op. Checked
-        /// by `submitPoll` / `submitPollCancel` after the swap-back; if set,
-        /// the wait returns `error.BadDescriptor` rather than
-        /// continuing into a libc retry that would EBADF anyway.
-        closed: bool = false,
     };
 
-    /// Cancel this coro's in-flight kqueue registration.
+    /// Cancel this coro's in-flight kqueue timer registration.
     ///
     /// Race-free single-unpark: `EV_DELETE` returns 0 if it actually
-    /// removed the registration (meaning the kernel hadn't yet
-    /// pulled an event for it) — only that path decrements
-    /// `pending` and unparks. If the call returns ENOENT, the
-    /// registration was already consumed by a concurrent poll();
-    /// poll's normal unpark path is in flight, and we no-op.
+    /// removed the registration (kernel hadn't pulled the event) —
+    /// only that path decrements `pending` and unparks. ENOENT means
+    /// poll() already pulled the event and its unpark is in flight.
     pub fn cancelCoro(self: *Reactor, c: *coroutine.Coroutine) void {
         const op_ptr = c.reactor_wait_op orelse return;
         const op: *WaitOp = @ptrCast(@alignCast(op_ptr));
@@ -389,240 +367,81 @@ pub const Reactor = struct {
         runtime.unpark(c);
     }
 
-    /// Close a fd whose registration may have a parked coroutine
-    /// waiting on it. Without this, the parked waiter hangs forever
-    /// because kqueue silently drops the kevent when the fd closes
-    /// (and so does epoll via EPOLL_CTL_DEL semantics, and io_uring's
-    /// POLL_ADD becomes orphaned). Per the libuv test-tcp-close-accept
-    /// regression test (and Volt's own SkipZigTest conformance cases
-    /// at src/reactor_conformance_test.zig).
-    ///
-    /// The dispatch path:
-    ///   1. Pop the (fd, filter) entry from the side-table. If two
-    ///      coros raced on the same fd, only one closeFd succeeds in
-    ///      the dispatch per filter — the other reads a null table
-    ///      entry and falls through to the libc close.
-    ///   2. Issue EV_DELETE. If 0, the kernel hadn't pulled the event
-    ///      yet — we own the unpark; set `op.closed = true` so the
-    ///      waiter returns `BadDescriptor` instead of retrying recv,
-    ///      and unpark the coro.
-    ///   3. ENOENT — poll() already pulled the event. The coro will
-    ///      resume normally and the next libc recv/send after our
-    ///      close below gets EBADF; the existing `errnoToIoError`
-    ///      path surfaces it as `BadDescriptor` cleanly. Don't write
-    ///      to op.closed in this branch — the coro may already be
-    ///      running, and the stack is not stable for cross-thread
-    ///      writes once it has resumed.
-    ///   4. libc close(fd).
-    ///
-    /// Caller must ensure no further reactor registrations land on
-    /// this fd after the call — typically by closing it from the
-    /// fd-owner type's `close()` method.
+    /// Close an fd that may have a PollDesc still registered with
+    /// kqueue. In the persistent-registration model the kernel auto-
+    /// removes EVFILT_READ/WRITE registrations on `close(fd)`, so all
+    /// we do here is the libc close. PD lifecycle (evict +
+    /// closeAndWait + unregisterFd + free) is owned by the socket
+    /// type via `pd_handle.release`, called BEFORE this fn.
     pub fn closeFd(self: *Reactor, fd: i32) void {
-        for ([_]i16{ posix.system.EVFILT.READ, posix.system.EVFILT.WRITE }) |filter| {
-            const coro = self.removeWaiter(.{ .fd = fd, .filter = filter }) orelse continue;
-            var kev = std.mem.zeroes(posix.Kevent);
-            kev.ident = @intCast(fd);
-            kev.filter = filter;
-            kev.flags = posix.system.EV.DELETE;
-            var changes = [_]posix.Kevent{kev};
-            var dummy: [1]posix.Kevent = undefined;
-            const rc = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
-            if (rc >= 0) {
-                // We won the EV_DELETE race against poll(); coro is
-                // still parked, stack is stable.
-                if (coro.reactor_wait_op) |op_ptr| {
-                    const op: *WaitOp = @ptrCast(@alignCast(op_ptr));
-                    op.closed = true;
-                }
-                _ = self.pending.fetchSub(1, .acq_rel);
-                runtime.unpark(coro);
-            }
-            // ENOENT: poll owns unpark; falls through to natural libc
-            // EBADF path. (Note: there is a residual race when the
-            // accepter's insertWaiter sneaks past our removeWaiter and
-            // its kevent ADD silently "succeeds" against the closed fd
-            // on Darwin — see Step 2d for the persistent-registration
-            // fix that eliminates the per-wait race entirely.)
-        }
+        _ = self;
         _ = posix_helpers.close(fd);
     }
 
-    /// Cancel-aware variant of `waitReadable`. Returns
-    /// `error.Cancelled` if the cancel fires before or during the
-    /// park; otherwise behaves like `waitReadable` and returns
-    /// `ReactorWaitError` on register failure.
-    pub fn waitReadableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        return self.submitPollCancel(fd, posix.system.EVFILT.READ, c);
+    /// Number of in-flight registrations. Used by the dispatcher to
+    /// decide whether to claim the poller role.
+    pub fn pendingCount(self: *const Reactor) u32 {
+        return self.pending.load(.acquire);
     }
 
-    /// Cancel-aware variant of `waitWritable`.
-    pub fn waitWritableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        return self.submitPollCancel(fd, posix.system.EVFILT.WRITE, c);
-    }
-
-    fn submitPollCancel(self: *Reactor, fd: i32, filter: i16, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        try c.checkpoint();
-        const me = current.require();
-
-        var op = WaitOp{ .ident = @intCast(fd), .filter = filter };
-        me.reactor_wait_op = &op;
-        defer me.reactor_wait_op = null;
-
-        // ─── Side-table insert FIRST (closes close-vs-register race) ──────
-        //
-        // See submitPoll for the rationale. Must precede kernel registration
-        // so a racing closeFd finds the waiter rather than orphaning
-        // a kevent that the kernel will auto-clean on fd close.
-        self.insertWaiter(.{ .fd = fd, .filter = filter }, me) catch return error.SystemResources;
-        defer _ = self.removeWaiter(.{ .fd = fd, .filter = filter });
-
-        // ─── Kernel registration SECOND (closes register-then-fire race) ──
-        //
-        // Old order — registerReactor then submitPoll — opened a window
-        // where fire() could call cancelCoro before this coroutine
-        // had registered with the kernel. The kevent DEL would
-        // return ENOENT (nothing to delete), cancelCoro's "ENOENT
-        // means poll() owns the unpark" heuristic would silently
-        // return, and the coroutine would then register and park
-        // forever. New order: register kernel side BEFORE cancel-list
-        // so any later cancelCoro finds a real kevent.
-        var kev = std.mem.zeroes(posix.Kevent);
-        kev.ident = @intCast(fd);
-        kev.filter = filter;
-        kev.flags = posix.system.EV.ADD | posix.system.EV.ONESHOT | posix.system.EV.RECEIPT;
-        kev.udata = @intFromPtr(me);
-        var changes = [_]posix.Kevent{kev};
-        // EV_RECEIPT — see `submitPoll` for the rationale.
-        var receipt: [1]posix.Kevent = undefined;
-        const n = posix.system.kevent(self.kq, &changes, 1, &receipt, 1, null);
-        if (n < 0) return registerError(posix_helpers.errnoVal());
-        if (n != 1 or receipt[0].data != 0) {
-            return registerError(@intCast(receipt[0].data));
-        }
-        _ = self.pending.fetchAdd(1, .acq_rel);
-
-        // ─── Cancel-list registration THIRD ─────────────────────────────
-        var w = cancel_mod.Waiter{};
-        if (c.registerReactor(&w, me)) {
-            // Fired before our register. cancelCoro was not called
-            // for us (we weren't in the list) — own the kevent
-            // cleanup.
-            deregisterKevent(self, kev.ident, filter);
-            return error.Cancelled;
-        }
-        defer c.deregister(&w);
-
-        // ─── Park ───────────────────────────────────────────────────────
-        //
-        // Wake source is one of:
-        //   * poll() pulled the event → normal unpark path
-        //   * cancelCoro from a later fire() → kevent DEL + unpark
-        //   * closeFd from a peer coroutine → kevent DEL + unpark
-        // If fire() happens between registerReactor returning and
-        // the swap below, runtime.unpark transitions park_state
-        // RUNNING → NOTIFIED. Dispatch's `.park` branch then
-        // re-queues immediately instead of leaving us stranded.
-        // That's the race the park_state machine exists to close
-        // (see runtime.zig:160).
-        me.pending = .park;
-        context.swap(&me.ctx, me.main_ctx);
-
-        if (op.closed) return error.BadDescriptor;
-        if (c.isFired()) return error.Cancelled;
-    }
-
-    /// Issue EV_DELETE for a (ident, filter) registration this
-    /// coroutine owns. Used by the cancel-aware wait functions'
-    /// "fired before register" cleanup path. ENOENT means poll()
-    /// or cancelCoro already removed it; only the successful
-    /// path decrements `pending`.
-    fn deregisterKevent(self: *Reactor, ident: usize, filter: i16) void {
-        var kev = std.mem.zeroes(posix.Kevent);
-        kev.ident = ident;
-        kev.filter = filter;
-        kev.flags = posix.system.EV.DELETE;
-        var changes = [_]posix.Kevent{kev};
-        var dummy: [1]posix.Kevent = undefined;
-        const rc = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
-        if (rc >= 0) _ = self.pending.fetchSub(1, .acq_rel);
-    }
-
-    /// Cancel-aware variant of `waitTimer`. The kqueue timer
-    /// registration is keyed on `(coro_ptr, EVFILT_TIMER)`, so the
-    /// same `WaitOp` mechanism + `EV_DELETE` deregister carries
-    /// through unchanged from the fd cancel path.
-    pub fn waitTimerCancel(self: *Reactor, ns: u64, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        // ns=0 mirrors waitTimer — the early-return contract is the
-        // same on every reactor (see waitTimer's comment). A zero-
-        // duration cancellable sleep should still respect a fire
-        // that happened before the call.
-        try c.checkpoint();
-        if (ns == 0) return;
-        if (ns > std.math.maxInt(i64)) return error.TimeoutOutOfRange;
-
-        const me = current.require();
-        var op = WaitOp{ .ident = @intFromPtr(me), .filter = EVFILT_TIMER };
-        me.reactor_wait_op = &op;
-        defer me.reactor_wait_op = null;
-
-        // Kernel registration FIRST — see submitPollCancel for the
-        // register-then-fire race this ordering closes.
-        var kev = std.mem.zeroes(posix.Kevent);
-        kev.ident = @intFromPtr(me);
-        kev.filter = EVFILT_TIMER;
-        kev.flags = posix.system.EV.ADD | posix.system.EV.ONESHOT | posix.system.EV.RECEIPT;
-        kev.fflags = NOTE_NSECONDS;
-        kev.data = @intCast(ns);
-        kev.udata = @intFromPtr(me);
-        var changes = [_]posix.Kevent{kev};
-        // EV_RECEIPT — see `submitPoll` for the rationale.
-        var receipt: [1]posix.Kevent = undefined;
-        const n = posix.system.kevent(self.kq, &changes, 1, &receipt, 1, null);
-        if (n < 0) return registerError(posix_helpers.errnoVal());
-        if (n != 1 or receipt[0].data != 0) {
-            return registerError(@intCast(receipt[0].data));
-        }
-        _ = self.pending.fetchAdd(1, .acq_rel);
-
-        var w = cancel_mod.Waiter{};
-        if (c.registerReactor(&w, me)) {
-            deregisterKevent(self, kev.ident, EVFILT_TIMER);
-            return error.Cancelled;
-        }
-        defer c.deregister(&w);
-
-        me.pending = .park;
-        context.swap(&me.ctx, me.main_ctx);
-
-        if (c.isFired()) return error.Cancelled;
-    }
-
-    /// Drain ready events. Returns the number of coroutines unparked.
-    /// If `blocking` is true and `pending > 0`, blocks until ≥ 1
-    /// event fires. If `blocking` is false, returns immediately
-    /// (timeout = 0).
+    /// Drain ready events. For each kernel event, decode the filter
+    /// to determine whether it's an fd readiness event (dispatch via
+    /// `pd.deliverReady`) or a timer (unpark coro directly). Returns
+    /// the number of events processed.
     pub fn poll(self: *Reactor, blocking: bool) usize {
         if (self.pending.load(.acquire) == 0) return 0;
         var events: [KEV_BATCH]posix.Kevent = undefined;
         const timeout_ptr: ?*const posix.timespec =
             if (blocking) null else &posix.timespec{ .sec = 0, .nsec = 0 };
+        // Set `in_poll` BEFORE `kevent`. A concurrent `unregisterFd`
+        // about to free a PD whose event the kernel will transfer
+        // into our `events[]` MUST observe `in_poll == true` for the
+        // entire window the buffer is live. If set after `kevent`,
+        // there's a race window between `kevent` returning a
+        // populated buffer and our `.store(true)` — a closer in that
+        // window sees false, frees, then we dispatch the stale udata.
+        //
+        // Cost: closers spin across a blocking `kevent()` too. That's
+        // bounded because `unregisterFd` issues `interrupt()` first,
+        // so the blocking `kevent()` returns promptly with the
+        // EVFILT_USER event (plus any events the kernel had queued
+        // before our EV_DELETE flushed its pre-delivery list).
+        self.in_poll.store(true, .release);
+        defer self.in_poll.store(false, .release);
         const n = posix.system.kevent(self.kq, &.{}, 0, &events, KEV_BATCH, timeout_ptr);
         if (n <= 0) return 0;
         const count: usize = @intCast(n);
-        var real_count: usize = 0;
+        var dispatched: usize = 0;
+        var timer_count: u32 = 0;
         var i: usize = 0;
         while (i < count) : (i += 1) {
-            // Interrupt events carry the sentinel udata and don't
-            // count toward `pending` — skip the unpark and the
-            // decrement. The kevent return itself was the wake.
+            // Interrupt events carry the sentinel udata.
             if (events[i].udata == INTERRUPT_UDATA) continue;
-            real_count += 1;
-            const coro: *coroutine.Coroutine = @ptrFromInt(events[i].udata);
-            runtime.unpark(coro);
+            switch (events[i].filter) {
+                posix.system.EVFILT.READ => {
+                    const pd: *poll_desc.PollDesc = @ptrFromInt(events[i].udata);
+                    if (pd.deliverReady(.read)) |coro| runtime.unpark(coro);
+                    dispatched += 1;
+                },
+                posix.system.EVFILT.WRITE => {
+                    const pd: *poll_desc.PollDesc = @ptrFromInt(events[i].udata);
+                    if (pd.deliverReady(.write)) |coro| runtime.unpark(coro);
+                    dispatched += 1;
+                },
+                EVFILT_TIMER => {
+                    const coro: *coroutine.Coroutine = @ptrFromInt(events[i].udata);
+                    runtime.unpark(coro);
+                    dispatched += 1;
+                    timer_count += 1;
+                },
+                else => {},
+            }
         }
-        if (real_count > 0) _ = self.pending.fetchSub(@intCast(real_count), .acq_rel);
-        return real_count;
+        // Only timer events decrement `pending` here — fd
+        // registrations stay armed across fires (EV_CLEAR is edge-
+        // triggered, not single-shot).
+        if (timer_count > 0) _ = self.pending.fetchSub(timer_count, .acq_rel);
+        return dispatched;
     }
 
     /// Wake a worker currently blocked in `poll(true)`. Safe to call
@@ -639,6 +458,45 @@ pub const Reactor = struct {
         _ = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
     }
 };
+
+/// Map a `kevent` registration errno into the categorical
+/// `ReactorWaitError` set.
+fn registerError(e: c_int) ReactorWaitError {
+    return switch (e) {
+        posix_helpers.Errno.EBADF, posix_helpers.Errno.ENOTSOCK => error.BadDescriptor,
+        posix_helpers.Errno.EMFILE, posix_helpers.Errno.ENFILE => error.OutOfDescriptors,
+        posix_helpers.Errno.ENOMEM, posix_helpers.Errno.ENOBUFS => error.SystemResources,
+        else => error.Unexpected,
+    };
+}
+
+/// Issue EV_DELETE for one (ident, filter) registration without
+/// affecting `pending`. Errors silently ignored — the only expected
+/// non-success is ENOENT (already removed), which is harmless.
+fn issueDelete(kq: i32, ident: usize, filter: i16) void {
+    var kev = std.mem.zeroes(posix.Kevent);
+    kev.ident = ident;
+    kev.filter = filter;
+    kev.flags = posix.system.EV.DELETE;
+    var changes = [_]posix.Kevent{kev};
+    var dummy: [1]posix.Kevent = undefined;
+    _ = posix.system.kevent(kq, &changes, 1, &dummy, 0, null);
+}
+
+/// Cancel-aware-timer rollback helper. Removes the timer kevent and
+/// decrements `pending` if the EV_DELETE actually removed it (rc >=
+/// 0). ENOENT (rc < 0) means poll() already pulled the event and is
+/// in flight on the unpark — leave it alone.
+fn deregisterTimer(self: *Reactor, ident: usize) void {
+    var kev = std.mem.zeroes(posix.Kevent);
+    kev.ident = ident;
+    kev.filter = EVFILT_TIMER;
+    kev.flags = posix.system.EV.DELETE;
+    var changes = [_]posix.Kevent{kev};
+    var dummy: [1]posix.Kevent = undefined;
+    const rc = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
+    if (rc >= 0) _ = self.pending.fetchSub(1, .acq_rel);
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Non-blocking IO helpers — shared with epoll / io_uring backends.

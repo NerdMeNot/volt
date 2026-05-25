@@ -773,7 +773,14 @@ pub const Runtime = struct {
                 const Poller = struct {
                     fn run(cn: *@import("cancel.zig").Cancel, fd: c_int) void {
                         const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
-                        rt.reactor.waitReadableCancel(fd, cn) catch return;
+                        // Lazy-init a PollDesc for the self-pipe.
+                        // pd_handle.release tears it down before the
+                        // outer scope libc-closes the pipe fds.
+                        var pd_slot: @import("pd_handle.zig").Atomic = .{};
+                        defer @import("pd_handle.zig").release(&pd_slot, fd);
+                        const pd = @import("pd_handle.zig").ensure(&pd_slot, rt, fd) catch return;
+                        defer pd.decref();
+                        rt.reactor.waitFdCancel(fd, pd, .read, cn) catch return;
                         cn.fire();
                     }
                 };
