@@ -1023,8 +1023,18 @@ fn parkWorker(rt: *Runtime, m: *M) void {
     if (m.p.lifo_slot.load(.acquire) != null) return;
     if (!m.p.local.isEmpty()) return;
     if (!m.p.mailbox.isEmpty()) return;
-    // Don't sniff sibling mailboxes here — stealing will find them
-    // on the next loop iteration if we get woken.
+    // Sniff sibling mailboxes too. The "if we get woken, stealing
+    // finds it" argument fails when the pusher's `wakeOneParked`
+    // short-circuits on `num_searching > 0`: we may be that searching
+    // worker, miss the push in our stealing pass (timing), then
+    // fetchSub and reach here. Without this check, we'd park while
+    // the just-pushed coroutine sits in some sibling's mailbox with
+    // no live worker to dispatch it — all workers eventually park
+    // and the runtime deadlocks. Repro: `poll_desc.test
+    // "PollDesc stress: 200 wait/evict races"` on ARM CI (~100%
+    // hang rate) and local cached-binary hammer (~3% rate). Cost:
+    // N-1 atomic loads per park-attempt, ~3-10 ns total at N=4-11.
+    for (rt.ps) |*p| if (p != m.p and !p.mailbox.isEmpty()) return;
     if (rt.reactor.pendingCount() > 0) return;
     if (rt.shutdown.load(.acquire)) return;
 
@@ -1038,6 +1048,7 @@ fn parkWorker(rt: *Runtime, m: *M) void {
         if (m.p.lifo_slot.load(.acquire) != null) return;
         if (!m.p.mailbox.isEmpty()) return;
         if (!m.p.local.isEmpty()) return;
+        for (rt.ps) |*p| if (p != m.p and !p.mailbox.isEmpty()) return;
         if (rt.reactor.pendingCount() > 0) return;
         if (rt.shutdown.load(.acquire)) return;
     }
