@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const reactor_mod = @import("reactor.zig");
 const poll_desc = @import("poll_desc.zig");
+const pd_handle = @import("pd_handle.zig");
 const runtime = @import("runtime.zig");
 const current = @import("current.zig");
 
@@ -189,6 +190,11 @@ test {
 
 pub const TcpListener = struct {
     fd: i32,
+    /// Per-fd PollDesc — allocated on first wait (lazy because
+    /// `bind` is callable before `rt.run()` with no coroutine
+    /// context to access the allocator). Owned by this listener:
+    /// closed and freed in `close`.
+    pd: pd_handle.Atomic = .{ .raw = null },
     /// Windows-only: tracks whether `fd` has been associated with
     /// the reactor's IOCP yet. CreateIoCompletionPort is one-shot
     /// per handle (calling it twice fails), so we set this flag on
@@ -222,6 +228,7 @@ pub const TcpListener = struct {
     }
 
     pub fn close(self: *TcpListener) void {
+        pd_handle.release(&self.pd, self.fd);
         closeFdDispatch(self.fd);
     }
 
@@ -260,6 +267,7 @@ pub const TcpListener = struct {
         if (comptime builtin.os.tag == .windows) {
             return acceptWindows(self, rt);
         }
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
         while (true) {
             const new_fd = c_accept(@intCast(self.fd), null, null);
             if (new_fd >= 0) {
@@ -267,7 +275,7 @@ pub const TcpListener = struct {
                 return .{ .fd = @intCast(new_fd) };
             }
             if (errnoVal() != EAGAIN) return error.AcceptFailed;
-            try rt.reactor.waitFd(self.fd, &poll_desc.shim_dummy, .read);
+            try rt.reactor.waitFd(self.fd, pd, .read);
         }
     }
 };
@@ -316,6 +324,9 @@ fn acceptWindows(listener: *TcpListener, rt: *runtime.Runtime) !TcpStream {
 
 pub const TcpStream = struct {
     fd: i32,
+    /// Per-fd PollDesc — symmetric with TcpListener; lazy-init at
+    /// first wait, closed and freed in `close`.
+    pd: pd_handle.Atomic = .{ .raw = null },
 
     pub fn connect(addr: Address) !TcpStream {
         const af: c_int = if (addr.isIpv6()) AF_INET6 else AF_INET;
@@ -336,12 +347,16 @@ pub const TcpStream = struct {
             if (e != EINPROGRESS) return error.ConnectFailed;
             // Wait for writable = connect completed.
             const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
-            try rt.reactor.waitFd(fd, &poll_desc.shim_dummy, .write);
+            var stream: TcpStream = .{ .fd = @intCast(fd) };
+            const pd = try pd_handle.ensure(&stream.pd, rt, stream.fd);
+            try rt.reactor.waitFd(stream.fd, pd, .write);
+            return stream;
         }
         return .{ .fd = @intCast(fd) };
     }
 
     pub fn close(self: *TcpStream) void {
+        pd_handle.release(&self.pd, self.fd);
         closeFdDispatch(self.fd);
     }
 
@@ -370,22 +385,26 @@ pub const TcpStream = struct {
 
     pub fn read(self: *TcpStream, buf: []u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
-        return reactor_mod.readAsync(&rt.reactor, self.fd, buf);
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        return reactor_mod.readAsync(&rt.reactor, self.fd, pd, buf);
     }
 
     pub fn write(self: *TcpStream, buf: []const u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
-        return reactor_mod.writeAsync(&rt.reactor, self.fd, buf);
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        return reactor_mod.writeAsync(&rt.reactor, self.fd, pd, buf);
     }
 
     pub fn writeAll(self: *TcpStream, buf: []const u8) !void {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
-        return reactor_mod.writeAll(&rt.reactor, self.fd, buf);
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        return reactor_mod.writeAll(&rt.reactor, self.fd, pd, buf);
     }
 
     pub fn readFull(self: *TcpStream, buf: []u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
-        return reactor_mod.readFull(&rt.reactor, self.fd, buf);
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        return reactor_mod.readFull(&rt.reactor, self.fd, pd, buf);
     }
 
     // ─── Socket options ─────────────────────────────────────────────
@@ -530,7 +549,11 @@ pub const TcpStream = struct {
             const self: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
             const dest = limit.slice(try io_w.writableSliceGreedy(1));
             const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
-            const n = reactor_mod.readAsync(&rt.reactor, self.stream.fd, dest) catch |err| {
+            const pd = pd_handle.ensure(&self.stream.pd, rt, self.stream.fd) catch {
+                self.err = error.SystemResources;
+                return error.ReadFailed;
+            };
+            const n = reactor_mod.readAsync(&rt.reactor, self.stream.fd, pd, dest) catch |err| {
                 self.err = err;
                 return error.ReadFailed;
             };
@@ -560,11 +583,15 @@ pub const TcpStream = struct {
         fn drainImpl(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
             const self: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
             const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+            const pd = pd_handle.ensure(&self.stream.pd, rt, self.stream.fd) catch {
+                self.err = error.SystemResources;
+                return error.WriteFailed;
+            };
 
             // First, drain the writer's internal buffer.
             const buffered = io_w.buffer[0..io_w.end];
             if (buffered.len > 0) {
-                reactor_mod.writeAll(&rt.reactor, self.stream.fd, buffered) catch |err| {
+                reactor_mod.writeAll(&rt.reactor, self.stream.fd, pd, buffered) catch |err| {
                     self.err = err;
                     return error.WriteFailed;
                 };
@@ -580,7 +607,7 @@ pub const TcpStream = struct {
                 const repeats: usize = if (i == last_idx) splat else 1;
                 var rep: usize = 0;
                 while (rep < repeats) : (rep += 1) {
-                    reactor_mod.writeAll(&rt.reactor, self.stream.fd, slice) catch |err| {
+                    reactor_mod.writeAll(&rt.reactor, self.stream.fd, pd, slice) catch |err| {
                         self.err = err;
                         return error.WriteFailed;
                     };
@@ -743,7 +770,8 @@ fn cancelAcceptServer(ctx: *CancelAcceptCtx) !void {
     const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
     // Direct reactor path: we want to test the cancel hook,
     // not the higher-level accept wrapper.
-    const result = rt.reactor.waitFdCancel(ctx.listener.fd, &poll_desc.shim_dummy, .read, ctx.cancel);
+    const pd = try pd_handle.ensure(&ctx.listener.pd, rt, ctx.listener.fd);
+    const result = rt.reactor.waitFdCancel(ctx.listener.fd, pd, .read, ctx.cancel);
     ctx.got = if (result) |_| null else |e| e;
 }
 

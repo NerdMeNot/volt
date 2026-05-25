@@ -29,6 +29,7 @@ const runtime = @import("../runtime.zig");
 const reactor_mod = @import("../reactor.zig");
 const cancel_mod = @import("../cancel.zig");
 const poll_desc = @import("../poll_desc.zig");
+const pd_handle = @import("../pd_handle.zig");
 const options = @import("options.zig");
 const address_mod = @import("address.zig");
 
@@ -222,6 +223,7 @@ const EINTR: c_int = switch (builtin.os.tag) {
 
 pub const UdpSocket = struct {
     fd: i32,
+    pd: pd_handle.Atomic = .{ .raw = null },
     /// Tracks whether `.connect(addr)` was called. Influences which
     /// of `.send/recv` vs `.sendTo/recvFrom` is correct to use; not
     /// enforced — calling the wrong one returns the kernel's error
@@ -284,6 +286,7 @@ pub const UdpSocket = struct {
     }
 
     pub fn close(self: *UdpSocket) void {
+        pd_handle.release(&self.pd, self.fd);
         // Route through reactor.closeFd when in a coroutine so any
         // parked peer (recvFrom blocked on this socket) gets
         // dispatched. Outside a coroutine, no peer can be parked —
@@ -339,12 +342,13 @@ pub const UdpSocket = struct {
     pub fn send(self: *UdpSocket, buf: []const u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
         while (true) {
             const n = c_send(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitFd(self.fd, &poll_desc.shim_dummy, .write);
+                try rt.reactor.waitFd(self.fd, pd, .write);
                 continue;
             }
             if (e == EINTR) continue;
@@ -355,13 +359,14 @@ pub const UdpSocket = struct {
     pub fn sendCancel(self: *UdpSocket, buf: []const u8, c: *cancel_mod.Cancel) (Error || cancel_mod.Error)!usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
         while (true) {
             try c.checkpoint();
             const n = c_send(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitFdCancel(self.fd, &poll_desc.shim_dummy, .write, c);
+                try rt.reactor.waitFdCancel(self.fd, pd, .write, c);
                 continue;
             }
             if (e == EINTR) continue;
@@ -375,12 +380,13 @@ pub const UdpSocket = struct {
     pub fn recv(self: *UdpSocket, buf: []u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
         while (true) {
             const n = c_recv(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitFd(self.fd, &poll_desc.shim_dummy, .read);
+                try rt.reactor.waitFd(self.fd, pd, .read);
                 continue;
             }
             if (e == EINTR) continue;
@@ -391,13 +397,14 @@ pub const UdpSocket = struct {
     pub fn recvCancel(self: *UdpSocket, buf: []u8, c: *cancel_mod.Cancel) (Error || cancel_mod.Error)!usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
         while (true) {
             try c.checkpoint();
             const n = c_recv(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitFdCancel(self.fd, &poll_desc.shim_dummy, .read, c);
+                try rt.reactor.waitFdCancel(self.fd, pd, .read, c);
                 continue;
             }
             if (e == EINTR) continue;
@@ -410,12 +417,13 @@ pub const UdpSocket = struct {
     pub fn sendTo(self: *UdpSocket, buf: []const u8, addr: Address) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
         while (true) {
             const n = c_sendto(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0, addr.sockaddr(), addr.len);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitFd(self.fd, &poll_desc.shim_dummy, .write);
+                try rt.reactor.waitFd(self.fd, pd, .write);
                 continue;
             }
             if (e == EINTR) continue;
@@ -426,13 +434,14 @@ pub const UdpSocket = struct {
     pub fn sendToCancel(self: *UdpSocket, buf: []const u8, addr: Address, c: *cancel_mod.Cancel) (Error || cancel_mod.Error)!usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
         while (true) {
             try c.checkpoint();
             const n = c_sendto(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0, addr.sockaddr(), addr.len);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitFdCancel(self.fd, &poll_desc.shim_dummy, .write, c);
+                try rt.reactor.waitFdCancel(self.fd, pd, .write, c);
                 continue;
             }
             if (e == EINTR) continue;
@@ -443,6 +452,7 @@ pub const UdpSocket = struct {
     pub fn recvFrom(self: *UdpSocket, buf: []u8) !RecvFromResult {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
         while (true) {
             var storage: posix.sockaddr.storage = undefined;
             var sa_len: c_uint = @sizeOf(posix.sockaddr.storage);
@@ -455,7 +465,7 @@ pub const UdpSocket = struct {
             }
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitFd(self.fd, &poll_desc.shim_dummy, .read);
+                try rt.reactor.waitFd(self.fd, pd, .read);
                 continue;
             }
             if (e == EINTR) continue;
@@ -466,6 +476,7 @@ pub const UdpSocket = struct {
     pub fn recvFromCancel(self: *UdpSocket, buf: []u8, c: *cancel_mod.Cancel) (Error || cancel_mod.Error)!RecvFromResult {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
         while (true) {
             try c.checkpoint();
             var storage: posix.sockaddr.storage = undefined;
@@ -479,7 +490,7 @@ pub const UdpSocket = struct {
             }
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitFdCancel(self.fd, &poll_desc.shim_dummy, .read, c);
+                try rt.reactor.waitFdCancel(self.fd, pd, .read, c);
                 continue;
             }
             if (e == EINTR) continue;
@@ -495,6 +506,7 @@ pub const UdpSocket = struct {
     pub fn peekFrom(self: *UdpSocket, buf: []u8) !RecvFromResult {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
         try self.ensureRegistered(rt);
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
         while (true) {
             var storage: posix.sockaddr.storage = undefined;
             var sa_len: c_uint = @sizeOf(posix.sockaddr.storage);
@@ -507,7 +519,7 @@ pub const UdpSocket = struct {
             }
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
-                try rt.reactor.waitFd(self.fd, &poll_desc.shim_dummy, .read);
+                try rt.reactor.waitFd(self.fd, pd, .read);
                 continue;
             }
             if (e == EINTR) continue;
