@@ -102,14 +102,22 @@ pub const Reactor = struct {
         // Register the EVFILT_USER interrupt event. EV_CLEAR makes it
         // edge-triggered (the event auto-resets after each fire), so
         // a single registration serves every subsequent interrupt.
+        //
+        // EV_RECEIPT — request per-change acknowledgement in the
+        // eventlist. Without it, kevent silently drops EV_ADD errors
+        // when nevents=0 AND can consume an already-fired event when
+        // nevents>0 (treating it as our changelist success). RECEIPT
+        // sidesteps both: every changelist entry yields exactly one
+        // EV_ERROR entry with `data` = 0 (success) or errno (failure).
         var kev = std.mem.zeroes(posix.Kevent);
         kev.ident = INTERRUPT_IDENT;
         kev.filter = EVFILT_USER;
-        kev.flags = posix.system.EV.ADD | posix.system.EV.CLEAR;
+        kev.flags = posix.system.EV.ADD | posix.system.EV.CLEAR | posix.system.EV.RECEIPT;
         kev.udata = INTERRUPT_UDATA;
         var changes = [_]posix.Kevent{kev};
-        var dummy: [1]posix.Kevent = undefined;
-        if (posix.system.kevent(kq, &changes, 1, &dummy, 0, null) < 0) {
+        var receipt: [1]posix.Kevent = undefined;
+        const rc = posix.system.kevent(kq, &changes, 1, &receipt, 1, null);
+        if (rc != 1 or receipt[0].data != 0) {
             _ = std.c.close(kq);
             return error.KqueueInitFailed;
         }
@@ -243,14 +251,19 @@ pub const Reactor = struct {
         var kev = std.mem.zeroes(posix.Kevent);
         kev.ident = @intFromPtr(me);
         kev.filter = EVFILT_TIMER;
-        kev.flags = posix.system.EV.ADD | posix.system.EV.ONESHOT;
+        kev.flags = posix.system.EV.ADD | posix.system.EV.ONESHOT | posix.system.EV.RECEIPT;
         kev.fflags = NOTE_NSECONDS;
         kev.data = @intCast(ns);
         kev.udata = @intFromPtr(me);
         var changes = [_]posix.Kevent{kev};
-        var dummy: [1]posix.Kevent = undefined;
-        const n = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
+        // EV_RECEIPT — see `init` and `submitPoll` for why every
+        // changelist needs explicit acknowledgement.
+        var receipt: [1]posix.Kevent = undefined;
+        const n = posix.system.kevent(self.kq, &changes, 1, &receipt, 1, null);
         if (n < 0) return registerError(posix_helpers.errnoVal());
+        if (n != 1 or receipt[0].data != 0) {
+            return registerError(@intCast(receipt[0].data));
+        }
         _ = self.pending.fetchAdd(1, .acq_rel);
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
@@ -290,20 +303,31 @@ pub const Reactor = struct {
         var kev = std.mem.zeroes(posix.Kevent);
         kev.ident = @intCast(fd);
         kev.filter = filter;
-        kev.flags = posix.system.EV.ADD | posix.system.EV.ONESHOT;
+        kev.flags = posix.system.EV.ADD | posix.system.EV.ONESHOT | posix.system.EV.RECEIPT;
         kev.udata = @intFromPtr(me);
         var changes = [_]posix.Kevent{kev};
-        var dummy: [1]posix.Kevent = undefined;
-        const n = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
+        // EV_RECEIPT — request per-change acknowledgement. Without
+        // this, two failure modes:
+        //   * nevents=0 path: EV_ADD errors (e.g., EBADF on a fd a
+        //     peer just closed between our removeWaiter and our ADD)
+        //     are silently dropped — we'd park forever on a phantom
+        //     registration.
+        //   * nevents=1 path: an already-ready event for an unrelated
+        //     registration gets consumed as if it were our changelist
+        //     ack — that registration's parked coro starves.
+        // RECEIPT sidesteps both: kevent returns exactly one entry
+        // per changelist entry, EV_ERROR flag set, data=0 for success
+        // or data=errno for failure. No unrelated events touched.
+        var receipt: [1]posix.Kevent = undefined;
+        const n = posix.system.kevent(self.kq, &changes, 1, &receipt, 1, null);
         if (n < 0) return registerError(posix_helpers.errnoVal());
+        if (n != 1 or receipt[0].data != 0) {
+            return registerError(@intCast(receipt[0].data));
+        }
         _ = self.pending.fetchAdd(1, .acq_rel);
 
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
-        // Resume: pending decremented by poll() before unpark.
-        // closeFd raced + won? `op.closed` was set; surface as
-        // BadDescriptor so the next libc-level retry mirrors what
-        // the kernel would have returned anyway.
         if (op.closed) return error.BadDescriptor;
     }
 
@@ -415,7 +439,11 @@ pub const Reactor = struct {
                 runtime.unpark(coro);
             }
             // ENOENT: poll owns unpark; falls through to natural libc
-            // EBADF path.
+            // EBADF path. (Note: there is a residual race when the
+            // accepter's insertWaiter sneaks past our removeWaiter and
+            // its kevent ADD silently "succeeds" against the closed fd
+            // on Darwin — see Step 2d for the persistent-registration
+            // fix that eliminates the per-wait race entirely.)
         }
         _ = posix_helpers.close(fd);
     }
@@ -462,12 +490,16 @@ pub const Reactor = struct {
         var kev = std.mem.zeroes(posix.Kevent);
         kev.ident = @intCast(fd);
         kev.filter = filter;
-        kev.flags = posix.system.EV.ADD | posix.system.EV.ONESHOT;
+        kev.flags = posix.system.EV.ADD | posix.system.EV.ONESHOT | posix.system.EV.RECEIPT;
         kev.udata = @intFromPtr(me);
         var changes = [_]posix.Kevent{kev};
-        var dummy: [1]posix.Kevent = undefined;
-        const n = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
+        // EV_RECEIPT — see `submitPoll` for the rationale.
+        var receipt: [1]posix.Kevent = undefined;
+        const n = posix.system.kevent(self.kq, &changes, 1, &receipt, 1, null);
         if (n < 0) return registerError(posix_helpers.errnoVal());
+        if (n != 1 or receipt[0].data != 0) {
+            return registerError(@intCast(receipt[0].data));
+        }
         _ = self.pending.fetchAdd(1, .acq_rel);
 
         // ─── Cancel-list registration THIRD ─────────────────────────────
@@ -539,14 +571,18 @@ pub const Reactor = struct {
         var kev = std.mem.zeroes(posix.Kevent);
         kev.ident = @intFromPtr(me);
         kev.filter = EVFILT_TIMER;
-        kev.flags = posix.system.EV.ADD | posix.system.EV.ONESHOT;
+        kev.flags = posix.system.EV.ADD | posix.system.EV.ONESHOT | posix.system.EV.RECEIPT;
         kev.fflags = NOTE_NSECONDS;
         kev.data = @intCast(ns);
         kev.udata = @intFromPtr(me);
         var changes = [_]posix.Kevent{kev};
-        var dummy: [1]posix.Kevent = undefined;
-        const n = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
+        // EV_RECEIPT — see `submitPoll` for the rationale.
+        var receipt: [1]posix.Kevent = undefined;
+        const n = posix.system.kevent(self.kq, &changes, 1, &receipt, 1, null);
         if (n < 0) return registerError(posix_helpers.errnoVal());
+        if (n != 1 or receipt[0].data != 0) {
+            return registerError(@intCast(receipt[0].data));
+        }
         _ = self.pending.fetchAdd(1, .acq_rel);
 
         var w = cancel_mod.Waiter{};

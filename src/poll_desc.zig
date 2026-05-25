@@ -136,8 +136,15 @@ pub const PollDesc = struct {
 
     // ─── Lock-free info reads ───────────────────────────────────────
 
+    /// SEQ_CST load — pairs with `publishInfo`'s seq_cst store to
+    /// close the Dekker race between `evict` (store closing → load
+    /// slot) and `wait` (CAS slot → load closing). Without the
+    /// total ordering, a waiter that wins step-1 CAS after evict's
+    /// slot-load can read stale closing=false, park, and never be
+    /// woken — see the `evict` doc for the full sequence. Matches
+    /// Go runtime's `atomic.Load(&pd.closing)` (runtime/netpoll.go).
     pub fn isClosing(self: *const PollDesc) bool {
-        return (self.info.load(.acquire) & INFO_CLOSING) != 0;
+        return (self.info.load(.seq_cst) & INFO_CLOSING) != 0;
     }
 
     pub fn currentFdseq(self: *const PollDesc) u32 {
@@ -154,11 +161,14 @@ pub const PollDesc = struct {
         self.lock.store(0, .release);
     }
 
+    /// SEQ_CST store — pairs with `isClosing`'s seq_cst load. See
+    /// `isClosing` for the Dekker rationale. Matches Go runtime's
+    /// `atomic.Store(&pd.closing, 1)` pattern.
     fn publishInfo(self: *PollDesc) void {
         var i: u32 = 0;
         if (self.closing) i |= INFO_CLOSING;
         i |= (self.fdseq & INFO_FDSEQ_MASK) << INFO_FDSEQ_SHIFT;
-        self.info.store(i, .release);
+        self.info.store(i, .seq_cst);
     }
 
     inline fn slot(self: *PollDesc, mode: Mode) *std.atomic.Value(usize) {
