@@ -1,72 +1,52 @@
-//! Linux io_uring reactor — **persistent registration via POLL_ADD_MULTI**.
+//! Linux io_uring reactor — **poll mode**.
 //!
-//! Step 2f migration: structural parity with kqueue's Step 2d.2.
-//! Each socket's `PollDesc` is registered with io_uring ONCE at socket
-//! creation (`registerFd`) via `IORING_OP_POLL_ADD` with
-//! `IORING_POLL_ADD_MULTI` set — a single SQE that produces a CQE
-//! every time the fd transitions to readable / writable / errored,
-//! until cancelled. The `*PollDesc` pointer rides in `user_data` (tagged
-//! to distinguish from timer / interrupt / cancel-ack CQEs); the
-//! kernel-side registration lives for the socket's lifetime and is
-//! retired by `ASYNC_CANCEL` in `unregisterFd`.
+//! Uses `IORING_OP_POLL_ADD` for fd readiness and `IORING_OP_TIMEOUT`
+//! for sleeps. Same readiness contract as kqueue / epoll — the
+//! caller does its own `read` / `write` after a wake — so `net.zig`
+//! works unchanged. The buffer-ownership ops (`IORING_OP_RECV` /
+//! `_SEND`) that give io_uring its full perf advantage are
+//! deliberately not used; they'd force a parallel completion-based
+//! path in `net.zig`, which is out of scope for this landing.
 //!
-//! `waitFd(fd, pd, mode)`:
-//!   1. `pd.incref()` / `defer pd.decref()` (the PD lifecycle ref).
-//!   2. `pd.wait(mode)` — pure user-space state machine.
-//!   3. On `.ready`, return; caller retries the syscall.
-//!   4. On `.closing`, return `error.BadDescriptor`.
+//! ## Why io_uring at all if we're not using completion mode?
 //!
-//! `poll(blocking)`:
-//!   1. Flush the SQ under `lock`; block in `io_uring_enter` outside it.
-//!   2. For each CQE, dispatch by `user_data`:
-//!      - `CANCEL_SQE_USER_DATA` (sentinel) — skip (cancel ack).
-//!      - `INTERRUPT_USER_DATA` (sentinel) — drain eventfd + re-arm.
-//!      - `pd | POLL_DESC_TAG` — multi-shot PD CQE. Parse `revents` in
-//!        `cqe.res`, call `pd.deliverReady(.read)` / `(.write)` for
-//!        each event that fired. `pd.deliverReady` either pops a parked
-//!        coro (we `runtime.unpark`) or caches PD_READY for the next
-//!        wait. The `IORING_CQE_F_MORE` flag distinguishes intermediate
-//!        CQEs (`F_MORE` set — multi-shot still live) from the
-//!        terminal CQE (no `F_MORE` — registration retired).
-//!      - other (coroutine pointer) — timer CQE; unpark directly.
+//! Even in poll mode, io_uring beats epoll on the syscall path:
 //!
-//! Why this design eliminates the legacy per-wait races:
-//!   * **close-vs-register**: no per-wait SQE submit, so the close-vs-
-//!     register race the legacy `submitPoll` carried (insert-waiter
-//!     then submit poll_add, with a `closeFd` racing in between to
-//!     submit a cancel SQE before the target poll_add lands) is gone.
-//!     The registration was made at socket open, before any peer
-//!     could see the fd.
-//!   * **cancel-vs-register**: same — cancel-aware wait is purely
-//!     user-space (`pd.waitCancel` runs the state machine), no kernel
-//!     SQE submit during wait.
+//! - **Batched submission.** Each `submitPoll` / `waitTimer` enqueues a
+//!   submission queue entry (SQE) without invoking a syscall. Only
+//!   when the dispatcher calls `poll(blocking=true)` do we
+//!   `submit_and_wait` — that single syscall submits the entire
+//!   pending batch and waits for at least one completion.
+//! - **Userspace ring polling.** The SQ/CQ rings are mmap'd shared
+//!   memory; producers and consumers communicate via the rings
+//!   without crossing the syscall boundary at all in the steady
+//!   state.
 //!
-//! Timers (`waitTimer` / `waitTimerCancel`) keep per-wait SQE
-//! submission since they're inherently single-shot. `cancelCoro` and
-//! the `WaitOp` it consumes are timer-only in this model.
+//! Result: high-concurrency I/O workloads do fewer
+//! `io_uring_enter` syscalls per RTT than they would `epoll_ctl` +
+//! `epoll_wait`. Expected ~10–20% TCP throughput improvement on
+//! loopback. Real workloads vary.
 //!
 //! ## Threading model
 //!
 //! `IoUring`'s SQE production is **not** thread-safe by default —
 //! producers race on the SQ tail counter. Volt has multiple workers
-//! concurrently submitting SQEs (registerFd from any worker, cancel
-//! from unregisterFd / waitTimerCancel), so production needs a
-//! lock. CQE consumption stays on the single claimed poller worker
-//! (`runtime.tryClaimPoller`), so no additional sync there.
+//! concurrently parking coroutines on I/O, so SQE production needs
+//! a lock. CQE consumption stays on the single claimed poller
+//! worker (`runtime.tryClaimPoller`), so no additional sync there.
 //!
 //! Critical invariant: the SQ lock MUST NOT be held across the
 //! blocking `io_uring_enter(GETEVENTS)` call in `poll()`. A peer
-//! coroutine's `unregisterFd` or `waitTimerCancel` needs the lock to
-//! push the cancel SQE that generates the CQE we're waiting for —
-//! if we hold it through the kernel wait, the firer can't submit and
-//! we never wake. `poll()` is two-phase: flush the SQ under the
-//! lock, then wait outside it.
+//! coroutine's `cancelCoro` / `closeFd` needs the lock to push the
+//! cancel SQE that generates the CQE we're waiting for — if we hold
+//! it through the kernel wait, the firer can't submit and we never
+//! wake. `poll()` is two-phase: flush the SQ under the lock, then
+//! wait outside it.
 //!
 //! A future optimisation could use `IORING_SETUP_SINGLE_ISSUER` to
 //! shard production per-worker via a fan-in ring; for now the
 //! spinlock is fine — production is rare in steady-state TCP
-//! workloads (one SQE per socket register + one per close, not per
-//! byte).
+//! workloads (one SQE per EAGAIN, not per byte).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -84,9 +64,6 @@ const DEFAULT_RING_ENTRIES: u16 = 256;
 // Linux poll(2) mask bits — io_uring's POLL_ADD uses the same encoding.
 const POLLIN: u32 = 0x0001;
 const POLLOUT: u32 = 0x0004;
-const POLLERR: u32 = 0x0008;
-const POLLHUP: u32 = 0x0010;
-const POLLRDHUP: u32 = 0x2000;
 
 // eventfd constants — matches reactor_epoll.zig.
 const EFD_NONBLOCK: c_int = 0o4000;
@@ -105,100 +82,41 @@ pub const writeAsync = posix_helpers.writeAsync;
 pub const readFull = posix_helpers.readFull;
 pub const writeAll = posix_helpers.writeAll;
 
-// ─── user_data encoding ──────────────────────────────────────────
-//
-// We multiplex four kinds of completions through the IOCP:
-//
-//   * Cancel-SQE acks      — user_data == CANCEL_SQE_USER_DATA (0x1).
-//   * Interrupt eventfd    — user_data == INTERRUPT_USER_DATA (0x2).
-//   * Multi-shot PD CQEs   — user_data == @intFromPtr(pd) | POLL_DESC_TAG.
-//   * Timer CQEs           — user_data == @intFromPtr(coro).
-//
-// The tag picks bit 2 (= 0x4). Coroutine and PollDesc heap
-// allocations are both ≥ 8-byte aligned (Volt's allocator default
-// gives 8; `PollDesc` is `align(std.atomic.cache_line)` so ≥ 64),
-// so bit 2 is naturally 0 in their addresses. Setting bit 2 on PD
-// CQEs makes them trivially distinguishable from timer CQEs (which
-// also carry a heap pointer) without consulting any side state.
-
-const CANCEL_SQE_USER_DATA: u64 = 0x1;
-const INTERRUPT_USER_DATA: u64 = 0x2;
-const POLL_DESC_TAG: u64 = 0x4;
-
-inline fn userDataForPd(pd: *poll_desc.PollDesc) u64 {
-    const raw: u64 = @intFromPtr(pd);
-    // Sanity: alignment must leave bit 2 free.
-    std.debug.assert(raw & POLL_DESC_TAG == 0);
-    return raw | POLL_DESC_TAG;
-}
-
-inline fn pdFromUserData(user_data: u64) *poll_desc.PollDesc {
-    return @ptrFromInt(user_data & ~POLL_DESC_TAG);
-}
-
-inline fn isPdUserData(user_data: u64) bool {
-    return (user_data & POLL_DESC_TAG) != 0 and
-        user_data != CANCEL_SQE_USER_DATA and
-        user_data != INTERRUPT_USER_DATA;
-}
-
-// ─── Per-PD backend state ────────────────────────────────────────
-//
-// Held in `pd.backend_data`. Tracks the multi-shot's terminal-CQE
-// arrival so `unregisterFd` knows when it's safe to free the PD.
-// The kernel guarantees: after `ASYNC_CANCEL` targeting our
-// `user_data`, exactly one CQE without `IORING_CQE_F_MORE` arrives;
-// after that CQE, no more CQEs reference our `user_data`.
-
-const IoUringPdBackend = struct {
-    /// Set true by the poll loop when it dispatches the terminal
-    /// (no-F_MORE) CQE for this PD's multi-shot. `unregisterFd`
-    /// spins on this before freeing — combined with the `in_poll`
-    /// barrier, it guarantees no concurrent dispatch is still
-    /// reading our PD's memory.
-    drained: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-};
-
 // ─── Reactor ─────────────────────────────────────────────────────
 
 pub const Reactor = struct {
     ring: linux.IoUring,
-    /// eventfd used for cross-thread wake (`interrupt`). A single
-    /// `POLL_ADD_MULTI` SQE on this fd, carrying the
-    /// `INTERRUPT_USER_DATA` sentinel, is submitted at init and
-    /// stays armed for the runtime's lifetime.
+    /// eventfd used for cross-thread wake (`interrupt`). A
+    /// `POLL_ADD` SQE on this fd, carrying the `INTERRUPT_USER_DATA`
+    /// sentinel, is submitted at init and re-armed after each wake.
     interrupt_fd: c_int = -1,
 
-    /// Sum of in-flight kernel registrations:
-    /// - One per `registerFd` (the persistent multi-shot poll). Stays
-    ///   incremented for the socket's lifetime; decremented when the
-    ///   terminal CQE arrives after `unregisterFd`'s cancel.
-    /// - One per `waitTimer*` (single-shot timer SQE). Decremented
-    ///   when the timer fires or is cancelled.
+    /// In-flight registrations (one per coroutine parked on an SQE).
+    /// Producers (submitPoll / waitTimer) increment under `lock`; the
+    /// poller decrements as it drains CQEs. Same role as kqueue's
+    /// `pending`.
     ///
-    /// The interrupt eventfd's POLL_ADD does NOT count — it's a
-    /// reactor-internal wake channel, not a coroutine park.
+    /// The interrupt eventfd's POLL_ADD does NOT count here — it's
+    /// a reactor-internal wake channel, not a coroutine park.
     pending: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// TTAS spinlock around SQE production. The ring's SQ tail
     /// counter is shared mutable state; multiple workers calling
-    /// `registerFd`/`unregisterFd`/`waitTimer*` need to be serialised
-    /// on the producer side. Submission and CQE consumption are
-    /// single-threaded by the poller-claim in `runtime.zig`.
+    /// `submitPoll` need to be serialised on the producer side.
+    /// Submission and CQE consumption are single-threaded by the
+    /// poller-claim in `runtime.zig`.
     lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-
-    /// True while the poller is iterating the CQEs returned by a
-    /// kernel `enter()` call. `unregisterFd` MUST wait for this to
-    /// clear before freeing the PD backend: the kernel may have
-    /// already transferred a CQE referencing our PD into a poller's
-    /// user-space buffer, and that buffer is owned by the poller —
-    /// the kernel can't reach into it to invalidate. The dispatch
-    /// loop then dereferences `user_data` as `*PollDesc`, and if the
-    /// closer has already freed the PD, that's a use-after-free.
-    /// See `unregisterFd`'s drain spin.
-    in_poll: std.atomic.Value(bool) align(std.atomic.cache_line) =
-        std.atomic.Value(bool).init(false),
-
+    /// Reverse lookup `fd → parked coro`. closeFd uses it to find
+    /// the parked waiter and submit a cancel SQE targeting its
+    /// user_data (== coro pointer). io_uring's cancellation model
+    /// is async — the cancel SQE eventually produces a CQE that the
+    /// poll loop dispatches — so unlike kqueue/epoll, no `op.closed`
+    /// flag is needed. The coro resumes via the normal CQE path
+    /// (with -ECANCELED) and the next libc recv after our close
+    /// surfaces EBADF, which `errnoToIoError` already maps to
+    /// BadDescriptor.
+    fd_waiters: std.AutoHashMapUnmanaged(i32, *coroutine.Coroutine) = .{},
+    fd_waiters_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !Reactor {
@@ -214,148 +132,113 @@ pub const Reactor = struct {
         if (efd < 0) return error.IoUringInitFailed;
         errdefer _ = posix_helpers.close(efd);
 
-        // Arm the interrupt eventfd as a multi-shot POLL_ADD so a
-        // single registration covers every subsequent interrupt
-        // without per-wake re-arm. Single-threaded here (init runs
-        // once, before any worker spawns) so no acquire/release.
-        const sqe = ring.poll_add(INTERRUPT_USER_DATA, efd, POLLIN) catch return error.IoUringInitFailed;
-        sqe.len = linux.IORING_POLL_ADD_MULTI;
+        // Arm the interrupt POLL_ADD. Single-threaded here (init is
+        // called once, before any worker spawns), so no acquire/
+        // release needed.
+        _ = ring.poll_add(INTERRUPT_USER_DATA, efd, POLLIN) catch return error.IoUringInitFailed;
         _ = ring.submit() catch return error.IoUringInitFailed;
 
         return .{ .ring = ring, .interrupt_fd = efd, .allocator = allocator };
     }
 
+    inline fn lockWaiters(self: *Reactor) void {
+        while (self.fd_waiters_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+    inline fn unlockWaiters(self: *Reactor) void {
+        self.fd_waiters_lock.store(0, .release);
+    }
+    fn insertWaiter(self: *Reactor, fd: i32, c: *coroutine.Coroutine) std.mem.Allocator.Error!void {
+        self.lockWaiters();
+        defer self.unlockWaiters();
+        try self.fd_waiters.put(self.allocator, fd, c);
+    }
+    fn removeWaiter(self: *Reactor, fd: i32) ?*coroutine.Coroutine {
+        self.lockWaiters();
+        defer self.unlockWaiters();
+        if (self.fd_waiters.fetchRemove(fd)) |kv| return kv.value;
+        return null;
+    }
+
+    /// Close a fd whose io_uring POLL_ADD may have a parked
+    /// coroutine waiting on it. Mirrors reactor_kqueue.zig closeFd
+    /// in spirit but uses io_uring's async-cancel model: submit a
+    /// cancel SQE targeting the parked coro's user_data, then close
+    /// the fd. The cancel CQE eventually delivers and the normal
+    /// poll-loop dispatch path wakes the coro with the (cancelled)
+    /// completion; the next libc recv/send after the close gets
+    /// EBADF, surfacing as BadDescriptor via errnoToIoError. No
+    /// `op.closed` flag is needed because the EBADF path is
+    /// deterministic — io_uring's POLL_ADD operates on the fd by
+    /// number, and the kernel returns -EBADF as soon as the fd is
+    /// gone.
+    pub fn closeFd(self: *Reactor, fd: i32) void {
+        if (self.removeWaiter(fd)) |c| {
+            self.acquire();
+            // Submit-then-cancel-then-submit, same rationale as in
+            // cancelCoro — the target poll_add must reach the kernel
+            // before the cancel SQE.
+            _ = self.ring.submit() catch {};
+            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(c), 0) catch {};
+            _ = self.ring.submit() catch {};
+            self.release();
+        }
+        _ = posix_helpers.close(fd);
+    }
+
     pub fn deinit(self: *Reactor) void {
-        // In-flight registrations at deinit means either a coroutine
-        // is still parked in the kernel, or a multi-shot poll is
-        // still armed. Asserting here catches the shutdown-ordering
-        // bug at the source instead of a mysterious crash later.
+        // In-flight ops at deinit would have their completion
+        // posted to a no-longer-mapped CQ ring after teardown —
+        // kernel-side undefined behaviour. Asserting catches the
+        // shutdown-ordering bug at the source instead of as a
+        // mysterious crash later.
         std.debug.assert(self.pending.load(.acquire) == 0);
-        std.debug.assert(!self.in_poll.load(.acquire));
+        std.debug.assert(self.fd_waiters.count() == 0);
+        self.fd_waiters.deinit(self.allocator);
         if (self.interrupt_fd >= 0) _ = posix_helpers.close(self.interrupt_fd);
         self.interrupt_fd = -1;
         self.ring.deinit();
     }
 
-    // ─── PollDesc-aware interface (Step 2f real implementation) ─────
+    pub fn waitReadable(self: *Reactor, fd: i32) ReactorWaitError!void {
+        return self.submitPoll(@intCast(fd), POLLIN);
+    }
 
-    /// Register `pd` as the per-fd state machine for `fd`. Submits a
-    /// multi-shot `POLL_ADD` covering both directions plus error
-    /// conditions; `pd.deliverReady` is called for each event the
-    /// kernel reports.
-    ///
-    /// Allocates an `IoUringPdBackend` and stores it in
-    /// `pd.backend_data` — needed by `unregisterFd` to detect
-    /// terminal-CQE arrival.
+    pub fn waitWritable(self: *Reactor, fd: i32) ReactorWaitError!void {
+        return self.submitPoll(@intCast(fd), POLLOUT);
+    }
+
+    // ─── PollDesc-aware interface (Step 2b shims) ──────────────────────
+    //
+    // Cross-backend interface that the post-restructure net.zig will
+    // call. Today these are no-op / delegate shims — see reactor_kqueue
+    // for the rationale. io_uring's real migration is Step 2f+ (will
+    // adopt IORING_POLL_ADD_MULTI for persistent registration).
+
     pub fn registerFd(self: *Reactor, fd: i32, pd: *poll_desc.PollDesc) ReactorWaitError!void {
-        const backend = self.allocator.create(IoUringPdBackend) catch
-            return error.SystemResources;
-        backend.* = .{};
-        pd.backend_data = backend;
-        errdefer {
-            pd.backend_data = null;
-            self.allocator.destroy(backend);
-        }
-
-        const mask: u32 = POLLIN | POLLOUT | POLLERR | POLLHUP | POLLRDHUP;
-        const ud = userDataForPd(pd);
-
-        self.acquire();
-        const submitted = (self.ring.poll_add(ud, fd, mask) catch blk: {
-            _ = self.ring.submit() catch {};
-            break :blk self.ring.poll_add(ud, fd, mask) catch null;
-        });
-        if (submitted) |sqe| {
-            sqe.len = linux.IORING_POLL_ADD_MULTI;
-        }
-        self.release();
-        if (submitted == null) return error.SystemResources;
-
-        _ = self.pending.fetchAdd(1, .acq_rel);
-    }
-
-    /// Reverse of `registerFd`. Submits `ASYNC_CANCEL` targeting our
-    /// `user_data`, then drains until the kernel's terminal CQE
-    /// arrives. The `in_poll` barrier guarantees no concurrent
-    /// dispatch is still reading our PD's memory when we free it.
-    pub fn unregisterFd(self: *Reactor, fd: i32, pd: *poll_desc.PollDesc) void {
+        _ = self;
         _ = fd;
-        const backend_raw = pd.backend_data orelse return;
-        const backend: *IoUringPdBackend = @ptrCast(@alignCast(backend_raw));
-
-        // Submit ASYNC_CANCEL targeting our user_data. The kernel
-        // posts:
-        //   1. A cancel-ack CQE (CANCEL_SQE_USER_DATA — skipped).
-        //   2. The cancelled multi-shot's terminal CQE (no F_MORE —
-        //      sets backend.drained = true via the poll loop).
-        const ud = userDataForPd(pd);
-        self.acquire();
-        // Submit any queued SQEs first so the target poll_add (if it
-        // hasn't been flushed yet from a recent registerFd) is
-        // visible to the kernel before the cancel SQE.
-        _ = self.ring.submit() catch {};
-        _ = self.ring.cancel(CANCEL_SQE_USER_DATA, ud, 0) catch {};
-        _ = self.ring.submit() catch {};
-        self.release();
-
-        // Wake any worker blocked in poll() so it processes the
-        // pending CQEs promptly.
-        self.interrupt();
-
-        // Drain until the terminal CQE has been dispatched:
-        //   1. `poll(false)` pulls visible CQEs into this thread and
-        //      dispatches them (the terminal CQE sets drained=true).
-        //   2. Spin until `in_poll == false` — catches concurrent
-        //      workers mid-dispatch with our PD in their buffer.
-        //   3. If `drained == true`, we're safe to free.
-        //   4. Otherwise loop — the kernel hasn't posted the terminal
-        //      CQE yet (typically a handful of microseconds after the
-        //      cancel SQE was consumed).
-        var spins: u32 = 0;
-        while (!backend.drained.load(.acquire)) {
-            _ = self.poll(false);
-            while (self.in_poll.load(.acquire)) std.atomic.spinLoopHint();
-            if (backend.drained.load(.acquire)) break;
-            spins += 1;
-            // Safety bound: in practice the terminal CQE arrives in
-            // <10 iterations. If we hit this we have a kernel bug
-            // or a structural error — bail rather than hang.
-            if (spins > 100_000) break;
-            std.atomic.spinLoopHint();
-        }
-
-        pd.backend_data = null;
-        self.allocator.destroy(backend);
+        _ = pd;
     }
 
-    /// Park the current coroutine until `fd` is ready in `mode`.
-    /// Runs the per-fd state machine on `pd`; the kernel side stays
-    /// armed across the call (persistent multi-shot registration).
-    ///
-    /// incref/decref around `pd.wait` so a concurrent socket-close
-    /// (which calls `pd.closeAndWait` and frees the PD) can't free
-    /// the PD while we're in the post-wake epilogue still touching
-    /// its slot.
+    pub fn unregisterFd(self: *Reactor, fd: i32, pd: *poll_desc.PollDesc) void {
+        _ = self;
+        _ = fd;
+        _ = pd;
+    }
+
     pub fn waitFd(
         self: *Reactor,
         fd: i32,
         pd: *poll_desc.PollDesc,
         mode: poll_desc.Mode,
     ) ReactorWaitError!void {
-        _ = self;
-        _ = fd;
-        pd.incref();
-        defer pd.decref();
-        return switch (pd.wait(mode)) {
-            .ready => {},
-            .closing => error.BadDescriptor,
+        _ = pd;
+        return switch (mode) {
+            .read => self.waitReadable(fd),
+            .write => self.waitWritable(fd),
         };
     }
 
-    /// Cancel-aware variant of `waitFd`. `pd.waitCancel` handles its
-    /// own refcount and wake-via-state-machine; no kernel SQE for
-    /// cancel is needed (the multi-shot stays alive, the parked coro
-    /// just gets woken via `deliverCancel`).
     pub fn waitFdCancel(
         self: *Reactor,
         fd: i32,
@@ -363,16 +246,48 @@ pub const Reactor = struct {
         mode: poll_desc.Mode,
         c: *cancel_mod.Cancel,
     ) (ReactorWaitError || cancel_mod.Error)!void {
-        _ = self;
-        _ = fd;
-        const result = try pd.waitCancel(mode, c);
-        return switch (result) {
-            .ready => {},
-            .closing => error.BadDescriptor,
+        _ = pd;
+        return switch (mode) {
+            .read => self.waitReadableCancel(fd, c),
+            .write => self.waitWritableCancel(fd, c),
         };
     }
 
-    // ─── Timer (kept per-wait — timers are inherently single-shot) ──
+    fn submitPoll(self: *Reactor, fd: i32, mask: u32) ReactorWaitError!void {
+        const me = current.require();
+
+        // ─── Side-table insert FIRST, poll_add SQE second ──────────────
+        //
+        // See reactor_kqueue.zig submitPoll: a racing closeFd between
+        // SQE submission and side-table insert orphans the parked
+        // coroutine. Side-table first means closeFd finds us before
+        // it submits the cancel SQE; our subsequent poll_add either
+        // succeeds (closeFd's cancel will land on it) or fails with
+        // EBADF after the fd is closed (registerError-style surface).
+        self.insertWaiter(fd, me) catch return error.SystemResources;
+        errdefer _ = self.removeWaiter(fd);
+
+        self.acquire();
+        const submitted = (self.ring.poll_add(@intFromPtr(me), fd, mask) catch blk: {
+            // SQ-full is recoverable: a submit hands queued SQEs to
+            // the kernel and frees up user-space slots. Drain and
+            // retry once before giving up.
+            _ = self.ring.submit() catch {};
+            break :blk self.ring.poll_add(@intFromPtr(me), fd, mask) catch null;
+        }) != null;
+        self.release();
+        if (!submitted) return error.SystemResources;
+
+        // SQE is queued but not yet submitted. The dispatcher's
+        // poll() call will submit_and_wait — that batched syscall
+        // is the whole perf win over epoll.
+        _ = self.pending.fetchAdd(1, .acq_rel);
+
+        defer _ = self.removeWaiter(fd);
+
+        me.pending = .park;
+        context.swap(&me.ctx, me.main_ctx);
+    }
 
     pub fn waitTimer(self: *Reactor, ns: u64) ReactorWaitError!void {
         // ns=0 is a no-op. IORING_OP_TIMEOUT with an all-zero
@@ -401,11 +316,141 @@ pub const Reactor = struct {
         context.swap(&me.ctx, me.main_ctx);
     }
 
+    pub fn pendingCount(self: *const Reactor) u32 {
+        return self.pending.load(.acquire);
+    }
+
+    /// Sentinel `user_data` for cancel SQEs themselves — the poll
+    /// path skips CQEs carrying this value (they're acknowledgement
+    /// completions for `ASYNC_CANCEL` ops, not parked coroutines).
+    /// Zero would alias the null pointer at @ptrFromInt time, so we
+    /// pick a value that can't collide with any real coroutine
+    /// address (heap allocations are at least 8-byte aligned;
+    /// 0x1 is reserved as our sentinel).
+    const CANCEL_SQE_USER_DATA: u64 = 0x1;
+
+    /// Sentinel `user_data` for the interrupt-eventfd POLL_ADD SQE.
+    /// Distinct from `CANCEL_SQE_USER_DATA` so the poll loop can
+    /// distinguish "interrupt fired — drain + re-arm" from "cancel
+    /// SQE acknowledged — skip".
+    const INTERRUPT_USER_DATA: u64 = 0x2;
+
+    /// Cancel this coro's in-flight io_uring op.
+    ///
+    /// Unlike kqueue/epoll, io_uring's `ASYNC_CANCEL` produces a
+    /// CQE for the cancelled op (with a Cancelled status). The
+    /// poll path picks it up and unparks via the normal route —
+    /// we just submit the cancel and let the kernel arbitrate.
+    /// No double-unpark / double-decrement risk here because there
+    /// is exactly one CQE per submitted op.
+    ///
+    /// `user_data` for the original op == `@intFromPtr(coro)`
+    /// (set in `submitPoll`/`waitTimer`), so no per-coro stash needed.
+    /// The CANCEL SQE itself carries the sentinel `user_data` so
+    /// the poll loop discards its own completion.
+    pub fn cancelCoro(self: *Reactor, c: *coroutine.Coroutine) void {
+        self.acquire();
+        defer self.release();
+        // Drain pending SQEs FIRST so the target user_data is visible
+        // to the kernel before our cancel SQE goes in. Without this
+        // submit, a cancel batched with a not-yet-submitted poll_add
+        // it targets can race: the kernel may process the cancel
+        // before the poll_add is registered, the cancel hits -ENOENT,
+        // and the coro then parks on the poll_add forever. Per
+        // io_uring_prep_cancel(3): submit the target in one batch,
+        // then submit the cancel in a separate batch. This is the
+        // root cause of the Linux CI recvCancel stress hang that
+        // local Mac kqueue + un-loaded podman never exposed; it
+        // surfaces under contention where the firer coroutine reaches
+        // cancelCoro before any worker has called submit_and_wait.
+        _ = self.ring.submit() catch {};
+        _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(c), 0) catch {
+            // SQ full even after the proactive submit — extremely
+            // rare. Drain once more and retry; if that fails too,
+            // silently return — the original op will eventually
+            // complete via the normal CQE path (fd close, hangup, or
+            // peer activity), and the cancel waiter's `c.isFired()`
+            // check will surface error.Cancelled when the coro wakes.
+            _ = self.ring.submit() catch {};
+            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(c), 0) catch {};
+        };
+        _ = self.ring.submit() catch {};
+    }
+
+    pub fn waitReadableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+        return self.submitPollCancel(@intCast(fd), POLLIN, c);
+    }
+
+    pub fn waitWritableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+        return self.submitPollCancel(@intCast(fd), POLLOUT, c);
+    }
+
+    fn submitPollCancel(self: *Reactor, fd: i32, mask: u32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
+        try c.checkpoint();
+        const me = current.require();
+
+        // ─── Side-table insert FIRST (closes close-vs-register race) ──────
+        //
+        // See reactor_kqueue.zig submitPoll for the rationale.
+        self.insertWaiter(fd, me) catch return error.SystemResources;
+        defer _ = self.removeWaiter(fd);
+
+        // ─── SQE submission SECOND (closes register-then-fire race) ──────
+        //
+        // Old order — registerReactor then submitPoll — opened a window
+        // where fire() could call cancelCoro before this coroutine's
+        // poll_add SQE was queued. The cancel SQE would land in the
+        // ring before the target op SQE; the kernel processes them
+        // in submission order so the cancel hits -ENOENT, the
+        // poll_add then registers, and the coroutine parks forever.
+        // Queueing the poll_add SQE BEFORE registerReactor guarantees
+        // the kernel sees it before any later cancel SQE from
+        // cancelCoro (the lock around .acquire()/.release()
+        // serialises queue order across threads).
+        self.acquire();
+        const submitted = (self.ring.poll_add(@intFromPtr(me), fd, mask) catch blk: {
+            _ = self.ring.submit() catch {};
+            break :blk self.ring.poll_add(@intFromPtr(me), fd, mask) catch null;
+        }) != null;
+        self.release();
+        if (!submitted) return error.SystemResources;
+        _ = self.pending.fetchAdd(1, .acq_rel);
+
+        // ─── Cancel-list registration THIRD ─────────────────────────────
+        var w = cancel_mod.Waiter{};
+        if (c.registerReactor(&w, me)) {
+            // Fired before our register. Issue a CANCEL SQE
+            // ourselves to retire the orphan poll_add; its CQE will
+            // be delivered to poll() and runtime.unpark'd, which
+            // (since we never park) just transitions park_state
+            // RUNNING → NOTIFIED — harmless once we return.
+            // Submit the poll_add FIRST so the kernel has it before
+            // the cancel SQE goes in (see cancelCoro for the
+            // io_uring batching race rationale).
+            self.acquire();
+            _ = self.ring.submit() catch {};
+            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(me), 0) catch {};
+            _ = self.ring.submit() catch {};
+            self.release();
+            return error.Cancelled;
+        }
+        defer c.deregister(&w);
+
+        // ─── Park ───────────────────────────────────────────────────────
+        //
+        // park_state RUNNING → NOTIFIED handles fire() landing in
+        // the window between registerReactor returning and the swap
+        // below. See runtime.zig:160 for the machine's contract.
+        me.pending = .park;
+        context.swap(&me.ctx, me.main_ctx);
+
+        if (c.isFired()) return error.Cancelled;
+    }
+
     /// Cancel-aware variant of `waitTimer`. The timeout SQE's
-    /// `user_data` is `@intFromPtr(coro)` (untagged, so the poll
-    /// loop's coro/PD discriminator works), so the existing
-    /// `ASYNC_CANCEL`-by-user_data path matches it without any new
-    /// bookkeeping.
+    /// `user_data` is `@intFromPtr(coro)` (same as fd waits), so
+    /// the existing `ASYNC_CANCEL`-by-user_data path in
+    /// `cancelCoro` matches it without any new bookkeeping.
     pub fn waitTimerCancel(self: *Reactor, ns: u64, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
         try c.checkpoint();
         if (ns == 0) return;
@@ -417,14 +462,7 @@ pub const Reactor = struct {
             .nsec = @intCast(ns % std.time.ns_per_s),
         };
 
-        // Stash the user_data so cancelCoro can target it.
-        var op = WaitOp{ .ident = @intFromPtr(me) };
-        me.reactor_wait_op = &op;
-        defer me.reactor_wait_op = null;
-
-        // Timeout SQE FIRST — same race rationale as the legacy
-        // submitPollCancel: the target SQE must be visible to the
-        // kernel before a cancel SQE referencing it goes in.
+        // Timeout SQE FIRST — same race rationale as submitPollCancel.
         self.acquire();
         const submitted = (self.ring.timeout(@intFromPtr(me), &ts, 0, 0) catch blk: {
             _ = self.ring.submit() catch {};
@@ -436,6 +474,9 @@ pub const Reactor = struct {
 
         var w = cancel_mod.Waiter{};
         if (c.registerReactor(&w, me)) {
+            // Submit-then-cancel-then-submit, same rationale as in
+            // cancelCoro — the target SQE must reach the kernel
+            // before the cancel SQE.
             self.acquire();
             _ = self.ring.submit() catch {};
             _ = self.ring.cancel(CANCEL_SQE_USER_DATA, @intFromPtr(me), 0) catch {};
@@ -451,56 +492,18 @@ pub const Reactor = struct {
         if (c.isFired()) return error.Cancelled;
     }
 
-    /// Per-call stash for cancel-aware waits — now only used by the
-    /// timer path. Lives on the waiter's stack and is pointed at by
-    /// `Coroutine.reactor_wait_op` for the lifetime of the park.
-    pub const WaitOp = struct {
-        ident: usize,
-    };
-
-    /// Cancel this coro's in-flight io_uring op. In the Step 2f
-    /// model this only fires for timer parks (PD waits go through
-    /// `pd.waitCancel`'s state machine without touching the reactor).
-    ///
-    /// Submit-then-cancel-then-submit ordering: the target SQE must
-    /// be visible to the kernel before our cancel SQE goes in, or
-    /// the cancel hits ENOENT and the original op runs to completion.
-    pub fn cancelCoro(self: *Reactor, c: *coroutine.Coroutine) void {
-        const op_ptr = c.reactor_wait_op orelse return;
-        const op: *WaitOp = @ptrCast(@alignCast(op_ptr));
-        self.acquire();
-        defer self.release();
-        _ = self.ring.submit() catch {};
-        _ = self.ring.cancel(CANCEL_SQE_USER_DATA, op.ident, 0) catch {
-            _ = self.ring.submit() catch {};
-            _ = self.ring.cancel(CANCEL_SQE_USER_DATA, op.ident, 0) catch {};
-        };
-        _ = self.ring.submit() catch {};
-    }
-
-    /// Close an fd that may have a PollDesc still registered. PD
-    /// lifecycle (evict + closeAndWait + unregisterFd + free) is
-    /// owned by the socket type via `pd_handle.release`, called
-    /// BEFORE this fn. All we do here is the libc close — same
-    /// as kqueue's persistent-registration model.
-    pub fn closeFd(self: *Reactor, fd: i32) void {
-        _ = self;
-        _ = posix_helpers.close(fd);
-    }
-
-    pub fn pendingCount(self: *const Reactor) u32 {
-        return self.pending.load(.acquire);
-    }
-
     pub fn poll(self: *Reactor, blocking: bool) usize {
         if (self.pending.load(.acquire) == 0) return 0;
 
         // Two-phase: flush the SQ under the lock, then block in the
         // kernel WITHOUT the lock. Holding the SQ spinlock across a
         // blocking `io_uring_enter` deadlocks the firing path: a peer
-        // coroutine's `unregisterFd` (or `waitTimerCancel`) needs the
-        // same lock to push the cancel SQE that generates the CQE
-        // we're waiting for.
+        // coroutine's `cancelCoro` (or `closeFd`) needs the same lock
+        // to push the cancel SQE that would generate the CQE we're
+        // waiting for. macOS kqueue doesn't expose this because its
+        // `kevent` syscall is kernel-side thread-safe and needs no
+        // userspace lock — that's why the recvCancel stress test
+        // passes on Darwin but hung on Linux CI for the entire phase.
         const wait_nr: u32 = if (blocking) 1 else 0;
 
         // Phase 1: push queued SQEs to the kernel under the lock.
@@ -524,100 +527,49 @@ pub const Reactor = struct {
             _ = self.ring.enter(0, wait_nr, linux.IORING_ENTER_GETEVENTS) catch return 0;
         }
 
-        // Set `in_poll` BEFORE reading CQEs. A concurrent
-        // `unregisterFd` about to free a PD whose CQE the kernel
-        // will transfer into our buffer MUST observe `in_poll == true`
-        // for the entire window the buffer is live. See
-        // `reactor_kqueue.zig:396` for the full rationale (the same
-        // barrier discipline applies here).
-        self.in_poll.store(true, .release);
-        defer self.in_poll.store(false, .release);
-
         // CQE consumption is single-threaded by the
         // `reactor_poller_taken` claim in runtime.zig — no lock needed.
         var cqes: [CQE_BATCH]linux.io_uring_cqe = undefined;
         const n = self.ring.copy_cqes(&cqes, 0) catch return 0;
         if (n == 0) return 0;
         const count: usize = @intCast(n);
-        var pending_dec: u32 = 0;
-        var dispatched: usize = 0;
+        var real_count: usize = 0;
+        var saw_interrupt = false;
         var i: usize = 0;
         while (i < count) : (i += 1) {
-            const c = &cqes[i];
-            const ud = c.user_data;
-
-            // Cancel SQE ack — skip (the cancelled op's own CQE
-            // arrives separately).
-            if (ud == CANCEL_SQE_USER_DATA) continue;
-
-            // Interrupt eventfd fired. Multi-shot, so no re-arm
-            // needed; just drain the counter to clear its readable
-            // state. Doesn't count toward `pending`.
-            if (ud == INTERRUPT_USER_DATA) {
-                // Multi-shot POLL_ADD on the eventfd: drain the
-                // counter to clear its readable state. No re-arm
-                // needed — the kernel keeps reporting until the
-                // multi-shot is cancelled (we never cancel it).
+            // CANCEL SQE acknowledgements arrive with the sentinel
+            // user_data — skip them (the cancelled op's own CQE
+            // arrives separately and carries the real coro ptr).
+            if (cqes[i].user_data == CANCEL_SQE_USER_DATA) continue;
+            // Interrupt POLL_ADD fired: drain the eventfd counter
+            // (clears its readable state) and flag for re-arm.
+            // Doesn't count toward `pending`.
+            if (cqes[i].user_data == INTERRUPT_USER_DATA) {
                 var drain_buf: [8]u8 = undefined;
                 _ = posix_helpers.read(self.interrupt_fd, &drain_buf, 8);
+                saw_interrupt = true;
                 continue;
             }
-
-            dispatched += 1;
-
-            if (isPdUserData(ud)) {
-                // Multi-shot PD CQE. `c.res` is either a revents
-                // bitmap (success) or a negative errno (the
-                // registration was cancelled or the kernel detected
-                // an error).
-                const pd = pdFromUserData(ud);
-                const more = (c.flags & linux.IORING_CQE_F_MORE) != 0;
-
-                if (c.res >= 0) {
-                    const revents: u32 = @intCast(c.res);
-                    // POLLERR / POLLHUP are delivered alongside any
-                    // direction-specific bit; for safety also dispatch
-                    // to both modes on those signals so a parked
-                    // reader on a hung-up fd wakes.
-                    const wake_read = (revents & (POLLIN | POLLERR | POLLHUP | POLLRDHUP)) != 0;
-                    const wake_write = (revents & (POLLOUT | POLLERR | POLLHUP)) != 0;
-                    if (wake_read) {
-                        if (pd.deliverReady(.read)) |coro| runtime.unpark(coro);
-                    }
-                    if (wake_write) {
-                        if (pd.deliverReady(.write)) |coro| runtime.unpark(coro);
-                    }
-                } else {
-                    // Negative res — typically -ECANCELED on the
-                    // terminal CQE after `unregisterFd`'s cancel.
-                    // No userland-visible wake here; the PD is being
-                    // torn down and any waiters were already evicted
-                    // via `pd.closeAndWait` before `unregisterFd` ran.
-                }
-
-                if (!more) {
-                    // Terminal CQE — kernel guarantees no further
-                    // completions for this user_data. Mark the
-                    // backend drained so `unregisterFd` can free it,
-                    // and decrement the per-registration `pending`
-                    // entry that `registerFd` added.
-                    if (pd.backend_data) |raw| {
-                        const backend: *IoUringPdBackend = @ptrCast(@alignCast(raw));
-                        backend.drained.store(true, .release);
-                    }
-                    pending_dec += 1;
-                }
-                continue;
-            }
-
-            // Timer CQE — user_data is a raw coroutine pointer.
-            // Unpark and account for the per-timer `pending` entry.
-            const coro: *coroutine.Coroutine = @ptrFromInt(ud);
+            real_count += 1;
+            // `user_data` for normal ops is the coroutine pointer
+            // we set in submitPoll/waitTimer. Cast back and unpark.
+            const coro: *coroutine.Coroutine = @ptrFromInt(cqes[i].user_data);
             runtime.unpark(coro);
-            pending_dec += 1;
         }
-        if (pending_dec > 0) _ = self.pending.fetchSub(pending_dec, .acq_rel);
-        return dispatched;
+        // Pending was incremented per real-op submit, not per
+        // cancel SQE — only decrement by the real-op count.
+        if (real_count > 0) _ = self.pending.fetchSub(@intCast(real_count), .acq_rel);
+
+        // Re-arm the interrupt POLL_ADD if it fired. POLL_ADD is
+        // single-shot in io_uring (unlike epoll's level-triggered
+        // mode), so each wake needs a fresh SQE.
+        if (saw_interrupt) {
+            self.acquire();
+            _ = self.ring.poll_add(INTERRUPT_USER_DATA, self.interrupt_fd, POLLIN) catch {};
+            _ = self.ring.submit() catch {};
+            self.release();
+        }
+        return real_count;
     }
 
     /// Wake a worker currently blocked in `poll(true)`. Safe to call
