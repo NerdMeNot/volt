@@ -211,13 +211,24 @@ fn doResolveSync(allocator: std.mem.Allocator, host: []const u8, port: u16) Reso
 }
 
 fn mapEaiError(rc: c_int) LookupError {
-    // EAI_* codes — POSIX standard set. Negative on Linux,
-    // positive on Darwin / BSD; we accept both. Common subset:
+    // EAI_* codes vary across platforms.
+    //
+    // POSIX (Linux/Darwin/BSD): small integers. Negative on Linux,
+    // positive on Darwin. Common subset:
     //   EAI_NONAME    -2 (Linux) / 8 (Darwin)
     //   EAI_AGAIN     -3 (Linux) / 2 (Darwin)
     //   EAI_SERVICE   -8 (Linux) / 9 (Darwin)
     //   EAI_MEMORY    -10 / 6
     //   EAI_SYSTEM    -11 / 11
+    //
+    // Windows: WSA-prefixed codes (positive, ≥ 11001). Per MSDN
+    // `getaddrinfo` returns ordinary EAI_* names but they're
+    // `#define`d to the WSA codes:
+    //   WSAHOST_NOT_FOUND  11001  → NameNotFound (EAI_NONAME)
+    //   WSATRY_AGAIN       11002  → TemporaryFailure (EAI_AGAIN)
+    //   WSANO_RECOVERY     11003  → SystemError (EAI_FAIL)
+    //   WSANO_DATA         11004  → NameNotFound (EAI_NODATA — host
+    //                               exists but has no address records)
     const code = if (rc < 0) -rc else rc;
     return switch (code) {
         2, 3 => error.TemporaryFailure,
@@ -225,6 +236,9 @@ fn mapEaiError(rc: c_int) LookupError {
         8 => error.NameNotFound,
         9 => error.BadService,
         11 => error.SystemError,
+        11001, 11004 => error.NameNotFound,
+        11002 => error.TemporaryFailure,
+        11003 => error.SystemError,
         else => error.Unexpected,
     };
 }
