@@ -75,20 +75,6 @@ pub const Reactor = union(Backend) {
         }
     }
 
-    pub fn waitReadable(self: *Reactor, fd: i32) posix_helpers.ReactorWaitError!void {
-        return switch (self.*) {
-            .epoll => |*r| r.waitReadable(fd),
-            .io_uring => |*r| r.waitReadable(fd),
-        };
-    }
-
-    pub fn waitWritable(self: *Reactor, fd: i32) posix_helpers.ReactorWaitError!void {
-        return switch (self.*) {
-            .epoll => |*r| r.waitWritable(fd),
-            .io_uring => |*r| r.waitWritable(fd),
-        };
-    }
-
     pub fn waitTimer(self: *Reactor, ns: u64) posix_helpers.ReactorWaitError!void {
         return switch (self.*) {
             .epoll => |*r| r.waitTimer(ns),
@@ -129,28 +115,6 @@ pub const Reactor = union(Backend) {
             .epoll => |*r| r.closeFd(fd),
             .io_uring => |*r| r.closeFd(fd),
         }
-    }
-
-    pub fn waitReadableCancel(
-        self: *Reactor,
-        fd: i32,
-        c: *@import("cancel.zig").Cancel,
-    ) (posix_helpers.ReactorWaitError || @import("cancel.zig").Error)!void {
-        return switch (self.*) {
-            .epoll => |*r| r.waitReadableCancel(fd, c),
-            .io_uring => |*r| r.waitReadableCancel(fd, c),
-        };
-    }
-
-    pub fn waitWritableCancel(
-        self: *Reactor,
-        fd: i32,
-        c: *@import("cancel.zig").Cancel,
-    ) (posix_helpers.ReactorWaitError || @import("cancel.zig").Error)!void {
-        return switch (self.*) {
-            .epoll => |*r| r.waitWritableCancel(fd, c),
-            .io_uring => |*r| r.waitWritableCancel(fd, c),
-        };
     }
 
     pub fn waitTimerCancel(
