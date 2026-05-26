@@ -112,15 +112,68 @@ workers that are currently dispatching a coroutine.
   entering `reactor.poll` / before parking.
 * **Readers**: any thread calling `wakeOneParked`
   (`load(.acquire)`). If positive, the wake is skipped — the
-  searching worker will pick up the just-pushed work on its current
-  or next pass.
-* **Why this is sound**: a pusher's push happens-before its load of
-  `num_searching`. A worker that is searching will either (a)
-  observe the push on a subsequent local/injection/steal scan, or
-  (b) have just decremented `num_searching` to park. In case (b),
-  `parkWorker`'s recheck (which loads each queue *after*
-  `markParked`) catches the push because the pusher's
-  `wakeOneParked` will then see the bit and unpark.
+  searching worker is expected to pick up the just-pushed work on
+  its current or next pass. The latch below covers the case where
+  it has already passed its last scan.
+
+#### Missed-wakeup latch (`need_spinning`)
+
+```zig
+Runtime.need_spinning: std.atomic.Value(u32)
+```
+
+Modelled on Go's `sched.needspinning` (`runtime/proc.go` design
+doc, set/cleared at proc.go:3158, 3618). Closes the race that
+`num_searching` alone leaves open:
+
+1. Worker A is searching: `num_searching == 1`.
+2. A's last scan returns empty. A `fetchSub`'s `num_searching`,
+   reaching 0.
+3. Pusher P pushes work + calls `wakeOneParked`. Reads
+   `num_searching == 0` (visible by load-acquire / release-rmw
+   pairing with A's fetchSub). Reads `parked_workers` bitmap;
+   A has not yet `markParked`'d, so the bitmap is empty. P
+   bails without waking anyone.
+4. A reaches `parkWorker`, marks itself, rechecks queues, sees
+   nothing, and parks. P's pushed work sits with no live worker.
+
+`need_spinning` closes step 3 → step 4: when P observes
+`num_searching > 0`, it sets `need_spinning = 1` AND re-loads
+`num_searching`. If the second load still shows > 0, the searcher
+hasn't transitioned yet — it will catch the push via its normal
+scan. If the second load shows 0 (the searcher transitioned
+between P's first load and the latch set), P falls through to do
+a real wake.
+
+The worker side drains the latch AFTER `fetchSub` and BEFORE
+`parkWorker`:
+
+```zig
+_ = rt.num_searching.fetchSub(1, .acq_rel);
+if (rt.need_spinning.swap(0, .acq_rel) != 0) continue; // re-search
+parkWorker(rt, m);
+```
+
+The `swap(0, .acq_rel)` synchronises-with the pusher's
+`store(1, .release)` — if the worker observes 1, all stores
+sequenced before the latch set (including the pushed work) are
+visible to subsequent loads in the next find-work pass.
+
+* **Writers**: `wakeOneParked` (`store(1, .release)` when bailing
+  on the anti-herd guard).
+* **Readers / clearers**: worker loops
+  (`workerLoopUntilShutdown`, `workerLoopUntilTaskDone`) via
+  `swap(0, .acq_rel)` after the `fetchSub` of `num_searching` and
+  before `parkWorker`.
+* **Why this is sound (audit-anchored)**: the previous "wakeOneParked
+  will see the bit and unpark" invariant relied on `markParked`
+  happening before any pusher's check; this was racy when the
+  pusher loaded `num_searching` before the searcher's `fetchSub`
+  but loaded `parked_workers` after — both reads can see "no one
+  to wake". The latch is the explicit handshake the previous design
+  was missing. Tokio achieves the same closure via mutex-mediated
+  idle transition (`tokio::runtime::scheduler::multi_thread::idle`);
+  the latch is the lock-free variant.
 
 #### Reactor poller claim
 

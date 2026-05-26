@@ -352,6 +352,26 @@ pub const Runtime = struct {
     /// Count of workers currently in the find-work phase of the
     /// dispatch loop. Anti-herd: `wakeOneParked` skips when > 0.
     num_searching: std.atomic.Value(u32) align(std.atomic.cache_line) = std.atomic.Value(u32).init(0),
+    /// Missed-wakeup latch. Set by `wakeOneParked` when it bails
+    /// because `num_searching > 0` (the anti-herd guard). Read +
+    /// cleared by the worker loop AFTER it fetchSub's `num_searching`
+    /// and BEFORE it commits to `parkWorker`. If observed set, the
+    /// worker re-enters find-work instead of parking — closing the
+    /// race where a pusher saw `num_searching > 0` while the
+    /// searcher was already mid-fetchSub, and bailed on the wake
+    /// expecting that searcher to find the work, but the searcher
+    /// had already passed its last `tryFindAndDispatch` and was
+    /// about to park.
+    ///
+    /// Modelled on Go's `sched.needspinning` (`runtime/proc.go`
+    /// design doc lines 79-104, set/cleared sites at proc.go:3158,
+    /// 3618). Without this latch, the lock-free `wakeOneParked` /
+    /// `num_searching.fetchSub` / `parkWorker` triangle has a
+    /// missed-wakeup window that Go closes via the explicit
+    /// `needspinning → goto top` re-becomes-spinning path and
+    /// Tokio closes via mutex-mediated idle-set transition
+    /// (`idle.rs::transition_worker_to_parked`).
+    need_spinning: std.atomic.Value(u32) align(std.atomic.cache_line) = std.atomic.Value(u32).init(0),
     /// CAS-claim "I am the current reactor poller".
     reactor_poller_taken: std.atomic.Value(bool) align(std.atomic.cache_line) = std.atomic.Value(bool).init(false),
     /// Shared parking lot — one wait/wake mechanism for every
@@ -576,12 +596,35 @@ pub const Runtime = struct {
     /// its bit), unpark its Parker. Safe to call from any thread;
     /// no-op if no M is parked OR if another M is already searching
     /// for work (anti-herd guard).
+    ///
+    /// ## Anti-herd guard + missed-wakeup latch (Go's `wakep`)
+    ///
+    /// `num_searching > 0` ⇒ don't wake — the searcher will find
+    /// the work via its dispatch cycle. But this opens a race:
+    /// the "searcher" may have already fetchSub'd its share of
+    /// `num_searching` and be in `parkWorker`'s commit path. To
+    /// close it, we set `need_spinning = 1` when bailing, and the
+    /// worker-loop's post-fetchSub recheck (see
+    /// `workerLoopUntilShutdown` / `workerLoopUntilTaskDone`)
+    /// observes that flag and retries `tryFindAndDispatch` instead
+    /// of parking.
+    ///
+    /// The re-load of `num_searching` AFTER `need_spinning.store`
+    /// closes the symmetric race: if the searcher fetchSub'd
+    /// between our first load and our flag-set, our flag is
+    /// useless (the searcher already passed its check); we must
+    /// fall through to the real wake.
     pub fn wakeOneParked(self: *Runtime) void {
-        // Anti-herd: if any M is already searching, it will find
-        // the new work on its current or next dispatch cycle. No
-        // need to wake a parked sibling — that's just thrashing
-        // the bitmap cache line + paying ulock_wake overhead.
-        if (self.num_searching.load(.acquire) > 0) return;
+        // Anti-herd: any searcher will find the work — unless it
+        // has already fetchSub'd and is on the parkWorker commit
+        // path. The need_spinning latch + re-load handles that
+        // narrow window.
+        if (self.num_searching.load(.acquire) > 0) {
+            self.need_spinning.store(1, .release);
+            if (self.num_searching.load(.acquire) > 0) return;
+            // Fall through — the searcher already transitioned out
+            // and may not observe our latch. Do a real wake.
+        }
 
         var bitmap = self.parked_workers.load(.acquire);
         while (bitmap != 0) {
@@ -914,6 +957,14 @@ fn workerLoopUntilTaskDone(rt: *Runtime, m: *M, target_done: *std.atomic.Value(u
         _ = rt.num_searching.fetchAdd(1, .acq_rel);
         if (tryFindAndDispatch(rt, m)) continue;
         _ = rt.num_searching.fetchSub(1, .acq_rel);
+        // Drain the need_spinning latch — see Runtime.need_spinning
+        // doc + wakeOneParked. A pusher that bailed on our anti-herd
+        // guard while we were fetchSub'ing here set this flag, and
+        // is relying on us to retry the find-work loop instead of
+        // parking. The swap is acq_rel so the next fetchAdd above
+        // is happens-after any pusher's mailbox push that paired
+        // with the latch set.
+        if (rt.need_spinning.swap(0, .acq_rel) != 0) continue;
         if (target_done.load(.acquire) == task_mod.DONE) return;
         parkWorker(rt, m);
     }
@@ -925,6 +976,9 @@ fn workerLoopUntilShutdown(rt: *Runtime, m: *M) void {
         _ = rt.num_searching.fetchAdd(1, .acq_rel);
         if (tryFindAndDispatch(rt, m)) continue;
         _ = rt.num_searching.fetchSub(1, .acq_rel);
+        // Drain the need_spinning latch — see workerLoopUntilTaskDone
+        // for the rationale.
+        if (rt.need_spinning.swap(0, .acq_rel) != 0) continue;
         if (rt.shutdown.load(.acquire)) return;
         parkWorker(rt, m);
     }
@@ -1020,21 +1074,16 @@ fn parkWorker(rt: *Runtime, m: *M) void {
     rt.markParked(m);
     defer rt.unmarkParked(m);
     // Recheck — work may have arrived between findWork and mark.
+    // We deliberately do NOT sniff sibling queues here: the
+    // missed-wakeup race that a sniff used to address is now
+    // closed by `Runtime.need_spinning`, drained in the worker
+    // loop BEFORE we reach this point. A sniff at park time
+    // would be an incomplete patch (work can sit in a sibling's
+    // lifo_slot / local WSQ too, not just mailbox), and racy
+    // against the sibling's owner popping concurrently.
     if (m.p.lifo_slot.load(.acquire) != null) return;
     if (!m.p.local.isEmpty()) return;
     if (!m.p.mailbox.isEmpty()) return;
-    // Sniff sibling mailboxes too. The "if we get woken, stealing
-    // finds it" argument fails when the pusher's `wakeOneParked`
-    // short-circuits on `num_searching > 0`: we may be that searching
-    // worker, miss the push in our stealing pass (timing), then
-    // fetchSub and reach here. Without this check, we'd park while
-    // the just-pushed coroutine sits in some sibling's mailbox with
-    // no live worker to dispatch it — all workers eventually park
-    // and the runtime deadlocks. Repro: `poll_desc.test
-    // "PollDesc stress: 200 wait/evict races"` on ARM CI (~100%
-    // hang rate) and local cached-binary hammer (~3% rate). Cost:
-    // N-1 atomic loads per park-attempt, ~3-10 ns total at N=4-11.
-    for (rt.ps) |*p| if (p != m.p and !p.mailbox.isEmpty()) return;
     if (rt.reactor.pendingCount() > 0) return;
     if (rt.shutdown.load(.acquire)) return;
 
@@ -1048,7 +1097,6 @@ fn parkWorker(rt: *Runtime, m: *M) void {
         if (m.p.lifo_slot.load(.acquire) != null) return;
         if (!m.p.mailbox.isEmpty()) return;
         if (!m.p.local.isEmpty()) return;
-        for (rt.ps) |*p| if (p != m.p and !p.mailbox.isEmpty()) return;
         if (rt.reactor.pendingCount() > 0) return;
         if (rt.shutdown.load(.acquire)) return;
     }
