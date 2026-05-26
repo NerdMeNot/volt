@@ -1,43 +1,53 @@
-//! Linux epoll reactor.
+//! Linux epoll reactor — **persistent registration model**.
 //!
-//! Mirror of `reactor_kqueue.zig`'s design, swapping the syscall
-//! family from kqueue → epoll and `EVFILT_TIMER` → `timerfd_create`.
-//! `EPOLLONESHOT` matches kqueue's `EV_ONESHOT` semantics — each
-//! `waitReadable`/`waitWritable` registration auto-disables after
-//! one wake — so the dispatch interface is identical across both
-//! platforms.
+//! Each socket's `PollDesc` is registered ONCE at socket creation
+//! (`registerFd`) via `EPOLL_CTL_ADD` with the mask
+//! `EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET`. The `*PollDesc`
+//! pointer rides in `epoll_event.data` (tagged so the poll loop can
+//! distinguish PD events from per-call timer events). The kernel
+//! registration lives for the socket's lifetime; it's torn down by
+//! `epoll_ctl(DEL)` in `unregisterFd`.
 //!
-//! ## Design choices (locked in via the L2a plan)
+//! `waitFd(fd, pd, mode)`:
+//!   1. `pd.incref()` / `defer pd.decref()` (PD lifecycle ref).
+//!   2. `pd.wait(mode)` — pure user-space state machine.
+//!   3. On `.ready`, return; caller retries the syscall.
+//!   4. On `.closing`, return `error.BadDescriptor`.
 //!
-//! - **`EPOLLONESHOT` + level-triggered**, not `EPOLLET`. Avoids
-//!   the drain-until-EAGAIN loop that edge-triggered demands; each
-//!   waiter registers fresh per call, same shape as kqueue's
-//!   `EV_ONESHOT`. mio uses `EPOLLET`; we don't, because Volt's
-//!   I/O helpers (`readAsync` / `writeAsync`) issue one syscall per
-//!   loop iteration and we want a clean re-register on each EAGAIN.
-//! - **`epoll_data.ptr` is the coroutine pointer** — exact analog
-//!   of kqueue's `udata = *Coroutine`. The poll loop casts back and
-//!   unparks via `runtime.unpark`.
-//! - **Timers via `timerfd`**: each `volt.sleep(ns)` creates a
-//!   one-shot `timerfd_create(CLOCK_MONOTONIC, ...)`, registers it
-//!   in the same epoll fd with `EPOLLIN | EPOLLONESHOT`, parks the
-//!   coroutine, and closes the timerfd on return. The create+close
-//!   pair costs ~1 µs on Linux; for sleeps of any meaningful
-//!   duration that's a rounding error. A per-P timerfd pool is the
-//!   natural optimisation if profiling shows the syscall overhead
-//!   matters at high sleep rates — deferred until measured.
-//! - **`pending` atomic** identical to kqueue's. Same acquire/release
-//!   ordering, same dispatcher gate.
+//! `poll(blocking)`:
+//!   1. `epoll_wait` drains ready events into a batch.
+//!   2. For each event, dispatch by `data`:
+//!      - `INTERRUPT_DATA` (sentinel) — drain eventfd, skip.
+//!      - tagged PD ptr — parse events bitmap, call `pd.deliverReady`
+//!        for each direction that fired.
+//!      - untagged ptr — timer CQE; unpark the coroutine directly.
 //!
-//! ## What's deliberately not here
+//! ## Why edge-triggered (`EPOLLET`)
 //!
-//! - No `signalfd` integration. Volt's user-facing signal handling
-//!   lives outside the runtime.
-//! - No `eventfd` for cross-thread wakeups. The parking lot owns
-//!   inter-worker coordination; the reactor is purely an I/O / timer
-//!   waker.
-//! - No `EPOLLEXCLUSIVE` thundering-herd protection. The single-
-//!   poller-claim in `runtime.zig` already serialises poll calls.
+//! Matches Go's `netpoll_epoll.go` (it uses
+//! `EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET`). The wake-and-retry
+//! pattern in our I/O helpers (`readAsync` / `writeAsync` loop on
+//! EAGAIN) cooperates with edge-triggered semantics correctly: the
+//! user's read syscall sees the level state directly, returning data
+//! while it's available and EAGAIN only when the kernel buffer is
+//! empty. We only enter `pd.wait` on EAGAIN, by which point the
+//! kernel state has actually transitioned to "not readable" — so
+//! the next ET event (on the next arrival) will fire.
+//!
+//! ## Why this design closes the legacy races
+//!
+//! In the previous per-wait registration model (`Step 2b` shim), a
+//! close racing with a register opened a "kernel-accepts-ADD-on-just-
+//! closed-fd" window and an orphaned coroutine. The persistent
+//! registration eliminates this by construction: the registration
+//! happens at socket open, before any peer can see the fd. Cancel
+//! is purely user-space (`pd.waitCancel` runs the state machine),
+//! so it doesn't touch the kernel either.
+//!
+//! Timer paths (`waitTimer` / `waitTimerCancel`) keep per-call
+//! `timerfd_create` + `epoll_ctl(ADD)` since timers are inherently
+//! single-shot. `cancelCoro` + the `WaitOp` stash are timer-only in
+//! this model.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -60,7 +70,11 @@ const EPOLL_CTL_DEL: c_int = 2;
 const EPOLL_CTL_MOD: c_int = 3;
 const EPOLLIN: u32 = 0x001;
 const EPOLLOUT: u32 = 0x004;
+const EPOLLERR: u32 = 0x008;
+const EPOLLHUP: u32 = 0x010;
+const EPOLLRDHUP: u32 = 0x2000;
 const EPOLLONESHOT: u32 = 1 << 30;
+const EPOLLET: u32 = 1 << 31;
 
 // `epoll_event` layout differs by arch: the kernel header uses
 // `__attribute__((packed))` on x86_64 (12 bytes) and natural
@@ -69,9 +83,6 @@ const EPOLLONESHOT: u32 = 1 << 30;
 // kernel's per-arch layout exactly — otherwise epoll_wait writes
 // N×kernelSize bytes into our buffer but we read N×zigSize-byte
 // strides, and every event past index 0 reads garbage.
-//
-// Comptime assertion below pins the layout against the kernel
-// per arch so any drift fails the build, not silently at runtime.
 const epoll_event = if (builtin.target.cpu.arch == .x86_64)
     extern struct {
         events: u32 align(1),
@@ -99,13 +110,9 @@ const EFD_NONBLOCK: c_int = 0o4000; // O_NONBLOCK
 const EFD_CLOEXEC: c_int = 0o2000000;
 extern "c" fn eventfd(initval: c_uint, flags: c_int) c_int;
 
-// Sentinel `data` value for the interrupt registration. Coroutine
-// pointers are heap-allocated and never null, so 0 is safe.
-const INTERRUPT_DATA: u64 = 0;
-
 // ─── timerfd syscalls ────────────────────────────────────────────
 
-const TFD_NONBLOCK: c_int = 0o4000; // O_NONBLOCK
+const TFD_NONBLOCK: c_int = 0o4000;
 const TFD_CLOEXEC: c_int = 0o2000000;
 const CLOCK_MONOTONIC: c_int = 1;
 
@@ -128,25 +135,16 @@ const read = posix_helpers.read;
 const close = posix_helpers.close;
 const errnoVal = posix_helpers.errnoVal;
 
-// Re-exported as the shim's public surface. setNonblock /
-// readAsync / writeAsync / readFull / writeAll are identical
-// across kqueue / epoll / io_uring.
 pub const setNonblock = posix_helpers.setNonblock;
 pub const readAsync = posix_helpers.readAsync;
 pub const writeAsync = posix_helpers.writeAsync;
 pub const readFull = posix_helpers.readFull;
 pub const writeAll = posix_helpers.writeAll;
 
-// EEXIST is specific to epoll_ctl's ADD-vs-MOD branching, so it
-// stays here rather than in the shared POSIX module.
-const EEXIST: c_int = 17;
-
 const ReactorWaitError = posix_helpers.ReactorWaitError;
 
-/// Map an `epoll_ctl` / `timerfd_*` errno into the categorical
-/// `ReactorWaitError` set. Resource-exhaustion cases (EMFILE / ENFILE
-/// / ENOMEM) are surfaced explicitly so libraries can decide
-/// back-off; EBADF means the fd was closed under us.
+/// Map `epoll_ctl` / `timerfd_*` errno into the categorical
+/// `ReactorWaitError` set.
 fn registerError(e: c_int) ReactorWaitError {
     return switch (e) {
         posix_helpers.Errno.EBADF, posix_helpers.Errno.ENOTSOCK => error.BadDescriptor,
@@ -156,35 +154,72 @@ fn registerError(e: c_int) ReactorWaitError {
     };
 }
 
+// ─── data encoding ───────────────────────────────────────────────
+//
+// `epoll_event.data` is a u64 carrying any one of three things:
+//
+//   * `INTERRUPT_DATA` (0) — the cross-thread interrupt eventfd.
+//   * `pd | POLL_DESC_TAG` — a persistent PD registration on a
+//     network/socket fd.
+//   * raw coroutine pointer — a per-call timerfd registration.
+//
+// `POLL_DESC_TAG` picks bit 2 (= 0x4). Coroutine and PollDesc heap
+// allocations are both ≥ 8-byte aligned (Volt's allocator default
+// gives 8; `PollDesc` is `align(std.atomic.cache_line)` so ≥ 64),
+// so bit 2 is naturally 0 in their addresses. Setting bit 2 on PD
+// events makes them trivially distinguishable from timer events
+// without consulting any side state.
+
+const INTERRUPT_DATA: u64 = 0;
+const POLL_DESC_TAG: u64 = 0x4;
+
+inline fn dataForPd(pd: *poll_desc.PollDesc) u64 {
+    const raw: u64 = @intFromPtr(pd);
+    std.debug.assert(raw & POLL_DESC_TAG == 0);
+    return raw | POLL_DESC_TAG;
+}
+
+inline fn pdFromData(data: u64) *poll_desc.PollDesc {
+    return @ptrFromInt(data & ~POLL_DESC_TAG);
+}
+
+inline fn isPdData(data: u64) bool {
+    return data != INTERRUPT_DATA and (data & POLL_DESC_TAG) != 0;
+}
+
 // ─── Reactor ─────────────────────────────────────────────────────
 
 pub const Reactor = struct {
     epfd: c_int = -1,
     /// eventfd registered with the epoll instance for cross-thread
     /// wakeups (`interrupt`). Lives for the reactor's lifetime; the
-    /// epoll registration is level-triggered (no EPOLLONESHOT) so a
+    /// epoll registration is level-triggered (no `EPOLLET`) so a
     /// single ADD covers every subsequent interrupt.
     interrupt_fd: c_int = -1,
 
-    /// In-flight epoll registrations (one per coroutine parked on
-    /// an fd or timer). Read by every dispatcher to decide whether
-    /// to claim the poller role; same role as kqueue's `pending`.
-    /// The eventfd interrupt registration is excluded — it's a
-    /// reactor-internal wake channel, not a coroutine park.
+    /// In-flight kernel registrations:
+    /// - One per `registerFd` (persistent socket registration). Stays
+    ///   incremented for the socket's lifetime.
+    /// - One per `waitTimer*` (single-shot timerfd). Decremented when
+    ///   the timer fires or is cancelled.
+    ///
+    /// Read by the dispatcher to decide whether to claim the poller
+    /// role. The interrupt eventfd is excluded — reactor-internal.
     pending: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    /// Reverse lookup `fd → parked coro`. Required so `closeFd(fd)`
-    /// can find and dispatch any coroutine parked on the fd before
-    /// the close orphans the EPOLL_CTL_DEL. Same pattern as kqueue's
-    /// FdWaiterKey table — but epoll's per-fd registration is
-    /// single-event (EPOLLONESHOT + EPOLL_CTL_MOD races between read
-    /// and write coroutines on the same fd, so only one waiter per fd
-    /// is supported by the existing backend; the side-table key is
-    /// just `fd`).
-    fd_waiters: std.AutoHashMapUnmanaged(c_int, *coroutine.Coroutine) = .{},
-    fd_waiters_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    allocator: std.mem.Allocator,
+
+    /// True while the poller is iterating the `epoll_wait` events
+    /// buffer. Closers that have just issued `epoll_ctl(DEL)` on an
+    /// fd MUST wait for this to clear before freeing the PD:
+    /// `epoll_ctl(DEL)` removes the kernel registration synchronously,
+    /// but events already transferred into a poller's user-space
+    /// buffer are NOT flushed — the dispatch loop would then read
+    /// `data` as a freed `*PollDesc`. See `unregisterFd` for the
+    /// spin discipline. Mirrors `reactor_kqueue.zig:95`.
+    in_poll: std.atomic.Value(bool) align(std.atomic.cache_line) =
+        std.atomic.Value(bool).init(false),
 
     pub fn init(allocator: std.mem.Allocator) !Reactor {
+        _ = allocator; // no per-reactor allocation needed
         const ep = epoll_create1(EPOLL_CLOEXEC);
         if (ep < 0) return error.EpollCreateFailed;
         errdefer _ = posix_helpers.close(ep);
@@ -194,111 +229,94 @@ pub const Reactor = struct {
         errdefer _ = posix_helpers.close(efd);
 
         // Register the interrupt eventfd. Level-triggered (no
-        // ONESHOT) so re-arm isn't needed — the drain in `poll`
-        // resets the readable state.
+        // `EPOLLET`) so a single ADD covers every subsequent
+        // interrupt; the drain in `poll()` resets the readable state.
         var ev = epoll_event{
             .events = EPOLLIN,
             .data = INTERRUPT_DATA,
         };
         if (epoll_ctl(ep, EPOLL_CTL_ADD, efd, &ev) < 0) return error.EpollCreateFailed;
 
-        return .{ .epfd = ep, .interrupt_fd = efd, .allocator = allocator };
-    }
-
-    inline fn lockWaiters(self: *Reactor) void {
-        while (self.fd_waiters_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
-    }
-    inline fn unlockWaiters(self: *Reactor) void {
-        self.fd_waiters_lock.store(0, .release);
-    }
-    fn insertWaiter(self: *Reactor, fd: c_int, c: *coroutine.Coroutine) std.mem.Allocator.Error!void {
-        self.lockWaiters();
-        defer self.unlockWaiters();
-        try self.fd_waiters.put(self.allocator, fd, c);
-    }
-    fn removeWaiter(self: *Reactor, fd: c_int) ?*coroutine.Coroutine {
-        self.lockWaiters();
-        defer self.unlockWaiters();
-        if (self.fd_waiters.fetchRemove(fd)) |kv| return kv.value;
-        return null;
-    }
-
-    /// Close a fd whose epoll registration may have a parked
-    /// coroutine waiting on it. Mirrors reactor_kqueue.zig closeFd;
-    /// see that file for the full rationale.
-    pub fn closeFd(self: *Reactor, fd: i32) void {
-        const coro = self.removeWaiter(@intCast(fd));
-        if (coro) |c| {
-            const rc = epoll_ctl(self.epfd, EPOLL_CTL_DEL, @intCast(fd), null);
-            if (rc >= 0) {
-                // Won the EPOLL_CTL_DEL race against poll(); coro is
-                // still parked, stack is stable.
-                if (c.reactor_wait_op) |op_ptr| {
-                    const op: *WaitOp = @ptrCast(@alignCast(op_ptr));
-                    op.closed = true;
-                }
-                _ = self.pending.fetchSub(1, .acq_rel);
-                runtime.unpark(c);
-            }
-            // ENOENT: poll() owns the unpark; coro will resume
-            // naturally; the next libc recv/send call after our
-            // close below gets EBADF → BadDescriptor.
-        }
-        _ = posix_helpers.close(fd);
+        return .{ .epfd = ep, .interrupt_fd = efd };
     }
 
     pub fn deinit(self: *Reactor) void {
-        // See `reactor_kqueue.zig` for the in-flight-at-deinit
-        // contract. Caller is responsible for ensuring no coros
-        // are parked in the kernel before tearing down.
         std.debug.assert(self.pending.load(.acquire) == 0);
-        std.debug.assert(self.fd_waiters.count() == 0);
-        self.fd_waiters.deinit(self.allocator);
+        std.debug.assert(!self.in_poll.load(.acquire));
         if (self.interrupt_fd >= 0) _ = posix_helpers.close(self.interrupt_fd);
         if (self.epfd >= 0) _ = posix_helpers.close(self.epfd);
         self.interrupt_fd = -1;
         self.epfd = -1;
     }
 
-    pub fn waitReadable(self: *Reactor, fd: i32) ReactorWaitError!void {
-        return self.submitPoll(@intCast(fd), EPOLLIN);
-    }
+    // ─── PollDesc-aware interface (Step 2f real implementation) ─────
 
-    pub fn waitWritable(self: *Reactor, fd: i32) ReactorWaitError!void {
-        return self.submitPoll(@intCast(fd), EPOLLOUT);
-    }
-
-    // ─── PollDesc-aware interface (Step 2b shims) ──────────────────────
-    //
-    // Cross-backend interface that the post-restructure net.zig will
-    // call. Today these are no-op / delegate shims — see reactor_kqueue
-    // for the rationale. epoll's real migration is Step 2e+.
-
+    /// Register `pd` as the per-fd state machine for `fd`. Submits
+    /// `EPOLL_CTL_ADD` with `EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET`
+    /// and `data = pd | POLL_DESC_TAG`. Edge-triggered: `poll()` sees
+    /// an event each time the fd transitions to readable / writable
+    /// / hung up, and `pd.deliverReady` pops a parked waiter or
+    /// caches `PD_READY` for the next wait.
+    ///
+    /// Matches Go's `runtime/netpoll_epoll.go::netpollopen` exactly
+    /// in mask + registration shape (plus our `POLL_DESC_TAG` instead
+    /// of Go's `taggedPointer(pd, fdseq)`).
     pub fn registerFd(self: *Reactor, fd: i32, pd: *poll_desc.PollDesc) ReactorWaitError!void {
-        _ = self;
-        _ = fd;
-        _ = pd;
+        var ev = epoll_event{
+            .events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET,
+            .data = dataForPd(pd),
+        };
+        if (epoll_ctl(self.epfd, EPOLL_CTL_ADD, @intCast(fd), &ev) < 0) {
+            return registerError(errnoVal());
+        }
+        _ = self.pending.fetchAdd(1, .acq_rel);
     }
 
+    /// Reverse of `registerFd`. Issues `EPOLL_CTL_DEL`, decrements
+    /// `pending`, then synchronises with any in-flight poll dispatch
+    /// so the caller may safely free `pd`.
+    ///
+    /// `EPOLL_CTL_DEL` removes the kernel registration AND discards
+    /// any events triggered-but-not-yet-delivered. What it does NOT
+    /// do is reach into a poller's existing user-space `events[]`
+    /// buffer that the kernel already populated. The `in_poll`
+    /// spin handles that — same barrier as kqueue Step 2d.2.
     pub fn unregisterFd(self: *Reactor, fd: i32, pd: *poll_desc.PollDesc) void {
-        _ = self;
-        _ = fd;
         _ = pd;
+        // ENOENT is silently fine — kernel already removed the
+        // registration (fd closed by some other path) or it was
+        // never added.
+        _ = epoll_ctl(self.epfd, EPOLL_CTL_DEL, @intCast(fd), null);
+        _ = self.pending.fetchSub(1, .acq_rel);
+        // Wake any worker blocked in `epoll_wait` so it completes
+        // its current dispatch promptly, then spin until `in_poll`
+        // clears.
+        self.interrupt();
+        while (self.in_poll.load(.acquire)) std.atomic.spinLoopHint();
     }
 
+    /// Park the current coroutine until `fd` is ready in `mode`.
+    /// Runs the per-fd state machine on `pd`; the kernel side stays
+    /// armed across the call (persistent ET registration).
     pub fn waitFd(
         self: *Reactor,
         fd: i32,
         pd: *poll_desc.PollDesc,
         mode: poll_desc.Mode,
     ) ReactorWaitError!void {
-        _ = pd;
-        return switch (mode) {
-            .read => self.waitReadable(fd),
-            .write => self.waitWritable(fd),
+        _ = self;
+        _ = fd;
+        pd.incref();
+        defer pd.decref();
+        return switch (pd.wait(mode)) {
+            .ready => {},
+            .closing => error.BadDescriptor,
         };
     }
 
+    /// Cancel-aware variant of `waitFd`. Returns `error.Cancelled`
+    /// if `c` fires before readiness; otherwise behaves like
+    /// `waitFd`.
     pub fn waitFdCancel(
         self: *Reactor,
         fd: i32,
@@ -306,72 +324,26 @@ pub const Reactor = struct {
         mode: poll_desc.Mode,
         c: *cancel_mod.Cancel,
     ) (ReactorWaitError || cancel_mod.Error)!void {
-        _ = pd;
-        return switch (mode) {
-            .read => self.waitReadableCancel(fd, c),
-            .write => self.waitWritableCancel(fd, c),
+        _ = self;
+        _ = fd;
+        const result = try pd.waitCancel(mode, c);
+        return switch (result) {
+            .ready => {},
+            .closing => error.BadDescriptor,
         };
     }
 
-    fn submitPoll(self: *Reactor, fd: c_int, filter: u32) ReactorWaitError!void {
-        const me = current.require();
-        // Stack-allocate a WaitOp so closeFd has somewhere to write
-        // the `closed` flag (and cancelCoro has fd to deregister).
-        var op = WaitOp{ .fd = fd };
-        me.reactor_wait_op = &op;
-        defer me.reactor_wait_op = null;
-
-        // ─── Side-table insert FIRST, EPOLL_CTL_ADD second ──────────────
-        //
-        // See reactor_kqueue.zig's waitFd for the rationale: if a
-        // peer's closeFd races between EPOLL_CTL_ADD and our
-        // side-table insert, close() silently orphans the kernel
-        // registration on fd close and we park forever. Side-table
-        // first means closeFd finds us; EPOLL_CTL_DEL returns ENOENT
-        // (not yet registered) so it doesn't unpark, but the
-        // subsequent libc close happens AFTER our removeWaiter so we
-        // get EBADF on the EPOLL_CTL_ADD attempt that follows —
-        // surfaces cleanly as BadDescriptor.
-        self.insertWaiter(fd, me) catch return error.SystemResources;
-        defer _ = self.removeWaiter(fd);
-
-        var ev = epoll_event{
-            .events = filter | EPOLLONESHOT,
-            .data = @intFromPtr(me),
-        };
-        // `EPOLLONESHOT` auto-removes the registration after one
-        // wake. On the first wait for an fd: ADD succeeds. On
-        // subsequent waits (same fd, re-armed): MOD is needed.
-        // Try ADD first; on EEXIST fall back to MOD.
-        var rc = epoll_ctl(self.epfd, EPOLL_CTL_ADD, fd, &ev);
-        if (rc < 0 and errnoVal() == EEXIST) {
-            rc = epoll_ctl(self.epfd, EPOLL_CTL_MOD, fd, &ev);
-        }
-        if (rc < 0) return registerError(errnoVal());
-        _ = self.pending.fetchAdd(1, .acq_rel);
-
-        me.pending = .park;
-        context.swap(&me.ctx, me.main_ctx);
-        // Resume: pending decremented by poll() before unpark.
-        if (op.closed) return error.BadDescriptor;
-    }
+    // ─── Timer (kept per-wait — timers are inherently single-shot) ──
 
     pub fn waitTimer(self: *Reactor, ns: u64) ReactorWaitError!void {
-        // ns=0 is a no-op. timerfd_settime(2) treats an all-zero
-        // it_value as "disarm the timer" — without this guard the
-        // coroutine parks forever waiting for a fire that never
-        // comes. Caught by the sleep(0) reactor-conformance test.
+        // ns=0 is a no-op. `timerfd_settime` with an all-zero
+        // `it_value` disarms the timer — without this guard the
+        // coroutine parks forever.
         if (ns == 0) return;
-        // itimerspec.it_value.sec is `time_t` (i64 on Linux). ns > i64_max
-        // would wrap silently after the divide.
         if (ns > std.math.maxInt(i64)) return error.TimeoutOutOfRange;
 
         const me = current.require();
 
-        // Create a one-shot timerfd. Closed before this function
-        // returns — no fd leak. A per-P pool of pre-created
-        // timerfds is the natural optimisation if `bench-sleep`-
-        // style workloads show the syscall overhead; deferred.
         const tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
         if (tfd < 0) return registerError(errnoVal());
         errdefer _ = close(tfd);
@@ -395,130 +367,16 @@ pub const Reactor = struct {
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
 
-        // Drain the 8-byte expiration count so the timerfd isn't
-        // sitting in "readable" state. EPOLLONESHOT already
-        // disabled the registration, but reading defensively
-        // matches semantics across kernels.
+        // Drain the 8-byte expiration count and close.
         var buf: [8]u8 = undefined;
         _ = read(tfd, &buf, 8);
         _ = close(tfd);
     }
 
-    pub fn pendingCount(self: *const Reactor) u32 {
-        return self.pending.load(.acquire);
-    }
-
-    /// Per-call stash for cancel-aware waits. `fd` is the
-    /// epoll-registered descriptor (a socket fd or a timerfd).
-    /// `is_timer` differentiates the two on the cancel path —
-    /// timer cancels must also close the per-call timerfd, since
-    /// the wait function won't run its own `close` if it never
-    /// resumes naturally.
-    pub const WaitOp = struct {
-        fd: c_int,
-        is_timer: bool = false,
-        /// Set by `closeFd` when the fd was closed under the parked
-        /// op. Checked by waitFd / waitFdCancel after the swap-back.
-        closed: bool = false,
-    };
-
-    /// Cancel this coro's in-flight epoll registration.
-    /// Race-free single-unpark: `EPOLL_CTL_DEL` returns 0 if it
-    /// actually removed the registration; ENOENT means the
-    /// registration was already consumed by poll() and the normal
-    /// unpark path is in flight.
-    pub fn cancelCoro(self: *Reactor, c: *coroutine.Coroutine) void {
-        const op_ptr = c.reactor_wait_op orelse return;
-        const op: *WaitOp = @ptrCast(@alignCast(op_ptr));
-        const rc = epoll_ctl(self.epfd, EPOLL_CTL_DEL, op.fd, null);
-        if (rc < 0) return; // ENOENT — poll() owns the unpark.
-        // For timer waits, the per-call timerfd is also our
-        // responsibility — the wait fn won't run its natural
-        // close-after-read path because it never resumes.
-        if (op.is_timer) _ = posix_helpers.close(op.fd);
-        _ = self.pending.fetchSub(1, .acq_rel);
-        runtime.unpark(c);
-    }
-
-    pub fn waitReadableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        return self.submitPollCancel(@intCast(fd), EPOLLIN, c);
-    }
-
-    pub fn waitWritableCancel(self: *Reactor, fd: i32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        return self.submitPollCancel(@intCast(fd), EPOLLOUT, c);
-    }
-
-    fn submitPollCancel(self: *Reactor, fd: c_int, filter: u32, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
-        try c.checkpoint();
-        const me = current.require();
-
-        var op = WaitOp{ .fd = fd };
-        me.reactor_wait_op = &op;
-        defer me.reactor_wait_op = null;
-
-        // ─── Side-table insert FIRST (closes close-vs-register race) ──────
-        //
-        // See waitFd for the rationale.
-        self.insertWaiter(fd, me) catch return error.SystemResources;
-        defer _ = self.removeWaiter(fd);
-
-        // ─── Kernel registration SECOND (closes register-then-fire race) ──
-        //
-        // Old order — registerReactor then kernel-register — opened a
-        // window where fire() could call cancelCoro before the kernel
-        // had the registration. EPOLL_CTL_DEL then returned ENOENT;
-        // cancelCoro's "ENOENT means poll() owns the unpark"
-        // heuristic silently returned, the coroutine registered and
-        // parked forever.
-        var ev = epoll_event{
-            .events = filter | EPOLLONESHOT,
-            .data = @intFromPtr(me),
-        };
-        var rc = epoll_ctl(self.epfd, EPOLL_CTL_ADD, fd, &ev);
-        if (rc < 0 and errnoVal() == EEXIST) {
-            rc = epoll_ctl(self.epfd, EPOLL_CTL_MOD, fd, &ev);
-        }
-        if (rc < 0) return registerError(errnoVal());
-        _ = self.pending.fetchAdd(1, .acq_rel);
-
-        // ─── Cancel-list registration THIRD ─────────────────────────────
-        var w = cancel_mod.Waiter{};
-        if (c.registerReactor(&w, me)) {
-            // Fire happened before our register. cancelCoro was not
-            // called for us (we weren't in the list) — own cleanup.
-            if (epoll_ctl(self.epfd, EPOLL_CTL_DEL, fd, null) >= 0) {
-                _ = self.pending.fetchSub(1, .acq_rel);
-            }
-            return error.Cancelled;
-        }
-        defer c.deregister(&w);
-
-        // ─── Park ───────────────────────────────────────────────────────
-        //
-        // park_state RUNNING → NOTIFIED handles fire() landing in
-        // the window between registerReactor returning and the swap
-        // below: dispatch sees NOTIFIED and re-queues us immediately
-        // (runtime.zig:160 documents the machine).
-        me.pending = .park;
-        context.swap(&me.ctx, me.main_ctx);
-
-        if (op.closed) return error.BadDescriptor;
-        if (c.isFired()) return error.Cancelled;
-    }
-
-    /// Cancel-aware variant of `waitTimer`. The timerfd is set up
-    /// inline (we can't share state with `waitTimer` because the
-    /// op stash would be a stack-frame address held across one of
-    /// our calls). On cancel, `cancelCoro` is what closes the
-    /// timerfd via the `is_timer` branch.
+    /// Cancel-aware variant of `waitTimer`.
     pub fn waitTimerCancel(self: *Reactor, ns: u64, c: *cancel_mod.Cancel) (ReactorWaitError || cancel_mod.Error)!void {
         const me = current.require();
         try c.checkpoint();
-        // ns=0 mirrors waitTimer — early return AFTER the checkpoint
-        // so a pre-fired cancel still surfaces error.Cancelled.
-        // timerfd_settime with an all-zero it_value disarms the timer
-        // (same gap as waitTimer, which bc4685a fixed only on the
-        // non-cancel variant).
         if (ns == 0) return;
         if (ns > std.math.maxInt(i64)) return error.TimeoutOutOfRange;
 
@@ -546,7 +404,7 @@ pub const Reactor = struct {
             return registerError(errnoVal());
         }
 
-        var op = WaitOp{ .fd = tfd, .is_timer = true };
+        var op = WaitOp{ .fd = tfd };
         me.reactor_wait_op = &op;
         defer me.reactor_wait_op = null;
 
@@ -554,8 +412,6 @@ pub const Reactor = struct {
         const already_fired = c.registerReactor(&w, me);
         defer c.deregister(&w);
         if (already_fired) {
-            // Cancel fired between checkpoint and register — tear
-            // down without parking.
             _ = epoll_ctl(self.epfd, EPOLL_CTL_DEL, tfd, null);
             _ = posix_helpers.close(tfd);
             return error.Cancelled;
@@ -565,8 +421,6 @@ pub const Reactor = struct {
         me.pending = .park;
         context.swap(&me.ctx, me.main_ctx);
 
-        // We resumed naturally (timer fired, not cancel). Drain
-        // the 8-byte expiration count and close the timerfd.
         var buf: [8]u8 = undefined;
         _ = read(tfd, &buf, 8);
         _ = posix_helpers.close(tfd);
@@ -574,38 +428,109 @@ pub const Reactor = struct {
         if (c.isFired()) return error.Cancelled;
     }
 
+    /// Per-call stash for cancel-aware waits — now only used by the
+    /// timer path. The PD wait path's cancellation is purely
+    /// user-space (`pd.waitCancel`).
+    pub const WaitOp = struct {
+        fd: c_int,
+    };
+
+    /// Cancel this coro's in-flight timer registration. `EPOLL_CTL_DEL`
+    /// returns 0 if it actually removed it; ENOENT means poll() got
+    /// the event first and the unpark is in flight.
+    pub fn cancelCoro(self: *Reactor, c: *coroutine.Coroutine) void {
+        const op_ptr = c.reactor_wait_op orelse return;
+        const op: *WaitOp = @ptrCast(@alignCast(op_ptr));
+        const rc = epoll_ctl(self.epfd, EPOLL_CTL_DEL, op.fd, null);
+        if (rc < 0) return; // ENOENT — poll() owns the unpark.
+        _ = posix_helpers.close(op.fd);
+        _ = self.pending.fetchSub(1, .acq_rel);
+        runtime.unpark(c);
+    }
+
+    /// Close an fd that may have a PollDesc still registered with
+    /// epoll. In the persistent-registration model PD lifecycle
+    /// (evict + closeAndWait + unregisterFd + free) is owned by the
+    /// socket type via `pd_handle.release`, called BEFORE this fn.
+    /// All we do here is the libc close.
+    pub fn closeFd(self: *Reactor, fd: i32) void {
+        _ = self;
+        _ = posix_helpers.close(fd);
+    }
+
+    pub fn pendingCount(self: *const Reactor) u32 {
+        return self.pending.load(.acquire);
+    }
+
     pub fn poll(self: *Reactor, blocking: bool) usize {
         if (self.pending.load(.acquire) == 0) return 0;
         var events: [EPOLL_EVENTS_BATCH]epoll_event = undefined;
         const timeout_ms: c_int = if (blocking) -1 else 0;
+
+        // Set `in_poll` BEFORE `epoll_wait`. A concurrent
+        // `unregisterFd` about to free a PD whose event the kernel
+        // will transfer into our `events[]` MUST observe
+        // `in_poll == true` for the entire window the buffer is
+        // live. See `reactor_kqueue.zig:396` for the full rationale.
+        self.in_poll.store(true, .release);
+        defer self.in_poll.store(false, .release);
+
         const n = epoll_wait(self.epfd, &events, EPOLL_EVENTS_BATCH, timeout_ms);
         if (n <= 0) return 0;
         const count: usize = @intCast(n);
-        var real_count: usize = 0;
+        var timer_count: u32 = 0;
+        var dispatched: usize = 0;
         var i: usize = 0;
         while (i < count) : (i += 1) {
-            // Interrupt event: drain the eventfd counter to clear
-            // its readable state (level-triggered registration would
-            // re-fire on the next epoll_wait otherwise). Doesn't
-            // count toward `pending`.
-            if (events[i].data == INTERRUPT_DATA) {
+            const data = events[i].data;
+            const ev_mask = events[i].events;
+
+            if (data == INTERRUPT_DATA) {
+                // Drain the eventfd counter to clear its readable
+                // state. Level-triggered registration would re-fire
+                // on the next epoll_wait otherwise. Doesn't count
+                // toward `pending`.
                 var drain_buf: [8]u8 = undefined;
                 _ = read(self.interrupt_fd, &drain_buf, 8);
                 continue;
             }
-            real_count += 1;
-            const coro: *coroutine.Coroutine = @ptrFromInt(events[i].data);
+
+            if (isPdData(data)) {
+                // Persistent PD registration — parse the events
+                // bitmap and dispatch to the appropriate direction(s).
+                // POLLERR / POLLHUP wake both directions so a hung-up
+                // fd doesn't strand parked readers or writers.
+                const pd = pdFromData(data);
+                const wake_read = (ev_mask & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0;
+                const wake_write = (ev_mask & (EPOLLOUT | EPOLLHUP | EPOLLERR)) != 0;
+                if (wake_read) {
+                    if (pd.deliverReady(.read)) |c| runtime.unpark(c);
+                }
+                if (wake_write) {
+                    if (pd.deliverReady(.write)) |c| runtime.unpark(c);
+                }
+                dispatched += 1;
+                continue;
+            }
+
+            // Timer event — `data` is a raw coroutine pointer.
+            // Per-call timerfd registration; decrement `pending`.
+            const coro: *coroutine.Coroutine = @ptrFromInt(data);
             runtime.unpark(coro);
+            timer_count += 1;
+            dispatched += 1;
         }
-        if (real_count > 0) _ = self.pending.fetchSub(@intCast(real_count), .acq_rel);
-        return real_count;
+        // Only timer events decrement `pending` — persistent PD
+        // registrations stay armed (`EPOLLET` is edge-triggered,
+        // not single-shot).
+        if (timer_count > 0) _ = self.pending.fetchSub(timer_count, .acq_rel);
+        return dispatched;
     }
 
     /// Wake a worker currently blocked in `poll(true)`. Safe to call
     /// from any thread. The eventfd write is non-blocking; if a
     /// previous interrupt's counter hasn't been drained yet, the
-    /// kernel coalesces (writes ADD to the u64). The first epoll
-    /// return will drain whatever has accumulated.
+    /// kernel coalesces.
     pub fn interrupt(self: *Reactor) void {
         const one: u64 = 1;
         var bytes: [8]u8 = undefined;
@@ -614,7 +539,7 @@ pub const Reactor = struct {
     }
 };
 
-// Compile-time check: this file is only meaningful on Linux.
+// Compile-time check: Linux-only.
 comptime {
     if (builtin.os.tag != .linux) {
         @compileError("reactor_epoll.zig is Linux-only; src/reactor.zig dispatches by os.tag");
