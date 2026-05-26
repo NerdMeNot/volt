@@ -9,8 +9,9 @@
 //!
 //! Each backend lives in its own file:
 //!   * `reactor_kqueue.zig`   — Darwin / BSD
-//!   * `reactor_epoll.zig`    — Linux (readiness)
-//!   * `reactor_io_uring.zig` — Linux (poll-mode)
+//!   * `reactor_epoll.zig`    — Linux (readiness; the only public Linux backend)
+//!   * `reactor_io_uring.zig` — Linux (completion; internal, reserved for the
+//!                              future async-file-I/O path — not user-selectable)
 //!   * `reactor_iocp.zig`     — Windows
 //!
 //! Adding a backend is a self-contained file + an entry in the
@@ -28,11 +29,6 @@ const backend = switch (builtin.os.tag) {
 };
 
 pub const Reactor = backend.Reactor;
-
-/// Linux-only — `Runtime.Config.io_backend` selects between
-/// `.epoll` and `.io_uring`; on other platforms the Config field
-/// is accepted but ignored. Public for `runtime.zig`'s use.
-pub const IoBackend = enum { auto, epoll, io_uring };
 
 // ─── Public error vocabulary ─────────────────────────────────────
 //

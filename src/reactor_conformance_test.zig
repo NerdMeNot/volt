@@ -385,11 +385,11 @@ const builtin = @import("builtin");
 // Phase 3d backend coverage:
 //   * kqueue   (Darwin)  — full closeFd impl
 //   * epoll    (Linux)   — full closeFd impl
-//   * io_uring (Linux)   — full closeFd impl (via IORING_OP_ASYNC_CANCEL)
 //   * IOCP     (Windows) — full closeFd impl (via CancelIoEx)
+// (io_uring also has full closeFd via IORING_OP_ASYNC_CANCEL, but the
+// public Linux backend is epoll — this test exercises the user-visible
+// path.)
 const has_full_closeFd = true;
-// .auto on every platform — the runtime picks the right backend.
-const closeFd_test_io_backend: @import("reactor.zig").IoBackend = .auto;
 
 const ListenerCloseCtx = struct {
     listener: *TcpListener,
@@ -431,7 +431,7 @@ test "conformance: TcpListener.close while accept() is parked — no hang" {
     // Phase 3d: kqueue + epoll have full closeFd; io_uring + IOCP are stubs.
     if (!has_full_closeFd) return error.SkipZigTest;
 
-    var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 2, .io_backend = closeFd_test_io_backend });
+    var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 2 });
     defer rt.deinit();
 
     var listener = try TcpListener.bind(Address.loopback4(0));
@@ -479,7 +479,7 @@ test "conformance: UdpSocket.close while recvFrom() is parked — no hang" {
     // Phase 3d: kqueue + epoll have full closeFd; io_uring + IOCP are stubs.
     if (!has_full_closeFd) return error.SkipZigTest;
 
-    var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 2, .io_backend = closeFd_test_io_backend });
+    var rt = try runtime.Runtime.init(.{ .allocator = test_alloc, .workers = 2 });
     defer rt.deinit();
 
     var socket = try UdpSocket.bind(Address.loopback4(0));

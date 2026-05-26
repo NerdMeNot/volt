@@ -130,11 +130,6 @@ pub const Config = struct {
     /// RSS is unaffected — every coroutine starts with the same 16
     /// KiB body commit; only this knob's *virtual* cost scales.
     stack_reservation_size: usize = stack_mod.DEFAULT_RESERVATION_SIZE,
-    /// **Linux only.** Chooses between epoll and io_uring backends.
-    /// `.auto` probes for io_uring at init and falls back to epoll
-    /// on older kernels (< 5.10) or sysctl-disabled environments.
-    /// Ignored on Darwin (always kqueue) and Windows (always IOCP).
-    io_backend: reactor_mod.IoBackend = .auto,
     /// OS-thread pool used by `volt.spawnBlocking` to run sync /
     /// CPU-bound code without pinning a worker. Lazy — no threads
     /// spawn until the first `spawnBlocking` call. Default caps
@@ -407,18 +402,11 @@ pub const Runtime = struct {
         const ps = try cfg.allocator.alloc(P, n);
         errdefer cfg.allocator.free(ps);
 
-        // Reactor init: on Linux, the io_backend config selects
-        // between epoll and io_uring (tagged union dispatch in
-        // reactor_linux.zig). On other platforms `io_backend` is
-        // accepted but ignored — kqueue or IOCP is fixed.
-        const reactor_inst = if (@import("builtin").os.tag == .linux)
-            switch (cfg.io_backend) {
-                .auto => try Reactor.init(cfg.allocator),
-                .epoll => try Reactor.initBackend(cfg.allocator, .epoll),
-                .io_uring => try Reactor.initBackend(cfg.allocator, .io_uring),
-            }
-        else
-            try Reactor.init(cfg.allocator);
+        // Reactor backend is fixed per platform — epoll (Linux),
+        // kqueue (Darwin), IOCP (Windows). io_uring exists in tree
+        // but is not user-selectable; see reactor_linux.zig for the
+        // future async-file-I/O plan.
+        const reactor_inst = try Reactor.init(cfg.allocator);
 
         rt.* = .{
             .allocator = cfg.allocator,

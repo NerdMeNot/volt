@@ -1,29 +1,29 @@
 //! Linux reactor dispatch — tagged union of epoll + io_uring.
 //!
-//! Linux is the only platform Volt ships with two backends. The
-//! choice is `Runtime.Config.io_backend`:
+//! **The public Linux backend is epoll.** `Runtime.Config` has no
+//! `io_backend` knob; `Reactor.init` always returns the epoll
+//! variant. This matches Go's runtime and Tokio (both epoll on
+//! Linux): epoll has 20+ years of production maturity, while
+//! io_uring's persistent-registration model (POLL_ADD_MULTI +
+//! cancellation drain) is younger and has subtler kernel-version-
+//! dependent behaviour. Volt's persistent-registration epoll
+//! backend (`reactor_epoll.zig`, Step 2f) is a direct port of Go's
+//! `runtime/netpoll_epoll.go`.
 //!
-//!   * `.auto` (default) — use epoll. Same default as Go's runtime
-//!     and Tokio: epoll is universally available since Linux 2.5
-//!     and has 20+ years of mature production use, while io_uring's
-//!     persistent-registration model (POLL_ADD_MULTI + cancellation
-//!     drain) is younger and has subtler kernel-version-dependent
-//!     behaviour. Volt's persistent-registration epoll backend
-//!     (`reactor_epoll.zig`, Step 2f) is a direct port of Go's
-//!     `runtime/netpoll_epoll.go`.
-//!   * `.epoll` — explicit epoll (same as `.auto`).
-//!   * `.io_uring` — explicit io_uring (the legacy per-wait
-//!     `Step 2b` shim, retained for future migration work). Users
-//!     opting in should be aware of the close-vs-register race
-//!     documented as audit `§4A`.
+//! **io_uring is kept in tree for one specific future use:** the
+//! async-file-I/O path. Today `src/fs/*` is spawnBlocking-backed
+//! (thread-pool dispatch around blocking pread/pwrite/fsync); the
+//! real win from io_uring is on storage I/O, where file fds don't
+//! churn the way socket fds do and the §4A close-vs-register race
+//! doesn't bite. When that migration lands, io_uring becomes the
+//! Linux backend *for the fs path only* — net stays on epoll. The
+//! tagged-union dispatch here is what makes that split possible
+//! without forking the reactor surface.
 //!
-//! The dispatch is a tagged union; method calls forward via a
-//! runtime branch (one indirect jump per reactor op). If profiling
-//! shows the dispatch overhead matters (>2% on bench-yield or
-//! bench-tcp-echo), the alternative is a comptime build flag
-//! (`-Dio_backend=epoll` / `-Dio_backend=io_uring`), forcing users
-//! to pick at build time. For now we accept the runtime cost in
-//! exchange for one binary that works on every Linux.
+//! Until then, `initBackend(.io_uring)` is reachable only from
+//! internal callers (conformance tests, future fs work). The
+//! Step 2b per-wait io_uring shim it builds has the §4A race; that
+//! is why it never sits behind a public Config flag.
 //!
 //! All other platforms compile-pick a single backend in
 //! `src/reactor.zig`; this dispatch wrapper exists only on Linux.
@@ -56,25 +56,17 @@ pub const Reactor = union(Backend) {
     io_uring: io_uring.Reactor,
 
     /// Default constructor matches the other platforms' shape — no
-    /// args, no config-injection. `Runtime.init` calls
-    /// `initBackend(backend)` directly when it wants to override.
-    ///
-    /// Defaults to epoll — the same default that Go's runtime and
-    /// Tokio use on Linux. epoll is universally available since
-    /// Linux 2.5 and is what Volt's persistent-registration Step
-    /// 2f migration ports directly from Go's
-    /// `runtime/netpoll_epoll.go`. io_uring's persistent-
-    /// registration story (POLL_ADD_MULTI + cancel-drain) is
-    /// younger; it can be opted into explicitly via
-    /// `Config.io_backend = .io_uring`, which uses the legacy
-    /// per-wait Step 2b shim with the close-vs-register race
-    /// documented as audit §4A — caveat emptor.
+    /// args, no config injection. Always returns the epoll variant;
+    /// the public Linux backend has no choice to make.
     pub fn init(allocator: std.mem.Allocator) !Reactor {
         return initBackend(allocator, .epoll);
     }
 
-    /// Explicit-backend constructor. Used by `Runtime.init` when
-    /// `Config.io_backend != .auto`.
+    /// Internal: explicit-backend constructor. Reserved for the
+    /// future async-file-I/O path (io_uring on the storage side)
+    /// and for conformance tests that exercise both backends. Not
+    /// called from public API surfaces — `Runtime.init` always uses
+    /// `init` above.
     pub fn initBackend(allocator: std.mem.Allocator, b: Backend) !Reactor {
         return switch (b) {
             .epoll => Reactor{ .epoll = try epoll.Reactor.init(allocator) },
