@@ -578,6 +578,23 @@ pub const Reactor = struct {
     /// for `mode`. CAS-flips `armed[mode]` 0→1; the poll loop CAS-
     /// flips it back to 0 on completion (BEFORE calling deliverReady,
     /// so a waiter racing in after sees armed=0 and submits fresh).
+    ///
+    /// ## UDP safety: `MSG_PEEK` on read probes
+    ///
+    /// Without `MSG_PEEK`, a zero-byte WSARecv on a UDP socket with
+    /// a pending datagram CONSUMES the datagram (truncated to 0
+    /// bytes), and the parked waiter resumes only to find the
+    /// real `recvFrom` blocking on an empty queue — hang. Setting
+    /// `MSG_PEEK` makes the kernel report readiness without
+    /// removing the datagram. On TCP, `MSG_PEEK` + 0-byte buffer
+    /// is harmless (nothing to consume either way). Mirrors Go's
+    /// `internal/poll/fd_windows.go:1276-1283` `RawRead`.
+    ///
+    /// `WSAEMSGSIZE` from the peek means "data is there, didn't
+    /// fit in 0 bytes" — exactly the readiness signal we want.
+    /// Treat it as immediate-success: deliver the ready signal
+    /// inline (no completion is posted for sync errors), undo
+    /// the `pending` bump.
     fn ensureArmed(self: *Reactor, pd: *poll_desc.PollDesc, mode: poll_desc.Mode) ReactorWaitError!void {
         const backend: *WinPdBackend = @ptrCast(@alignCast(pd.backend_data.?));
         const armed = armedFor(backend, mode);
@@ -593,7 +610,10 @@ pub const Reactor = struct {
         var dummy_buf: [1]u8 = .{0};
         var wsabuf = WSABUF{ .len = 0, .buf = &dummy_buf };
         var bytes_transferred: win.DWORD = 0;
-        var flags: win.DWORD = 0;
+        // For read probes, set `MSG_PEEK` so UDP datagrams aren't
+        // consumed by the zero-byte recv. See the function-level
+        // doc for the full rationale.
+        var flags: win.DWORD = if (mode == .read) MSG_PEEK else 0;
 
         // Bump `pending` BEFORE submit. A peer worker observing the
         // reactor between our WSARecv and a post-submit fetchAdd
@@ -601,9 +621,7 @@ pub const Reactor = struct {
         // and park. The IOCP poller is the only path that can
         // dequeue the completion we're about to cause; if no
         // worker is in `poll(true)`, the completion sits unread
-        // and the parked waiter hangs. Mirror the kqueue invariant
-        // where the registration's pending bump is sequenced
-        // before any peer can observe the registered state.
+        // and the parked waiter hangs.
         _ = self.pending.fetchAdd(1, .acq_rel);
 
         const rc = switch (mode) {
@@ -612,6 +630,19 @@ pub const Reactor = struct {
         };
         if (rc != 0) {
             const e = WSAGetLastError();
+            if (e == WSAEMSGSIZE) {
+                // The peek found a datagram. Data is buffered for
+                // the next real recvFrom. No async completion will
+                // fire (this is a synchronous error, not an
+                // overlapped initiation), so we deliver the ready
+                // signal inline. `pd.deliverReady` is idempotent —
+                // if a waiter is already parked it gets popped;
+                // otherwise PD_READY is cached for the next wait.
+                _ = self.pending.fetchSub(1, .acq_rel);
+                armed.store(0, .release);
+                if (pd.deliverReady(mode)) |c| runtime.unpark(c);
+                return;
+            }
             if (e != WSA_IO_PENDING) {
                 // Submit failed synchronously — no completion will
                 // fire. Undo the pending bump and clear armed so
@@ -1144,6 +1175,20 @@ const WSAEBADF: c_int = 10009;
 const WSAEMFILE: c_int = 10024;
 const WSAENOBUFS: c_int = 10055;
 const WSAEINTR: c_int = 10004;
+/// "Message too large to fit in the supplied buffer; truncated." Expected
+/// when our 0-byte readiness probe finds a pending UDP datagram with
+/// `MSG_PEEK` set. Treated as success — the data is buffered, ready
+/// for the caller's real recvFrom.
+const WSAEMSGSIZE: c_int = 10040;
+
+/// `MSG_PEEK` — peek at incoming data without removing it from the
+/// socket's input queue. Required on UDP for zero-byte WSARecv
+/// readiness probes; without it, a 0-byte recv on a datagram
+/// socket CONSUMES the queued datagram (truncated to 0 bytes), so
+/// the parked waiter resumes but the real recvFrom finds nothing
+/// and blocks forever. See Go's `internal/poll/fd_windows.go:1272-1287`
+/// (`RawRead`) for the canonical reference.
+const MSG_PEEK: win.DWORD = 0x0002;
 
 const reactor_mod = @import("reactor.zig");
 pub const IoError = reactor_mod.IoError;
