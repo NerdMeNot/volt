@@ -595,6 +595,17 @@ pub const Reactor = struct {
         var bytes_transferred: win.DWORD = 0;
         var flags: win.DWORD = 0;
 
+        // Bump `pending` BEFORE submit. A peer worker observing the
+        // reactor between our WSARecv and a post-submit fetchAdd
+        // would see pendingCount == 0, decide the reactor is idle,
+        // and park. The IOCP poller is the only path that can
+        // dequeue the completion we're about to cause; if no
+        // worker is in `poll(true)`, the completion sits unread
+        // and the parked waiter hangs. Mirror the kqueue invariant
+        // where the registration's pending bump is sequenced
+        // before any peer can observe the registered state.
+        _ = self.pending.fetchAdd(1, .acq_rel);
+
         const rc = switch (mode) {
             .read => WSARecv(backend.sock, @ptrCast(&wsabuf), 1, &bytes_transferred, &flags, &op.overlapped, null),
             .write => WSASend(backend.sock, @ptrCast(&wsabuf), 1, &bytes_transferred, 0, &op.overlapped, null),
@@ -603,12 +614,13 @@ pub const Reactor = struct {
             const e = WSAGetLastError();
             if (e != WSA_IO_PENDING) {
                 // Submit failed synchronously — no completion will
-                // fire, clear armed so the next wait can retry.
+                // fire. Undo the pending bump and clear armed so
+                // the next wait can retry.
+                _ = self.pending.fetchSub(1, .acq_rel);
                 armed.store(0, .release);
                 return wsaToSetupError(e);
             }
         }
-        _ = self.pending.fetchAdd(1, .acq_rel);
     }
 
     fn loadExtensionFn(self: *Reactor, sock: SOCKET, guid: *const GUID, cache: *std.atomic.Value(usize)) !usize {
