@@ -3,10 +3,19 @@
 //! Linux is the only platform Volt ships with two backends. The
 //! choice is `Runtime.Config.io_backend`:
 //!
-//!   * `.auto` (default) — probe for io_uring at `Runtime.init`;
-//!     use it on Linux ≥ 5.10, fall back to epoll otherwise.
-//!   * `.epoll` — force epoll.
-//!   * `.io_uring` — force io_uring (errors if unavailable).
+//!   * `.auto` (default) — use epoll. Same default as Go's runtime
+//!     and Tokio: epoll is universally available since Linux 2.5
+//!     and has 20+ years of mature production use, while io_uring's
+//!     persistent-registration model (POLL_ADD_MULTI + cancellation
+//!     drain) is younger and has subtler kernel-version-dependent
+//!     behaviour. Volt's persistent-registration epoll backend
+//!     (`reactor_epoll.zig`, Step 2f) is a direct port of Go's
+//!     `runtime/netpoll_epoll.go`.
+//!   * `.epoll` — explicit epoll (same as `.auto`).
+//!   * `.io_uring` — explicit io_uring (the legacy per-wait
+//!     `Step 2b` shim, retained for future migration work). Users
+//!     opting in should be aware of the close-vs-register race
+//!     documented as audit `§4A`.
 //!
 //! The dispatch is a tagged union; method calls forward via a
 //! runtime branch (one indirect jump per reactor op). If profiling
@@ -49,14 +58,19 @@ pub const Reactor = union(Backend) {
     /// Default constructor matches the other platforms' shape — no
     /// args, no config-injection. `Runtime.init` calls
     /// `initBackend(backend)` directly when it wants to override.
-    /// Silently falls back to epoll if io_uring is unavailable;
-    /// callers wanting the failure reason use `probeIoUring`.
+    ///
+    /// Defaults to epoll — the same default that Go's runtime and
+    /// Tokio use on Linux. epoll is universally available since
+    /// Linux 2.5 and is what Volt's persistent-registration Step
+    /// 2f migration ports directly from Go's
+    /// `runtime/netpoll_epoll.go`. io_uring's persistent-
+    /// registration story (POLL_ADD_MULTI + cancel-drain) is
+    /// younger; it can be opted into explicitly via
+    /// `Config.io_backend = .io_uring`, which uses the legacy
+    /// per-wait Step 2b shim with the close-vs-register race
+    /// documented as audit §4A — caveat emptor.
     pub fn init(allocator: std.mem.Allocator) !Reactor {
-        if (probeIoUring()) {
-            return initBackend(allocator, .io_uring);
-        } else |_| {
-            return initBackend(allocator, .epoll);
-        }
+        return initBackend(allocator, .epoll);
     }
 
     /// Explicit-backend constructor. Used by `Runtime.init` when
