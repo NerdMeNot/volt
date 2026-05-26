@@ -419,48 +419,30 @@ fn inCoroutine() bool {
     return @import("../current.zig").get() != null;
 }
 
-// ─── spawnBlocking adapters ──────────────────────────────────────
+// ─── Reactor-routed fs ops ───────────────────────────────────────
 //
-// Each adapter has two pieces: (1) a plain sync fn that captures
-// the syscall + errno into a tagged result, (2) a wrapper that
-// invokes spawnBlocking and unpacks the result.
+// Each `blockingFoo` now routes through `Reactor.fsFoo`. Today
+// every backend's fs methods proxy through spawnBlocking, so the
+// behaviour is identical to the pre-Phase-1 direct-spawnBlocking
+// path. Phase 2 will introduce per-worker io_uring rings on Linux
+// that bypass spawnBlocking for the io_uring backend — without
+// touching anything in this file.
+//
+// `reactor_fs.OFFSET_CUR` (= ~0 u64) is the io_uring-convention
+// sentinel meaning "use current file position"; the helpers
+// dispatch to read(2)/write(2) vs pread(2)/pwrite(2) on it.
 
-const IoResult = struct {
-    value: isize,
-    err: c_int,
-};
-
-const FdResult = struct {
-    fd: c_int,
-    err: c_int,
-};
-
-fn syncOpen(path_ptr: [*:0]const u8, flags: c_int, mode: c_uint) FdResult {
-    const fd = syscall.c_open(path_ptr, flags, mode);
-    return .{ .fd = fd, .err = if (fd < 0) fs_error.currentErrno() else 0 };
-}
+const reactor_fs = @import("../reactor_fs.zig");
 
 fn blockingOpen(z: *const PathZ, flags: c_int, mode: c_uint) c_int {
-    // Pass the path as a pointer — `z` lives on the caller's
-    // coroutine stack and outlives the blocking call.
-    const result = lib.spawnBlocking(syncOpen, .{ @as([*:0]const u8, &z.buf), flags, mode }) catch return -1;
-    if (result.err != 0) {
-        std.c._errno().* = result.err;
-    }
+    const result = lib.runtime().reactor.fsOpen(@as([*:0]const u8, &z.buf), flags, mode);
+    if (result.err != 0) std.c._errno().* = result.err;
     return result.fd;
 }
 
-fn syncRead(fd: c_int, buf_ptr: [*]u8, buf_len: usize) IoResult {
-    const n = c_read(fd, buf_ptr, buf_len);
-    return .{ .value = n, .err = if (n < 0) fs_error.currentErrno() else 0 };
-}
-
 fn blockingRead(fd: c_int, buf: []u8) FileError!usize {
-    const result = lib.spawnBlocking(syncRead, .{ fd, buf.ptr, buf.len }) catch return error.SystemResources;
-    if (result.value < 0) {
-        std.c._errno().* = result.err;
-        return fs_error.fromErrno(result.err);
-    }
+    const result = lib.runtime().reactor.fsRead(@intCast(fd), buf, reactor_fs.OFFSET_CUR);
+    if (result.value < 0) return fs_error.fromErrno(result.err);
     return @intCast(result.value);
 }
 
@@ -470,17 +452,9 @@ fn readRaw(fd: c_int, buf: []u8) FileError!usize {
     return @intCast(n);
 }
 
-fn syncWrite(fd: c_int, buf_ptr: [*]const u8, buf_len: usize) IoResult {
-    const n = c_write(fd, buf_ptr, buf_len);
-    return .{ .value = n, .err = if (n < 0) fs_error.currentErrno() else 0 };
-}
-
 fn blockingWrite(fd: c_int, buf: []const u8) FileError!usize {
-    const result = lib.spawnBlocking(syncWrite, .{ fd, buf.ptr, buf.len }) catch return error.SystemResources;
-    if (result.value < 0) {
-        std.c._errno().* = result.err;
-        return fs_error.fromErrno(result.err);
-    }
+    const result = lib.runtime().reactor.fsWrite(@intCast(fd), buf, reactor_fs.OFFSET_CUR);
+    if (result.value < 0) return fs_error.fromErrno(result.err);
     return @intCast(result.value);
 }
 
@@ -490,17 +464,9 @@ fn writeRaw(fd: c_int, buf: []const u8) FileError!usize {
     return @intCast(n);
 }
 
-fn syncPread(fd: c_int, buf_ptr: [*]u8, buf_len: usize, offset: i64) IoResult {
-    const n = c_pread(fd, buf_ptr, buf_len, offset);
-    return .{ .value = n, .err = if (n < 0) fs_error.currentErrno() else 0 };
-}
-
 fn blockingPread(fd: c_int, buf: []u8, offset: u64) FileError!usize {
-    const result = lib.spawnBlocking(syncPread, .{ fd, buf.ptr, buf.len, @as(i64, @intCast(offset)) }) catch return error.SystemResources;
-    if (result.value < 0) {
-        std.c._errno().* = result.err;
-        return fs_error.fromErrno(result.err);
-    }
+    const result = lib.runtime().reactor.fsRead(@intCast(fd), buf, offset);
+    if (result.value < 0) return fs_error.fromErrno(result.err);
     return @intCast(result.value);
 }
 
@@ -510,17 +476,9 @@ fn preadRaw(fd: c_int, buf: []u8, offset: u64) FileError!usize {
     return @intCast(n);
 }
 
-fn syncPwrite(fd: c_int, buf_ptr: [*]const u8, buf_len: usize, offset: i64) IoResult {
-    const n = c_pwrite(fd, buf_ptr, buf_len, offset);
-    return .{ .value = n, .err = if (n < 0) fs_error.currentErrno() else 0 };
-}
-
 fn blockingPwrite(fd: c_int, buf: []const u8, offset: u64) FileError!usize {
-    const result = lib.spawnBlocking(syncPwrite, .{ fd, buf.ptr, buf.len, @as(i64, @intCast(offset)) }) catch return error.SystemResources;
-    if (result.value < 0) {
-        std.c._errno().* = result.err;
-        return fs_error.fromErrno(result.err);
-    }
+    const result = lib.runtime().reactor.fsWrite(@intCast(fd), buf, offset);
+    if (result.value < 0) return fs_error.fromErrno(result.err);
     return @intCast(result.value);
 }
 
@@ -530,30 +488,14 @@ fn pwriteRaw(fd: c_int, buf: []const u8, offset: u64) FileError!usize {
     return @intCast(n);
 }
 
-fn syncFsync(fd: c_int) IoResult {
-    const rc = c_fsync(fd);
-    return .{ .value = rc, .err = if (rc != 0) fs_error.currentErrno() else 0 };
-}
-
 fn blockingFsync(fd: c_int) FileError!void {
-    const result = lib.spawnBlocking(syncFsync, .{fd}) catch return error.SystemResources;
-    if (result.value != 0) {
-        std.c._errno().* = result.err;
-        return fs_error.fromErrno(result.err);
-    }
-}
-
-fn syncFdatasync(fd: c_int) IoResult {
-    const rc = if (comptime builtin.os.tag == .linux) c_fdatasync(fd) else c_fsync(fd);
-    return .{ .value = rc, .err = if (rc != 0) fs_error.currentErrno() else 0 };
+    const result = lib.runtime().reactor.fsFsync(@intCast(fd));
+    if (result.value != 0) return fs_error.fromErrno(result.err);
 }
 
 fn blockingFdatasync(fd: c_int) FileError!void {
-    const result = lib.spawnBlocking(syncFdatasync, .{fd}) catch return error.SystemResources;
-    if (result.value != 0) {
-        std.c._errno().* = result.err;
-        return fs_error.fromErrno(result.err);
-    }
+    const result = lib.runtime().reactor.fsFdatasync(@intCast(fd));
+    if (result.value != 0) return fs_error.fromErrno(result.err);
 }
 
 // ─── libc externs not in std.c ───────────────────────────────────

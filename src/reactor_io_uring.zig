@@ -75,6 +75,7 @@ extern "c" fn eventfd(initval: c_uint, flags: c_int) c_int;
 // helpers take the reactor as `anytype`, so they bind to this
 // backend at the call site without a shared base class.
 const posix_helpers = @import("reactor_posix.zig");
+const reactor_fs = @import("reactor_fs.zig");
 const ReactorWaitError = posix_helpers.ReactorWaitError;
 pub const setNonblock = posix_helpers.setNonblock;
 pub const readAsync = posix_helpers.readAsync;
@@ -581,6 +582,43 @@ pub const Reactor = struct {
         var bytes: [8]u8 = undefined;
         @memcpy(&bytes, std.mem.asBytes(&one));
         _ = posix_helpers.write(self.interrupt_fd, &bytes, 8);
+    }
+
+    // ─── Fs op surface (Phase 1: spawnBlocking proxies) ──────────────
+    //
+    // Phase 2 will replace these with real io_uring SQEs submitted to
+    // a per-worker ring. For now they proxy through spawnBlocking so
+    // the cross-platform Reactor surface is in place and fs/file.zig
+    // can call into the reactor uniformly.
+
+    pub fn fsRead(self: *Reactor, fd: i32, buf: []u8, offset: u64) reactor_fs.FsResult {
+        _ = self;
+        return reactor_fs.fsRead(fd, buf, offset);
+    }
+
+    pub fn fsWrite(self: *Reactor, fd: i32, buf: []const u8, offset: u64) reactor_fs.FsResult {
+        _ = self;
+        return reactor_fs.fsWrite(fd, buf, offset);
+    }
+
+    pub fn fsFsync(self: *Reactor, fd: i32) reactor_fs.FsResult {
+        _ = self;
+        return reactor_fs.fsFsync(fd);
+    }
+
+    pub fn fsFdatasync(self: *Reactor, fd: i32) reactor_fs.FsResult {
+        _ = self;
+        return reactor_fs.fsFdatasync(fd);
+    }
+
+    pub fn fsOpen(self: *Reactor, path_ptr: [*:0]const u8, flags: c_int, mode: c_uint) reactor_fs.FdResult {
+        _ = self;
+        return reactor_fs.fsOpen(path_ptr, flags, mode);
+    }
+
+    pub fn fsClose(self: *Reactor, fd: i32) reactor_fs.FsResult {
+        _ = self;
+        return reactor_fs.fsClose(fd);
     }
 
     inline fn acquire(self: *Reactor) void {

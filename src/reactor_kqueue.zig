@@ -45,6 +45,7 @@ const context = @import("context.zig");
 const cancel_mod = @import("cancel.zig");
 const poll_desc = @import("poll_desc.zig");
 const posix_helpers = @import("reactor_posix.zig");
+const reactor_fs = @import("reactor_fs.zig");
 const ReactorWaitError = posix_helpers.ReactorWaitError;
 
 const KEV_BATCH: usize = 32;
@@ -456,6 +457,44 @@ pub const Reactor = struct {
         var changes = [_]posix.Kevent{kev};
         var dummy: [1]posix.Kevent = undefined;
         _ = posix.system.kevent(self.kq, &changes, 1, &dummy, 0, null);
+    }
+
+    // ─── Fs op surface (Phase 1: spawnBlocking proxies) ──────────────
+    //
+    // kqueue has no async file I/O equivalent to io_uring; Darwin/BSD
+    // file ops always bridge through the blocking pool. The methods
+    // exist on the Reactor surface so fs/file.zig has a single call
+    // shape on every platform — Phase 2's Linux io_uring backend swaps
+    // these out for real async ops without touching fs callers.
+
+    pub fn fsRead(self: *Reactor, fd: i32, buf: []u8, offset: u64) reactor_fs.FsResult {
+        _ = self;
+        return reactor_fs.fsRead(fd, buf, offset);
+    }
+
+    pub fn fsWrite(self: *Reactor, fd: i32, buf: []const u8, offset: u64) reactor_fs.FsResult {
+        _ = self;
+        return reactor_fs.fsWrite(fd, buf, offset);
+    }
+
+    pub fn fsFsync(self: *Reactor, fd: i32) reactor_fs.FsResult {
+        _ = self;
+        return reactor_fs.fsFsync(fd);
+    }
+
+    pub fn fsFdatasync(self: *Reactor, fd: i32) reactor_fs.FsResult {
+        _ = self;
+        return reactor_fs.fsFdatasync(fd);
+    }
+
+    pub fn fsOpen(self: *Reactor, path_ptr: [*:0]const u8, flags: c_int, mode: c_uint) reactor_fs.FdResult {
+        _ = self;
+        return reactor_fs.fsOpen(path_ptr, flags, mode);
+    }
+
+    pub fn fsClose(self: *Reactor, fd: i32) reactor_fs.FsResult {
+        _ = self;
+        return reactor_fs.fsClose(fd);
     }
 };
 

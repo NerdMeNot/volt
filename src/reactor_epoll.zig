@@ -131,6 +131,7 @@ extern "c" fn timerfd_settime(fd: c_int, flags: c_int, new_value: *const itimers
 // ─── generic libc ────────────────────────────────────────────────
 
 const posix_helpers = @import("reactor_posix.zig");
+const reactor_fs = @import("reactor_fs.zig");
 const read = posix_helpers.read;
 const close = posix_helpers.close;
 const errnoVal = posix_helpers.errnoVal;
@@ -536,6 +537,44 @@ pub const Reactor = struct {
         var bytes: [8]u8 = undefined;
         @memcpy(&bytes, std.mem.asBytes(&one));
         _ = posix_helpers.write(self.interrupt_fd, &bytes, 8);
+    }
+
+    // ─── Fs op surface (Phase 1: spawnBlocking proxies) ──────────────
+    //
+    // The epoll backend is the fallback when io_uring isn't available
+    // (older kernels, sysctl-disabled, init failed). Phase 2 wires the
+    // io_uring backend's fs methods to per-worker rings; the epoll
+    // variant stays on this proxy because there is no async file I/O
+    // available outside io_uring on Linux.
+
+    pub fn fsRead(self: *Reactor, fd: i32, buf: []u8, offset: u64) reactor_fs.FsResult {
+        _ = self;
+        return reactor_fs.fsRead(fd, buf, offset);
+    }
+
+    pub fn fsWrite(self: *Reactor, fd: i32, buf: []const u8, offset: u64) reactor_fs.FsResult {
+        _ = self;
+        return reactor_fs.fsWrite(fd, buf, offset);
+    }
+
+    pub fn fsFsync(self: *Reactor, fd: i32) reactor_fs.FsResult {
+        _ = self;
+        return reactor_fs.fsFsync(fd);
+    }
+
+    pub fn fsFdatasync(self: *Reactor, fd: i32) reactor_fs.FsResult {
+        _ = self;
+        return reactor_fs.fsFdatasync(fd);
+    }
+
+    pub fn fsOpen(self: *Reactor, path_ptr: [*:0]const u8, flags: c_int, mode: c_uint) reactor_fs.FdResult {
+        _ = self;
+        return reactor_fs.fsOpen(path_ptr, flags, mode);
+    }
+
+    pub fn fsClose(self: *Reactor, fd: i32) reactor_fs.FsResult {
+        _ = self;
+        return reactor_fs.fsClose(fd);
     }
 };
 

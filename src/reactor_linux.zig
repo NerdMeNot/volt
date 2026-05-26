@@ -32,6 +32,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const epoll = @import("reactor_epoll.zig");
 const io_uring = @import("reactor_io_uring.zig");
+const reactor_fs = @import("reactor_fs.zig");
 
 pub const Backend = enum { epoll, io_uring };
 
@@ -180,6 +181,54 @@ pub const Reactor = union(Backend) {
         return switch (self.*) {
             .epoll => |*r| r.waitFdCancel(fd, pd, mode, c),
             .io_uring => |*r| r.waitFdCancel(fd, pd, mode, c),
+        };
+    }
+
+    // ─── Fs op surface (Phase 1) ─────────────────────────────────────
+    //
+    // Both backends currently proxy through spawnBlocking; the
+    // dispatch exists so Phase 2's io_uring fs path is a per-variant
+    // swap without changing the surface.
+
+    pub fn fsRead(self: *Reactor, fd: i32, buf: []u8, offset: u64) reactor_fs.FsResult {
+        return switch (self.*) {
+            .epoll => |*r| r.fsRead(fd, buf, offset),
+            .io_uring => |*r| r.fsRead(fd, buf, offset),
+        };
+    }
+
+    pub fn fsWrite(self: *Reactor, fd: i32, buf: []const u8, offset: u64) reactor_fs.FsResult {
+        return switch (self.*) {
+            .epoll => |*r| r.fsWrite(fd, buf, offset),
+            .io_uring => |*r| r.fsWrite(fd, buf, offset),
+        };
+    }
+
+    pub fn fsFsync(self: *Reactor, fd: i32) reactor_fs.FsResult {
+        return switch (self.*) {
+            .epoll => |*r| r.fsFsync(fd),
+            .io_uring => |*r| r.fsFsync(fd),
+        };
+    }
+
+    pub fn fsFdatasync(self: *Reactor, fd: i32) reactor_fs.FsResult {
+        return switch (self.*) {
+            .epoll => |*r| r.fsFdatasync(fd),
+            .io_uring => |*r| r.fsFdatasync(fd),
+        };
+    }
+
+    pub fn fsOpen(self: *Reactor, path_ptr: [*:0]const u8, flags: c_int, mode: c_uint) reactor_fs.FdResult {
+        return switch (self.*) {
+            .epoll => |*r| r.fsOpen(path_ptr, flags, mode),
+            .io_uring => |*r| r.fsOpen(path_ptr, flags, mode),
+        };
+    }
+
+    pub fn fsClose(self: *Reactor, fd: i32) reactor_fs.FsResult {
+        return switch (self.*) {
+            .epoll => |*r| r.fsClose(fd),
+            .io_uring => |*r| r.fsClose(fd),
         };
     }
 };
