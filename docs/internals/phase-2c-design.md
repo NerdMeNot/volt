@@ -1,0 +1,235 @@
+# Phase 2C — implementation design
+
+**Status:** Approved 2026-05-27
+**Parent:** [docs/internals/async-fs-io.md](async-fs-io.md)
+**Tracking:** [#17](https://github.com/NerdMeNot/games/issues/17)
+**Driver:** Wire `Reactor.fsRead`/etc to the per-P io_uring rings
+populated in Phase 2B (commit `43abf4c`). Submit + park + drain +
+unpark, end-to-end, with no fs-side API change.
+
+This memo records the four decisions made before writing the code,
+so the implementation work can be reviewed against the design
+rather than re-deriving it from the diff.
+
+## 1. `FsOp` lives on the coroutine's stack
+
+The per-op state record carries a coroutine pointer and a result
+slot. `user_data` on the SQE points to it; the CQE drainer writes
+the result and unparks the coroutine. The record must have a
+stable address for the kernel's in-flight window.
+
+Stack-allocated. Coroutine stacks are pinned for the coroutine's
+lifetime (CLAUDE.md invariant 5); the address is stable. No pool,
+no allocation on the hot path. The coroutine waits for its own CQE
+before returning, so the frame is unconditionally live for the
+entire in-flight window.
+
+```zig
+const FsOp = struct {
+    coro: *Coroutine,
+    result: FsResult,
+};
+
+pub fn fsRead(fd, buf, offset) FsResult {
+    var op: FsOp = .{ .coro = current.require(), .result = undefined };
+    p.fs_ring.prepRead(fd, buf, offset, @intFromPtr(&op));
+    runtime.park();
+    return op.result;
+}
+```
+
+### Phase 3 invariant — cancellation must keep the frame alive
+
+`IORING_OP_ASYNC_CANCEL` is itself asynchronous. The kernel will
+eventually write to `user_data` regardless. **A coroutine that
+cancels an in-flight fs op cannot unwind or release its stack
+until the original CQE (or the cancel CQE) is fully reaped — or
+the kernel performs a silent memory write into a dead or
+reassigned stack frame.**
+
+The cancel-and-drain semantics from §5 of the parent memo handle
+this naturally — the coroutine waits for both CQEs before
+returning, keeping the frame alive. The Phase 3 implementation
+must not weaken this. (Documented here so the Phase 3 reviewer
+catches any "fast-path" that violates it.)
+
+## 2. Wake-up architecture — three layers + the "Signal-Only-If-Idle" rule
+
+A parked coroutine's worker may be in any of three states when
+its CQE becomes ready. Each is handled by a different layer:
+
+**Layer 1 — worker is actively running other coroutines.** Add
+`peekBatch` on its own P's ring as one more work source in the
+find-work loop, between "check mailbox" and "try to steal". Peek
+is a userspace memory read when no CQEs are ready — cheap. CQEs
+that arrived since the last iteration get drained on the next
+one. Locality is perfect: the worker drains its own ring, the
+resumed coroutine lands on the same P's local queue.
+
+**Layer 2 — worker is the designated reactor poller** (blocked
+in `epoll_wait`). Each P's fs ring gets its own eventfd via
+`IORING_REGISTER_EVENTFD`; every eventfd joins the shared epoll
+at `Runtime.init`. When any P's CQE fires, the kernel writes to
+that ring's eventfd, epoll wakes the poller. (Glommio's "ring-
+link" pattern, `glommio/src/sys/uring.rs:1226-1248`.)
+
+**Layer 3 — worker is parked in its M's parker** (idle, no
+reactor responsibilities). Already wakes via the existing
+`unparkOne` path whenever a coroutine is dispatched onto a P's
+queue. The cross-worker dispatch path (Layer 2's drainer pushing
+to another P's mailbox) triggers this naturally.
+
+### The "Signal-Only-If-Idle" invariant
+
+The naive Layer 2 implementation has a hidden performance trap.
+Under heavy disk I/O, worker B's eventfd fires on *every* CQE.
+If worker A is the reactor poller, it wakes from `epoll_wait` on
+every single completion — even though worker B is busy draining
+its own ring via Layer 1's peek loop. Worker A then signals B
+uselessly, the kernel does a cross-CPU IPI, and the notification
+storm destroys performance.
+
+**Fix:** the reactor poller checks the owner's run-state before
+signalling.
+
+```
+[Kernel CQE Populated] ──► fires eventfd ──► [Reactor poller wakes]
+                                                       │
+                                          read() eventfd (8-byte u64, MANDATORY)
+                                                       │
+                                          is owner worker Parked?
+                                            ╱                   ╲
+                                         (Yes)                 (No)
+                                          ╱                       ╲
+                       [parker.unpark(owner)]      [Drop — owner will peek on its
+                                                    next find-work iteration]
+```
+
+Cost when owner is busy: one userspace state-load + one branch.
+Cost when owner is idle: same as today's unpark (one futex/ulock
+wake). Critical correctness: the **kernel eventfd counter MUST
+be drained** (`read(fd, &u64_buf, 8)`) on every wake, otherwise
+the level-triggered epoll re-fires indefinitely. Edge-triggered
+isn't an option for shared eventfds.
+
+### Worker run-state
+
+Add an atomic enum on M (or piggyback on `parked_workers`):
+`{ Running, Searching, Parked }`. Searching means "in find-work
+loop, not actively dispatching" — equivalent to the existing
+`num_searching` counter. The Signal-Only-If-Idle check reads
+this atomic with `.acquire`; the worker's own state transitions
+use `.release`. Same shape as the existing parker integration.
+
+## 3. Per-P ring submission is single-writer
+
+Each P's ring has exactly one OS thread bound to it (the M).
+Coroutines on that P share the worker by cooperative scheduling
+— no concurrent submission within a P. So `get_sqe` / `submit`
+are single-writer per P, **no lock needed**.
+
+The cross-worker case is *reaping* — the reactor poller (Layer 2)
+may be a different worker draining your ring's eventfd. But under
+**owner-only drain** (next section), the poller never calls
+`copy_cqes` on a foreign ring; it only signals the owner. So
+`copy_cqes` is also single-reader per P. No lock anywhere on the
+ring's hot path.
+
+The only contention point is eventfd registration with the shared
+epoll, done once at `Runtime.init` before any coroutine runs. No
+hot-path contention.
+
+## 4. Owner-only drain
+
+When the reactor poller sees worker B's eventfd fire, it does NOT
+drain B's ring. It signals B (Signal-Only-If-Idle) and B drains
+its own ring on its next find-work iteration.
+
+### Why not "anyone-drains with CAS"
+
+- **Cache-line bouncing.** If worker A drains worker B's CQ, the
+  kernel-shared ring pointers and the CQE structures bounce to
+  A's L1. B then drains its next batch and bounces them back.
+  Defeats io_uring's whole "stay on one core" win.
+- **Double work.** Once A drains the CQE, it discovers the
+  coroutine belongs to B and has to push it onto B's mailbox
+  anyway. We're not saving a thread hop — we're just moving the
+  synchronization point from the parker to the ring buffer, while
+  thrashing both cores' caches.
+- **Anyone-drains is the wrong shape for this workload.** It only
+  makes sense in models where the drainer is also the dispatcher
+  (Glommio: per-thread executor, no cross-worker hop possible).
+  Volt's work-stealing scheduler can dispatch to any worker, so
+  the drainer→dispatcher hop is unavoidable. Better to let the
+  owner drain so the drainer→dispatcher path is local.
+
+## 5. Concrete edit list (in landing order)
+
+Each item below is a small commit on its own — same sub-phase
+discipline as 2A/2B.
+
+1. **`src/fs_ring.zig`**: add `eventfd: i32` field,
+   `registerEventFdWithEpoll(epfd: i32) !void` method (calls
+   `IORING_REGISTER_EVENTFD` + `epoll_ctl(EPOLL_CTL_ADD)`), and
+   `drainEventFd(self)` helper (reads the 8-byte u64 to clear
+   the kernel counter — invariant from §2 above).
+2. **`src/reactor_epoll.zig`**: extend the existing
+   `poll`/`interrupt_fd` machinery to recognise the per-P fs
+   ring eventfds. When one fires: read+clear it, check the
+   owner P's worker state, and either signal-or-drop per §2.
+3. **`src/runtime.zig`**: after `tryInitFsRings` (already in
+   Phase 2B), register each ring's eventfd with the shared
+   reactor's epoll. Add the `Running`/`Searching`/`Parked`
+   worker run-state atomic on M (or piggyback on existing
+   parker state).
+4. **Backends' `fs*` methods** (`reactor_io_uring.zig`,
+   `reactor_epoll.zig`): check `current.require()` → P →
+   `rt.fs_rings`; if non-null, do the SQE+park flow; if null,
+   fall back to the existing spawnBlocking proxy. The
+   spawnBlocking path stays exactly as Phase 1 implemented it.
+5. **`FsOp` struct** in `fs_ring.zig`:
+   `{ coro: *Coroutine, result: FsResult }`. Allocated on the
+   coroutine's stack at the `fsRead` call site.
+6. **Worker dispatch loop**: add `peekBatch` on current P's
+   ring between "mailbox check" and "steal" — Layer 1 of §2.
+   Resumed coroutines push onto the local queue (best
+   locality).
+
+## 6. Implementation gotchas to watch
+
+- **8-byte eventfd reads.** `read(eventfd_fd, &buf, 8)` — not
+  less. A short read leaves the kernel counter non-zero, and
+  level-triggered epoll will re-fire indefinitely. (Item flagged
+  by the reviewer on §2.)
+- **Find-work priority order.** `local → lifo_slot → fs ring
+  peek → mailbox → steal → reactor poll → park`. fs CQEs go
+  AFTER lifo/local (those are warmest) but BEFORE stealing
+  (local completions have better data locality than stolen
+  work). Confirmed by reviewer.
+- **Submitter vs reaper on `has_pending`.** Owner-only drain
+  fixes this: the worker that submits is the worker that
+  flushes. `has_pending` stays non-atomic (single-thread
+  access). The reactor poller never touches `has_pending`.
+- **Cross-P dispatch under work-stealing.** When the owner
+  drains its ring and the resumed coroutine then yields and
+  gets stolen by another worker — fine, that's the normal
+  steal path. The buffer (on the coroutine's stack) travels
+  with the coroutine; the SQE/CQE have already completed.
+  Nothing special needed.
+
+## 7. Decision log
+
+| Date | Decision | Rationale |
+|---|---|---|
+| 2026-05-27 | `FsOp` on coroutine stack, not pooled. | Pinned stack VA + stackful invariant 5 + zero-alloc hot path. |
+| 2026-05-27 | Three-layer wake-up (find-work peek + eventfd-into-epoll + parker). | Each handles a distinct worker state without paying for the others when they're absent. |
+| 2026-05-27 | Single-writer per P, no submission lock. | M:P binding + cooperative coroutines = no concurrent submitters. |
+| 2026-05-27 | Owner-only drain. | Avoids cache-line bouncing and double work that "anyone-drains" would cost on a work-stealing scheduler. |
+| 2026-05-27 | "Signal-Only-If-Idle" optimisation on the eventfd wake-up. | Prevents the notification storm where a busy worker's per-CQE eventfd fires the poller, which would otherwise uselessly signal the (already-running) owner. Cost: one atomic load + one branch on the poller path. |
+
+## 8. Risks for Phase 2C reviewer to verify
+
+1. **Eventfd registration ordering.** Register with `IORING_REGISTER_EVENTFD` *before* adding the eventfd to epoll, so a CQE that lands during registration doesn't get lost. (`io_uring_register` is synchronous; once it returns, the eventfd will fire on every subsequent CQE.)
+2. **Owner-only drain assumes worker stays bound to P.** M:P is 1:1 today (CLAUDE.md mentions this is Phase 1). If a later phase introduces M-detach, the "owner drains" model needs revisiting — the eventfd-registered M might not be the same M that ends up running the owner's coroutines.
+3. **`has_pending` lifetime.** Set true by `prepX`, cleared by `flush`. Owner-only access. If a later phase introduces a "submit-from-shutdown" path on Runtime.deinit, that path must run on each owner P (not a foreign thread).
+4. **Coroutine-stack lifetime in the cancel-CQE window** (Phase 3 concern, captured in §1 above).
