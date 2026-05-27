@@ -406,6 +406,16 @@ pub const Runtime = struct {
     /// defensive checks similarly avoid parking when > 0.
     fs_in_flight: std.atomic.Value(u32) align(std.atomic.cache_line) =
         std.atomic.Value(u32).init(0),
+    /// Phase 2D verification counter: monotonically incremented
+    /// every time an fs op successfully routes through the
+    /// per-P io_uring ring (instead of the spawnBlocking
+    /// fallback). Tests assert this is > 0 to prove the
+    /// io_uring path is actually being exercised — otherwise a
+    /// silent fallback to spawnBlocking would still make fs
+    /// tests pass with no visible signal. Never decremented;
+    /// not on a hot path beyond a single relaxed-order fetchAdd.
+    fs_ops_via_ring: std.atomic.Value(u64) align(std.atomic.cache_line) =
+        std.atomic.Value(u64).init(0),
     /// Optional instrumentation hook — see `Observer` doc. Read by
     /// the four hook sites (spawn, park, unpark, complete). Nullable
     /// so the hot path stays branch-and-fold when no observer is set.
@@ -1034,15 +1044,31 @@ fn drainFsRingInto(rt: *Runtime, p: *P) usize {
 // Each helper attempts to route an fs op through the per-P
 // io_uring ring. Returns non-null on success, null when the ring
 // path is unavailable (no fs_rings on this Runtime, not on a
-// worker M, SQ full, submit failed) — caller falls back to the
-// Phase 1 spawnBlocking proxy. Callers must be in a coroutine
-// (the spawnBlocking fallback also requires it).
+// worker M, SQ full) — caller falls back to the Phase 1
+// spawnBlocking proxy. Callers must be in a coroutine (the
+// spawnBlocking fallback also requires it).
 //
 // The FsOp is allocated on the caller's coroutine stack. The
 // stack VA is stable for the coroutine's lifetime (CLAUDE.md
 // invariant 5); the coroutine waits in `park()` for its CQE
 // before returning, so the FsOp outlives the kernel's in-flight
 // window. See `docs/internals/phase-2c-design.md §1`.
+//
+// **Error policy (Seastar `68cec26e`):** `flush()` failure is
+// treated as panic-worthy state corruption — `io_uring_enter`
+// only fails with EBADF/EINVAL/EOPNOTSUPP, all of which mean
+// the ring is in a state we can't recover from. Returning null
+// here instead would leave the orphan SQE (already written to
+// the userspace ring with our user_data) referencing a stack-
+// allocated `FsOp` that goes out of scope as soon as we fall
+// back — a subsequent successful flush would then submit that
+// orphan with a stale pointer, and the kernel would write into
+// a dead frame. Panic forces the issue surface as a crash, not
+// as memory corruption.
+//
+// `prepRead`/etc failures (SubmissionQueueFull) are different:
+// no SQE was written, so a graceful return-null + spawnBlocking
+// fallback is correct.
 
 const fs_result = @import("reactor_fs.zig").FsResult;
 
@@ -1054,14 +1080,26 @@ inline fn currentPRing(rt: *Runtime) ?*fs_ring_mod.FsRing {
     return &rings[m.p.id];
 }
 
+/// Submit the SQE prepared in `ring`. Panics on failure (see
+/// error policy in the comment above this section). Bumps
+/// `fs_in_flight` after a successful submit so the worker
+/// poll/park machinery knows there's a kernel-side op pending.
+inline fn flushRingOrPanic(rt: *Runtime, ring: *fs_ring_mod.FsRing) void {
+    _ = ring.flush() catch |e| std.debug.panic(
+        "fs_ring io_uring_enter failed: {s} — see Phase 2C.2 error policy in runtime.zig",
+        .{@errorName(e)},
+    );
+    _ = rt.fs_in_flight.fetchAdd(1, .acq_rel);
+    _ = rt.fs_ops_via_ring.fetchAdd(1, .monotonic);
+}
+
 pub fn fsRingRead(fd: i32, buf: []u8, offset: u64) ?fs_result {
     const co = current.require();
     const rt: *Runtime = @ptrCast(@alignCast(co.runtime));
     const ring = currentPRing(rt) orelse return null;
     var op: fs_ring_mod.FsOp = .{ .coro = co, .result = undefined };
     ring.prepRead(fd, buf, offset, @intFromPtr(&op)) catch return null;
-    _ = ring.flush() catch return null;
-    _ = rt.fs_in_flight.fetchAdd(1, .acq_rel);
+    flushRingOrPanic(rt, ring);
     park();
     return op.result;
 }
@@ -1072,8 +1110,7 @@ pub fn fsRingWrite(fd: i32, buf: []const u8, offset: u64) ?fs_result {
     const ring = currentPRing(rt) orelse return null;
     var op: fs_ring_mod.FsOp = .{ .coro = co, .result = undefined };
     ring.prepWrite(fd, buf, offset, @intFromPtr(&op)) catch return null;
-    _ = ring.flush() catch return null;
-    _ = rt.fs_in_flight.fetchAdd(1, .acq_rel);
+    flushRingOrPanic(rt, ring);
     park();
     return op.result;
 }
@@ -1084,8 +1121,7 @@ pub fn fsRingFsync(fd: i32) ?fs_result {
     const ring = currentPRing(rt) orelse return null;
     var op: fs_ring_mod.FsOp = .{ .coro = co, .result = undefined };
     ring.prepFsync(fd, @intFromPtr(&op), false) catch return null;
-    _ = ring.flush() catch return null;
-    _ = rt.fs_in_flight.fetchAdd(1, .acq_rel);
+    flushRingOrPanic(rt, ring);
     park();
     return op.result;
 }
@@ -1096,8 +1132,7 @@ pub fn fsRingFdatasync(fd: i32) ?fs_result {
     const ring = currentPRing(rt) orelse return null;
     var op: fs_ring_mod.FsOp = .{ .coro = co, .result = undefined };
     ring.prepFsync(fd, @intFromPtr(&op), true) catch return null;
-    _ = ring.flush() catch return null;
-    _ = rt.fs_in_flight.fetchAdd(1, .acq_rel);
+    flushRingOrPanic(rt, ring);
     park();
     return op.result;
 }
@@ -1541,6 +1576,73 @@ test "runtime: fs ring eventfd is wired into the shared reactor" {
     var cqes: [1]@import("std").os.linux.io_uring_cqe = undefined;
     _ = try rings[0].waitOne(&cqes);
     try std.testing.expectEqual(@as(u64, 0xC1_C1_C1_C1), cqes[0].user_data);
+}
+
+// Phase 2D: assert the public fs API actually exercises the
+// io_uring ring path, not just the spawnBlocking fallback. A
+// monotonic counter (`rt.fs_ops_via_ring`) is bumped by every
+// successful routing through `fsRingX`; this test runs a coro
+// that does a File write + sync, then asserts the counter moved.
+//
+// On Darwin the counter stays at 0 (fs_rings is null), and on
+// Linux without io_uring support the counter also stays at 0 —
+// either way we test that "the routing IS being exercised when
+// available, and ONLY when available."
+const _phase_2d_state = struct {
+    tmp_path: [:0]const u8,
+    bytes_written: usize = 0,
+};
+
+fn phase2dBody(state: *_phase_2d_state) !void {
+    const fs = @import("fs.zig");
+    var path_buf: [256:0]u8 = undefined;
+    const p = try std.fmt.bufPrintZ(&path_buf, "{s}/p2d.txt", .{state.tmp_path});
+    var f = try fs.File.create(p);
+    defer f.close();
+    try f.writeAll("phase 2D payload");
+    try f.sync();
+    state.bytes_written = "phase 2D payload".len;
+}
+
+test "runtime: Phase 2D — fs ops exercise the io_uring path when available" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+
+    var tmpl = "/tmp/volt-p2d-XXXXXX\x00".*;
+    const c_mkdtemp = @extern(*const fn ([*:0]u8) callconv(.c) ?[*:0]u8, .{ .name = "mkdtemp" });
+    if (c_mkdtemp(@ptrCast(&tmpl)) == null) return error.MkdtempFailed;
+    const tmp: [:0]const u8 = tmpl[0 .. tmpl.len - 1 :0];
+    defer {
+        var pbuf: [256:0]u8 = undefined;
+        const fp = std.fmt.bufPrintZ(&pbuf, "{s}/p2d.txt", .{tmp}) catch null;
+        if (fp) |path| {
+            const c_unlink = @extern(*const fn ([*:0]const u8) callconv(.c) c_int, .{ .name = "unlink" });
+            _ = c_unlink(path.ptr);
+        }
+        const c_rmdir = @extern(*const fn ([*:0]const u8) callconv(.c) c_int, .{ .name = "rmdir" });
+        _ = c_rmdir(tmp.ptr);
+    }
+
+    const before = rt.fs_ops_via_ring.load(.monotonic);
+    var state = _phase_2d_state{ .tmp_path = tmp };
+    try (try rt.run(phase2dBody, .{&state}));
+    try std.testing.expect(state.bytes_written > 0);
+
+    const after = rt.fs_ops_via_ring.load(.monotonic);
+    if (rt.fs_rings != null) {
+        // io_uring path available → at least one fs op should
+        // have gone through the ring. The body did writeAll +
+        // sync — both Linux-routed (write goes through fsWrite;
+        // sync goes through fsFsync). File.create still uses
+        // spawnBlocking (Phase 5 work), so doesn't count.
+        try std.testing.expect(after > before);
+    } else {
+        // fs_rings unavailable (Darwin, or Linux with seccomp /
+        // sysctl blocking io_uring) → counter must stay at 0:
+        // the routing was never exercised.
+        try std.testing.expectEqual(before, after);
+    }
 }
 
 test "runtime: spawn typed fn returning slice" {

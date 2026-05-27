@@ -294,11 +294,26 @@ pub const File = struct {
     // coroutine observes the cancel afterward. For tight blocking
     // ops (file reads), this is acceptable; documenting the
     // behaviour honestly.
+    //
+    // Same shape on Linux io_uring (Phase 2C.2): a `*Cancel.fire()`
+    // that arrives AFTER the SQE was submitted does NOT cancel the
+    // in-flight kernel op. The coroutine stays parked until the
+    // CQE arrives; the cancel is observed at the NEXT syscall.
+    // This is intentional — the FsOp lives on the coroutine's
+    // stack and the kernel will write to `user_data` when the op
+    // completes. Letting the coroutine unwind early would leave a
+    // dangling `FsOp` pointer for the kernel to dereference (UAF).
+    // See `docs/internals/phase-2c-design.md §1` for the lifetime
+    // invariant. Phase 3 will add real in-flight cancellation via
+    // `IORING_OP_ASYNC_CANCEL` with the cancel-and-drain semantics
+    // from the design memo's §5 — until then, fire-and-wait is the
+    // honest semantics.
 
     /// Read with a cancel handle. Today this checks `c.isFired()`
     /// before submitting; a fired cancel returns `error.Cancelled`
     /// immediately. The actual syscall, once submitted, runs to
-    /// completion.
+    /// completion (see section comment above for why this is
+    /// correct on both the spawnBlocking and io_uring paths).
     pub fn readCancel(self: *File, buf: []u8, c: *lib.Cancel) (FileError || error{Cancelled})!usize {
         if (c.isFired()) return error.Cancelled;
         return self.read(buf);
