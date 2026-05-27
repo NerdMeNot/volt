@@ -252,3 +252,14 @@ comptime {
         @compileError("reactor_linux.zig is Linux-only");
     }
 }
+
+// ─── Test discovery ──────────────────────────────────────────────
+//
+// Pull in fs_ring's tests transitively. The module is Linux-only
+// via its own comptime gate; we anchor it here so `zig build test`
+// on Linux discovers its tests, while Darwin / Windows builds skip
+// the whole subtree (reactor_linux itself never compiles there).
+
+test {
+    _ = @import("fs_ring.zig");
+}
