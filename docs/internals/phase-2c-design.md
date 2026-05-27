@@ -112,14 +112,71 @@ be drained** (`read(fd, &u64_buf, 8)`) on every wake, otherwise
 the level-triggered epoll re-fires indefinitely. Edge-triggered
 isn't an option for shared eventfds.
 
-### Worker run-state
+### Worker run-state — reuse `parked_workers`, no new atomic
 
-Add an atomic enum on M (or piggyback on `parked_workers`):
-`{ Running, Searching, Parked }`. Searching means "in find-work
-loop, not actively dispatching" — equivalent to the existing
-`num_searching` counter. The Signal-Only-If-Idle check reads
-this atomic with `.acquire`; the worker's own state transitions
-use `.release`. Same shape as the existing parker integration.
+The runtime already has `Runtime.parked_workers: u64` (bitmap,
+one bit per M; cache-line padded, every park/unpark already
+touches it). For the Signal-Only-If-Idle check the poller needs
+exactly one question: "is the owner currently parked?" Answer:
+`(parked_workers.load(.acquire) >> owner_id) & 1`. No new atomic
+required — the bit on this bitmap is the authoritative "parked"
+signal, and the existing parker integration already publishes it
+with the right ordering.
+
+The two-state distinction the original draft proposed —
+`Running` vs `Searching` — turns out to be unnecessary for this
+optimisation. Both states mean "the owner will catch the CQE on
+its own peek loop without our help"; we only care about the
+third state (`Parked`), and the bitmap tells us that directly.
+
+#### The load-bearing intent-to-park invariant
+
+For this to be race-free, the owner worker MUST set its bit
+*before* its final defensive work-check, not after. Otherwise:
+
+```
+Worker B (Owner)                       Worker A (Reactor Poller)
+----------------                       -------------------------
+1. peekBatch() -> empty
+                                       2. CQE completes in kernel
+                                       3. Eventfd fires, A wakes
+                                       4. A reads parked_workers — B's bit == 0
+                                       5. A drops the signal
+6. Sets B's bit in parked_workers
+7. parker.park() → ASLEEP, with a CQE pending
+```
+
+The fix is "intent-to-park": set the bit, THEN re-check work
+sources, THEN park if still nothing. If a check finds work,
+return early and `defer` clears the bit. **The current
+`parkWorker` (`src/runtime.zig:1114-1146`) already implements
+exactly this sequence** — `markParked` at line 1115 with
+`defer unmarkParked`, defensive checks at 1125-1129, spin loop
+with more checks at 1135-1143, `parker.park()` only at 1145.
+Phase 2C.1 just needs to extend the existing check list to
+include "fs_ring CQE ready" (a single `peekBatch` call against
+the current P's ring).
+
+#### The poller side (Worker A)
+
+1. Wake from `epoll_wait` because an eventfd fired.
+2. **Drain the eventfd** — `read(eventfd, &u64_buf, 8)`, exactly
+   8 bytes. Short reads leave the kernel counter non-zero and
+   level-triggered epoll re-fires forever.
+3. **Load the bitmap** — `parked_workers.load(.acquire)`. The
+   acquire pairs with the owner's `.release` (or stronger) store
+   in `markParked`.
+4. **If owner's bit is set**: `m.parker.unpark()`. The owner
+   wakes, runs its defensive recheck (which now finds the CQE),
+   clears its own bit via `defer unmarkParked`, returns to the
+   dispatch loop, and drains the ring on its next find-work
+   iteration.
+5. **If owner's bit is clear**: drop. The owner is in find-work
+   right now (Running or Searching, doesn't matter which), or
+   between fetchSub-num_searching and markParked (the
+   `need_spinning` latch in `wakeOneParked` already closes that
+   window — same mechanism, generalises to fs ring CQEs at no
+   extra cost).
 
 ## 3. Per-P ring submission is single-writer
 
@@ -179,9 +236,13 @@ discipline as 2A/2B.
    owner P's worker state, and either signal-or-drop per §2.
 3. **`src/runtime.zig`**: after `tryInitFsRings` (already in
    Phase 2B), register each ring's eventfd with the shared
-   reactor's epoll. Add the `Running`/`Searching`/`Parked`
-   worker run-state atomic on M (or piggyback on existing
-   parker state).
+   reactor's epoll. **No new worker state atomic** — the
+   existing `parked_workers` bitmap is the authoritative
+   "parked" signal (one bit per M). The Signal-Only-If-Idle
+   check reads bit N with `.acquire`. Extend `parkWorker`'s
+   defensive check list (lines 1125-1129 and 1138-1142) with a
+   `peekBatch` against the current P's fs ring — its existing
+   `defer unmarkParked` already closes the race window.
 4. **Backends' `fs*` methods** (`reactor_io_uring.zig`,
    `reactor_epoll.zig`): check `current.require()` → P →
    `rt.fs_rings`; if non-null, do the SQE+park flow; if null,
@@ -226,10 +287,14 @@ discipline as 2A/2B.
 | 2026-05-27 | Single-writer per P, no submission lock. | M:P binding + cooperative coroutines = no concurrent submitters. |
 | 2026-05-27 | Owner-only drain. | Avoids cache-line bouncing and double work that "anyone-drains" would cost on a work-stealing scheduler. |
 | 2026-05-27 | "Signal-Only-If-Idle" optimisation on the eventfd wake-up. | Prevents the notification storm where a busy worker's per-CQE eventfd fires the poller, which would otherwise uselessly signal the (already-running) owner. Cost: one atomic load + one branch on the poller path. |
+| 2026-05-27 | Reuse existing `parked_workers` bitmap; no new per-M state atomic. | The bit is the authoritative "parked" signal; `parkWorker:1114-1146` already implements intent-to-park (set bit → defensive checks → spin → park; `defer unmarkParked` on any return). Phase 2C.1 just extends the defensive check list. Saves an atomic per M and reuses existing ordering. |
+| 2026-05-27 | Intent-to-park sequence is the load-bearing invariant. | If the bit goes up *after* the final work check, a CQE arriving between the check and the bit-set goes unobserved and the poller drops its signal because the bit is still 0. The current `parkWorker` already gets this right; preserve the ordering when extending the check list. |
 
 ## 8. Risks for Phase 2C reviewer to verify
 
 1. **Eventfd registration ordering.** Register with `IORING_REGISTER_EVENTFD` *before* adding the eventfd to epoll, so a CQE that lands during registration doesn't get lost. (`io_uring_register` is synchronous; once it returns, the eventfd will fire on every subsequent CQE.)
 2. **Owner-only drain assumes worker stays bound to P.** M:P is 1:1 today (CLAUDE.md mentions this is Phase 1). If a later phase introduces M-detach, the "owner drains" model needs revisiting — the eventfd-registered M might not be the same M that ends up running the owner's coroutines.
+
+5. **Intent-to-park ordering** (formalised above). When extending `parkWorker`'s defensive check list with the fs ring peek, the peek MUST sit between `markParked` and `m.parker.park()` — not in `tryFindAndDispatch` only. A peek that happens only before `markParked` exposes the missed-wake race documented in §2. The existing structure of `parkWorker` (check list runs *after* `markParked`) makes this the natural place; the reviewer should still verify the new entry sits inside the `markParked` ... `parker.park()` window.
 3. **`has_pending` lifetime.** Set true by `prepX`, cleared by `flush`. Owner-only access. If a later phase introduces a "submit-from-shutdown" path on Runtime.deinit, that path must run on each owner P (not a foreign thread).
 4. **Coroutine-stack lifetime in the cancel-CQE window** (Phase 3 concern, captured in §1 above).
