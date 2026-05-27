@@ -1020,8 +1020,12 @@ fn fsRingWakeHandler(p_id: u32) void {
 /// before swap-back). `unpark`'s CAS handles both transitions
 /// correctly; a bare push would race with the swap-back's
 /// PARK_STATE transition and risk double-dispatch.
-fn drainFsRingInto(rt: *Runtime, p: *P) usize {
+inline fn drainFsRingInto(rt: *Runtime, p: *P) usize {
     if (builtin.os.tag != .linux) return 0;
+    // On Linux, the fast path (no fs ops in flight on this P) is
+    // a single load + branch. Inlined so spawn-heavy workloads
+    // (bench-spawn-hot, bench-fanout-scaling) don't pay a call
+    // overhead on the find-work / parkWorker hot path.
     const rings = rt.fs_rings orelse return 0;
     if (p.id >= rings.len) return 0;
     var cqes: [16]@import("std").os.linux.io_uring_cqe = undefined;
