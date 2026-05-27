@@ -110,6 +110,31 @@ pub const Reactor = union(Backend) {
         }
     }
 
+    // ─── Phase 2C.1: per-P fs ring eventfd integration ──────────────
+    //
+    // Only the epoll variant of the SHARED reactor supports fs ring
+    // eventfds — the io_uring variant doesn't have an epoll instance
+    // to register the eventfds against. The io_uring shared reactor
+    // is internal-only (not user-selectable since commit 4892a02),
+    // so this no-op path is exercised only by conformance tests that
+    // exercise both backends. In that path fs ring CQEs are still
+    // caught via Layer 1 (peek-on-find-work); only the Layer 2
+    // eventfd wake of parked workers is skipped.
+
+    pub fn addFsRingEventFd(self: *Reactor, fd: i32, p_id: u32) posix_helpers.ReactorWaitError!void {
+        switch (self.*) {
+            .epoll => |*r| return r.addFsRingEventFd(fd, p_id),
+            .io_uring => {}, // no-op; see note above
+        }
+    }
+
+    pub fn setFsWakeHandler(self: *Reactor, h: *const fn (p_id: u32) void) void {
+        switch (self.*) {
+            .epoll => |*r| r.setFsWakeHandler(h),
+            .io_uring => {}, // no-op; see note above
+        }
+    }
+
     pub fn cancelCoro(self: *Reactor, c: *@import("coroutine.zig").Coroutine) void {
         switch (self.*) {
             .epoll => |*r| r.cancelCoro(c),

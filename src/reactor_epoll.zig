@@ -157,22 +157,28 @@ fn registerError(e: c_int) ReactorWaitError {
 
 // ─── data encoding ───────────────────────────────────────────────
 //
-// `epoll_event.data` is a u64 carrying any one of three things:
+// `epoll_event.data` is a u64 carrying any one of four things:
 //
 //   * `INTERRUPT_DATA` (0) — the cross-thread interrupt eventfd.
 //   * `pd | POLL_DESC_TAG` — a persistent PD registration on a
 //     network/socket fd.
 //   * raw coroutine pointer — a per-call timerfd registration.
+//   * `(p_id << 3) | FS_RING_TAG` — a per-P io_uring fs ring's
+//     eventfd registration (Phase 2C.1). The kernel writes to
+//     this eventfd whenever a CQE lands on the corresponding
+//     fs ring; the poller uses it as a wake signal.
 //
-// `POLL_DESC_TAG` picks bit 2 (= 0x4). Coroutine and PollDesc heap
-// allocations are both ≥ 8-byte aligned (Volt's allocator default
-// gives 8; `PollDesc` is `align(std.atomic.cache_line)` so ≥ 64),
-// so bit 2 is naturally 0 in their addresses. Setting bit 2 on PD
-// events makes them trivially distinguishable from timer events
-// without consulting any side state.
+// Tag bits are chosen to be mutually exclusive:
+//   POLL_DESC_TAG = bit 2 (0x4)
+//   FS_RING_TAG   = bit 1 (0x2)
+// Both PD and Coroutine heap allocations are ≥ 8-byte aligned, so
+// their low 3 bits are naturally 0. p_id is shifted left by 3 to
+// keep the tag bits unambiguous (Volt's MAX_WORKERS = 64, so p_id
+// uses at most 6 bits; the shift loses nothing).
 
 const INTERRUPT_DATA: u64 = 0;
 const POLL_DESC_TAG: u64 = 0x4;
+const FS_RING_TAG: u64 = 0x2;
 
 inline fn dataForPd(pd: *poll_desc.PollDesc) u64 {
     const raw: u64 = @intFromPtr(pd);
@@ -186,6 +192,18 @@ inline fn pdFromData(data: u64) *poll_desc.PollDesc {
 
 inline fn isPdData(data: u64) bool {
     return data != INTERRUPT_DATA and (data & POLL_DESC_TAG) != 0;
+}
+
+inline fn dataForFsRing(p_id: u32) u64 {
+    return (@as(u64, p_id) << 3) | FS_RING_TAG;
+}
+
+inline fn fsRingPIdFromData(data: u64) u32 {
+    return @intCast((data & ~FS_RING_TAG) >> 3);
+}
+
+inline fn isFsRingData(data: u64) bool {
+    return data != INTERRUPT_DATA and (data & FS_RING_TAG) != 0;
 }
 
 // ─── Reactor ─────────────────────────────────────────────────────
@@ -218,6 +236,18 @@ pub const Reactor = struct {
     /// spin discipline. Mirrors `reactor_kqueue.zig:95`.
     in_poll: std.atomic.Value(bool) align(std.atomic.cache_line) =
         std.atomic.Value(bool).init(false),
+
+    /// Phase 2C.1: callback invoked when a per-P io_uring fs ring's
+    /// eventfd fires. Runtime sets this during init (after creating
+    /// the rings and registering their eventfds). The handler must:
+    /// (1) drain the eventfd's 8-byte counter (mandatory for
+    /// level-triggered epoll), (2) check `parked_workers` for the
+    /// owner's bit, (3) call `parker.unpark` if set, drop otherwise
+    /// — the Signal-Only-If-Idle protocol from
+    /// `docs/internals/phase-2c-design.md §2`. Null when fs rings
+    /// aren't populated; the poll loop skips the dispatch in that
+    /// case (defensive).
+    fs_wake_handler: ?*const fn (p_id: u32) void = null,
 
     pub fn init(allocator: std.mem.Allocator) !Reactor {
         _ = allocator; // no per-reactor allocation needed
@@ -464,7 +494,12 @@ pub const Reactor = struct {
     }
 
     pub fn poll(self: *Reactor, blocking: bool) usize {
-        if (self.pending.load(.acquire) == 0) return 0;
+        // Early return only if there's nothing the kernel could
+        // possibly deliver — no pending net/timer registrations AND
+        // no fs ring eventfds. With fs rings active the kernel can
+        // post an eventfd write at any time (Phase 2C.1), so we
+        // must always call epoll_wait to consume it.
+        if (self.pending.load(.acquire) == 0 and self.fs_wake_handler == null) return 0;
         var events: [EPOLL_EVENTS_BATCH]epoll_event = undefined;
         const timeout_ms: c_int = if (blocking) -1 else 0;
 
@@ -493,6 +528,22 @@ pub const Reactor = struct {
                 // toward `pending`.
                 var drain_buf: [8]u8 = undefined;
                 _ = read(self.interrupt_fd, &drain_buf, 8);
+                continue;
+            }
+
+            if (isFsRingData(data)) {
+                // Phase 2C.1: a per-P fs ring's eventfd fired. The
+                // handler is responsible for draining the eventfd
+                // (mandatory 8-byte read, otherwise level-triggered
+                // epoll re-fires) AND for the Signal-Only-If-Idle
+                // check on the owner worker's parked bit. Doesn't
+                // count toward `pending` — it's a wake signal, not
+                // a pending I/O. Counts toward `dispatched` so
+                // poll() returns truthy on fs ring activity.
+                if (self.fs_wake_handler) |h| {
+                    h(fsRingPIdFromData(data));
+                    dispatched += 1;
+                }
                 continue;
             }
 
@@ -526,6 +577,34 @@ pub const Reactor = struct {
         // not single-shot).
         if (timer_count > 0) _ = self.pending.fetchSub(timer_count, .acq_rel);
         return dispatched;
+    }
+
+    /// Phase 2C.1: register a per-P io_uring fs ring's eventfd
+    /// with this epoll instance. The eventfd is already configured
+    /// (created with EFD_NONBLOCK | EFD_CLOEXEC, registered with
+    /// the ring via IORING_REGISTER_EVENTFD) by the FsRing layer;
+    /// this method just adds it to epoll with the encoded
+    /// `(p_id << 3) | FS_RING_TAG` user_data. Level-triggered
+    /// (no EPOLLET): the handler is responsible for draining the
+    /// eventfd's counter on every wake.
+    pub fn addFsRingEventFd(self: *Reactor, fd: i32, p_id: u32) ReactorWaitError!void {
+        var ev = epoll_event{
+            .events = EPOLLIN,
+            .data = dataForFsRing(p_id),
+        };
+        if (epoll_ctl(self.epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
+            return registerError(errnoVal());
+        }
+        // Not counted in `pending` — fs ring eventfds are wake
+        // signals, not pending I/O. The poller's "claim role" CAS
+        // already runs whenever any worker has work to do.
+    }
+
+    /// Phase 2C.1: install the handler invoked when a per-P fs
+    /// ring eventfd fires. See `fs_wake_handler` field doc. Called
+    /// by Runtime.init AFTER `tryInitFsRings` populates the rings.
+    pub fn setFsWakeHandler(self: *Reactor, h: *const fn (p_id: u32) void) void {
+        self.fs_wake_handler = h;
     }
 
     /// Wake a worker currently blocked in `poll(true)`. Safe to call
