@@ -167,16 +167,64 @@ the current P's ring).
    acquire pairs with the owner's `.release` (or stronger) store
    in `markParked`.
 4. **If owner's bit is set**: `m.parker.unpark()`. The owner
-   wakes, runs its defensive recheck (which now finds the CQE),
-   clears its own bit via `defer unmarkParked`, returns to the
-   dispatch loop, and drains the ring on its next find-work
-   iteration.
+   wakes, runs its defensive recheck (which now drains the
+   ring), clears its own bit via `defer unmarkParked`, returns
+   to the dispatch loop, and the just-resumed coroutines run.
 5. **If owner's bit is clear**: drop. The owner is in find-work
-   right now (Running or Searching, doesn't matter which), or
-   between fetchSub-num_searching and markParked (the
-   `need_spinning` latch in `wakeOneParked` already closes that
-   window — same mechanism, generalises to fs ring CQEs at no
-   extra cost).
+   right now, or between fetchSub-num_searching and markParked
+   (the `need_spinning` latch in `wakeOneParked` already closes
+   that window — same mechanism, generalises to fs ring CQEs at
+   no extra cost).
+
+#### The peek must drain + dispatch, not just check
+
+A subtle but critical point: `peekBatch` returns raw CQEs.
+Checking only whether *some* CQE exists doesn't resume any
+coroutines. The find-work and pre-park integration both need
+to actually **drain the CQEs and push the resumed coroutines
+into `m.p.local`** so the subsequent `local.isEmpty()` check
+sees them.
+
+The shape Phase 2C.1 lands as a helper on Runtime (or in a
+small fs_dispatch module):
+
+```zig
+/// Drain ready CQEs on this P's fs ring, resolve each one to
+/// its parked coroutine, write the result into the FsOp, and
+/// push the coroutine onto the local queue. Returns the count
+/// drained. Safe to call from the owner worker only (single-
+/// reader per ring; cross-worker drains are forbidden by the
+/// owner-only-drain decision, §4).
+fn drainFsRingInto(rt: *Runtime, p: *P) usize {
+    const rings = rt.fs_rings orelse return 0;
+    var cqes: [16]linux.io_uring_cqe = undefined;
+    const n = rings[p.id].peekBatch(&cqes) catch return 0;
+    for (cqes[0..n]) |cqe| {
+        const op: *fs_ring.FsOp = @ptrFromInt(cqe.user_data);
+        op.result = .{ .value = cqe.res, .err = if (cqe.res < 0) @intCast(-cqe.res) else 0 };
+        p.pushQueue(op.coro);   // resumed coroutine joins local WSQ
+    }
+    return n;
+}
+```
+
+This helper gets called from two places:
+
+1. **`tryFindAndDispatch`** — once per find-work iteration, after
+   the local/lifo check, before steal attempts. If CQEs drained
+   into the local queue, the next dispatch picks them up
+   immediately. (Layer 1 of the wake-up architecture.)
+2. **`parkWorker`** — both in the post-`markParked` defensive
+   check block AND in the `SPIN_BEFORE_PARK` spin loop. After
+   the drain, the existing `if (!m.p.local.isEmpty()) return;`
+   check naturally catches the resumed coroutines and aborts
+   the park.
+
+The drain is cheap — userspace memory reads against the CQ
+ring — so doing it twice in parkWorker (once before spin, once
+per spin iteration) is fine. The eventfd fast path becomes a
+fallback for when the owner is genuinely asleep, never a
+critical path under sustained I/O.
 
 ## 3. Per-P ring submission is single-writer
 
@@ -239,10 +287,18 @@ discipline as 2A/2B.
    reactor's epoll. **No new worker state atomic** — the
    existing `parked_workers` bitmap is the authoritative
    "parked" signal (one bit per M). The Signal-Only-If-Idle
-   check reads bit N with `.acquire`. Extend `parkWorker`'s
-   defensive check list (lines 1125-1129 and 1138-1142) with a
-   `peekBatch` against the current P's fs ring — its existing
-   `defer unmarkParked` already closes the race window.
+   check reads bit N with `.acquire`. Add the
+   `drainFsRingInto(rt, p)` helper (drain CQEs → resolve FsOp
+   → push resumed coroutines onto `p.local`). Wire calls at:
+   (a) `tryFindAndDispatch` after the local/lifo check;
+   (b) `parkWorker` *after* `markParked` and *before* the
+   defensive `local.isEmpty()` check (so the drain populates
+   the queue first);
+   (c) the same again at the top of each `SPIN_BEFORE_PARK`
+   spin iteration (catches CQEs arriving during the brief
+   spin window without paying the eventfd round-trip).
+   `defer unmarkParked` continues to handle the abort-on-
+   late-work cleanup.
 4. **Backends' `fs*` methods** (`reactor_io_uring.zig`,
    `reactor_epoll.zig`): check `current.require()` → P →
    `rt.fs_rings`; if non-null, do the SQE+park flow; if null,
@@ -267,6 +323,17 @@ discipline as 2A/2B.
   AFTER lifo/local (those are warmest) but BEFORE stealing
   (local completions have better data locality than stolen
   work). Confirmed by reviewer.
+- **The peek must drain + dispatch, not just check.**
+  `ring.peekBatch` returns raw CQEs; checking "is there a CQE?"
+  doesn't actually resume any coroutines. Phase 2C.1's helper
+  drains CQEs, resolves each via `user_data → *FsOp`, writes
+  the result, and pushes the resumed coroutine onto the local
+  queue — so subsequent `local.isEmpty()` checks see them. If
+  this step is skipped or done in the wrong order, parkWorker
+  proceeds to `m.parker.park()` despite having a CQE pending,
+  and the worker only wakes when the eventfd fallback fires
+  (which still works, but costs an unnecessary syscall round
+  trip). Reviewer specifically called out this gotcha.
 - **Submitter vs reaper on `has_pending`.** Owner-only drain
   fixes this: the worker that submits is the worker that
   flushes. `has_pending` stays non-atomic (single-thread
@@ -289,6 +356,7 @@ discipline as 2A/2B.
 | 2026-05-27 | "Signal-Only-If-Idle" optimisation on the eventfd wake-up. | Prevents the notification storm where a busy worker's per-CQE eventfd fires the poller, which would otherwise uselessly signal the (already-running) owner. Cost: one atomic load + one branch on the poller path. |
 | 2026-05-27 | Reuse existing `parked_workers` bitmap; no new per-M state atomic. | The bit is the authoritative "parked" signal; `parkWorker:1114-1146` already implements intent-to-park (set bit → defensive checks → spin → park; `defer unmarkParked` on any return). Phase 2C.1 just extends the defensive check list. Saves an atomic per M and reuses existing ordering. |
 | 2026-05-27 | Intent-to-park sequence is the load-bearing invariant. | If the bit goes up *after* the final work check, a CQE arriving between the check and the bit-set goes unobserved and the poller drops its signal because the bit is still 0. The current `parkWorker` already gets this right; preserve the ordering when extending the check list. |
+| 2026-05-27 | The peek must drain + dispatch into `p.local`, not just check. | Checking readiness alone leaves resumed coroutines stranded — the subsequent `local.isEmpty()` returns true and the worker parks anyway. The `drainFsRingInto(rt, p)` helper does the drain + per-CQE FsOp resolve + push in one call; called from `tryFindAndDispatch`, from `parkWorker`'s post-`markParked` check, and from each iteration of the spin loop. Catches CQEs purely in userspace; eventfd fallback only kicks in when the owner is genuinely parked. |
 
 ## 8. Risks for Phase 2C reviewer to verify
 
