@@ -289,7 +289,7 @@ discipline as 2A/2B.
    "parked" signal (one bit per M). The Signal-Only-If-Idle
    check reads bit N with `.acquire`. Add the
    `drainFsRingInto(rt, p)` helper (drain CQEs → resolve FsOp
-   → push resumed coroutines onto `p.local`). Wire calls at:
+   → unpark resumed coroutines). Wire calls at:
    (a) `tryFindAndDispatch` after the local/lifo check;
    (b) `parkWorker` *after* `markParked` and *before* the
    defensive `local.isEmpty()` check (so the drain populates
@@ -299,6 +299,13 @@ discipline as 2A/2B.
    spin window without paying the eventfd round-trip).
    `defer unmarkParked` continues to handle the abort-on-
    late-work cleanup.
+   **Add `Runtime.fs_in_flight: std.atomic.Value(u32)`** —
+   bumped by each `fsRingX` after submit, decremented by
+   `drainFsRingInto` per CQE. Included in the
+   reactor-poll-claim and parking conditions so workers
+   actually enter `epoll_wait` when fs ops are in flight
+   (see decision log entry below for why `reactor.pending`
+   can't be reused).
 4. **Backends' `fs*` methods** (`reactor_io_uring.zig`,
    `reactor_epoll.zig`): check `current.require()` → P →
    `rt.fs_rings`; if non-null, do the SQE+park flow; if null,
@@ -357,6 +364,8 @@ discipline as 2A/2B.
 | 2026-05-27 | Reuse existing `parked_workers` bitmap; no new per-M state atomic. | The bit is the authoritative "parked" signal; `parkWorker:1114-1146` already implements intent-to-park (set bit → defensive checks → spin → park; `defer unmarkParked` on any return). Phase 2C.1 just extends the defensive check list. Saves an atomic per M and reuses existing ordering. |
 | 2026-05-27 | Intent-to-park sequence is the load-bearing invariant. | If the bit goes up *after* the final work check, a CQE arriving between the check and the bit-set goes unobserved and the poller drops its signal because the bit is still 0. The current `parkWorker` already gets this right; preserve the ordering when extending the check list. |
 | 2026-05-27 | The peek must drain + dispatch into `p.local`, not just check. | Checking readiness alone leaves resumed coroutines stranded — the subsequent `local.isEmpty()` returns true and the worker parks anyway. The `drainFsRingInto(rt, p)` helper does the drain + per-CQE FsOp resolve + push in one call; called from `tryFindAndDispatch`, from `parkWorker`'s post-`markParked` check, and from each iteration of the spin loop. Catches CQEs purely in userspace; eventfd fallback only kicks in when the owner is genuinely parked. |
+| 2026-05-27 | Drop `IORING_SETUP_DEFER_TASKRUN` from `SETUP_TIERS`. | DEFER_TASKRUN defers completion work (including making CQEs visible AND writing to the registered eventfd) until the submitter calls `io_uring_enter(GETEVENTS)`. Our `flush()` calls `submit()` with `wait_nr=0` (no GETEVENTS) and the worker then parks; nothing else calls enter-with-GETEVENTS until we manually do, so completions never become visible. DEFER_TASKRUN benefits workloads that BATCH many SQEs between drains; ours (submit one, park, drain on wake) is the opposite shape. Kept `SINGLE_ISSUER \| SUBMIT_ALL` which provide their wins without the same constraint. |
+| 2026-05-27 | New `Runtime.fs_in_flight` atomic counter. | Eventfds don't bump `reactor.pending` (they're wake signals, not registered I/O). Without a separate signal, `tryFindAndDispatch`'s reactor-poll-claim and `parkWorker`'s defensive check both see "nothing pending" and the worker parks — eventfd fires with nobody in `epoll_wait` to receive it, op hangs forever. The counter is incremented by `fsRingRead/Write/Fsync/Fdatasync` after submit, decremented by `drainFsRingInto` per CQE. Cache-line-aligned; one bump + one decrement per fs op. |
 
 ## 8. Risks for Phase 2C reviewer to verify
 

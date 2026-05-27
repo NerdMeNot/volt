@@ -57,20 +57,26 @@ pub const FsResult = reactor_fs.FsResult;
 pub const DEFAULT_RING_ENTRIES: u16 = 256;
 
 /// Setup-flag tiers, tried in order from most aggressive to bare.
-/// Stops at the first combo that succeeds. Modern kernels (6.1+)
-/// take the first tier; older kernels degrade gracefully.
+/// Stops at the first combo that succeeds.
 ///
-/// Why this ordering: each tier strictly weakens the previous one
-/// by dropping the newest-required flag. A kernel that rejects
-/// SUBMIT_ALL still accepts (SINGLE_ISSUER | DEFER_TASKRUN); a
-/// kernel that rejects DEFER_TASKRUN still accepts SINGLE_ISSUER;
-/// and 0 always works on any kernel that supports io_uring at all.
+/// **Why NOT `DEFER_TASKRUN`:** under DEFER_TASKRUN the kernel
+/// only runs completion work (including making CQEs visible AND
+/// writing to the registered eventfd) on the submitter's next
+/// `io_uring_enter(GETEVENTS)`. Our pattern is "submit one SQE,
+/// park the coroutine, eventually drain CQEs from a different
+/// scheduling context"; with DEFER_TASKRUN the eventfd never
+/// fires until we manually call enter(GETEVENTS), which would
+/// add a syscall per drain and erase the lazy-batch win.
+/// DEFER_TASKRUN benefits workloads that BATCH many SQEs between
+/// drains; ours is the opposite shape. Skip it.
+///
+/// SINGLE_ISSUER (single submitter task — the owner P's M) is
+/// still useful: lets the kernel skip cross-task locks. Same
+/// invariant we already enforce architecturally.
+/// SUBMIT_ALL (5.18+) keeps submitting on per-SQE error rather
+/// than stopping at the first failure — strict win.
 const SETUP_TIERS = [_]u32{
-    linux.IORING_SETUP_SINGLE_ISSUER |
-        linux.IORING_SETUP_DEFER_TASKRUN |
-        linux.IORING_SETUP_SUBMIT_ALL,
-    linux.IORING_SETUP_SINGLE_ISSUER |
-        linux.IORING_SETUP_DEFER_TASKRUN,
+    linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_SUBMIT_ALL,
     linux.IORING_SETUP_SINGLE_ISSUER,
     0,
 };

@@ -393,6 +393,19 @@ pub const Runtime = struct {
     /// check this slice (Phase 2C) and fall back to the
     /// spawnBlocking proxy when null.
     fs_rings: ?[]fs_ring_mod.FsRing = null,
+    /// Phase 2C.2: count of in-flight fs ring SQEs (kernel-side
+    /// pending, not yet drained as CQEs). The reactor's `pending`
+    /// counter doesn't include fs ring eventfds (those are
+    /// wake signals, not registered I/O), so workers wouldn't
+    /// otherwise know to claim the reactor poller role when the
+    /// only outstanding work is a parked fs coroutine.
+    /// Bumped by `fsRingRead/Write/etc` after submit; decremented
+    /// by `drainFsRingInto` per CQE drained. `tryFindAndDispatch`
+    /// enters the reactor poll path when this is > 0 (in addition
+    /// to the existing `pendingCount > 0` check); `parkWorker`'s
+    /// defensive checks similarly avoid parking when > 0.
+    fs_in_flight: std.atomic.Value(u32) align(std.atomic.cache_line) =
+        std.atomic.Value(u32).init(0),
     /// Optional instrumentation hook — see `Observer` doc. Read by
     /// the four hook sites (spawn, park, unpark, complete). Nullable
     /// so the hot path stays branch-and-fold when no observer is set.
@@ -979,15 +992,24 @@ fn fsRingWakeHandler(p_id: u32) void {
 }
 
 /// Phase 2C.1 Layer 1: drain ready CQEs on `p`'s fs ring, resolve
-/// each via `user_data → *FsOp`, write the result, and push the
-/// resumed coroutine onto the local queue. Returns count drained.
-/// Safe to call from the owner worker only (owner-only-drain
-/// decision, design memo §4).
+/// each via `user_data → *FsOp`, write the result, and unpark the
+/// waiting coroutine. Returns count drained. Safe to call from
+/// the owner worker only (owner-only-drain decision, design memo
+/// §4).
 ///
-/// Called from `tryFindAndDispatch` (between local/lifo and
-/// steal) and from `parkWorker` (after `markParked` and inside
-/// the spin loop) so the existing `local.isEmpty()` defensive
-/// check picks up the resumed coroutines and aborts the park.
+/// Called from `tryFindAndDispatch` (between popMailbox-fairness
+/// and popLocal) and from `parkWorker` (after `markParked` and
+/// inside the spin loop). The unparked coroutines land in this
+/// P's mailbox (via `unpark`'s currentM-aware target selection),
+/// where the existing `mailbox.isEmpty()` defensive check picks
+/// them up and aborts the park.
+///
+/// Uses `unpark` rather than direct `p.pushQueue` because the
+/// coroutine may be in PARKED state already (CQE arrived after
+/// the dispatcher's swap-back) or in RUNNING state (CQE arrived
+/// before swap-back). `unpark`'s CAS handles both transitions
+/// correctly; a bare push would race with the swap-back's
+/// PARK_STATE transition and risk double-dispatch.
 fn drainFsRingInto(rt: *Runtime, p: *P) usize {
     if (builtin.os.tag != .linux) return 0;
     const rings = rt.fs_rings orelse return 0;
@@ -1001,9 +1023,83 @@ fn drainFsRingInto(rt: *Runtime, p: *P) usize {
             .value = res,
             .err = if (res < 0) @intCast(-res) else 0,
         };
-        p.pushQueue(op.coro);
+        unpark(op.coro);
     }
+    if (n > 0) _ = rt.fs_in_flight.fetchSub(n, .acq_rel);
     return n;
+}
+
+// ─── Phase 2C.2: fs ring routing helpers ─────────────────────────
+//
+// Each helper attempts to route an fs op through the per-P
+// io_uring ring. Returns non-null on success, null when the ring
+// path is unavailable (no fs_rings on this Runtime, not on a
+// worker M, SQ full, submit failed) — caller falls back to the
+// Phase 1 spawnBlocking proxy. Callers must be in a coroutine
+// (the spawnBlocking fallback also requires it).
+//
+// The FsOp is allocated on the caller's coroutine stack. The
+// stack VA is stable for the coroutine's lifetime (CLAUDE.md
+// invariant 5); the coroutine waits in `park()` for its CQE
+// before returning, so the FsOp outlives the kernel's in-flight
+// window. See `docs/internals/phase-2c-design.md §1`.
+
+const fs_result = @import("reactor_fs.zig").FsResult;
+
+inline fn currentPRing(rt: *Runtime) ?*fs_ring_mod.FsRing {
+    const rings = rt.fs_rings orelse return null;
+    const m_raw = worker_mod.currentM() orelse return null;
+    const m: *M = @ptrCast(@alignCast(m_raw));
+    if (m.p.id >= rings.len) return null;
+    return &rings[m.p.id];
+}
+
+pub fn fsRingRead(fd: i32, buf: []u8, offset: u64) ?fs_result {
+    const co = current.require();
+    const rt: *Runtime = @ptrCast(@alignCast(co.runtime));
+    const ring = currentPRing(rt) orelse return null;
+    var op: fs_ring_mod.FsOp = .{ .coro = co, .result = undefined };
+    ring.prepRead(fd, buf, offset, @intFromPtr(&op)) catch return null;
+    _ = ring.flush() catch return null;
+    _ = rt.fs_in_flight.fetchAdd(1, .acq_rel);
+    park();
+    return op.result;
+}
+
+pub fn fsRingWrite(fd: i32, buf: []const u8, offset: u64) ?fs_result {
+    const co = current.require();
+    const rt: *Runtime = @ptrCast(@alignCast(co.runtime));
+    const ring = currentPRing(rt) orelse return null;
+    var op: fs_ring_mod.FsOp = .{ .coro = co, .result = undefined };
+    ring.prepWrite(fd, buf, offset, @intFromPtr(&op)) catch return null;
+    _ = ring.flush() catch return null;
+    _ = rt.fs_in_flight.fetchAdd(1, .acq_rel);
+    park();
+    return op.result;
+}
+
+pub fn fsRingFsync(fd: i32) ?fs_result {
+    const co = current.require();
+    const rt: *Runtime = @ptrCast(@alignCast(co.runtime));
+    const ring = currentPRing(rt) orelse return null;
+    var op: fs_ring_mod.FsOp = .{ .coro = co, .result = undefined };
+    ring.prepFsync(fd, @intFromPtr(&op), false) catch return null;
+    _ = ring.flush() catch return null;
+    _ = rt.fs_in_flight.fetchAdd(1, .acq_rel);
+    park();
+    return op.result;
+}
+
+pub fn fsRingFdatasync(fd: i32) ?fs_result {
+    const co = current.require();
+    const rt: *Runtime = @ptrCast(@alignCast(co.runtime));
+    const ring = currentPRing(rt) orelse return null;
+    var op: fs_ring_mod.FsOp = .{ .coro = co, .result = undefined };
+    ring.prepFsync(fd, @intFromPtr(&op), true) catch return null;
+    _ = ring.flush() catch return null;
+    _ = rt.fs_in_flight.fetchAdd(1, .acq_rel);
+    park();
+    return op.result;
 }
 
 // ─── runWithSignals — graceful-shutdown infrastructure ─────────────
@@ -1178,7 +1274,7 @@ fn tryFindAndDispatch(rt: *Runtime, m: *M) bool {
         dispatch(rt, m, c);
         return true;
     }
-    if (rt.reactor.pendingCount() > 0 and rt.tryClaimPoller()) {
+    if ((rt.reactor.pendingCount() > 0 or rt.fs_in_flight.load(.acquire) > 0) and rt.tryClaimPoller()) {
         // Don't enter the blocking poll if shutdown has fired: we'd
         // immediately be woken by `reactor.interrupt()` (deinit
         // always fires one), but a worker re-checking pending after
@@ -1243,6 +1339,7 @@ fn parkWorker(rt: *Runtime, m: *M) void {
     if (!m.p.local.isEmpty()) return;
     if (!m.p.mailbox.isEmpty()) return;
     if (rt.reactor.pendingCount() > 0) return;
+    if (rt.fs_in_flight.load(.acquire) > 0) return;
     if (rt.shutdown.load(.acquire)) return;
 
     // Spin briefly before committing to a real park. Bursty spawn
@@ -1260,6 +1357,7 @@ fn parkWorker(rt: *Runtime, m: *M) void {
         if (!m.p.mailbox.isEmpty()) return;
         if (!m.p.local.isEmpty()) return;
         if (rt.reactor.pendingCount() > 0) return;
+        if (rt.fs_in_flight.load(.acquire) > 0) return;
         if (rt.shutdown.load(.acquire)) return;
     }
 

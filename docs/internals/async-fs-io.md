@@ -160,17 +160,24 @@ path. Public API is identical across platforms.
 
 **Implementation invariants (lifted from the references, see §11):**
 
-1. **Setup flags** (Linux 6.1+):
-   `IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
-   IORING_SETUP_SUBMIT_ALL`. The first two require same-thread
-   submit and reap — which per-worker rings provide naturally.
-   `SUBMIT_ALL` (5.18+) keeps submitting on per-SQE error rather
-   than stopping at the first failure. Fall back to flags=0 on
-   older kernels.
+1. **Setup flags**:
+   `IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_SUBMIT_ALL`.
+   `SINGLE_ISSUER` (6.0+) requires same-thread submit-and-reap —
+   which per-worker rings provide naturally. `SUBMIT_ALL` (5.18+)
+   keeps submitting on per-SQE error rather than stopping at the
+   first failure. Fall back to flags=0 on older kernels.
+   **Don't use `DEFER_TASKRUN`** — it defers completion work
+   (CQE visibility AND registered-eventfd writes) until the
+   submitter calls `io_uring_enter(GETEVENTS)`. Our submit-once /
+   park / drain-on-wake pattern doesn't naturally call enter with
+   GETEVENTS (just submit, no wait), so completions never become
+   visible. DEFER_TASKRUN benefits workloads that batch many SQEs
+   between drains; ours is the opposite shape. (Caught during the
+   Phase 2C.2 routing implementation when the `fs facade` test
+   hung — see Phase 2C decision log.)
 2. **Never use SQPOLL.** None of the three references enable it.
    Trades a kernel thread for a syscall; bad fit unless cores are
-   idle, and mutually exclusive with `DEFER_TASKRUN`'s same-task
-   invariant.
+   idle.
 3. **`io_uring_ring_dontfork`** at construction
    (Seastar `reactor_backend.cc:1228`). Fork+exec in a child
    shouldn't inherit locked ring mappings.
@@ -442,6 +449,7 @@ Phases 2-6 require Linux.
 | 2026-05-26 | Cancel-and-drain on in-flight cancellation (Option B1), refined with Glommio's Enqueued/Dispatched two-state model. | Matches existing fs cancel semantics; preserves stack-buffer ownership; the Enqueued fast path matches the empirically-common cancellation case. |
 | 2026-05-26 | Pure replacement of fs ops' internals (no additive variants). | Same principle as removing `Config.io_backend`: Volt picks the right impl, developer never sees the choice. |
 | 2026-05-26 | Setup flags: `SINGLE_ISSUER \| DEFER_TASKRUN \| SUBMIT_ALL` on ≥6.1, fall back to 0 on older kernels. No SQPOLL. | Modern stack for per-worker rings. SQPOLL is mutually exclusive with DEFER_TASKRUN and none of the three references enable it. |
+| 2026-05-27 | **Revised**: setup flags are `SINGLE_ISSUER \| SUBMIT_ALL` only — drop DEFER_TASKRUN. | DEFER_TASKRUN defers CQE-visibility AND eventfd writes until `io_uring_enter(GETEVENTS)`. Our submit-once / park / drain-on-wake pattern doesn't call enter-with-GETEVENTS, so completions never appear. Caught when the `fs facade` test hung during Phase 2C.2 routing. DEFER_TASKRUN is for workloads that BATCH many SQEs between drains. |
 | 2026-05-26 | Linux Reactor stays a tagged union; fs ring lives on P, not on Reactor. | Smaller restructure than the original "Reactor becomes a struct" proposal. Per-worker rings naturally live alongside the WSQ in `src/p.zig`. |
 | 2026-05-26 | No registered buffers / no registered files in v1. Heap-canonical buffer pattern; stack buffers safe given B1. | All three references either skip registration (TB, Seastar) or use it only for DMA (Glommio). Defer to Phase 6 with a benchmark gate. |
 
@@ -561,8 +569,11 @@ needs cancel from day one (§5).
 ### 11.4 What Volt must do (consolidated)
 
 1. **One io_uring per worker (P)**, lifetime tied to P.
-2. **Setup flags**: `SINGLE_ISSUER | DEFER_TASKRUN | SUBMIT_ALL`
-   on ≥6.1, fall back to 0 below.
+2. **Setup flags**: `SINGLE_ISSUER | SUBMIT_ALL`, fall back to 0
+   below. **Do NOT include DEFER_TASKRUN** — it defers
+   CQE-visibility and registered-eventfd writes until
+   `io_uring_enter(GETEVENTS)`, which our submit/park/drain
+   pattern doesn't call.
 3. **`io_uring_ring_dontfork`** every ring.
 4. **Probe features + opcodes** at `Runtime.init`; cache
    `rt.fs_uring_available`.
@@ -581,22 +592,29 @@ needs cancel from day one (§5).
 
 ### 11.5 What Volt must NOT do
 
-1. **No SQPOLL.** Mutually exclusive with DEFER_TASKRUN, no
-   reference uses it.
-2. **No cross-worker ring sharing.** Breaks SINGLE_ISSUER.
-3. **No per-syscall `io_uring_enter`.** Always batch.
-4. **No `IOPOLL` without O_DIRECT** — no-op on cached files.
-5. **No assumption that a setup flag works because the kernel
+1. **No SQPOLL.** No reference uses it; the kernel poll thread
+   trades a kernel thread for a syscall, bad fit unless cores
+   are idle.
+2. **No `DEFER_TASKRUN`** for submit/park/drain workloads.
+   Defers completion work — including CQE-visibility and
+   eventfd writes — until the submitter calls
+   `io_uring_enter(GETEVENTS)`. Our pattern doesn't, so ops
+   hang. Use it only when batching SQEs and draining many at
+   once.
+3. **No cross-worker ring sharing.** Breaks SINGLE_ISSUER.
+4. **No per-syscall `io_uring_enter`.** Always batch.
+5. **No `IOPOLL` without O_DIRECT** — no-op on cached files.
+6. **No assumption that a setup flag works because the kernel
    is new enough** — even Axboe's `poll-bench.c:34-40` falls
    back to `flags=0` on `-EINVAL`. Probe the flag.
-6. **No `free()` on a probe** — use `io_uring_free_probe` (or
+7. **No `free()` on a probe** — use `io_uring_free_probe` (or
    the Zig equivalent).
-7. **No stack-allocated buffer for an op whose coroutine might
+8. **No stack-allocated buffer for an op whose coroutine might
    unwind past the call.** The B1 cancel-and-drain guarantees
    the coroutine waits for the cancel CQE, so stack buffers are
    safe in the normal cancel path. A panic past the parked
    coroutine would violate this — same constraint as everywhere
    else in Volt.
-8. **No silent cancellation TODO.** Seastar deferred it but
+9. **No silent cancellation TODO.** Seastar deferred it but
    `abort()`s loudly. If Volt defers any part of cancel, mirror
    that pattern so it can't regress into a silent no-op.
