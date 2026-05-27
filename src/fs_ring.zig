@@ -33,11 +33,13 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
 
-comptime {
-    if (builtin.os.tag != .linux) {
-        @compileError("fs_ring.zig is Linux-only — guard imports with comptime os.tag checks");
-    }
-}
+// Linux-only by *use*: every public method ultimately calls
+// `std.os.linux.IoUring.*` which only does anything useful on
+// Linux. The module is intentionally importable from other
+// platforms — Runtime needs the type to declare an `?[]FsRing`
+// field that's always null off Linux. Per-test skips guard
+// runtime-failing tests; `FsRing.init` on non-Linux returns
+// `error.IoUringUnavailable` cleanly.
 
 /// Default SQ/CQ depth. Matches the conservative Seastar default
 /// (`s_queue_len = 200`; rounded to a power of two). Caller may

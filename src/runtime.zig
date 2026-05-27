@@ -46,6 +46,7 @@ const park_mod = @import("park.zig");
 const stack_mod = @import("stack.zig");
 const blocking_pool_mod = @import("blocking_pool.zig");
 const signal_mod = @import("signal.zig");
+const fs_ring_mod = @import("fs_ring.zig");
 const builtin = @import("builtin");
 
 pub const Coroutine = coroutine.Coroutine;
@@ -381,6 +382,17 @@ pub const Runtime = struct {
     /// OS-thread pool used by `volt.spawnBlocking`. Lazy — no
     /// threads spawn until the first submit. See `src/blocking_pool.zig`.
     blocking_pool: blocking_pool_mod.Pool,
+    /// Per-P io_uring instances for async file I/O — Phase 2B.
+    /// One ring per P (matches the universal "ring per OS thread"
+    /// pattern from TigerBeetle / Glommio / Seastar, see
+    /// `docs/internals/async-fs-io.md §3.1`). Indexed by `P.id`.
+    /// Populated only on Linux, and only when every per-P ring
+    /// init succeeded. Left null on Darwin / Windows, on older
+    /// Linux kernels without io_uring, and on Linux when seccomp
+    /// or sysctl blocks io_uring_setup. The Reactor's fs methods
+    /// check this slice (Phase 2C) and fall back to the
+    /// spawnBlocking proxy when null.
+    fs_rings: ?[]fs_ring_mod.FsRing = null,
     /// Optional instrumentation hook — see `Observer` doc. Read by
     /// the four hook sites (spawn, park, unpark, complete). Nullable
     /// so the hot path stays branch-and-fold when no observer is set.
@@ -433,6 +445,18 @@ pub const Runtime = struct {
         }
         for (rt.ms, 0..) |*m, i| m.init(&rt.ps[i]);
 
+        // Per-P io_uring rings (Linux, Phase 2B). Graceful
+        // degradation: if any per-P init fails — kernel too old,
+        // sysctl-disabled, seccomp-blocked, ENOMEM — undo the
+        // successful inits and leave `fs_rings = null`. The
+        // Reactor's fs methods (Phase 2C) read this slice and fall
+        // back to the spawnBlocking proxy when null, so the
+        // failure mode is "no async fs win on this host", not
+        // "Runtime.init fails".
+        if (builtin.os.tag == .linux) {
+            tryInitFsRings(rt, cfg.allocator);
+        }
+
         // Spawn pthread workers 1..N-1. M[0] is the driver thread
         // (the thread that called Runtime.init / will call
         // Runtime.run); it joins the pool in `run()`. This makes
@@ -474,6 +498,12 @@ pub const Runtime = struct {
         // pools back to the allocator and stack pools back to the
         // arena; the arena's munmap happens after all Ps are done.
         for (self.ps) |*p| p.drainPools(self.allocator);
+        // Per-P io_uring rings (if init populated them).
+        if (self.fs_rings) |rings| {
+            for (rings) |*r| r.deinit();
+            self.allocator.free(rings);
+            self.fs_rings = null;
+        }
         self.stack_arena.deinit(self.allocator);
         self.allocator.free(self.ms);
         self.allocator.free(self.ps);
@@ -854,6 +884,29 @@ pub const Runtime = struct {
     }
 };
 
+// ─── Phase 2B: per-P io_uring (fs) ring initialisation ────────────
+
+/// Try to populate `rt.fs_rings` with one `FsRing` per P. All-or-
+/// nothing: any per-P init failure undoes the successful ones and
+/// leaves `rt.fs_rings = null`. The Reactor's fs path treats null
+/// as "use spawnBlocking proxy", so the fallback is automatic.
+///
+/// Caller must already have checked `builtin.os.tag == .linux`.
+fn tryInitFsRings(rt: *Runtime, allocator: std.mem.Allocator) void {
+    const rings = allocator.alloc(fs_ring_mod.FsRing, rt.ps.len) catch return;
+    var inited: usize = 0;
+    while (inited < rings.len) : (inited += 1) {
+        rings[inited] = fs_ring_mod.FsRing.init() catch {
+            // Roll back what we've built, then bail.
+            var j: usize = 0;
+            while (j < inited) : (j += 1) rings[j].deinit();
+            allocator.free(rings);
+            return;
+        };
+    }
+    rt.fs_rings = rings;
+}
+
 // ─── runWithSignals — graceful-shutdown infrastructure ─────────────
 //
 // File-scope helpers used by Runtime.runWithSignals (which lives on
@@ -1217,6 +1270,31 @@ test "runtime: spawn typed fn returning u32" {
     defer rt.deinit();
     const result = try rt.run(returnInt, .{@as(u32, 21)});
     try std.testing.expectEqual(@as(u32, 42), result);
+}
+
+// Phase 2B: verify the per-P io_uring rings are populated when the
+// environment supports them. On Linux with a usable kernel + perms
+// (the scripts/probe-linux.sh "READY" path) every P gets a ring.
+// On non-Linux, on older kernels, or when seccomp/sysctl blocks
+// io_uring, fs_rings stays null and fs ops will fall back to
+// spawnBlocking once Phase 2C wires the Reactor surface.
+test "runtime: fs_rings populated when io_uring is available" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 3 });
+    defer rt.deinit();
+    if (builtin.os.tag != .linux) {
+        try std.testing.expect(rt.fs_rings == null);
+        return;
+    }
+    // On Linux: rings should exist iff the kernel and sandbox
+    // permit io_uring_setup. If they don't, fs_rings stays null
+    // (graceful degradation, not an init failure). Don't hard-assert
+    // either way — the probe script is the authoritative test for
+    // io_uring availability.
+    if (rt.fs_rings) |rings| {
+        try std.testing.expectEqual(@as(usize, 3), rings.len);
+        // Every ring accepted at least the bare flags=0 tier.
+        for (rings) |r| try std.testing.expect(r.flags_used != 0xffff_ffff);
+    }
 }
 
 test "runtime: spawn typed fn returning slice" {
