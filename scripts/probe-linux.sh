@@ -59,8 +59,20 @@ echo "==> Running io_uring probe in $IMAGE"
 TTY_ARG=""
 [[ -t 1 ]] && TTY_ARG="-t"
 
+# `--security-opt seccomp=unconfined`: Fedora 41's default podman
+#   seccomp profile blocks the io_uring syscalls and returns
+#   ENOSYS to disguise the rejection. Disabling seccomp for the
+#   probe is acceptable — this is a local dev container, not an
+#   exposed surface. (Phase 2 will need the same flag for any
+#   container that runs the io_uring tests / benchmarks.)
+# `--security-opt label=disable`: with seccomp out of the way,
+#   SELinux still refuses io_uring_setup for the unconfined
+#   container_t context (errno EACCES). label=disable opts this
+#   container out of SELinux relabelling so the call succeeds.
 exec "$PODMAN" run --rm -i ${TTY_ARG} \
     --platform "$PLATFORM" \
+    --security-opt seccomp=unconfined \
+    --security-opt label=disable \
     -v "$REPO_ROOT":/work:Z \
     -w /work \
     "$IMAGE" \
