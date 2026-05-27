@@ -32,6 +32,16 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
+const reactor_fs = @import("reactor_fs.zig");
+
+/// Re-export so callers within the fs_ring module / Phase 2C
+/// `drainFsRingInto` helper share one result vocabulary with
+/// the Phase 1 spawnBlocking proxy. Shape: `value` is the
+/// io_uring CQE's `res` field cast to isize (positive = bytes
+/// or fd, negative = -errno); `err` is unpacked errno on
+/// failure, 0 on success — matches what `reactor_fs.fsRead`
+/// etc. return.
+pub const FsResult = reactor_fs.FsResult;
 
 // Linux-only by *use*: every public method ultimately calls
 // `std.os.linux.IoUring.*` which only does anything useful on
@@ -75,6 +85,24 @@ pub const InitError = error{
     SystemResources,
 };
 
+/// Per-op state record. Allocated on the calling coroutine's
+/// stack at the `fsRead`/etc call site — the coroutine's stack
+/// VA is stable for its lifetime (CLAUDE.md invariant 5), and
+/// the coroutine waits for its own CQE before returning, so the
+/// frame outlives the kernel's in-flight window. SQE.user_data
+/// is the address of an `FsOp`; the CQE drainer dereferences it,
+/// writes `result`, and unparks `coro`.
+///
+/// Phase 3 cancellation MUST preserve this invariant: a
+/// cancelled coroutine cannot unwind until both the original
+/// CQE and the IORING_OP_ASYNC_CANCEL ack have been reaped, or
+/// the kernel will silently write into a dead frame. See
+/// `docs/internals/phase-2c-design.md §1`.
+pub const FsOp = struct {
+    coro: *@import("coroutine.zig").Coroutine,
+    result: FsResult,
+};
+
 pub const FsRing = struct {
     ring: linux.IoUring,
     /// Which `IORING_SETUP_*` mask the kernel accepted. Useful for
@@ -85,6 +113,12 @@ pub const FsRing = struct {
     /// `io_uring_enter` when nothing has been queued. Lazy-batch
     /// dirty bit, Seastar `reactor_backend.cc:1380-1389` pattern.
     has_pending: bool = false,
+    /// eventfd registered with the ring via
+    /// `IORING_REGISTER_EVENTFD` (Phase 2C.1). The kernel writes
+    /// to this fd whenever a CQE lands — used by the shared
+    /// reactor poller as a wake signal. Created lazily by
+    /// `registerEventFd`; -1 until then. Closed by `deinit`.
+    eventfd: i32 = -1,
 
     /// Initialise with `DEFAULT_RING_ENTRIES`. Returns the first
     /// setup tier the kernel accepts.
@@ -109,7 +143,52 @@ pub const FsRing = struct {
     }
 
     pub fn deinit(self: *FsRing) void {
+        // Close the eventfd BEFORE the ring teardown. The kernel
+        // unregisters the eventfd association on ring close, but
+        // we own the fd's lifecycle.
+        if (self.eventfd >= 0) {
+            _ = c_close(self.eventfd);
+            self.eventfd = -1;
+        }
         self.ring.deinit();
+    }
+
+    // ─── eventfd integration (Phase 2C.1) ─────────────────────────
+
+    /// Create an eventfd and register it with the ring. The kernel
+    /// writes to the eventfd on every CQE landing — the shared
+    /// reactor's epoll watches this fd and uses it as a wake
+    /// signal. EFD_NONBLOCK so the poller's drain `read` never
+    /// blocks; EFD_CLOEXEC so fork+exec children don't inherit.
+    ///
+    /// Idempotent: a second call is a no-op (returns success
+    /// without touching the existing registration). Errors only
+    /// from the eventfd syscall itself or the kernel-level
+    /// register call.
+    pub fn registerEventFd(self: *FsRing) !void {
+        if (self.eventfd >= 0) return;
+        const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+        if (linux.errno(rc) != .SUCCESS) return error.EventFdCreateFailed;
+        const fd: i32 = @intCast(rc);
+        errdefer _ = c_close(fd);
+        try self.ring.register_eventfd(fd);
+        self.eventfd = fd;
+    }
+
+    /// Drain the kernel counter on the registered eventfd. MUST be
+    /// called by the reactor poller every time the eventfd fires —
+    /// a short read or no read leaves the counter non-zero, and
+    /// level-triggered epoll will re-fire indefinitely (see
+    /// `docs/internals/phase-2c-design.md §2`). Returns silently
+    /// on EAGAIN (the kernel may have already had the counter
+    /// drained by a previous wake on the same epoll batch).
+    pub fn drainEventFd(self: *FsRing) void {
+        if (self.eventfd < 0) return;
+        var buf: [8]u8 = undefined;
+        _ = c_read(self.eventfd, &buf, 8);
+        // Errors ignored: EAGAIN means already drained, EBADF
+        // means concurrent deinit (we can't do anything useful
+        // either way).
     }
 
     // ─── SQE prep helpers — lazy, no syscall ──────────────────────
@@ -290,6 +369,8 @@ extern "c" fn mkstemp(template: [*:0]u8) c_int;
 const c_mkstemp = &mkstemp;
 extern "c" fn close(fd: c_int) c_int;
 const c_close = &close;
+extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
+const c_read = &read;
 extern "c" fn unlink(path: [*:0]const u8) c_int;
 const c_unlink = &unlink;
 
@@ -484,4 +565,73 @@ test "FsRing: lazy batch — multiple preps, one flush" {
     try ring.prepClose(fd, 300);
     _ = try ring.flush();
     _ = try ring.waitOne(&cqes);
+}
+
+// Use poll(2) directly to test whether the eventfd is readable
+// without consuming bytes from it. Avoids depending on the
+// reactor's epoll plumbing (this test is standalone).
+extern "c" fn poll(fds: [*]PollFd, nfds: u32, timeout_ms: c_int) c_int;
+const PollFd = extern struct {
+    fd: c_int,
+    events: i16,
+    revents: i16,
+};
+const POLLIN: i16 = 0x001;
+
+fn eventFdReadable(fd: i32) bool {
+    var pfd = [_]PollFd{.{ .fd = @intCast(fd), .events = POLLIN, .revents = 0 }};
+    const rc = poll(&pfd, 1, 0);
+    if (rc <= 0) return false;
+    return (pfd[0].revents & POLLIN) != 0;
+}
+
+test "FsRing: eventfd fires on CQE landing, drain clears it" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var ring = FsRing.init() catch |e| {
+        if (e == error.IoUringUnavailable) return error.SkipZigTest;
+        return e;
+    };
+    defer ring.deinit();
+
+    try ring.registerEventFd();
+    try testing.expect(ring.eventfd >= 0);
+    // Nothing in flight → eventfd is NOT readable.
+    try testing.expect(!eventFdReadable(ring.eventfd));
+
+    // Submit an fsync on stderr (always-open fd; the syscall is
+    // either a no-op or returns EINVAL — either is a CQE we can
+    // wait for). user_data = 1.
+    try ring.prepFsync(2, 1, false);
+    _ = try ring.flush();
+
+    // Block until the CQE lands so we know the kernel has had a
+    // chance to also write to the eventfd. (The eventfd write
+    // happens at CQE post time, before the userspace `wait_cqe`
+    // returns.)
+    var cqes: [1]linux.io_uring_cqe = undefined;
+    _ = try ring.waitOne(&cqes);
+    try testing.expectEqual(@as(u64, 1), cqes[0].user_data);
+
+    // Now the eventfd MUST be readable — the kernel wrote 1 to
+    // its counter when the CQE landed.
+    try testing.expect(eventFdReadable(ring.eventfd));
+
+    // Drain it (Phase 2C.1's contract): the 8-byte read clears
+    // the counter, and a subsequent poll reports non-readable.
+    ring.drainEventFd();
+    try testing.expect(!eventFdReadable(ring.eventfd));
+}
+
+test "FsRing: registerEventFd is idempotent" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var ring = FsRing.init() catch |e| {
+        if (e == error.IoUringUnavailable) return error.SkipZigTest;
+        return e;
+    };
+    defer ring.deinit();
+
+    try ring.registerEventFd();
+    const fd_first = ring.eventfd;
+    try ring.registerEventFd(); // no-op second call
+    try testing.expectEqual(fd_first, ring.eventfd);
 }
