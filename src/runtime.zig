@@ -1124,48 +1124,189 @@ inline fn flushRingOrPanic(rt: *Runtime, ring: *fs_ring_mod.FsRing) void {
     _ = rt.fs_ops_via_ring.fetchAdd(1, .monotonic);
 }
 
-pub fn fsRingRead(fd: i32, buf: []u8, offset: u64) ?fs_result {
+// ─── Phase 3C: cancel-aware fs ring helpers ──────────────────────
+//
+// The four fsRingX helpers take an optional `cancel: ?*Cancel`
+// final parameter. When null, behaviour is identical to Phase 2C
+// (no register, no state branching — the drainer's CAS
+// Pending→Completed succeeds on the first try, coro wakes, reads
+// result). When non-null, the helper registers a cancel
+// callback before submit and branches on `op.state` after wake
+// per the state machine in `docs/internals/phase-3-design.md §1`.
+//
+// Cancelled result is encoded as `FsResult{.value=-1, .err=ECANCELED}`
+// — the kernel's natural CQE shape for cancelled ops. The caller
+// (fs/file.zig) maps the ECANCELED errno to `error.Cancelled` the
+// same way it maps any other errno.
+
+const cancel_mod = @import("cancel.zig");
+
+/// Stack-allocated callback context for the cancel-deliver path.
+/// Lives in the caller's `fsRingX` frame for the duration of the
+/// in-flight op. The callback is invoked under `cancel.fire()`
+/// from arbitrary thread; the busy-wait on `completed` (post-park)
+/// keeps the ctx alive until the callback finishes touching it
+/// — standard PollDesc.waitCancel pattern (poll_desc.zig:457-461).
+const FsCancelCtx = struct {
+    op: *fs_ring_mod.FsOp,
+    completed: std.atomic.Value(bool) align(std.atomic.cache_line) =
+        std.atomic.Value(bool).init(false),
+};
+
+fn fsCancelDeliver(raw: *anyopaque) void {
+    const ctx: *FsCancelCtx = @ptrCast(@alignCast(raw));
+    // CAS Pending → Cancelling. If it fails, state is already
+    // Completed — the op finished before cancel could land,
+    // race resolves in favour of completion (memo §2.3). No
+    // unpark needed; the drainer already unparked the coro and
+    // it'll observe state=Completed on wake.
+    const observed = ctx.op.state.cmpxchgStrong(
+        fs_ring_mod.STATE_PENDING,
+        fs_ring_mod.STATE_CANCELLING,
+        .acq_rel,
+        .acquire,
+    );
+    if (observed == null) {
+        // CAS won: state is now Cancelling. Wake the parked coro
+        // — it'll see Cancelling and drive the ASYNC_CANCEL +
+        // re-park flow. Standard `unpark` handles the case where
+        // the coro hasn't actually called park() yet
+        // (NOTIFIED-before-PARK race) via park_state.
+        unpark(ctx.op.coro);
+    }
+    // Always publish completion so the caller's post-wake
+    // busy-wait can drop ctx safely.
+    ctx.completed.store(true, .release);
+}
+
+/// Build the Cancelled-encoded `FsResult` returned by the
+/// helpers when the op was cancelled. Caller maps the ECANCELED
+/// errno to `error.Cancelled`.
+inline fn cancelledFsResult() fs_result {
+    return .{
+        .value = -1,
+        .err = @intFromEnum(std.c.E.CANCELED),
+    };
+}
+
+/// Shared post-submit machinery. The op's SQE is already in the
+/// ring + flushed; `op` is the caller's stack-allocated FsOp.
+/// Handles the optional cancel: register / park / branch on
+/// state / submit cancel + re-park if needed / return.
+fn fsRingAwait(
+    rt: *Runtime,
+    ring: *fs_ring_mod.FsRing,
+    op: *fs_ring_mod.FsOp,
+    cancel: ?*cancel_mod.Cancel,
+) fs_result {
+    // Cancel registration (no-op when cancel == null).
+    var w: cancel_mod.Waiter = .{};
+    var ctx: FsCancelCtx = .{ .op = op };
+    var registered = false;
+    if (cancel) |c| {
+        const fired = c.registerCallback(&w, &ctx, fsCancelDeliver);
+        if (fired) {
+            // Cancel fired between caller's isFired pre-check and
+            // here. The original SQE is already in flight; we
+            // can't un-submit. Mark Cancelling so the drainer's
+            // CAS observes it correctly when the CQE comes back,
+            // then fall through to wait for the original CQE
+            // (memory safety: we must drain the CQE before the
+            // buffer can be freed).
+            const observed = op.state.cmpxchgStrong(
+                fs_ring_mod.STATE_PENDING,
+                fs_ring_mod.STATE_CANCELLING,
+                .acq_rel,
+                .acquire,
+            );
+            _ = observed;
+            // Submit ASYNC_CANCEL eagerly to nudge the kernel.
+            const op_ud = @intFromPtr(op);
+            ring.prepCancel(op_ud, fs_ring_mod.cancelUserDataFor(op_ud)) catch {};
+            flushRingOrPanic(rt, ring);
+            park();
+            return cancelledFsResult();
+        }
+        registered = true;
+    }
+
+    park();
+
+    // Post-wake: deregister cancel + (if callback in flight)
+    // busy-wait for it to release ctx.
+    if (registered) {
+        if (!cancel.?.deregisterRemoved(&w)) {
+            while (!ctx.completed.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    }
+
+    // Branch on state. With no cancel, state is always Completed.
+    // With cancel, state is one of {Completed, Cancelling,
+    // CancelledAndDrained}; see memo §2 for the four scenarios.
+    const state = op.state.load(.acquire);
+    return switch (state) {
+        fs_ring_mod.STATE_COMPLETED => op.result,
+        fs_ring_mod.STATE_CANCELLING => blk: {
+            // Cancel fired first, original CQE hasn't drained.
+            // Submit ASYNC_CANCEL + re-park; drainer transitions
+            // Cancelling→CancelledAndDrained when the original
+            // CQE arrives (with the cancel-ack CQE handled by
+            // the bit-0 fast path). When we wake again the state
+            // must be CancelledAndDrained.
+            const op_ud = @intFromPtr(op);
+            ring.prepCancel(op_ud, fs_ring_mod.cancelUserDataFor(op_ud)) catch {};
+            flushRingOrPanic(rt, ring);
+            park();
+            std.debug.assert(op.state.load(.acquire) == fs_ring_mod.STATE_CANCELLED_AND_DRAINED);
+            break :blk cancelledFsResult();
+        },
+        fs_ring_mod.STATE_CANCELLED_AND_DRAINED => cancelledFsResult(),
+        else => unreachable, // drainer never leaves state at Pending after unpark
+    };
+}
+
+pub fn fsRingRead(fd: i32, buf: []u8, offset: u64, cancel: ?*cancel_mod.Cancel) ?fs_result {
     const co = current.require();
     const rt: *Runtime = @ptrCast(@alignCast(co.runtime));
     const ring = currentPRing(rt) orelse return null;
+    if (cancel) |c| if (c.isFired()) return cancelledFsResult();
     var op: fs_ring_mod.FsOp = .{ .coro = co, .result = undefined };
     ring.prepRead(fd, buf, offset, @intFromPtr(&op)) catch return null;
     flushRingOrPanic(rt, ring);
-    park();
-    return op.result;
+    return fsRingAwait(rt, ring, &op, cancel);
 }
 
-pub fn fsRingWrite(fd: i32, buf: []const u8, offset: u64) ?fs_result {
+pub fn fsRingWrite(fd: i32, buf: []const u8, offset: u64, cancel: ?*cancel_mod.Cancel) ?fs_result {
     const co = current.require();
     const rt: *Runtime = @ptrCast(@alignCast(co.runtime));
     const ring = currentPRing(rt) orelse return null;
+    if (cancel) |c| if (c.isFired()) return cancelledFsResult();
     var op: fs_ring_mod.FsOp = .{ .coro = co, .result = undefined };
     ring.prepWrite(fd, buf, offset, @intFromPtr(&op)) catch return null;
     flushRingOrPanic(rt, ring);
-    park();
-    return op.result;
+    return fsRingAwait(rt, ring, &op, cancel);
 }
 
-pub fn fsRingFsync(fd: i32) ?fs_result {
+pub fn fsRingFsync(fd: i32, cancel: ?*cancel_mod.Cancel) ?fs_result {
     const co = current.require();
     const rt: *Runtime = @ptrCast(@alignCast(co.runtime));
     const ring = currentPRing(rt) orelse return null;
+    if (cancel) |c| if (c.isFired()) return cancelledFsResult();
     var op: fs_ring_mod.FsOp = .{ .coro = co, .result = undefined };
     ring.prepFsync(fd, @intFromPtr(&op), false) catch return null;
     flushRingOrPanic(rt, ring);
-    park();
-    return op.result;
+    return fsRingAwait(rt, ring, &op, cancel);
 }
 
-pub fn fsRingFdatasync(fd: i32) ?fs_result {
+pub fn fsRingFdatasync(fd: i32, cancel: ?*cancel_mod.Cancel) ?fs_result {
     const co = current.require();
     const rt: *Runtime = @ptrCast(@alignCast(co.runtime));
     const ring = currentPRing(rt) orelse return null;
+    if (cancel) |c| if (c.isFired()) return cancelledFsResult();
     var op: fs_ring_mod.FsOp = .{ .coro = co, .result = undefined };
     ring.prepFsync(fd, @intFromPtr(&op), true) catch return null;
     flushRingOrPanic(rt, ring);
-    park();
-    return op.result;
+    return fsRingAwait(rt, ring, &op, cancel);
 }
 
 // ─── runWithSignals — graceful-shutdown infrastructure ─────────────
@@ -1681,6 +1822,120 @@ test "runtime: spawn typed fn returning slice" {
     defer rt.deinit();
     const result = try rt.run(returnString, .{});
     try std.testing.expectEqualStrings("hello from coro", result);
+}
+
+// ─── Phase 3C tests: cancel during in-flight fs ring op ──────────
+//
+// Tests target `runtime.fsRingRead` directly (Reactor wiring is
+// Phase 3D). Slow-op setup uses an empty pipe — read blocks in
+// the kernel until written to or until ASYNC_CANCEL fires.
+
+const _phase3c_ctx = struct {
+    pipe_read_fd: i32,
+    cancel: *cancel_mod.Cancel,
+    observed_cancelled: bool = false,
+    observed_value: isize = 0,
+    observed_err: c_int = 0,
+};
+
+fn phase3cReader(ctx: *_phase3c_ctx) !void {
+    var buf: [16]u8 = undefined;
+    const result_opt = fsRingRead(ctx.pipe_read_fd, &buf, ~@as(u64, 0), ctx.cancel);
+    if (result_opt) |r| {
+        ctx.observed_value = r.value;
+        ctx.observed_err = r.err;
+        ctx.observed_cancelled = r.err == @intFromEnum(std.c.E.CANCELED);
+    }
+}
+
+fn phase3cFirer(ctx: *_phase3c_ctx) void {
+    // Yield enough times for the reader to actually park on the
+    // io_uring SQE. Without this the cancel could fire pre-submit
+    // and exercise the wrong path.
+    var i: u32 = 0;
+    while (i < 128) : (i += 1) yield();
+    ctx.cancel.fire();
+}
+
+fn phase3cRoot(ctx: *_phase3c_ctx) !void {
+    const lib = @import("lib.zig");
+    var reader = try lib.spawn(phase3cReader, .{ctx});
+    var firer = try lib.spawn(phase3cFirer, .{ctx});
+    _ = reader.join() catch {};
+    _ = firer.join();
+}
+
+test "runtime: Phase 3C — cancel during in-flight fsRingRead returns ECANCELED" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+    if (rt.fs_rings == null) return error.SkipZigTest; // probe-blocked env
+
+    // Build an empty pipe via raw syscall — the read end has
+    // nothing to read, so io_uring's READ on it parks in the
+    // kernel until cancelled.
+    var pipefd: [2]i32 = undefined;
+    const rc = std.os.linux.pipe2(@as(*[2]i32, &pipefd), .{ .CLOEXEC = true });
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.PipeFailed;
+    defer _ = std.os.linux.close(pipefd[0]);
+    defer _ = std.os.linux.close(pipefd[1]);
+
+    var c = cancel_mod.Cancel.init(rt);
+    defer c.deinit();
+    var ctx = _phase3c_ctx{ .pipe_read_fd = pipefd[0], .cancel = &c };
+    try (try rt.run(phase3cRoot, .{&ctx}));
+
+    try std.testing.expect(ctx.observed_cancelled);
+    try std.testing.expectEqual(@as(isize, -1), ctx.observed_value);
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(std.c.E.CANCELED)),
+        ctx.observed_err,
+    );
+}
+
+fn phase3cPrefiredReader(ctx: *_phase3c_ctx) !void {
+    var buf: [16]u8 = undefined;
+    const result_opt = fsRingRead(ctx.pipe_read_fd, &buf, ~@as(u64, 0), ctx.cancel);
+    if (result_opt) |r| {
+        ctx.observed_value = r.value;
+        ctx.observed_err = r.err;
+        ctx.observed_cancelled = r.err == @intFromEnum(std.c.E.CANCELED);
+    }
+}
+
+fn phase3cPrefiredRoot(ctx: *_phase3c_ctx) !void {
+    // Fire BEFORE the reader spawns — the reader's pre-check
+    // sees fired and returns Cancelled without submitting any SQE.
+    ctx.cancel.fire();
+    const lib = @import("lib.zig");
+    var reader = try lib.spawn(phase3cPrefiredReader, .{ctx});
+    _ = reader.join() catch {};
+}
+
+test "runtime: Phase 3C — pre-fired cancel returns ECANCELED without submitting" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+    if (rt.fs_rings == null) return error.SkipZigTest;
+
+    var pipefd: [2]i32 = undefined;
+    const rc = std.os.linux.pipe2(@as(*[2]i32, &pipefd), .{ .CLOEXEC = true });
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.PipeFailed;
+    defer _ = std.os.linux.close(pipefd[0]);
+    defer _ = std.os.linux.close(pipefd[1]);
+
+    var c = cancel_mod.Cancel.init(rt);
+    defer c.deinit();
+    const before = rt.fs_ops_via_ring.load(.monotonic);
+    var ctx = _phase3c_ctx{ .pipe_read_fd = pipefd[0], .cancel = &c };
+    try (try rt.run(phase3cPrefiredRoot, .{&ctx}));
+
+    try std.testing.expect(ctx.observed_cancelled);
+    // Pre-fired path returns immediately at the isFired pre-check
+    // — no SQE submitted, so the io_uring routing counter stays
+    // put. This proves the early-bail path is taken vs going
+    // through prep + flush.
+    try std.testing.expectEqual(before, rt.fs_ops_via_ring.load(.monotonic));
 }
 
 fn fanOutRoot(counter: *std.atomic.Value(u32)) !void {

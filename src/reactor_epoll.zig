@@ -631,25 +631,27 @@ pub const Reactor = struct {
         // Phase 2C.2: try the per-P io_uring ring first; fall back
         // to spawnBlocking when the ring path is unavailable (no
         // fs_rings, not on a worker, SQ full, etc).
-        if (runtime.fsRingRead(fd, buf, offset)) |r| return r;
+        // Phase 3C: cancel param is null here; Phase 3D wires the
+        // cancel-aware variant.
+        if (runtime.fsRingRead(fd, buf, offset, null)) |r| return r;
         return reactor_fs.fsRead(fd, buf, offset);
     }
 
     pub fn fsWrite(self: *Reactor, fd: i32, buf: []const u8, offset: u64) reactor_fs.FsResult {
         _ = self;
-        if (runtime.fsRingWrite(fd, buf, offset)) |r| return r;
+        if (runtime.fsRingWrite(fd, buf, offset, null)) |r| return r;
         return reactor_fs.fsWrite(fd, buf, offset);
     }
 
     pub fn fsFsync(self: *Reactor, fd: i32) reactor_fs.FsResult {
         _ = self;
-        if (runtime.fsRingFsync(fd)) |r| return r;
+        if (runtime.fsRingFsync(fd, null)) |r| return r;
         return reactor_fs.fsFsync(fd);
     }
 
     pub fn fsFdatasync(self: *Reactor, fd: i32) reactor_fs.FsResult {
         _ = self;
-        if (runtime.fsRingFdatasync(fd)) |r| return r;
+        if (runtime.fsRingFdatasync(fd, null)) |r| return r;
         return reactor_fs.fsFdatasync(fd);
     }
 
