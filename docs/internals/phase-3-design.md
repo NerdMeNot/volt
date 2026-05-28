@@ -328,29 +328,41 @@ In landing order (mirrors Phase 2C sub-phases):
    CancelledAndDrained`. Write result. Unpark. Decrement
    fs_in_flight per CQE.
 
-3. **`src/runtime.zig` fsRingReadCancel / fsRingWriteCancel /
-   fsRingFsyncCancel / fsRingFdatasyncCancel helpers.** Mirror
-   the existing fsRingX helpers but: take a `*Cancel` arg;
-   register a cancel callback before submit; check state on
-   wake; if Cancelling, submit ASYNC_CANCEL + re-park; if
-   CancelledAndDrained, return error.Cancelled.
+3. **Extend existing `fsRingRead/Write/Fsync/Fdatasync` helpers
+   with an optional `cancel: ?*Cancel` final parameter.** No
+   new helper names. When `cancel == null` the function behaves
+   exactly as today (Phase 2 callers pass null, semantics
+   unchanged). When non-null the function: registers a cancel
+   callback before submit, branches on `op.state` post-wake,
+   and either returns the result (Completed), submits
+   ASYNC_CANCEL + re-parks (Cancelling), or returns
+   `error.Cancelled` encoded as `FsResult{.value=-1, .err=ECANCELED}`
+   (CancelledAndDrained). Caller in `fs/file.zig` maps the
+   ECANCELED errno to `error.Cancelled` the same way it maps
+   other errnos.
 
 4. **`fsCancelDeliver` callback.** CAS `op.state` Pending →
    Cancelling. On success, unpark. Always set
    `ctx.completed = true`. Lives next to the helpers in
    `runtime.zig`.
 
-5. **Reactor surface methods.** Each backend
-   (`reactor_io_uring.zig`, `reactor_epoll.zig`) gets
-   `fsReadCancel`/`fsWriteCancel`/`fsFsyncCancel`/
-   `fsFdatasyncCancel`. Try the ring helper first; fall back to
-   the existing "check c.isFired before submit" spawnBlocking
-   path on null.
+5. **Extend existing `Reactor.fsRead/Write/Fsync/Fdatasync`
+   methods with the same optional `cancel: ?*Cancel` parameter.**
+   No new Reactor methods. Both backends (`reactor_io_uring.zig`,
+   `reactor_epoll.zig`) forward the cancel to the helper. The
+   spawnBlocking-proxy fallback path checks `c.isFired()` before
+   submitting (when cancel is non-null) — same semantics as
+   today, just plumbed through one signature. Tagged-union
+   dispatch in `reactor_linux.zig` forwards the new parameter.
 
-6. **`fs/file.zig`** routing: `readCancel`/`writeCancel`/
-   `syncCancel` call into the new Reactor methods. The current
-   "check then call read" pattern stays as the implementation
-   when the ring path isn't taken.
+6. **`fs/file.zig`** routing: the `blockingRead`/etc helpers
+   gain `blockingReadCancel`/etc counterparts that pass the
+   cancel through to `Reactor.fsRead(..., &cancel)`. The
+   public `File.readCancel(buf, &c)` etc methods stop being
+   "check c.isFired then call self.read"; they call the new
+   cancel-aware helpers directly. Public signatures unchanged.
+   On the spawnBlocking fallback path the cancel still degrades
+   to "check at submit only" — same semantics as today.
 
 7. **Tests** (Phase 3E in the parent plan):
    - Cancel-during-slow-read returns `error.Cancelled`.
@@ -406,6 +418,7 @@ In landing order (mirrors Phase 2C sub-phases):
 | 2026-05-28 | Cancel SQE has tagged sentinel user_data (bit 0 set on original FsOp ptr). | Avoids second stack-allocated FsOp; drainer fast-paths on bit 0. |
 | 2026-05-28 | Owner submits ASYNC_CANCEL, not the callback. | Preserves single-writer-per-P invariant. Callback only CASes state + unparks. |
 | 2026-05-28 | Wait for ORIGINAL op CQE (not cancel-ack) before return. | Kernel guarantees buffer is free when original CQE fires; cancel-ack only signals "cancellation initiated." Memory safety. |
+| 2026-05-28 | **Revised**: extend existing `fsRingRead/Write/Fsync/Fdatasync` + `Reactor.fsRead/etc` with optional `cancel: ?*Cancel` parameter. No new `*Cancel`-suffixed helper names. Cancelled result encoded as `FsResult{.value=-1, .err=ECANCELED}` — the kernel's natural CQE shape for cancelled ops. | The user pushed back on the original draft's `fsRingReadCancel/fsRingWriteCancel/fsRingFsyncCancel/fsRingFdatasyncCancel` proliferation as non-ergonomic. Single signature with optional cancel is cleaner: same number of internal symbols pre- and post-Phase-3, Phase 2 callers continue to pass `null` unchanged, no public API churn whatsoever (`File.read` / `File.readCancel` etc. signatures all unchanged). Implementation branches internally on `cancel == null`. |
 
 ## 8. Phase 3 sub-phases (mirrors Phase 2 cadence)
 
@@ -413,7 +426,7 @@ In landing order (mirrors Phase 2C sub-phases):
 |---|---|---|
 | **3A** | This memo + sign-off. | — |
 | **3B** | FsOp state + `prepCancel` + drainer cancel-ack fast-path. Tests in fs_ring.zig. | ~150 |
-| **3C** | `fsRingReadCancel/etc` helpers + `fsCancelDeliver` callback in runtime.zig. Unit test. | ~250 |
+| **3C** | Extend `fsRingX` helpers with `cancel: ?*Cancel` param + add `fsCancelDeliver` callback in runtime.zig. Unit test. | ~250 |
 | **3D** | Reactor surface methods + fs/file.zig routing. | ~100 |
 | **3E** | End-to-end tests (cancel timing, race resolution, memory safety). | ~200 |
 
