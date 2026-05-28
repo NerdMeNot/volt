@@ -99,15 +99,50 @@ pub const InitError = error{
 /// is the address of an `FsOp`; the CQE drainer dereferences it,
 /// writes `result`, and unparks `coro`.
 ///
-/// Phase 3 cancellation MUST preserve this invariant: a
-/// cancelled coroutine cannot unwind until both the original
-/// CQE and the IORING_OP_ASYNC_CANCEL ack have been reaped, or
-/// the kernel will silently write into a dead frame. See
-/// `docs/internals/phase-2c-design.md §1`.
+/// Phase 3 cancellation: the `state` field drives the four-state
+/// machine documented in `docs/internals/phase-3-design.md §1`.
+/// CASes from `STATE_PENDING` are mutually exclusive between
+/// drainer (→ Completed) and cancel-deliver (→ Cancelling); the
+/// Cancelling → CancelledAndDrained transition is single-writer
+/// (drainer only). The coroutine must wait for the ORIGINAL op
+/// CQE before returning (NOT just the cancel ack) so the kernel
+/// has provably stopped touching `result` and any caller buffer.
 pub const FsOp = struct {
     coro: *@import("coroutine.zig").Coroutine,
     result: FsResult,
+    /// Phase 3: state machine for cancel/completion arbitration.
+    /// Default `STATE_PENDING` so existing Phase 2 callers (which
+    /// don't use cancel) keep the same shape — the drainer's CAS
+    /// `Pending → Completed` succeeds on the very first try and
+    /// the path matches Phase 2 exactly.
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(STATE_PENDING),
 };
+
+/// FsOp.state values. See `docs/internals/phase-3-design.md §1`
+/// for the state-machine diagram.
+pub const STATE_PENDING: u8 = 0;
+pub const STATE_COMPLETED: u8 = 1;
+pub const STATE_CANCELLING: u8 = 2;
+pub const STATE_CANCELLED_AND_DRAINED: u8 = 3;
+
+/// Phase 3: the cancel SQE's user_data is the original FsOp
+/// pointer with bit 0 set. The drainer fast-paths on this bit
+/// — decrement `fs_in_flight`, ignore the rest. Avoids a second
+/// stack-allocated FsOp for the cancel ack (which carries no
+/// useful info for the coroutine; the coroutine waits on the
+/// ORIGINAL CQE for buffer safety).
+///
+/// FsOp pointers are heap- or stack-aligned to at least 8 bytes,
+/// so bit 0 is naturally free.
+pub const CANCEL_ACK_TAG: u64 = 0x1;
+
+pub inline fn isCancelAckUserData(user_data: u64) bool {
+    return (user_data & CANCEL_ACK_TAG) != 0;
+}
+
+pub inline fn cancelUserDataFor(op_user_data: u64) u64 {
+    return op_user_data | CANCEL_ACK_TAG;
+}
 
 pub const FsRing = struct {
     ring: linux.IoUring,
@@ -267,6 +302,36 @@ pub const FsRing = struct {
     ) !void {
         const sqe = try self.ring.get_sqe();
         sqe.prep_close(fd);
+        sqe.user_data = user_data;
+        self.has_pending = true;
+    }
+
+    /// Phase 3: submit IORING_OP_ASYNC_CANCEL targeting an
+    /// in-flight SQE identified by its original `user_data`.
+    /// The cancel ack arrives as a CQE whose own `user_data` is
+    /// `user_data` (the cancel SQE's identifier — caller's
+    /// choice, conventionally `cancelUserDataFor(orig)` so the
+    /// drainer can fast-path-recognise it via the low bit).
+    ///
+    /// Kernel semantics:
+    ///   * cancel ack `res == 0`: cancellation initiated; the
+    ///     original op CQE will fire with `-ECANCELED`.
+    ///   * cancel ack `res == -ENOENT`: original op already
+    ///     completed; the original CQE arrives normally with
+    ///     its result.
+    ///   * cancel ack `res == -EALREADY`: cancellation is
+    ///     in progress (someone else already cancelled).
+    ///
+    /// Either way, the caller MUST wait for the ORIGINAL op CQE
+    /// before considering its buffer free — only that CQE
+    /// signals "kernel has stopped touching the buffer."
+    pub fn prepCancel(
+        self: *FsRing,
+        target_user_data: u64,
+        user_data: u64,
+    ) !void {
+        const sqe = try self.ring.get_sqe();
+        sqe.prep_cancel(target_user_data, 0);
         sqe.user_data = user_data;
         self.has_pending = true;
     }
@@ -640,4 +705,69 @@ test "FsRing: registerEventFd is idempotent" {
     const fd_first = ring.eventfd;
     try ring.registerEventFd(); // no-op second call
     try testing.expectEqual(fd_first, ring.eventfd);
+}
+
+// ─── Phase 3B tests: FsOp state + prepCancel + cancel-ack tag ───
+
+test "FsOp: default state is Pending" {
+    // Constructable without a Linux runtime; the FsOp struct is
+    // pure data. Caller fills `coro` and `result` at use site;
+    // `state` defaults to STATE_PENDING so existing Phase 2
+    // call sites (which don't touch state) still work unchanged.
+    var dummy_coro: @import("coroutine.zig").Coroutine = undefined;
+    var op: FsOp = .{
+        .coro = &dummy_coro,
+        .result = .{ .value = 0, .err = 0 },
+    };
+    try testing.expectEqual(STATE_PENDING, op.state.load(.acquire));
+}
+
+test "cancel-ack tag encoding round-trips" {
+    // FsOp pointers are at least 8-byte aligned, so bit 0 is
+    // free for the cancel-ack tag.
+    const fake_op: u64 = 0xCAFEBABE_DEAD_0000; // 8-byte aligned
+    try testing.expect(!isCancelAckUserData(fake_op));
+    const tagged = cancelUserDataFor(fake_op);
+    try testing.expect(isCancelAckUserData(tagged));
+    // Both encode "the same op" — only the tag bit differs.
+    try testing.expectEqual(fake_op | CANCEL_ACK_TAG, tagged);
+}
+
+test "FsRing: prepCancel submits, drain sees cancel-ack" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var ring = FsRing.init() catch |e| {
+        if (e == error.IoUringUnavailable) return error.SkipZigTest;
+        return e;
+    };
+    defer ring.deinit();
+
+    // Submit a long-ish op (an fsync on stderr — quick but
+    // gives the kernel something to point ASYNC_CANCEL at).
+    // user_data = 0x100 (low bit clear → "original op").
+    try ring.prepFsync(2, 0x100, false);
+    _ = try ring.flush();
+
+    // Drain the original CQE first so the kernel has finished
+    // with op 0x100 — otherwise ASYNC_CANCEL will return ENOENT
+    // for "already completed." We're not testing cancellation
+    // semantics here, just that prepCancel actually submits AND
+    // that the cancel ack arrives with its own user_data.
+    var cqes: [2]linux.io_uring_cqe = undefined;
+    _ = try ring.waitOne(&cqes);
+
+    // Now submit a cancel targeting a non-existent op (use a
+    // fake target_user_data that the kernel will respond ENOENT
+    // to). user_data on the cancel = 0x201 (low bit set → cancel
+    // ack tag).
+    try ring.prepCancel(0xDEADBEEF, 0x201);
+    _ = try ring.flush();
+
+    _ = try ring.waitOne(&cqes);
+    try testing.expectEqual(@as(u64, 0x201), cqes[0].user_data);
+    try testing.expect(isCancelAckUserData(cqes[0].user_data));
+    // ENOENT (errno 2) because the target user_data doesn't
+    // exist — proves the cancel SQE actually reached the kernel
+    // (vs. being silently dropped) and that the user_data
+    // round-tripped.
+    try testing.expectEqual(@as(i32, -2), cqes[0].res);
 }

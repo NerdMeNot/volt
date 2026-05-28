@@ -1031,12 +1031,39 @@ inline fn drainFsRingInto(rt: *Runtime, p: *P) usize {
     var cqes: [16]@import("std").os.linux.io_uring_cqe = undefined;
     const n = rings[p.id].peekBatch(&cqes) catch return 0;
     for (cqes[0..n]) |cqe| {
+        // Phase 3: cancel-ack CQE fast path. The cancel SQE's
+        // user_data is the original FsOp ptr with bit 0 set;
+        // the kernel echoes it back unchanged. No FsOp lookup,
+        // no unpark — the coroutine is waiting on the ORIGINAL
+        // op's CQE (handled below), not the cancel ack.
+        if (fs_ring_mod.isCancelAckUserData(cqe.user_data)) {
+            continue;
+        }
         const op: *fs_ring_mod.FsOp = @ptrFromInt(cqe.user_data);
         const res: isize = cqe.res;
         op.result = .{
             .value = res,
             .err = if (res < 0) @intCast(-res) else 0,
         };
+        // Phase 3 state machine: try Pending → Completed first
+        // (the common path; no cancel involved). If that fails
+        // the state must be Cancelling — transition to
+        // CancelledAndDrained so the coroutine knows on wake to
+        // return error.Cancelled. Both transitions write the
+        // result and unpark; the coroutine's branch on wake
+        // decides what to return.
+        const cas = op.state.cmpxchgStrong(
+            fs_ring_mod.STATE_PENDING,
+            fs_ring_mod.STATE_COMPLETED,
+            .acq_rel,
+            .acquire,
+        );
+        if (cas) |observed| {
+            // CAS failed — must be Cancelling. Drainer is the
+            // single writer of this transition; no contention.
+            std.debug.assert(observed == fs_ring_mod.STATE_CANCELLING);
+            op.state.store(fs_ring_mod.STATE_CANCELLED_AND_DRAINED, .release);
+        }
         unpark(op.coro);
     }
     if (n > 0) _ = rt.fs_in_flight.fetchSub(n, .acq_rel);
