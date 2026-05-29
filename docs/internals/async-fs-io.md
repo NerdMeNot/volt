@@ -403,23 +403,16 @@ Phases 2-6 require Linux.
   Darwin, and Windows. Same code paths, just different reactor
   internals.
 - **Throughput parity-or-better** on `bench-fs-read` vs the
-  spawnBlocking baseline on Linux. **Originally targeted ≥ 2×;
-  the Phase 4 measurement on a podman-machine arm64 VM with a
-  tmpfs-backed file shows the AUTO (io_uring) path is currently
-  1.19-1.88× SLOWER, not faster, depending on concurrency
-  level.** Honest analysis (see `bench/bench_fs_read.zig`
-  header): for cached reads the per-op pread is microseconds;
-  our Phase 2/3 io_uring path adds non-trivial per-op overhead
-  (io_uring_enter per submit with no batching, eventfd →
-  epoll → Signal-Only-If-Idle → owner unpark round-trip). The
-  thread-hop cost spawnBlocking pays per op is small for
-  cached I/O. io_uring's win materialises when (a) syscall
-  cost matters (cold disk I/O), (b) submits can be batched
-  across coroutines, or (c) we're saturating spawnBlocking's
-  pool — none of which apply to the current bench shape. The
-  ≥ 2× target is deferred to Phase 6 optimisation work
-  (batched submission, registered buffers, inline-completion
-  fast path).
+  spawnBlocking baseline on Linux. Original ≥ 2× target was
+  not met in Phase 4 (io_uring was 1.19-1.88× *slower* across
+  concurrency levels). **Phase 6A (inline-completion fast
+  path) flipped the trend**: at N=256 io_uring is now 1.09×
+  *faster*; at N=64 still 1.43× slower (improved from 1.68×).
+  Remaining Phase 6 work needed for the full ≥ 2× target:
+  batched submission across coroutines (don't `io_uring_enter`
+  per op), registered buffers (avoid per-op `get_user_pages`
+  on the kernel side). See `bench/bench_fs_read.zig` header
+  for the results timeline.
 - **Cancellation correctness.** An in-flight fs read cancelled
   mid-op returns `error.Cancelled`, the buffer is not touched by
   the kernel after `read` returns, and no use-after-free occurs.

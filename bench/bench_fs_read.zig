@@ -11,34 +11,44 @@
 //! Report per-op ns/op (median of 5 runs after 2 warmups), total
 //! ops/sec, and the speedup ratio (or regression).
 //!
-//! ## Honest results on the current implementation
+//! ## Results timeline
 //!
-//! On a podman-machine arm64 VM with a tmpfs-backed file (fully
-//! page-cached after the warmups), the AUTO path (io_uring) is
-//! consistently **slower** than the FORCED spawnBlocking path:
+//! podman-machine arm64 VM, tmpfs-backed file (fully cached
+//! after warmups), 4 KiB random reads.
 //!
+//! Pre-Phase-6A (only the spawnBlocking-fallback path landing):
 //!   N=8   ops=64:   io_uring 1.88× slower
 //!   N=64  ops=128:  io_uring 1.68× slower
 //!   N=256 ops=128:  io_uring 1.19× slower
 //!
-//! Why: for cached reads, the actual pread is microseconds. Our
-//! Phase 2/3 io_uring path adds per-op overhead — io_uring_enter
-//! per submit (no batching), eventfd → epoll → Signal-Only-If-Idle
-//! → owner unpark wake-up cost. The thread-hop cost spawnBlocking
-//! pays per op is small for cached I/O. io_uring's win materialises
-//! when (a) the syscall cost matters (cold disk I/O), (b) we can
-//! batch submits across coroutines, or (c) we're saturating
-//! spawnBlocking's pool. None of those apply here.
+//! Post-Phase-6A (inline-completion fast path):
+//!   N=64  ops=128:  io_uring 1.43× slower  (still slower, but
+//!                                            ~273 ns/op better)
+//!   N=256 ops=128:  io_uring 1.09× FASTER  (trend flipped)
 //!
-//! Future Phase 6 optimisations that would close the gap:
-//!   * Batch SQE submission — don't io_uring_enter per op.
-//!   * Inline-completion fast path when CQE arrives before park.
-//!   * IORING_REGISTER_BUFFERS for hot buffers.
+//! Phase 6A saves the park/unpark futex round-trip when the
+//! kernel completes the SQE inline (during `io_uring_enter`),
+//! which is the common case for page-cached reads. After flush,
+//! we peek the CQ; if our CQE is already there, we return
+//! without parking. Other CQEs in the batch are dispatched
+//! normally.
 //!
-//! This bench is the perf gate the async-fs-io.md memo §8 talked
-//! about. The honest result tells us we don't yet meet the
-//! ≥ 2× target the memo aspired to. Updated memo §8 reflects
-//! reality.
+//! Why N=64 still loses: at low concurrency the spawnBlocking
+//! pool is fast (pool threads are warm and abundant; futex
+//! wake is cheap), and our remaining per-op overhead in
+//! io_uring (mostly the `io_uring_enter` syscall, ~1µs) still
+//! exceeds the thread-hop cost.
+//!
+//! Remaining Phase 6 optimisations that would close more of
+//! the gap:
+//!   * Batch SQE submission — defer flush to a worker block
+//!     boundary so multiple coro submits amortise one
+//!     io_uring_enter.
+//!   * IORING_REGISTER_BUFFERS for hot buffers (avoids per-op
+//!     get_user_pages on the kernel side).
+//!   * IORING_SETUP_SUBMIT_ALL — already on.
+//!
+//! Updated memo §8 reflects reality.
 
 const std = @import("std");
 const volt = @import("volt");
@@ -51,7 +61,7 @@ fn nanosNow() i128 {
 
 const FILE_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 const READ_BYTES: usize = 4096; // 4 KiB
-const N_COROS: u32 = 256;
+const N_COROS: u32 = 64;
 const OPS_PER_CORO: u32 = 128;
 const TOTAL_OPS: u64 = @as(u64, N_COROS) * @as(u64, OPS_PER_CORO);
 

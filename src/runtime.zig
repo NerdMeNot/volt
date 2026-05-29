@@ -1124,6 +1124,65 @@ inline fn flushRingOrPanic(rt: *Runtime, ring: *fs_ring_mod.FsRing) void {
     _ = rt.fs_ops_via_ring.fetchAdd(1, .monotonic);
 }
 
+/// Phase 6A: inline-completion fast path. After flush, peek the
+/// CQ for CQEs that the kernel finished synchronously (cached
+/// reads complete inline almost always). If our `my_op`'s CQE
+/// is in the drained batch, write the result, decrement
+/// `fs_in_flight`, and return true — caller can return without
+/// parking, saving the ~1-2µs futex park+unpark round-trip.
+///
+/// Other CQEs in the same drain batch are dispatched normally
+/// (CAS state + unpark) — same as the standard `drainFsRingInto`
+/// path. This is important: `copy_cqes` ADVANCES the CQ head as
+/// it copies, so we can't leave drained CQEs unprocessed without
+/// losing them. We must handle the whole batch.
+///
+/// Skips `unpark(my_op.coro)` for the caller's own op (we're
+/// returning to it inline, no wake needed). For my_op we also
+/// skip the state CAS — the FsOp is going out of scope as soon
+/// as the helper returns; no one else will ever look at state.
+inline fn tryFsRingInlineComplete(
+    rt: *Runtime,
+    ring: *fs_ring_mod.FsRing,
+    my_op: *fs_ring_mod.FsOp,
+) bool {
+    if (builtin.os.tag != .linux) return false;
+    var cqes: [16]@import("std").os.linux.io_uring_cqe = undefined;
+    const n = ring.peekBatch(&cqes) catch return false;
+    if (n == 0) return false;
+    var found_my_op = false;
+    for (cqes[0..n]) |cqe| {
+        if (fs_ring_mod.isCancelAckUserData(cqe.user_data)) continue;
+        const op: *fs_ring_mod.FsOp = @ptrFromInt(cqe.user_data);
+        const res: isize = cqe.res;
+        op.result = .{
+            .value = res,
+            .err = if (res < 0) @intCast(-res) else 0,
+        };
+        if (op == my_op) {
+            // Our op — caller will return directly with the
+            // result. No state CAS, no unpark; FsOp's stack
+            // frame ends as soon as fsRingX returns.
+            found_my_op = true;
+            continue;
+        }
+        // Other ops in the batch — full standard dispatch.
+        const cas = op.state.cmpxchgStrong(
+            fs_ring_mod.STATE_PENDING,
+            fs_ring_mod.STATE_COMPLETED,
+            .acq_rel,
+            .acquire,
+        );
+        if (cas) |observed| {
+            std.debug.assert(observed == fs_ring_mod.STATE_CANCELLING);
+            op.state.store(fs_ring_mod.STATE_CANCELLED_AND_DRAINED, .release);
+        }
+        unpark(op.coro);
+    }
+    _ = rt.fs_in_flight.fetchSub(n, .acq_rel);
+    return found_my_op;
+}
+
 // ─── Phase 3C: cancel-aware fs ring helpers ──────────────────────
 //
 // The four fsRingX helpers take an optional `cancel: ?*Cancel`
@@ -1267,6 +1326,23 @@ fn fsRingAwait(
     };
 }
 
+/// Shared epilogue: post-flush, try the inline-completion fast
+/// path; if our CQE wasn't ready, fall through to the
+/// park-aware Await machinery. Cancel-aware callers can't take
+/// the inline path — Await's register/deregister sequence has
+/// to wrap the entire wait window for safe `*Cancel` lifetime.
+inline fn fsRingTail(
+    rt: *Runtime,
+    ring: *fs_ring_mod.FsRing,
+    op: *fs_ring_mod.FsOp,
+    cancel: ?*cancel_mod.Cancel,
+) fs_result {
+    if (cancel == null) {
+        if (tryFsRingInlineComplete(rt, ring, op)) return op.result;
+    }
+    return fsRingAwait(rt, ring, op, cancel);
+}
+
 pub fn fsRingRead(fd: i32, buf: []u8, offset: u64, cancel: ?*cancel_mod.Cancel) ?fs_result {
     const co = current.require();
     const rt: *Runtime = @ptrCast(@alignCast(co.runtime));
@@ -1275,7 +1351,7 @@ pub fn fsRingRead(fd: i32, buf: []u8, offset: u64, cancel: ?*cancel_mod.Cancel) 
     var op: fs_ring_mod.FsOp = .{ .coro = co, .result = undefined };
     ring.prepRead(fd, buf, offset, @intFromPtr(&op)) catch return null;
     flushRingOrPanic(rt, ring);
-    return fsRingAwait(rt, ring, &op, cancel);
+    return fsRingTail(rt, ring, &op, cancel);
 }
 
 pub fn fsRingWrite(fd: i32, buf: []const u8, offset: u64, cancel: ?*cancel_mod.Cancel) ?fs_result {
@@ -1286,7 +1362,7 @@ pub fn fsRingWrite(fd: i32, buf: []const u8, offset: u64, cancel: ?*cancel_mod.C
     var op: fs_ring_mod.FsOp = .{ .coro = co, .result = undefined };
     ring.prepWrite(fd, buf, offset, @intFromPtr(&op)) catch return null;
     flushRingOrPanic(rt, ring);
-    return fsRingAwait(rt, ring, &op, cancel);
+    return fsRingTail(rt, ring, &op, cancel);
 }
 
 pub fn fsRingFsync(fd: i32, cancel: ?*cancel_mod.Cancel) ?fs_result {
@@ -1297,7 +1373,7 @@ pub fn fsRingFsync(fd: i32, cancel: ?*cancel_mod.Cancel) ?fs_result {
     var op: fs_ring_mod.FsOp = .{ .coro = co, .result = undefined };
     ring.prepFsync(fd, @intFromPtr(&op), false) catch return null;
     flushRingOrPanic(rt, ring);
-    return fsRingAwait(rt, ring, &op, cancel);
+    return fsRingTail(rt, ring, &op, cancel);
 }
 
 pub fn fsRingFdatasync(fd: i32, cancel: ?*cancel_mod.Cancel) ?fs_result {
@@ -1308,7 +1384,7 @@ pub fn fsRingFdatasync(fd: i32, cancel: ?*cancel_mod.Cancel) ?fs_result {
     var op: fs_ring_mod.FsOp = .{ .coro = co, .result = undefined };
     ring.prepFsync(fd, @intFromPtr(&op), true) catch return null;
     flushRingOrPanic(rt, ring);
-    return fsRingAwait(rt, ring, &op, cancel);
+    return fsRingTail(rt, ring, &op, cancel);
 }
 
 // ─── runWithSignals — graceful-shutdown infrastructure ─────────────
