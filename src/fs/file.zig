@@ -885,3 +885,123 @@ test "File.readCancel: in-flight cancel returns error.Cancelled" {
     try (try rt.run(phase3dRoot, .{&ctx}));
     try testing.expect(ctx.got_cancelled);
 }
+
+// ─── Phase 3E tests: additional cancel coverage ────────────────
+
+const Phase3ECtx = struct {
+    tmp_path: [:0]const u8,
+    c: *lib.Cancel,
+    first_write_n: usize = 0,
+    second_write_was_cancelled: bool = false,
+    double_fire_was_cancelled: bool = false,
+    happy_path_n: usize = 0,
+};
+
+fn phase3eHappyBody(ctx: *Phase3ECtx) !void {
+    var path_buf: [256:0]u8 = undefined;
+    const p = try std.fmt.bufPrintZ(&path_buf, "{s}/happy.txt", .{ctx.tmp_path});
+    var f = try File.create(p);
+    defer f.close();
+    // Cancel is constructed but never fired. The op must
+    // observe the actual byte count, not Cancelled.
+    ctx.happy_path_n = try f.writeCancel("happy", ctx.c);
+}
+
+test "File.writeCancel: cancel that never fires returns the actual result" {
+    if (is_windows) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const volt_test_alloc = @import("../testing.zig").allocator;
+    var rt = try lib.Runtime.init(.{ .allocator = volt_test_alloc });
+    defer rt.deinit();
+    if (rt.fs_rings == null) return error.SkipZigTest;
+
+    const tmp = try allocTmpDir(testing.allocator);
+    defer {
+        cleanupTmpFile(tmp, "happy.txt");
+        _ = syscall.c_rmdir(tmp.ptr);
+        testing.allocator.free(tmp);
+    }
+
+    var cancel = lib.Cancel.init(rt);
+    defer cancel.deinit();
+    var ctx = Phase3ECtx{ .tmp_path = tmp, .c = &cancel };
+    try (try rt.run(phase3eHappyBody, .{&ctx}));
+    try testing.expectEqual(@as(usize, 5), ctx.happy_path_n);
+}
+
+fn phase3eReuseBody(ctx: *Phase3ECtx) !void {
+    var path_buf: [256:0]u8 = undefined;
+    const p = try std.fmt.bufPrintZ(&path_buf, "{s}/reuse.txt", .{ctx.tmp_path});
+    var f = try File.create(p);
+    defer f.close();
+    // First write succeeds; cancel hasn't fired yet.
+    ctx.first_write_n = try f.writeCancel("first", ctx.c);
+    // Fire cancel; subsequent writeCancel must see Cancelled.
+    ctx.c.fire();
+    _ = f.writeCancel(" second", ctx.c) catch |e| {
+        if (e == error.Cancelled) ctx.second_write_was_cancelled = true;
+        return;
+    };
+}
+
+test "File.writeCancel: post-success fire makes the next op return Cancelled" {
+    if (is_windows) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const volt_test_alloc = @import("../testing.zig").allocator;
+    var rt = try lib.Runtime.init(.{ .allocator = volt_test_alloc });
+    defer rt.deinit();
+    if (rt.fs_rings == null) return error.SkipZigTest;
+
+    const tmp = try allocTmpDir(testing.allocator);
+    defer {
+        cleanupTmpFile(tmp, "reuse.txt");
+        _ = syscall.c_rmdir(tmp.ptr);
+        testing.allocator.free(tmp);
+    }
+
+    var cancel = lib.Cancel.init(rt);
+    defer cancel.deinit();
+    var ctx = Phase3ECtx{ .tmp_path = tmp, .c = &cancel };
+    try (try rt.run(phase3eReuseBody, .{&ctx}));
+    try testing.expectEqual(@as(usize, 5), ctx.first_write_n);
+    try testing.expect(ctx.second_write_was_cancelled);
+}
+
+fn phase3eDoubleFireBody(ctx: *Phase3ECtx) !void {
+    var path_buf: [256:0]u8 = undefined;
+    const p = try std.fmt.bufPrintZ(&path_buf, "{s}/double.txt", .{ctx.tmp_path});
+    var f = try File.create(p);
+    defer f.close();
+    // Fire twice — Cancel.fire() is documented idempotent
+    // (cancel.zig:227-229: `if (self.fired_flag.swap(true, ...)) return;`).
+    // The op must observe Cancelled exactly the same way as a
+    // single fire would; no crash, no double-wake.
+    ctx.c.fire();
+    ctx.c.fire();
+    _ = f.writeCancel("doomed", ctx.c) catch |e| {
+        if (e == error.Cancelled) ctx.double_fire_was_cancelled = true;
+        return;
+    };
+}
+
+test "File.writeCancel: double Cancel.fire() is idempotent" {
+    if (is_windows) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const volt_test_alloc = @import("../testing.zig").allocator;
+    var rt = try lib.Runtime.init(.{ .allocator = volt_test_alloc });
+    defer rt.deinit();
+    if (rt.fs_rings == null) return error.SkipZigTest;
+
+    const tmp = try allocTmpDir(testing.allocator);
+    defer {
+        cleanupTmpFile(tmp, "double.txt");
+        _ = syscall.c_rmdir(tmp.ptr);
+        testing.allocator.free(tmp);
+    }
+
+    var cancel = lib.Cancel.init(rt);
+    defer cancel.deinit();
+    var ctx = Phase3ECtx{ .tmp_path = tmp, .c = &cancel };
+    try (try rt.run(phase3eDoubleFireBody, .{&ctx}));
+    try testing.expect(ctx.double_fire_was_cancelled);
+}
