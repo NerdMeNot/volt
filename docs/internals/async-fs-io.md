@@ -402,10 +402,24 @@ Phases 2-6 require Linux.
 - **Transparent fallback** to spawnBlocking on older Linux,
   Darwin, and Windows. Same code paths, just different reactor
   internals.
-- **≥ 2× throughput** on `bench-fs-read` (4 KB random reads on
-  1 GiB file, 64 concurrent ops) vs the spawnBlocking baseline
-  on Linux. Target is approximate; actual gain depends on kernel
-  version and storage backend.
+- **Throughput parity-or-better** on `bench-fs-read` vs the
+  spawnBlocking baseline on Linux. **Originally targeted ≥ 2×;
+  the Phase 4 measurement on a podman-machine arm64 VM with a
+  tmpfs-backed file shows the AUTO (io_uring) path is currently
+  1.19-1.88× SLOWER, not faster, depending on concurrency
+  level.** Honest analysis (see `bench/bench_fs_read.zig`
+  header): for cached reads the per-op pread is microseconds;
+  our Phase 2/3 io_uring path adds non-trivial per-op overhead
+  (io_uring_enter per submit with no batching, eventfd →
+  epoll → Signal-Only-If-Idle → owner unpark round-trip). The
+  thread-hop cost spawnBlocking pays per op is small for
+  cached I/O. io_uring's win materialises when (a) syscall
+  cost matters (cold disk I/O), (b) submits can be batched
+  across coroutines, or (c) we're saturating spawnBlocking's
+  pool — none of which apply to the current bench shape. The
+  ≥ 2× target is deferred to Phase 6 optimisation work
+  (batched submission, registered buffers, inline-completion
+  fast path).
 - **Cancellation correctness.** An in-flight fs read cancelled
   mid-op returns `error.Cancelled`, the buffer is not touched by
   the kernel after `read` returns, and no use-after-free occurs.
