@@ -1180,9 +1180,11 @@ fn fsCancelDeliver(raw: *anyopaque) void {
 }
 
 /// Build the Cancelled-encoded `FsResult` returned by the
-/// helpers when the op was cancelled. Caller maps the ECANCELED
-/// errno to `error.Cancelled`.
-inline fn cancelledFsResult() fs_result {
+/// helpers (and Reactor.fsX spawnBlocking-fallback path) when
+/// the op was cancelled. Caller maps the ECANCELED errno to
+/// `error.Cancelled`. Public so the Reactor backends can reuse
+/// it on their fallback path (Phase 3D).
+pub inline fn cancelledFsResult() fs_result {
     return .{
         .value = -1,
         .err = @intFromEnum(std.c.E.CANCELED),

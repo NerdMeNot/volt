@@ -309,34 +309,60 @@ pub const File = struct {
     // from the design memo's §5 — until then, fire-and-wait is the
     // honest semantics.
 
-    /// Read with a cancel handle. Today this checks `c.isFired()`
-    /// before submitting; a fired cancel returns `error.Cancelled`
-    /// immediately. The actual syscall, once submitted, runs to
-    /// completion (see section comment above for why this is
-    /// correct on both the spawnBlocking and io_uring paths).
+    /// Read with a cancel handle. On the Linux io_uring path
+    /// (Phase 3), a cancel that fires mid-op promptly returns
+    /// `error.Cancelled` after the kernel finishes draining the
+    /// SQE. On the spawnBlocking fallback path (Darwin, or Linux
+    /// without io_uring), the cancel is checked only at the
+    /// submit boundary — the syscall in the pool thread runs to
+    /// completion. Both paths surface the same error type.
     pub fn readCancel(self: *File, buf: []u8, c: *lib.Cancel) (FileError || error{Cancelled})!usize {
+        if (inCoroutine()) {
+            return blockingReadCancel(self.fd, buf, c) catch |e| return e;
+        }
+        // Outside a coroutine the cancel handle has no parker to
+        // wake; the raw read runs to completion. Mirrors the
+        // non-cancel path's behaviour.
         if (c.isFired()) return error.Cancelled;
-        return self.read(buf);
+        return readRaw(self.fd, buf);
     }
 
     pub fn writeCancel(self: *File, buf: []const u8, c: *lib.Cancel) (FileError || error{Cancelled})!usize {
+        if (inCoroutine()) {
+            return blockingWriteCancel(self.fd, buf, c) catch |e| return e;
+        }
         if (c.isFired()) return error.Cancelled;
-        return self.write(buf);
+        return writeRaw(self.fd, buf);
     }
 
+    /// Loop wrapper — inherits cancel semantics from `readCancel`.
     pub fn readFullCancel(self: *File, buf: []u8, c: *lib.Cancel) (FileError || error{Cancelled})!usize {
-        if (c.isFired()) return error.Cancelled;
-        return self.readFull(buf);
+        var total: usize = 0;
+        while (total < buf.len) {
+            const n = try self.readCancel(buf[total..], c);
+            if (n == 0) return total;
+            total += n;
+        }
+        return total;
     }
 
+    /// Loop wrapper — inherits cancel semantics from `writeCancel`.
     pub fn writeAllCancel(self: *File, buf: []const u8, c: *lib.Cancel) (FileError || error{Cancelled})!void {
-        if (c.isFired()) return error.Cancelled;
-        return self.writeAll(buf);
+        var written: usize = 0;
+        while (written < buf.len) {
+            const n = try self.writeCancel(buf[written..], c);
+            if (n == 0) return error.BrokenPipe;
+            written += n;
+        }
     }
 
     pub fn syncCancel(self: *File, c: *lib.Cancel) (FileError || error{Cancelled})!void {
+        if (is_windows) @compileError("Windows File: pending");
+        if (inCoroutine()) {
+            return blockingFsyncCancel(self.fd, c) catch |e| return e;
+        }
         if (c.isFired()) return error.Cancelled;
-        return self.sync();
+        if (c_fsync(self.fd) != 0) return fs_error.fromErrno(fs_error.currentErrno());
     }
 
     // ─── std.Io adapter pair ─────────────────────────────────────
@@ -456,7 +482,7 @@ fn blockingOpen(z: *const PathZ, flags: c_int, mode: c_uint) c_int {
 }
 
 fn blockingRead(fd: c_int, buf: []u8) FileError!usize {
-    const result = lib.runtime().reactor.fsRead(@intCast(fd), buf, reactor_fs.OFFSET_CUR);
+    const result = lib.runtime().reactor.fsRead(@intCast(fd), buf, reactor_fs.OFFSET_CUR, null);
     if (result.value < 0) return fs_error.fromErrno(result.err);
     return @intCast(result.value);
 }
@@ -468,7 +494,7 @@ fn readRaw(fd: c_int, buf: []u8) FileError!usize {
 }
 
 fn blockingWrite(fd: c_int, buf: []const u8) FileError!usize {
-    const result = lib.runtime().reactor.fsWrite(@intCast(fd), buf, reactor_fs.OFFSET_CUR);
+    const result = lib.runtime().reactor.fsWrite(@intCast(fd), buf, reactor_fs.OFFSET_CUR, null);
     if (result.value < 0) return fs_error.fromErrno(result.err);
     return @intCast(result.value);
 }
@@ -480,7 +506,7 @@ fn writeRaw(fd: c_int, buf: []const u8) FileError!usize {
 }
 
 fn blockingPread(fd: c_int, buf: []u8, offset: u64) FileError!usize {
-    const result = lib.runtime().reactor.fsRead(@intCast(fd), buf, offset);
+    const result = lib.runtime().reactor.fsRead(@intCast(fd), buf, offset, null);
     if (result.value < 0) return fs_error.fromErrno(result.err);
     return @intCast(result.value);
 }
@@ -492,7 +518,7 @@ fn preadRaw(fd: c_int, buf: []u8, offset: u64) FileError!usize {
 }
 
 fn blockingPwrite(fd: c_int, buf: []const u8, offset: u64) FileError!usize {
-    const result = lib.runtime().reactor.fsWrite(@intCast(fd), buf, offset);
+    const result = lib.runtime().reactor.fsWrite(@intCast(fd), buf, offset, null);
     if (result.value < 0) return fs_error.fromErrno(result.err);
     return @intCast(result.value);
 }
@@ -504,13 +530,52 @@ fn pwriteRaw(fd: c_int, buf: []const u8, offset: u64) FileError!usize {
 }
 
 fn blockingFsync(fd: c_int) FileError!void {
-    const result = lib.runtime().reactor.fsFsync(@intCast(fd));
+    const result = lib.runtime().reactor.fsFsync(@intCast(fd), null);
     if (result.value != 0) return fs_error.fromErrno(result.err);
 }
 
 fn blockingFdatasync(fd: c_int) FileError!void {
-    const result = lib.runtime().reactor.fsFdatasync(@intCast(fd));
+    const result = lib.runtime().reactor.fsFdatasync(@intCast(fd), null);
     if (result.value != 0) return fs_error.fromErrno(result.err);
+}
+
+// ─── Phase 3D: cancel-aware variants ─────────────────────────────
+//
+// Mirror the non-cancel `blockingX` helpers above but thread the
+// cancel through to `Reactor.fsX(..., &cancel)`. On the io_uring
+// path the Reactor routes through `runtime.fsRingX` which honours
+// the cancel in-flight. On the spawnBlocking fallback path the
+// Reactor checks `c.isFired()` once before submit — same
+// "boundary-only" cancel semantics as the pre-Phase-3 code.
+//
+// ECANCELED in the result is the kernel's natural shape for a
+// cancelled CQE; we translate it to `error.Cancelled` here so the
+// caller's error set stays `FileError || error{Cancelled}`.
+
+fn blockingReadCancel(fd: c_int, buf: []u8, c: *lib.Cancel) (FileError || error{Cancelled})!usize {
+    const result = lib.runtime().reactor.fsRead(@intCast(fd), buf, reactor_fs.OFFSET_CUR, c);
+    if (result.value < 0) {
+        if (result.err == @intFromEnum(std.c.E.CANCELED)) return error.Cancelled;
+        return fs_error.fromErrno(result.err);
+    }
+    return @intCast(result.value);
+}
+
+fn blockingWriteCancel(fd: c_int, buf: []const u8, c: *lib.Cancel) (FileError || error{Cancelled})!usize {
+    const result = lib.runtime().reactor.fsWrite(@intCast(fd), buf, reactor_fs.OFFSET_CUR, c);
+    if (result.value < 0) {
+        if (result.err == @intFromEnum(std.c.E.CANCELED)) return error.Cancelled;
+        return fs_error.fromErrno(result.err);
+    }
+    return @intCast(result.value);
+}
+
+fn blockingFsyncCancel(fd: c_int, c: *lib.Cancel) (FileError || error{Cancelled})!void {
+    const result = lib.runtime().reactor.fsFsync(@intCast(fd), c);
+    if (result.value != 0) {
+        if (result.err == @intFromEnum(std.c.E.CANCELED)) return error.Cancelled;
+        return fs_error.fromErrno(result.err);
+    }
 }
 
 // ─── libc externs not in std.c ───────────────────────────────────
@@ -749,4 +814,74 @@ test "File: std.Io.Reader adapter — takeDelimiterExclusive" {
     var state = TestState{ .tmp_path = tmp };
     try (try rt.run(stdIoReaderRoundTrip, .{&state}));
     try testing.expect(state.ok);
+}
+
+// ─── Phase 3D test: public File.readCancel through full stack ──
+//
+// Verifies the cancel param actually plumbs through fs/file.zig
+// → Reactor → runtime.fsRingRead → kernel ASYNC_CANCEL. Uses an
+// empty pipe so the io_uring READ parks indefinitely. The
+// sibling coro fires the cancel; readCancel should return
+// `error.Cancelled` promptly.
+
+const Phase3DCtx = struct {
+    pipe_read_fd: c_int,
+    c: *lib.Cancel,
+    got_cancelled: bool = false,
+};
+
+fn phase3dReader(ctx: *Phase3DCtx) !void {
+    var f = File.fromFd(ctx.pipe_read_fd);
+    var buf: [16]u8 = undefined;
+    _ = f.readCancel(&buf, ctx.c) catch |e| {
+        if (e == error.Cancelled) ctx.got_cancelled = true;
+        return;
+    };
+}
+
+fn phase3dFirer(ctx: *Phase3DCtx) void {
+    var i: u32 = 0;
+    while (i < 128) : (i += 1) lib.yield();
+    ctx.c.fire();
+}
+
+fn phase3dRoot(ctx: *Phase3DCtx) !void {
+    var reader = try lib.spawn(phase3dReader, .{ctx});
+    var firer = try lib.spawn(phase3dFirer, .{ctx});
+    _ = reader.join() catch {};
+    _ = firer.join();
+}
+
+test "File.readCancel: in-flight cancel returns error.Cancelled" {
+    if (is_windows) return error.SkipZigTest;
+    // On Darwin this exercises the spawnBlocking-fallback +
+    // boundary-check semantics: cancel fires while the pool
+    // thread is blocked in read(); the cancel is observed at
+    // the NEXT call, not this one. So on Darwin the test would
+    // hang waiting for data that never arrives. Skip there.
+    // The same logic applies to any Linux env where io_uring is
+    // unavailable (the runtime.fs_rings == null path).
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    // Use volt.testing.allocator — std.testing.allocator's
+    // DebugAllocator captures stack traces via DWARF unwinding,
+    // which races with cross-worker spawn writes and SEGVs.
+    // See feedback_debug_stack_frames + src/testing.zig.
+    const volt_test_alloc = @import("../testing.zig").allocator;
+    var rt = try lib.Runtime.init(.{ .allocator = volt_test_alloc });
+    defer rt.deinit();
+    if (rt.fs_rings == null) return error.SkipZigTest;
+
+    var pipefd: [2]i32 = undefined;
+    const rc = std.os.linux.pipe2(@as(*[2]i32, &pipefd), .{ .CLOEXEC = true });
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.PipeFailed;
+    defer _ = std.os.linux.close(pipefd[0]);
+    defer _ = std.os.linux.close(pipefd[1]);
+
+    var cancel = lib.Cancel.init(rt);
+    defer cancel.deinit();
+
+    var ctx = Phase3DCtx{ .pipe_read_fd = pipefd[0], .c = &cancel };
+    try (try rt.run(phase3dRoot, .{&ctx}));
+    try testing.expect(ctx.got_cancelled);
 }

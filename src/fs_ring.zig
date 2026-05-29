@@ -70,14 +70,22 @@ pub const DEFAULT_RING_ENTRIES: u16 = 256;
 /// DEFER_TASKRUN benefits workloads that BATCH many SQEs between
 /// drains; ours is the opposite shape. Skip it.
 ///
-/// SINGLE_ISSUER (single submitter task — the owner P's M) is
-/// still useful: lets the kernel skip cross-task locks. Same
-/// invariant we already enforce architecturally.
+/// **Why NOT `SINGLE_ISSUER`:** the cancel-and-drain path
+/// (Phase 3) submits `IORING_OP_ASYNC_CANCEL` after the
+/// coroutine resumes from `park()`. By that time the coroutine
+/// may have migrated to a different worker (work stealing), and
+/// SINGLE_ISSUER causes the kernel to reject `io_uring_enter`
+/// from any task other than the original submitter — `EEXIST`,
+/// surfaced as `error.InvalidThread`. Cross-thread submission of
+/// the SQ ring itself is safe (sequential with park acting as
+/// release/acquire); only the kernel-level SINGLE_ISSUER flag
+/// rejects it. Initial Phase 2A draft enabled SINGLE_ISSUER, but
+/// the Phase 3 cancel path exposed the conflict. Dropped here.
+///
 /// SUBMIT_ALL (5.18+) keeps submitting on per-SQE error rather
 /// than stopping at the first failure — strict win.
 const SETUP_TIERS = [_]u32{
-    linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_SUBMIT_ALL,
-    linux.IORING_SETUP_SINGLE_ISSUER,
+    linux.IORING_SETUP_SUBMIT_ALL,
     0,
 };
 

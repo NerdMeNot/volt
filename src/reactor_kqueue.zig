@@ -467,23 +467,53 @@ pub const Reactor = struct {
     // shape on every platform — Phase 2's Linux io_uring backend swaps
     // these out for real async ops without touching fs callers.
 
-    pub fn fsRead(self: *Reactor, fd: i32, buf: []u8, offset: u64) reactor_fs.FsResult {
+    // Phase 3D: signatures now take an optional cancel even
+    // though kqueue (Darwin) has no async file I/O path. spawn-
+    // Blocking pool can't be interrupted mid-syscall, so cancel
+    // is checked once before submit and otherwise ignored —
+    // honest "boundary-only" semantics, same as the
+    // pre-Phase-3 readCancel behaviour on Darwin.
+    pub fn fsRead(
+        self: *Reactor,
+        fd: i32,
+        buf: []u8,
+        offset: u64,
+        cancel: ?*@import("cancel.zig").Cancel,
+    ) reactor_fs.FsResult {
         _ = self;
+        if (cancel) |c| if (c.isFired()) return runtime.cancelledFsResult();
         return reactor_fs.fsRead(fd, buf, offset);
     }
 
-    pub fn fsWrite(self: *Reactor, fd: i32, buf: []const u8, offset: u64) reactor_fs.FsResult {
+    pub fn fsWrite(
+        self: *Reactor,
+        fd: i32,
+        buf: []const u8,
+        offset: u64,
+        cancel: ?*@import("cancel.zig").Cancel,
+    ) reactor_fs.FsResult {
         _ = self;
+        if (cancel) |c| if (c.isFired()) return runtime.cancelledFsResult();
         return reactor_fs.fsWrite(fd, buf, offset);
     }
 
-    pub fn fsFsync(self: *Reactor, fd: i32) reactor_fs.FsResult {
+    pub fn fsFsync(
+        self: *Reactor,
+        fd: i32,
+        cancel: ?*@import("cancel.zig").Cancel,
+    ) reactor_fs.FsResult {
         _ = self;
+        if (cancel) |c| if (c.isFired()) return runtime.cancelledFsResult();
         return reactor_fs.fsFsync(fd);
     }
 
-    pub fn fsFdatasync(self: *Reactor, fd: i32) reactor_fs.FsResult {
+    pub fn fsFdatasync(
+        self: *Reactor,
+        fd: i32,
+        cancel: ?*@import("cancel.zig").Cancel,
+    ) reactor_fs.FsResult {
         _ = self;
+        if (cancel) |c| if (c.isFired()) return runtime.cancelledFsResult();
         return reactor_fs.fsFdatasync(fd);
     }
 

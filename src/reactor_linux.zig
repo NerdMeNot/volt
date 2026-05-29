@@ -215,31 +215,51 @@ pub const Reactor = union(Backend) {
     // dispatch exists so Phase 2's io_uring fs path is a per-variant
     // swap without changing the surface.
 
-    pub fn fsRead(self: *Reactor, fd: i32, buf: []u8, offset: u64) reactor_fs.FsResult {
+    pub fn fsRead(
+        self: *Reactor,
+        fd: i32,
+        buf: []u8,
+        offset: u64,
+        cancel: ?*@import("cancel.zig").Cancel,
+    ) reactor_fs.FsResult {
         return switch (self.*) {
-            .epoll => |*r| r.fsRead(fd, buf, offset),
-            .io_uring => |*r| r.fsRead(fd, buf, offset),
+            .epoll => |*r| r.fsRead(fd, buf, offset, cancel),
+            .io_uring => |*r| r.fsRead(fd, buf, offset, cancel),
         };
     }
 
-    pub fn fsWrite(self: *Reactor, fd: i32, buf: []const u8, offset: u64) reactor_fs.FsResult {
+    pub fn fsWrite(
+        self: *Reactor,
+        fd: i32,
+        buf: []const u8,
+        offset: u64,
+        cancel: ?*@import("cancel.zig").Cancel,
+    ) reactor_fs.FsResult {
         return switch (self.*) {
-            .epoll => |*r| r.fsWrite(fd, buf, offset),
-            .io_uring => |*r| r.fsWrite(fd, buf, offset),
+            .epoll => |*r| r.fsWrite(fd, buf, offset, cancel),
+            .io_uring => |*r| r.fsWrite(fd, buf, offset, cancel),
         };
     }
 
-    pub fn fsFsync(self: *Reactor, fd: i32) reactor_fs.FsResult {
+    pub fn fsFsync(
+        self: *Reactor,
+        fd: i32,
+        cancel: ?*@import("cancel.zig").Cancel,
+    ) reactor_fs.FsResult {
         return switch (self.*) {
-            .epoll => |*r| r.fsFsync(fd),
-            .io_uring => |*r| r.fsFsync(fd),
+            .epoll => |*r| r.fsFsync(fd, cancel),
+            .io_uring => |*r| r.fsFsync(fd, cancel),
         };
     }
 
-    pub fn fsFdatasync(self: *Reactor, fd: i32) reactor_fs.FsResult {
+    pub fn fsFdatasync(
+        self: *Reactor,
+        fd: i32,
+        cancel: ?*@import("cancel.zig").Cancel,
+    ) reactor_fs.FsResult {
         return switch (self.*) {
-            .epoll => |*r| r.fsFdatasync(fd),
-            .io_uring => |*r| r.fsFdatasync(fd),
+            .epoll => |*r| r.fsFdatasync(fd, cancel),
+            .io_uring => |*r| r.fsFdatasync(fd, cancel),
         };
     }
 

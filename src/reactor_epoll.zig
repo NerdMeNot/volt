@@ -626,32 +626,58 @@ pub const Reactor = struct {
     // variant stays on this proxy because there is no async file I/O
     // available outside io_uring on Linux.
 
-    pub fn fsRead(self: *Reactor, fd: i32, buf: []u8, offset: u64) reactor_fs.FsResult {
+    pub fn fsRead(
+        self: *Reactor,
+        fd: i32,
+        buf: []u8,
+        offset: u64,
+        cancel: ?*@import("cancel.zig").Cancel,
+    ) reactor_fs.FsResult {
         _ = self;
         // Phase 2C.2: try the per-P io_uring ring first; fall back
         // to spawnBlocking when the ring path is unavailable (no
         // fs_rings, not on a worker, SQ full, etc).
-        // Phase 3C: cancel param is null here; Phase 3D wires the
-        // cancel-aware variant.
-        if (runtime.fsRingRead(fd, buf, offset, null)) |r| return r;
+        // Phase 3D: cancel param threads through to the ring helper
+        // (real in-flight cancel on the io_uring path) or, on the
+        // spawnBlocking fallback, is checked once before submit —
+        // same "boundary-only" semantics that path has always had.
+        if (runtime.fsRingRead(fd, buf, offset, cancel)) |r| return r;
+        if (cancel) |c| if (c.isFired()) return runtime.cancelledFsResult();
         return reactor_fs.fsRead(fd, buf, offset);
     }
 
-    pub fn fsWrite(self: *Reactor, fd: i32, buf: []const u8, offset: u64) reactor_fs.FsResult {
+    pub fn fsWrite(
+        self: *Reactor,
+        fd: i32,
+        buf: []const u8,
+        offset: u64,
+        cancel: ?*@import("cancel.zig").Cancel,
+    ) reactor_fs.FsResult {
         _ = self;
-        if (runtime.fsRingWrite(fd, buf, offset, null)) |r| return r;
+        if (runtime.fsRingWrite(fd, buf, offset, cancel)) |r| return r;
+        if (cancel) |c| if (c.isFired()) return runtime.cancelledFsResult();
         return reactor_fs.fsWrite(fd, buf, offset);
     }
 
-    pub fn fsFsync(self: *Reactor, fd: i32) reactor_fs.FsResult {
+    pub fn fsFsync(
+        self: *Reactor,
+        fd: i32,
+        cancel: ?*@import("cancel.zig").Cancel,
+    ) reactor_fs.FsResult {
         _ = self;
-        if (runtime.fsRingFsync(fd, null)) |r| return r;
+        if (runtime.fsRingFsync(fd, cancel)) |r| return r;
+        if (cancel) |c| if (c.isFired()) return runtime.cancelledFsResult();
         return reactor_fs.fsFsync(fd);
     }
 
-    pub fn fsFdatasync(self: *Reactor, fd: i32) reactor_fs.FsResult {
+    pub fn fsFdatasync(
+        self: *Reactor,
+        fd: i32,
+        cancel: ?*@import("cancel.zig").Cancel,
+    ) reactor_fs.FsResult {
         _ = self;
-        if (runtime.fsRingFdatasync(fd, null)) |r| return r;
+        if (runtime.fsRingFdatasync(fd, cancel)) |r| return r;
+        if (cancel) |c| if (c.isFired()) return runtime.cancelledFsResult();
         return reactor_fs.fsFdatasync(fd);
     }
 
