@@ -403,16 +403,41 @@ Phases 2-6 require Linux.
   Darwin, and Windows. Same code paths, just different reactor
   internals.
 - **Throughput parity-or-better** on `bench-fs-read` vs the
-  spawnBlocking baseline on Linux. Original ≥ 2× target was
-  not met in Phase 4 (io_uring was 1.19-1.88× *slower* across
-  concurrency levels). **Phase 6A (inline-completion fast
-  path) flipped the trend**: at N=256 io_uring is now 1.09×
-  *faster*; at N=64 still 1.43× slower (improved from 1.68×).
-  Remaining Phase 6 work needed for the full ≥ 2× target:
-  batched submission across coroutines (don't `io_uring_enter`
-  per op), registered buffers (avoid per-op `get_user_pages`
-  on the kernel side). See `bench/bench_fs_read.zig` header
-  for the results timeline.
+  spawnBlocking baseline on Linux. **NOT met, and the honest
+  measurement is worse than earlier Phase 4/6A numbers
+  suggested — because those were measured on a flawed bench.**
+  The pre-2026-05-31 `bench-fs-read` read a *sparse* file
+  (`ftruncate`, no writes → 0 blocks allocated), so every
+  "read" was an instant kernel zero-fill with ZERO block I/O;
+  the Phase 4 "1.19-1.88× slower" and Phase 6A "1.09× faster
+  at N=256" results captured only runtime-overhead deltas, not
+  fs performance. The fixed bench writes real data and adds a
+  `fadvise(DONTNEED)` COLD matrix. Real results (N=64, 128
+  ops/coro, podman arm64 VM):
+    - WARM (cached): io_uring 1.20× slower than spawnBlocking.
+    - COLD (evicted): io_uring **1.90× slower**.
+  io_uring loses even cold: spawnBlocking gets cheap I/O
+  parallelism from ~64 warm pool threads, while our io_uring
+  path pays a per-op `io_uring_enter` + eventfd→epoll→unpark
+  round-trip with no cross-coro SQE batching. Caveat: "cold"
+  evicts only the guest page cache; the host caches the VM
+  disk image (~22 µs physical), so this is a floor for
+  io_uring's standing, not a verdict on true cold storage
+  (NVMe/spinning, where the gap should narrow). This sharpens
+  the **Phase 7** question of whether io_uring is the right
+  call. Remaining levers for the ≥ 2× target: batched
+  submission across coroutines, registered buffers. See the
+  `bench/bench_fs_read.zig` header for the full timeline.
+- **(Found while building the cold bench)** a pre-existing
+  use-after-free in `spawnBlocking` (lib.zig) — the
+  stack-allocated closure could be freed by the coroutine
+  before the pool thread's `unparkOne` finished dereferencing
+  it — deadlocked the scheduler under bursty blocking I/O.
+  Plus a secondary lost-worker-wakeup (coro stranded in a
+  mailbox with all workers parked, via the capped steal +
+  anti-herd `wakeOneParked`). Both fixed; guarded by
+  `bench/repro_blocking_deadlock.zig`. Without the first fix
+  the COLD spawnBlocking column simply hangs.
 - **Cancellation correctness.** An in-flight fs read cancelled
   mid-op returns `error.Cancelled`, the buffer is not touched by
   the kernel after `read` returns, and no use-after-free occurs.

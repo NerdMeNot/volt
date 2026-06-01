@@ -1646,7 +1646,39 @@ fn parkWorker(rt: *Runtime, m: *M) void {
         if (rt.shutdown.load(.acquire)) return;
     }
 
+    // Last line of defense before the park syscall: a FULL, uncapped
+    // scan of every sibling P's mailbox. The find-work path's
+    // `stealFromSiblings` is capped + randomized (a perf choice to
+    // bound CAS contention at high worker counts), so it can miss
+    // work sitting in one specific mailbox. Cross-thread unparks from
+    // pool threads (no current M) all push to `ps[0].mailbox`, and
+    // `wakeOneParked`'s anti-herd path may decline to wake anyone
+    // (trusting a searcher that then misses it via the cap). Result:
+    // a coroutine stranded in a mailbox with every worker parked —
+    // a hang. `markParked` is already set, so any FUTURE push wakes
+    // us; this catches work ALREADY queued. The last worker to reach
+    // this point cannot park while any mailbox is non-empty, which is
+    // the invariant that makes the all-parked state safe. O(N) but
+    // only on the otherwise-idle park path.
+    if (stealAnyMailboxInto(rt, m)) return;
+
     m.parker.park();
+}
+
+/// Pop one coroutine from any sibling P's mailbox into this M's local
+/// queue. Returns true if work was found (caller bails out of parking;
+/// the worker loop's next `tryFindAndDispatch` pops it from local).
+/// Uncapped on purpose — this is the correctness backstop for the
+/// capped `stealFromSiblings`; see the call site in `parkWorker`.
+fn stealAnyMailboxInto(rt: *Runtime, m: *M) bool {
+    for (rt.ps) |*p| {
+        if (p == m.p) continue;
+        if (p.mailbox.pop()) |c| {
+            m.p.pushQueue(c);
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Steal from a sibling P. Tries to steal a batch from the sibling's

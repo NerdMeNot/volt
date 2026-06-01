@@ -174,6 +174,47 @@ visible to subsequent loads in the next find-work pass.
   was missing. Tokio achieves the same closure via mutex-mediated
   idle transition (`tokio::runtime::scheduler::multi_thread::idle`);
   the latch is the lock-free variant.
+* **Residual gap closed by a park-time full scan (2026-05-31)**: the
+  latch fixes the searcher-*transition* race, but a *coverage* gap
+  remained. `stealFromSiblings` is capped + randomized (bounds CAS
+  contention at high worker counts), so a searching worker can fail
+  to sample the one sibling mailbox holding work. Cross-thread
+  unparks from blocking-pool threads (which have no current M) all
+  push to `ps[0].mailbox`; combined with `wakeOneParked`'s anti-herd
+  bail, the coro could be stranded in `ps[0].mailbox` with every
+  worker parked. Fix: `parkWorker`, after `markParked` (intent-to-park
+  established) and the spin loop, does ONE uncapped scan of every
+  sibling mailbox (`stealAnyMailboxInto`) before the `park()` syscall.
+  Invariant: **no worker commits to parking while any mailbox is
+  non-empty**, so the all-parked state cannot coexist with queued
+  work. Future pushes are still covered by the bit being set.
+
+#### `spawnBlocking` completion handshake (`done` + `released`)
+
+```zig
+// closure on the calling coroutine's stack (lib.zig)
+done: std.atomic.Value(u32)      // set by pool thread when result ready
+released: std.atomic.Value(u32)  // set by pool thread as its LAST touch
+```
+
+The pool thread runs `result = f(args); done.store(1, .release);
+unparkOne(rt, &done); released.store(1, .release)`. The coroutine
+parks on `done` via the parking lot (validator reads `done`), then —
+critically — spins `while (released.load(.acquire) == 0)` before
+returning.
+
+* **Why two flags**: `done` gates the *waiter's logic* (result is
+  ready, stop waiting). It is NOT a lifetime barrier: the validator
+  can observe `done == 1` and the coroutine can return + free its
+  stack frame (where the closure lives) while the pool thread is
+  still inside `unparkOne(rt, &done)`, dereferencing `rt` and
+  `&done`. That was a use-after-free that woke the wrong coroutine
+  and deadlocked the scheduler (pre-2026-05-31). `released` is the
+  separate lifetime barrier the owner spins on, published by the
+  pool thread as its final action. Same pattern as `FsCancelCtx.completed`.
+* **Writers**: pool thread (`store(.release)` on both, in order).
+* **Readers**: the coroutine — `done` via the parking-lot validator,
+  `released` via the post-park acquire-spin.
 
 #### Reactor poller claim
 

@@ -157,6 +157,11 @@ pub fn spawnBlocking(
         args: Args,
         result: Ret = undefined,
         done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        // Set TRUE by the pool thread as its very last touch of this
+        // closure — after `unparkOne` returns. The coroutine must not
+        // return (and thereby free this stack-allocated closure) until
+        // it observes `released`. See the closure-lifetime note below.
+        released: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
         fn run(opaque_ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(opaque_ptr));
@@ -165,6 +170,12 @@ pub fn spawnBlocking(
             // Wake the parked coroutine. unparkOne is thread-safe;
             // the pool thread isn't the coroutine's owning worker.
             _ = parking.unparkOne(self.rt, &self.done);
+            // Last touch of `self`. The coroutine spins on this below
+            // before freeing the closure — without it, the coro can
+            // observe `done` (via parkOn's validator), return, and
+            // free this frame BEFORE the line above dereferences
+            // `self.rt` / `&self.done`, a use-after-free.
+            self.released.store(1, .release);
         }
     };
 
@@ -187,6 +198,16 @@ pub fn spawnBlocking(
             return done.load(.acquire) == 0;
         }
     }.validator);
+
+    // Closure-lifetime barrier. `done` becoming visible is NOT
+    // sufficient to free the closure: the pool thread still has to
+    // run `unparkOne(self.rt, &self.done)`, which dereferences this
+    // closure. parkOn can return (either woken, or validator-bailed
+    // on an already-set `done`) while the pool thread is still inside
+    // that call. Spin until the pool thread publishes `released` as
+    // its final action. Same pattern as `FsCancelCtx.completed`
+    // (see runtime.zig) and Go's `poll_desc` waiter teardown.
+    while (closure.released.load(.acquire) == 0) std.atomic.spinLoopHint();
 
     return closure.result;
 }
