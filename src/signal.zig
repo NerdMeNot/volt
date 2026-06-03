@@ -104,7 +104,12 @@ const SigsetT = extern struct { _pad: [128]u8 align(8) = @splat(0) };
 
 const SigInfo = opaque {};
 
-pub const SigactionFn = *const fn (sig: c_int, info: *SigInfo, ctx: ?*anyopaque) callconv(.c) void;
+// `align(1)`: relaxes the pointer-alignment requirement so the
+// `SIG_IGN` sentinel (the integer 1, never dereferenced/called) can
+// be formed via `@ptrFromInt`. Real handler pointers (alignment ≥ the
+// target's function alignment) coerce down to this freely, so the
+// existing SIGSEGV/SIGBUS/SIGINT installs are unaffected.
+pub const SigactionFn = *align(1) const fn (sig: c_int, info: *SigInfo, ctx: ?*anyopaque) callconv(.c) void;
 
 // Darwin sigaction layout differs slightly from Linux; both have
 // (handler, mask, flags) but the field order varies. We use the
@@ -331,6 +336,37 @@ pub fn ensureInstalled() void {
     };
     _ = sigaction_fn(SIGSEGV, &act, &prev_segv);
     _ = sigaction_fn(SIGBUS, &act, &prev_bus);
+}
+
+const SIGPIPE: c_int = 13; // identical on Linux + Darwin/BSD
+
+var sigpipe_handled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// Ignore `SIGPIPE` process-wide so a write to a peer-closed socket
+/// surfaces `EPIPE` (→ `error.BrokenPipe`) instead of killing the
+/// whole process via SIGPIPE's default terminate action. Volt's
+/// socket I/O uses raw `write(2)`, which (unlike `send(2)`) takes no
+/// `MSG_NOSIGNAL`, and Linux has no per-socket `SO_NOSIGPIPE` — so a
+/// process-wide `SIG_IGN` is the one mechanism that covers every
+/// fd and platform uniformly. This is what Go, Rust std, and libuv
+/// all do.
+///
+/// No-op on Windows (no SIGPIPE; socket errors return directly).
+/// Courteous to embedders: only overrides the *default* disposition,
+/// so an application that already installed its own SIGPIPE policy
+/// keeps it. Idempotent (runs once regardless of Runtime count).
+pub fn ignoreSigpipe() void {
+    if (comptime is_windows) return;
+    if (sigpipe_handled.swap(true, .acq_rel)) return;
+    // Read the current disposition without changing it.
+    var old: Sigaction = .{ .sa_sigaction = null, .sa_mask = .{}, .sa_flags = 0 };
+    if (sigaction_fn(SIGPIPE, null, &old) != 0) return;
+    // SIG_DFL is a null handler. Anything else (a handler, or an
+    // explicit SIG_IGN the app set) we leave untouched.
+    if (old.sa_sigaction != null) return;
+    const sig_ign: SigactionFn = @ptrFromInt(1); // SIG_IGN
+    var act: Sigaction = .{ .sa_sigaction = sig_ign, .sa_mask = .{}, .sa_flags = 0 };
+    _ = sigaction_fn(SIGPIPE, &act, null);
 }
 
 /// Register a single-stack region with the handler. `size` is the

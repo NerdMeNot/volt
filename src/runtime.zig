@@ -429,6 +429,11 @@ pub const Runtime = struct {
         const n = cfg.workers orelse @max(1, try std.Thread.getCpuCount());
         if (n > MAX_WORKERS) return error.TooManyWorkers;
 
+        // A networked runtime must not die from SIGPIPE when a peer
+        // closes mid-write. Ignore it process-wide (once) before any
+        // socket I/O can happen. See signal.ignoreSigpipe.
+        signal_mod.ignoreSigpipe();
+
         const rt = try cfg.allocator.create(Runtime);
         errdefer cfg.allocator.destroy(rt);
 

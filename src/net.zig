@@ -58,6 +58,11 @@ const EAGAIN: c_int = switch (builtin.os.tag) {
     .windows => 10035, // WSAEWOULDBLOCK
     else => @compileError("EAGAIN not defined for this OS"),
 };
+// EINTR is 4 on every POSIX target. A signal can interrupt a
+// blocking-shaped syscall (accept/connect) before it would return
+// EAGAIN/EINPROGRESS; the call must be retried (accept) or treated
+// as in-progress (connect), never surfaced as a hard failure.
+const EINTR: c_int = 4;
 
 // `sockaddr_in` layout is not portable. Darwin / *BSD prepend a
 // `sin_len` byte and treat `sin_family` as u8; Linux and Windows
@@ -275,7 +280,9 @@ pub const TcpListener = struct {
                 try reactor_mod.setNonblock(@intCast(new_fd));
                 return .{ .fd = @intCast(new_fd) };
             }
-            if (errnoVal() != EAGAIN) return error.AcceptFailed;
+            const e = errnoVal();
+            if (e == EINTR) continue; // interrupted before ready — retry
+            if (e != EAGAIN) return error.AcceptFailed;
             try rt.reactor.waitFd(self.fd, pd, .read);
         }
     }
@@ -345,7 +352,11 @@ pub const TcpStream = struct {
         // an IPv6 addr will fail here — that's caught at connect time.
         if (c_connect(fd, addr.sockaddr(), addr.len) < 0) {
             const e = errnoVal();
-            if (e != EINPROGRESS) return error.ConnectFailed;
+            // EINTR means the connect was initiated and is proceeding
+            // in the background — same as EINPROGRESS, you must NOT
+            // re-call connect() (that returns EALREADY/EISCONN); wait
+            // for write-readiness instead.
+            if (e != EINPROGRESS and e != EINTR) return error.ConnectFailed;
             // Wait for writable = connect completed.
             const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
             var stream: TcpStream = .{ .fd = @intCast(fd) };
@@ -703,6 +714,13 @@ test "TCP echo single client round-trip" {
     try std.testing.expect(ctx.client_done);
     try std.testing.expectEqual(@as(u8, 0x42), ctx.result_byte);
 }
+
+// NOTE: the SIGPIPE-ignore behavior (Runtime.init -> signal.ignoreSigpipe)
+// cannot be guarded by an in-suite `zig test` test: the Zig test runner
+// installs its own SIGPIPE handler, which masks the crash regardless of
+// our fix. The behavioral regression guard is the standalone
+// `bench/repro_sigpipe.zig` (run: `zig build bench-repro-sigpipe`),
+// which starts at the default disposition and exits 141 without the fix.
 
 // std.Io.Reader/Writer adapter round-trip — proves the adapters work
 // with the new Zig 0.16 vtable. The server reads via the std.Io.Reader

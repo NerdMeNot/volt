@@ -196,7 +196,10 @@ const StreamImpl = if (is_windows) void else struct {
 
         if (c_connect(fd, addr.sockaddr(), addr.len) < 0) {
             const e = errnoVal();
-            if (e != EINPROGRESS) return error.ConnectFailed;
+            // EINTR: connect is in-progress in the background; treat
+            // like EINPROGRESS and wait for writability (re-calling
+            // connect() would return EALREADY/EISCONN).
+            if (e != EINPROGRESS and e != EINTR) return error.ConnectFailed;
             // Wait for writable = connect completed.
             const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
             var stream: StreamImpl = .{ .fd = @intCast(fd) };

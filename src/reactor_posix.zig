@@ -63,6 +63,11 @@ pub const EAGAIN: c_int = switch (builtin.os.tag) {
     .freebsd, .openbsd, .netbsd, .dragonfly => 35,
     else => @compileError("EAGAIN not defined for this OS"),
 };
+// On Linux and Darwin EWOULDBLOCK == EAGAIN, but POSIX permits them
+// to differ; check both so a backend that ever runs where they
+// diverge still yields instead of erroring. Matches net/unix.zig and
+// net/udp.zig, which already check both.
+pub const EWOULDBLOCK: c_int = EAGAIN;
 
 // Errno values used for the IoError mapping. Linux glibc + Darwin
 // disagree on the numbers; we keep both branches in one place.
@@ -158,7 +163,7 @@ pub fn readAsync(rx: anytype, fd: i32, pd: *poll_desc.PollDesc, buf: []u8) IoErr
         const r = read(@intCast(fd), buf.ptr, buf.len);
         if (r >= 0) return @intCast(r);
         const e = errnoVal();
-        if (e == EAGAIN) {
+        if (e == EAGAIN or e == EWOULDBLOCK) {
             try rx.waitFd(fd, pd, .read);
             continue;
         }
@@ -172,7 +177,7 @@ pub fn writeAsync(rx: anytype, fd: i32, pd: *poll_desc.PollDesc, buf: []const u8
         const w = write(@intCast(fd), buf.ptr, buf.len);
         if (w >= 0) return @intCast(w);
         const e = errnoVal();
-        if (e == EAGAIN) {
+        if (e == EAGAIN or e == EWOULDBLOCK) {
             try rx.waitFd(fd, pd, .write);
             continue;
         }
