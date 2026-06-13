@@ -133,6 +133,17 @@ const ipv6_mreq = extern struct {
 
 // ─── libc extern bindings ────────────────────────────────────────────
 
+// Winsock's `recv/send/recvfrom/sendto` take `int` lengths and return
+// `int` — POSIX uses `size_t` / `ssize_t`. Declaring the wrong width
+// is silently wrong on Microsoft x64: the lower 32 bits of RAX hold
+// the actual return; the upper 32 are caller-poisoned. A successful
+// `recv` of 2 bytes then shows up as 0x????????00000002 in the
+// `isize`-typed return, and even 0 in the high bits can flip to a
+// large positive `usize` after `@intCast` — surfaced as the
+// "index 4294967295, len 16" panic in `buf[0..r.len]`.
+const SockSSize = if (builtin.os.tag == .windows) c_int else isize;
+const SockSize = if (builtin.os.tag == .windows) c_int else usize;
+
 const c_socket = @extern(
     *const fn (c_int, c_int, c_int) callconv(.c) c_int,
     .{ .name = "socket" },
@@ -150,19 +161,19 @@ const c_close = @extern(
     .{ .name = "close" },
 );
 const c_sendto = @extern(
-    *const fn (c_int, *const anyopaque, usize, c_int, ?*const anyopaque, c_uint) callconv(.c) isize,
+    *const fn (c_int, *const anyopaque, SockSize, c_int, ?*const anyopaque, c_uint) callconv(.c) SockSSize,
     .{ .name = "sendto" },
 );
 const c_recvfrom = @extern(
-    *const fn (c_int, *anyopaque, usize, c_int, ?*anyopaque, ?*c_uint) callconv(.c) isize,
+    *const fn (c_int, *anyopaque, SockSize, c_int, ?*anyopaque, ?*c_uint) callconv(.c) SockSSize,
     .{ .name = "recvfrom" },
 );
 const c_send = @extern(
-    *const fn (c_int, *const anyopaque, usize, c_int) callconv(.c) isize,
+    *const fn (c_int, *const anyopaque, SockSize, c_int) callconv(.c) SockSSize,
     .{ .name = "send" },
 );
 const c_recv = @extern(
-    *const fn (c_int, *anyopaque, usize, c_int) callconv(.c) isize,
+    *const fn (c_int, *anyopaque, SockSize, c_int) callconv(.c) SockSSize,
     .{ .name = "recv" },
 );
 const getsockname = @extern(
@@ -200,6 +211,13 @@ pub const UdpSocket = struct {
     /// option calls (`joinMulticast4` vs `joinMulticast6` family-
     /// check at runtime).
     family: c_int,
+    /// Windows-only: tracks whether this socket has been associated
+    /// with the runtime's IOCP. `bind` / `unbound*` can't do this
+    /// because they may be called before `rt.run()` (no current
+    /// runtime in scope). First send/recv inside a coroutine does
+    /// the association lazily — mirrors the TCP `acceptWindows`
+    /// pattern in `src/net.zig`.
+    iocp_associated: bool = false,
 
     pub const Error = reactor_mod.IoError;
 
@@ -248,6 +266,22 @@ pub const UdpSocket = struct {
         _ = c_close(@intCast(self.fd));
     }
 
+    /// Windows: associate `self.fd` with the runtime's IOCP on first
+    /// use so the readiness probe (zero-byte `WSARecv` / `WSASend`)
+    /// the reactor uses for `waitReadable` / `waitWritable` has a
+    /// completion port to post to. No-op on POSIX backends.
+    ///
+    /// `CreateIoCompletionPort` failure is collapsed to
+    /// `error.SystemResources` so the surface stays inside `IoError`
+    /// — the only way it can fail on a freshly-created UDP socket
+    /// is OOM / kernel-resource exhaustion.
+    inline fn ensureRegistered(self: *UdpSocket, rt: *runtime.Runtime) Error!void {
+        if (comptime builtin.os.tag != .windows) return;
+        if (self.iocp_associated) return;
+        rt.reactor.associate(@intCast(self.fd)) catch return error.SystemResources;
+        self.iocp_associated = true;
+    }
+
     /// Set a default peer. After this, `.send` / `.recv` work
     /// stream-style (no per-call address). Doesn't actually
     /// establish a connection — UDP is connectionless; this just
@@ -273,8 +307,9 @@ pub const UdpSocket = struct {
     /// packet).
     pub fn send(self: *UdpSocket, buf: []const u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+        try self.ensureRegistered(rt);
         while (true) {
-            const n = c_send(@intCast(self.fd), buf.ptr, buf.len, 0);
+            const n = c_send(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
@@ -288,9 +323,10 @@ pub const UdpSocket = struct {
 
     pub fn sendCancel(self: *UdpSocket, buf: []const u8, c: *cancel_mod.Cancel) (Error || cancel_mod.Error)!usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+        try self.ensureRegistered(rt);
         while (true) {
             try c.checkpoint();
-            const n = c_send(@intCast(self.fd), buf.ptr, buf.len, 0);
+            const n = c_send(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
@@ -307,8 +343,9 @@ pub const UdpSocket = struct {
     /// packet arrives or `cancel.fire()` (via `recvCancel`).
     pub fn recv(self: *UdpSocket, buf: []u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+        try self.ensureRegistered(rt);
         while (true) {
-            const n = c_recv(@intCast(self.fd), buf.ptr, buf.len, 0);
+            const n = c_recv(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
@@ -322,9 +359,10 @@ pub const UdpSocket = struct {
 
     pub fn recvCancel(self: *UdpSocket, buf: []u8, c: *cancel_mod.Cancel) (Error || cancel_mod.Error)!usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+        try self.ensureRegistered(rt);
         while (true) {
             try c.checkpoint();
-            const n = c_recv(@intCast(self.fd), buf.ptr, buf.len, 0);
+            const n = c_recv(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
@@ -340,8 +378,9 @@ pub const UdpSocket = struct {
 
     pub fn sendTo(self: *UdpSocket, buf: []const u8, addr: Address) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+        try self.ensureRegistered(rt);
         while (true) {
-            const n = c_sendto(@intCast(self.fd), buf.ptr, buf.len, 0, addr.sockaddr(), addr.len);
+            const n = c_sendto(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0, addr.sockaddr(), addr.len);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
@@ -355,9 +394,10 @@ pub const UdpSocket = struct {
 
     pub fn sendToCancel(self: *UdpSocket, buf: []const u8, addr: Address, c: *cancel_mod.Cancel) (Error || cancel_mod.Error)!usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+        try self.ensureRegistered(rt);
         while (true) {
             try c.checkpoint();
-            const n = c_sendto(@intCast(self.fd), buf.ptr, buf.len, 0, addr.sockaddr(), addr.len);
+            const n = c_sendto(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0, addr.sockaddr(), addr.len);
             if (n >= 0) return @intCast(n);
             const e = errnoVal();
             if (e == EAGAIN or e == EWOULDBLOCK) {
@@ -371,10 +411,11 @@ pub const UdpSocket = struct {
 
     pub fn recvFrom(self: *UdpSocket, buf: []u8) !RecvFromResult {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+        try self.ensureRegistered(rt);
         while (true) {
             var storage: posix.sockaddr.storage = undefined;
             var sa_len: c_uint = @sizeOf(posix.sockaddr.storage);
-            const n = c_recvfrom(@intCast(self.fd), buf.ptr, buf.len, 0, &storage, &sa_len);
+            const n = c_recvfrom(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0, &storage, &sa_len);
             if (n >= 0) {
                 return .{
                     .len = @intCast(n),
@@ -393,11 +434,12 @@ pub const UdpSocket = struct {
 
     pub fn recvFromCancel(self: *UdpSocket, buf: []u8, c: *cancel_mod.Cancel) (Error || cancel_mod.Error)!RecvFromResult {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+        try self.ensureRegistered(rt);
         while (true) {
             try c.checkpoint();
             var storage: posix.sockaddr.storage = undefined;
             var sa_len: c_uint = @sizeOf(posix.sockaddr.storage);
-            const n = c_recvfrom(@intCast(self.fd), buf.ptr, buf.len, 0, &storage, &sa_len);
+            const n = c_recvfrom(@intCast(self.fd), buf.ptr, @intCast(buf.len), 0, &storage, &sa_len);
             if (n >= 0) {
                 return .{
                     .len = @intCast(n),
@@ -421,10 +463,11 @@ pub const UdpSocket = struct {
     /// inspection before deciding how to handle.
     pub fn peekFrom(self: *UdpSocket, buf: []u8) !RecvFromResult {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+        try self.ensureRegistered(rt);
         while (true) {
             var storage: posix.sockaddr.storage = undefined;
             var sa_len: c_uint = @sizeOf(posix.sockaddr.storage);
-            const n = c_recvfrom(@intCast(self.fd), buf.ptr, buf.len, MSG_PEEK, &storage, &sa_len);
+            const n = c_recvfrom(@intCast(self.fd), buf.ptr, @intCast(buf.len), MSG_PEEK, &storage, &sa_len);
             if (n >= 0) {
                 return .{
                     .len = @intCast(n),
