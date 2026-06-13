@@ -632,6 +632,7 @@ test {
     _ = @import("time.zig");
     _ = @import("select.zig");
     _ = @import("fs.zig");
+    _ = @import("reactor_conformance_test.zig");
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────

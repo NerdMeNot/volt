@@ -118,6 +118,12 @@ pub const Reactor = struct {
     /// (each coro can have at most one outstanding sleep at a time).
     /// Kernel timer resolution is bounded below by ~1 µs on Darwin.
     pub fn waitTimer(self: *Reactor, ns: u64) ReactorWaitError!void {
+        // ns=0 is a no-op. EVFILT_TIMER with data=0 happens to fire
+        // immediately on Darwin but the contract isn't documented and
+        // other kqueue platforms (FreeBSD/NetBSD) differ — keep the
+        // cross-reactor behaviour explicit at every impl site.
+        if (ns == 0) return;
+
         const me = current.require();
         var kev = std.mem.zeroes(posix.Kevent);
         kev.ident = @intFromPtr(me);

@@ -10,8 +10,11 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const metadata = @import("metadata.zig");
+const PlatformStat = metadata.PlatformStat;
 
 const is_windows = builtin.os.tag == .windows;
+const is_linux = builtin.os.tag == .linux;
 const is_darwin = switch (builtin.os.tag) {
     .macos, .ios, .tvos, .watchos => true,
     else => false,
@@ -21,16 +24,23 @@ const is_darwin = switch (builtin.os.tag) {
 // on Darwin arm64 it's the plain `stat`. Same shape for fstat /
 // lstat. std.c picks the right symbol for fstat but not for stat /
 // lstat in 0.16, so we wire all three ourselves.
+//
+// Linux uses `statx` instead of `stat` — `std.c.Stat` is `void`
+// there (glibc / musl / per-arch layouts diverge enough that std
+// won't commit). `statx` has a kernel-defined stable layout
+// (`std.os.linux.Statx`); we issue it via raw syscall and decode
+// the errno path manually since the libc wrapper is only available
+// from glibc 2.28+ and we don't want to gate on that.
 
-const c_stat_default = if (is_windows) {} else @extern(
+const c_stat_default = if (is_windows or is_linux) {} else @extern(
     *const fn ([*:0]const u8, *std.c.Stat) callconv(.c) c_int,
     .{ .name = "stat" },
 );
-const c_fstat_default = if (is_windows) {} else @extern(
+const c_fstat_default = if (is_windows or is_linux) {} else @extern(
     *const fn (c_int, *std.c.Stat) callconv(.c) c_int,
     .{ .name = "fstat" },
 );
-const c_lstat_default = if (is_windows) {} else @extern(
+const c_lstat_default = if (is_windows or is_linux) {} else @extern(
     *const fn ([*:0]const u8, *std.c.Stat) callconv(.c) c_int,
     .{ .name = "lstat" },
 );
@@ -48,22 +58,64 @@ const c_lstat_darwin_x86_64 = if (is_darwin and builtin.cpu.arch == .x86_64) @ex
     .{ .name = "lstat$INODE64" },
 ) else {};
 
-pub fn stat(path: [*:0]const u8, buf: *std.c.Stat) c_int {
+// statx mask covering everything `Metadata`'s accessors care about
+// — BASIC_STATS (0x7ff: type, mode, nlink, uid, gid, atime, mtime,
+// ctime, ino, size, blocks) plus BTIME for creation-time support on
+// filesystems that record it.
+const STATX_DEFAULT_MASK: if (is_linux) std.os.linux.STATX else void = if (is_linux) .{
+    .TYPE = true,
+    .MODE = true,
+    .NLINK = true,
+    .UID = true,
+    .GID = true,
+    .ATIME = true,
+    .MTIME = true,
+    .CTIME = true,
+    .INO = true,
+    .SIZE = true,
+    .BLOCKS = true,
+    .BTIME = true,
+} else {};
+
+fn linuxStatxAt(dirfd: i32, path: [*:0]const u8, flags: u32, buf: *PlatformStat) c_int {
+    const linux = std.os.linux;
+    const ret = linux.statx(dirfd, path, flags, STATX_DEFAULT_MASK, &buf.inner);
+    const sret: isize = @bitCast(ret);
+    if (sret < 0) {
+        std.c._errno().* = @intCast(-sret);
+        return -1;
+    }
+    return 0;
+}
+
+pub fn stat(path: [*:0]const u8, buf: *PlatformStat) c_int {
     if (is_windows) @compileError("stat not available on Windows path");
-    if (comptime is_darwin and builtin.cpu.arch == .x86_64) return c_stat_darwin_x86_64(path, buf);
-    return c_stat_default(path, buf);
+    if (comptime is_linux) {
+        return linuxStatxAt(std.os.linux.AT.FDCWD, path, 0, buf);
+    }
+    if (comptime is_darwin and builtin.cpu.arch == .x86_64) return c_stat_darwin_x86_64(path, &buf.inner);
+    return c_stat_default(path, &buf.inner);
 }
 
-pub fn fstat(fd: c_int, buf: *std.c.Stat) c_int {
+pub fn fstat(fd: c_int, buf: *PlatformStat) c_int {
     if (is_windows) @compileError("fstat not available on Windows path");
-    if (comptime is_darwin and builtin.cpu.arch == .x86_64) return c_fstat_darwin_x86_64(fd, buf);
-    return c_fstat_default(fd, buf);
+    if (comptime is_linux) {
+        // AT_EMPTY_PATH (0x1000) + empty path => stat the open fd.
+        const AT_EMPTY_PATH: u32 = 0x1000;
+        return linuxStatxAt(fd, "", AT_EMPTY_PATH, buf);
+    }
+    if (comptime is_darwin and builtin.cpu.arch == .x86_64) return c_fstat_darwin_x86_64(fd, &buf.inner);
+    return c_fstat_default(fd, &buf.inner);
 }
 
-pub fn lstat(path: [*:0]const u8, buf: *std.c.Stat) c_int {
+pub fn lstat(path: [*:0]const u8, buf: *PlatformStat) c_int {
     if (is_windows) @compileError("lstat not available on Windows");
-    if (comptime is_darwin and builtin.cpu.arch == .x86_64) return c_lstat_darwin_x86_64(path, buf);
-    return c_lstat_default(path, buf);
+    if (comptime is_linux) {
+        const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+        return linuxStatxAt(std.os.linux.AT.FDCWD, path, AT_SYMLINK_NOFOLLOW, buf);
+    }
+    if (comptime is_darwin and builtin.cpu.arch == .x86_64) return c_lstat_darwin_x86_64(path, &buf.inner);
+    return c_lstat_default(path, &buf.inner);
 }
 
 // `access`, `chmod`, `chown` ride on std.c.* directly — no Darwin

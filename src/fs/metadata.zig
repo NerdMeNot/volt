@@ -14,6 +14,15 @@ const builtin = @import("builtin");
 const Duration = @import("../time.zig").Duration;
 
 const is_windows = builtin.os.tag == .windows;
+const is_linux = builtin.os.tag == .linux;
+const is_darwin = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos => true,
+    else => false,
+};
+const has_birthtime = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos, .freebsd, .dragonfly => true,
+    else => false,
+};
 
 /// Kind of filesystem entry. Maps directly to the `S_IFMT` mask on
 /// POSIX; on Windows we collapse to `.file` / `.directory` / `.sym_link`
@@ -239,7 +248,7 @@ pub const Metadata = struct {
                 .perms = .{ .mode = if ((stat.file_attributes & windows.FILE_ATTRIBUTE_READONLY) != 0) 0o444 else 0o644 },
             };
         }
-        const mode_u32: u32 = @intCast(stat.mode);
+        const mode_u32: u32 = stat.mode();
         return .{
             .inner = stat,
             .kind = FileType.fromMode(mode_u32),
@@ -267,7 +276,7 @@ pub const Metadata = struct {
     /// dependent — usually a small constant — so don't read into it.
     pub fn size(self: Metadata) u64 {
         if (is_windows) return self.inner.file_size;
-        return @intCast(self.inner.size);
+        return self.inner.size();
     }
 
     pub fn permissions(self: Metadata) Permissions {
@@ -278,7 +287,7 @@ pub const Metadata = struct {
     /// file's content change."
     pub fn modified(self: Metadata) SystemTime {
         if (is_windows) return SystemTime{ .secs = self.inner.mtime_secs, .nsecs = self.inner.mtime_nsecs };
-        return SystemTime.fromTimespec(self.inner.mtime());
+        return self.inner.mtime();
     }
 
     /// Last-access time. Filesystems often defer or disable atime
@@ -286,65 +295,167 @@ pub const Metadata = struct {
     /// fine-grained ordering across two atimes.
     pub fn accessed(self: Metadata) SystemTime {
         if (is_windows) return SystemTime{ .secs = self.inner.atime_secs, .nsecs = self.inner.atime_nsecs };
-        return SystemTime.fromTimespec(self.inner.atime());
+        return self.inner.atime();
     }
 
-    /// Creation time. Returns `null` on Linux — ext4 / xfs only
-    /// surface birthtime via `statx`, and we use plain `stat` here.
+    /// Creation time. Returns `null` on Linux filesystems that
+    /// don't track btime (only ext4 / btrfs / xfs do via `statx`);
+    /// always returns a value on Darwin / FreeBSD / DragonFly /
+    /// Windows.
     pub fn created(self: Metadata) ?SystemTime {
         if (is_windows) return SystemTime{ .secs = self.inner.ctime_secs, .nsecs = self.inner.ctime_nsecs };
-        return switch (comptime builtin.os.tag) {
-            .linux => null,
-            .macos, .ios, .tvos, .watchos, .freebsd, .dragonfly => SystemTime.fromTimespec(self.inner.birthtime()),
-            else => null,
-        };
+        return self.inner.btime();
     }
 
     /// POSIX-only: device + inode. Useful for cycle detection in
     /// `walk` with `follow_symlinks = true`.
     pub fn device(self: Metadata) u64 {
         if (is_windows) return 0;
-        return @intCast(self.inner.dev);
+        return self.inner.dev();
     }
 
     pub fn inode(self: Metadata) u64 {
         if (is_windows) return 0;
-        return @intCast(self.inner.ino);
+        return self.inner.ino();
     }
 
     pub fn links(self: Metadata) u64 {
         if (is_windows) return self.inner.nlink;
-        return @intCast(self.inner.nlink);
+        return self.inner.nlink();
     }
 
     pub fn uid(self: Metadata) u32 {
         if (is_windows) return 0;
-        return @intCast(self.inner.uid);
+        return self.inner.uid();
     }
 
     pub fn gid(self: Metadata) u32 {
         if (is_windows) return 0;
-        return @intCast(self.inner.gid);
+        return self.inner.gid();
     }
 
     pub fn blksize(self: Metadata) u64 {
         if (is_windows) return 0;
-        return @intCast(self.inner.blksize);
+        return self.inner.blksize();
     }
 
     pub fn blocks(self: Metadata) u64 {
         if (is_windows) return 0;
-        return @intCast(self.inner.blocks);
+        return self.inner.blocks();
     }
 };
 
 // ─── Platform stat backing store ─────────────────────────────────
 
-/// POSIX path uses `std.c.Stat`; Windows path uses a synthetic
-/// struct populated from `BY_HANDLE_FILE_INFORMATION` +
-/// `GetFileSizeEx`. The public `Metadata` API hides which one is in
-/// play.
-pub const PlatformStat = if (is_windows) WindowsStat else std.c.Stat;
+/// Per-OS stat representation, behind a uniform method-style accessor
+/// API. Three backings:
+///   * `LinuxStat`   wraps `std.os.linux.Statx` (Linux ≥ 4.11)
+///   * `PosixStat`   wraps `std.c.Stat` (Darwin + BSDs)
+///   * `WindowsStat` synthesized from `BY_HANDLE_FILE_INFORMATION`
+///                   + `GetFileSizeEx` (populated by Phase B.2)
+///
+/// Linux needed its own backing because `std.c.Stat` resolves to
+/// `void` there — glibc / musl / per-arch `struct stat` layouts
+/// diverge enough that std refuses to commit. `statx` has a
+/// kernel-defined stable layout (`linux.Statx`) and ships everywhere
+/// we care about (4.11+ kernel, glibc 2.28+).
+pub const PlatformStat = if (is_windows) WindowsStat else if (is_linux) LinuxStat else PosixStat;
+
+/// Darwin + BSD backing — `std.c.Stat` is real there.
+pub const PosixStat = struct {
+    inner: std.c.Stat,
+
+    pub fn mode(self: PosixStat) u32 {
+        return @intCast(self.inner.mode);
+    }
+    pub fn size(self: PosixStat) u64 {
+        return @intCast(self.inner.size);
+    }
+    pub fn mtime(self: PosixStat) SystemTime {
+        return SystemTime.fromTimespec(self.inner.mtime());
+    }
+    pub fn atime(self: PosixStat) SystemTime {
+        return SystemTime.fromTimespec(self.inner.atime());
+    }
+    pub fn btime(self: PosixStat) ?SystemTime {
+        if (comptime !has_birthtime) return null;
+        return SystemTime.fromTimespec(self.inner.birthtime());
+    }
+    pub fn dev(self: PosixStat) u64 {
+        return @intCast(self.inner.dev);
+    }
+    pub fn ino(self: PosixStat) u64 {
+        return @intCast(self.inner.ino);
+    }
+    pub fn nlink(self: PosixStat) u64 {
+        return @intCast(self.inner.nlink);
+    }
+    pub fn uid(self: PosixStat) u32 {
+        return @intCast(self.inner.uid);
+    }
+    pub fn gid(self: PosixStat) u32 {
+        return @intCast(self.inner.gid);
+    }
+    pub fn blksize(self: PosixStat) u64 {
+        return @intCast(self.inner.blksize);
+    }
+    pub fn blocks(self: PosixStat) u64 {
+        return @intCast(self.inner.blocks);
+    }
+};
+
+/// Linux backing — wraps `Statx`. The `mask` field on `Statx`
+/// tells us which fields the kernel filled; we trust it for the
+/// BASIC_STATS bits (always filled on a 4.11+ kernel) and gate
+/// `btime` on the optional BTIME bit.
+pub const LinuxStat = struct {
+    inner: std.os.linux.Statx,
+
+    pub fn mode(self: LinuxStat) u32 {
+        return self.inner.mode;
+    }
+    pub fn size(self: LinuxStat) u64 {
+        return self.inner.size;
+    }
+    pub fn mtime(self: LinuxStat) SystemTime {
+        return statxTsToSystemTime(self.inner.mtime);
+    }
+    pub fn atime(self: LinuxStat) SystemTime {
+        return statxTsToSystemTime(self.inner.atime);
+    }
+    pub fn btime(self: LinuxStat) ?SystemTime {
+        if (!self.inner.mask.BTIME) return null;
+        return statxTsToSystemTime(self.inner.btime);
+    }
+    pub fn dev(self: LinuxStat) u64 {
+        return (@as(u64, self.inner.dev_major) << 32) | self.inner.dev_minor;
+    }
+    pub fn ino(self: LinuxStat) u64 {
+        return self.inner.ino;
+    }
+    pub fn nlink(self: LinuxStat) u64 {
+        return self.inner.nlink;
+    }
+    pub fn uid(self: LinuxStat) u32 {
+        return self.inner.uid;
+    }
+    pub fn gid(self: LinuxStat) u32 {
+        return self.inner.gid;
+    }
+    pub fn blksize(self: LinuxStat) u64 {
+        return self.inner.blksize;
+    }
+    pub fn blocks(self: LinuxStat) u64 {
+        return self.inner.blocks;
+    }
+
+    fn statxTsToSystemTime(ts: std.os.linux.statx_timestamp) SystemTime {
+        return .{
+            .secs = ts.sec,
+            .nsecs = if (ts.nsec >= 0) @intCast(ts.nsec) else 0,
+        };
+    }
+};
 
 const WindowsStat = extern struct {
     file_attributes: u32,

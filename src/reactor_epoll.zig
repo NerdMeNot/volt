@@ -234,6 +234,12 @@ pub const Reactor = struct {
     }
 
     pub fn waitTimer(self: *Reactor, ns: u64) ReactorWaitError!void {
+        // ns=0 is a no-op. timerfd_settime(2) treats an all-zero
+        // it_value as "disarm the timer" — without this guard the
+        // coroutine parks forever waiting for a fire that never
+        // comes. Caught by the sleep(0) reactor-conformance test.
+        if (ns == 0) return;
+
         const me = current.require();
 
         // Create a one-shot timerfd. Closed before this function
