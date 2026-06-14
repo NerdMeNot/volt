@@ -76,6 +76,31 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       - run: zig build-lib src/lib.zig -target ${{ matrix.target }} -lc -fno-emit-bin
 
+  # Windows fs compile gate (issue #6). The cross-compile job above
+  # does NOT catch the `is_windows @compileError` stubs in src/fs*:
+  # nothing in lib.zig *calls* the gated paths, so semantic analysis
+  # never reaches them and the build-lib check passes with stubs
+  # still present. tools/check_windows.zig references the full fs.*
+  # surface, so a Windows-targeted compile of it instantiates every
+  # gated path — any surviving @compileError fails here.
+  # `-fno-emit-bin` ⇒ compile-check only (no link / no run).
+  check-windows-fs:
+    name: Windows fs compile gate (${{ matrix.target }})
+    needs: format
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-windows-gnu
+          - aarch64-windows-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build-exe -target ${{ matrix.target }} -lc -fno-emit-bin --dep volt -Mroot=tools/check_windows.zig -Mvolt=src/lib.zig
+
   test:
     name: Test (${{ matrix.os }})
     needs: format

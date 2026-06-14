@@ -57,6 +57,67 @@ pub const allocator: std.mem.Allocator = instance.allocator();
 // `error.TestUnexpectedWinner`.
 
 const lib = @import("lib.zig");
+const fs = @import("fs.zig");
+
+// ─────────────────────────────────────────────────────────────────────
+// Cross-platform temp directory for fs tests
+// ─────────────────────────────────────────────────────────────────────
+//
+// Built entirely on volt's own fs API (`tempDir` / `makeDir` /
+// `removeDir` / `writeFile`), so the same test scaffolding runs on
+// POSIX and Windows — no libc `mkdtemp` / `c_open` / `c_unlink`, which
+// don't exist on Windows. Replaces the per-file POSIX-only helpers the
+// fs tests used to carry.
+
+/// A unique scoped temp directory. `create` makes it; `deinit`
+/// recursively removes it. Paths use `/` separators, which every
+/// Win32 path API accepts.
+var temp_counter: std.atomic.Value(u64) = .init(0);
+
+pub const TempDir = struct {
+    path: []u8,
+    allocator: std.mem.Allocator,
+
+    pub fn create(gpa: std.mem.Allocator) !TempDir {
+        const base = try fs.tempDir(gpa);
+        defer gpa.free(base);
+        // Uniqueness from a process-atomic counter plus the base
+        // allocation's address (ASLR entropy across runs). The
+        // AlreadyExists-retry loop covers any residual collision.
+        const token = @intFromPtr(base.ptr);
+        var attempt: u32 = 0;
+        while (attempt < 1000) : (attempt += 1) {
+            const seq = temp_counter.fetchAdd(1, .monotonic);
+            const candidate = try std.fmt.allocPrint(gpa, "{s}/volt-test-{x}-{x}", .{ base, token, seq });
+            fs.makeDir(candidate, .{}) catch |e| {
+                gpa.free(candidate);
+                if (e == error.AlreadyExists) continue;
+                return e;
+            };
+            return .{ .path = candidate, .allocator = gpa };
+        }
+        return error.TempDirExhausted;
+    }
+
+    pub fn deinit(self: *TempDir) void {
+        fs.removeDir(self.allocator, self.path, .{ .recursive = true }) catch {};
+        self.allocator.free(self.path);
+    }
+
+    /// Owned `"<tmp>/<sub>"` path. Caller frees with `gpa`.
+    pub fn childPath(self: *const TempDir, gpa: std.mem.Allocator, sub: []const u8) ![]u8 {
+        return std.fmt.allocPrint(gpa, "{s}/{s}", .{ self.path, sub });
+    }
+
+    /// Create (truncating) a file `<tmp>/<sub>` containing `data`.
+    /// Returns the owned child path.
+    pub fn writeChild(self: *const TempDir, gpa: std.mem.Allocator, sub: []const u8, data: []const u8) ![]u8 {
+        const p = try self.childPath(gpa, sub);
+        errdefer gpa.free(p);
+        try fs.writeFile(p, data);
+        return p;
+    }
+};
 
 /// Run `body(args..., *Cancel)` with a budget. Fails the test if the
 /// body exceeds `budget`. Returns the body's result if it completed

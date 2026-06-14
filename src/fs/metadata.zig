@@ -12,6 +12,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Duration = @import("../time.zig").Duration;
+const win32 = @import("win32.zig");
 
 const is_windows = builtin.os.tag == .windows;
 const is_linux = builtin.os.tag == .linux;
@@ -474,6 +475,27 @@ const windows = struct {
     pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
     pub const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 };
+
+/// Build `Metadata` from a `GetFileInformationByHandle` result. The
+/// Windows analog of `Metadata.fromStat(fstat(...))`. FILETIME ticks
+/// (100-ns since 1601) are converted to Unix `(secs, nsecs)`.
+pub fn metadataFromWindowsInfo(info: win32.BY_HANDLE_FILE_INFORMATION) Metadata {
+    const mtime = win32.filetimeToUnix(info.ftLastWriteTime);
+    const atime = win32.filetimeToUnix(info.ftLastAccessTime);
+    const ctime = win32.filetimeToUnix(info.ftCreationTime);
+    const ws = WindowsStat{
+        .file_attributes = info.dwFileAttributes,
+        .file_size = (@as(u64, info.nFileSizeHigh) << 32) | @as(u64, info.nFileSizeLow),
+        .nlink = info.nNumberOfLinks,
+        .mtime_secs = mtime.secs,
+        .mtime_nsecs = mtime.nsecs,
+        .atime_secs = atime.secs,
+        .atime_nsecs = atime.nsecs,
+        .ctime_secs = ctime.secs,
+        .ctime_nsecs = ctime.nsecs,
+    };
+    return Metadata.fromStat(ws);
+}
 
 // ─── Tests ───────────────────────────────────────────────────────
 

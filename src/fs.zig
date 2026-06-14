@@ -22,6 +22,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const syscall = @import("fs/syscall.zig");
 const fs_error = @import("fs/error.zig");
+const win32 = @import("fs/win32.zig");
+const file_mod = @import("fs/file.zig");
+const metadata_mod = @import("fs/metadata.zig");
 
 const is_windows = builtin.os.tag == .windows;
 
@@ -76,7 +79,7 @@ pub const FileError = fs_error.FileError;
 /// Common errors: `FsError.NotFound` if the path doesn't exist,
 /// `FsError.AccessDenied` on a component without search permission.
 pub fn stat(file_path: []const u8) FsError!Metadata {
-    if (is_windows) @compileError("Windows stat: pending (Phase B.2)");
+    if (is_windows) return winStatPath(file_path, true);
     var z: PathZ = undefined;
     try pathZInto(file_path, &z);
     var buf: PlatformStat = undefined;
@@ -87,7 +90,7 @@ pub fn stat(file_path: []const u8) FsError!Metadata {
 /// Like `stat` but does not follow a terminal symlink — returns
 /// info about the symlink itself.
 pub fn lstat(file_path: []const u8) FsError!Metadata {
-    if (is_windows) @compileError("Windows lstat: pending (Phase B.2)");
+    if (is_windows) return winStatPath(file_path, false);
     var z: PathZ = undefined;
     try pathZInto(file_path, &z);
     var buf: PlatformStat = undefined;
@@ -98,11 +101,12 @@ pub fn lstat(file_path: []const u8) FsError!Metadata {
 /// Stat by file descriptor. The handle must be currently open;
 /// works for any fd that's bound to a filesystem object (regular
 /// file, directory, socket).
-pub fn fstat(fd: c_int) FsError!Metadata {
-    if (is_windows) @compileError("Windows fstat: pending (Phase B.2)");
-    var buf: PlatformStat = undefined;
-    if (syscall.fstat(fd, &buf) != 0) return fs_error.fromErrno(fs_error.currentErrno());
-    return Metadata.fromStat(buf);
+pub fn fstat(fd: file_mod.Handle) FsError!Metadata {
+    // Delegate to File.metadata so both platforms share one path
+    // (fstat on POSIX, GetFileInformationByHandle on Windows). The
+    // handle is not consumed/closed.
+    var f = File.fromFd(fd);
+    return f.metadata();
 }
 
 // ─── Existence + access checks ───────────────────────────────────
@@ -118,7 +122,13 @@ pub fn exists(file_path: []const u8) bool {
 /// `NotFound` — that way callers can distinguish "definitely
 /// doesn't exist" from "couldn't tell" (e.g. ACL on a parent dir).
 pub fn tryExists(file_path: []const u8) FsError!bool {
-    if (is_windows) @compileError("Windows tryExists: pending (Phase B.2)");
+    if (is_windows) {
+        const z = try win32.WPathZ.fromUtf8(file_path);
+        if (win32.GetFileAttributesW(z.ptr()) != win32.INVALID_FILE_ATTRIBUTES) return true;
+        const code = win32.GetLastError();
+        if (code == win32.ERROR_FILE_NOT_FOUND or code == win32.ERROR_PATH_NOT_FOUND) return false;
+        return win32.fromLastError(code);
+    }
     var z: PathZ = undefined;
     try pathZInto(file_path, &z);
     var buf: PlatformStat = undefined;
@@ -143,7 +153,16 @@ pub const AccessMode = struct {
 /// classic TOCTOU caveat — between the `access` check and any
 /// subsequent open, permissions can change.
 pub fn access(file_path: []const u8, mode: AccessMode) bool {
-    if (is_windows) @compileError("Windows access: pending (Phase B.2)");
+    if (is_windows) {
+        // Windows has no access(2). Approximate: the file must exist,
+        // and a write check fails on a read-only file. Read/execute
+        // are not meaningfully gated at the attribute level.
+        const z = win32.WPathZ.fromUtf8(file_path) catch return false;
+        const attrs = win32.GetFileAttributesW(z.ptr());
+        if (attrs == win32.INVALID_FILE_ATTRIBUTES) return false;
+        if (mode.write and (attrs & win32.FILE_ATTRIBUTE_READONLY) != 0) return false;
+        return true;
+    }
     var z: PathZ = undefined;
     pathZInto(file_path, &z) catch return false;
     var bits: c_uint = syscall.F_OK;
@@ -159,7 +178,21 @@ pub fn access(file_path: []const u8, mode: AccessMode) bool {
 /// to flip a single bit, `stat` first to get the current
 /// permissions, mutate, then `chmod` back.
 pub fn chmod(file_path: []const u8, perms: Permissions) FsError!void {
-    if (is_windows) @compileError("Windows chmod: pending (Phase B.2)");
+    if (is_windows) {
+        // Only the read-only bit maps to the Windows attribute model.
+        const z = try win32.WPathZ.fromUtf8(file_path);
+        const cur = win32.GetFileAttributesW(z.ptr());
+        if (cur == win32.INVALID_FILE_ATTRIBUTES) return win32.fromLastError(win32.GetLastError());
+        var attrs = cur;
+        if (perms.readonly()) {
+            attrs |= win32.FILE_ATTRIBUTE_READONLY;
+        } else {
+            attrs &= ~win32.FILE_ATTRIBUTE_READONLY;
+        }
+        if (attrs == 0) attrs = win32.FILE_ATTRIBUTE_NORMAL;
+        if (win32.SetFileAttributesW(z.ptr(), attrs) == 0) return win32.fromLastError(win32.GetLastError());
+        return;
+    }
     var z: PathZ = undefined;
     try pathZInto(file_path, &z);
     const mode: std.c.mode_t = @intCast(perms.getMode());
@@ -169,7 +202,13 @@ pub fn chmod(file_path: []const u8, perms: Permissions) FsError!void {
 /// Change ownership of `path`. Most callers need to be root for
 /// this to succeed; the typical use case is install scripts.
 pub fn chown(file_path: []const u8, uid: u32, gid: u32) FsError!void {
-    if (is_windows) @compileError("Windows chown: pending (Phase B.2)");
+    if (is_windows) {
+        // Windows uses ACLs/SIDs, not POSIX uid/gid — no faithful
+        // mapping. No-op (success) so cross-platform callers don't
+        // have to special-case the platform. (Params are unused on
+        // this path; Zig allows unused function parameters.)
+        return;
+    }
     var z: PathZ = undefined;
     try pathZInto(file_path, &z);
     if (syscall.chown(&z.buf, @intCast(uid), @intCast(gid)) != 0) {
@@ -181,7 +220,16 @@ pub fn chown(file_path: []const u8, uid: u32, gid: u32) FsError!void {
 /// via `utimensat`; the kernel rounds to the filesystem's
 /// resolution (commonly 1µs on ext4, 1s on FAT).
 pub fn setTimes(file_path: []const u8, atime: SystemTime, mtime: SystemTime) FsError!void {
-    if (is_windows) @compileError("Windows setTimes: pending (Phase B.2)");
+    if (is_windows) {
+        const z = try win32.WPathZ.fromUtf8(file_path);
+        const h = win32.CreateFileW(z.ptr(), win32.FILE_WRITE_ATTRIBUTES, win32.FILE_SHARE_ALL, null, win32.OPEN_EXISTING, win32.FILE_FLAG_BACKUP_SEMANTICS, null);
+        if (h == win32.INVALID_HANDLE_VALUE) return win32.fromLastError(win32.GetLastError());
+        defer _ = win32.CloseHandle(h);
+        const at = win32.unixToFiletime(atime.secs, atime.nsecs);
+        const mt = win32.unixToFiletime(mtime.secs, mtime.nsecs);
+        if (win32.SetFileTime(h, null, &at, &mt) == 0) return win32.fromLastError(win32.GetLastError());
+        return;
+    }
     var z: PathZ = undefined;
     try pathZInto(file_path, &z);
     const times = [2]std.c.timespec{ atime.toTimespec(), mtime.toTimespec() };
@@ -196,7 +244,22 @@ pub fn setTimes(file_path: []const u8, atime: SystemTime, mtime: SystemTime) FsE
 /// Errors for paths that don't fully resolve (e.g. a component is
 /// missing or unreadable).
 pub fn canonicalize(allocator: std.mem.Allocator, file_path: []const u8) (FsError || error{OutOfMemory})![]u8 {
-    if (is_windows) @compileError("Windows canonicalize: pending (Phase B.2)");
+    if (is_windows) {
+        const z = try win32.WPathZ.fromUtf8(file_path);
+        const h = win32.CreateFileW(z.ptr(), win32.FILE_READ_ATTRIBUTES, win32.FILE_SHARE_ALL, null, win32.OPEN_EXISTING, win32.FILE_FLAG_BACKUP_SEMANTICS, null);
+        if (h == win32.INVALID_HANDLE_VALUE) return win32.fromLastError(win32.GetLastError());
+        defer _ = win32.CloseHandle(h);
+        var wbuf: [win32.WPATH_MAX]u16 = undefined;
+        const n = win32.GetFinalPathNameByHandleW(h, &wbuf, win32.WPATH_MAX, 0);
+        if (n == 0) return win32.fromLastError(win32.GetLastError());
+        if (n >= win32.WPATH_MAX) return error.NameTooLong;
+        var wslice = wbuf[0..n];
+        // GetFinalPathNameByHandleW prepends the `\\?\` long-path
+        // namespace prefix; strip it for a conventional path.
+        const dos_prefix = [_]u16{ '\\', '\\', '?', '\\' };
+        if (wslice.len >= 4 and std.mem.eql(u16, wslice[0..4], &dos_prefix)) wslice = wslice[4..];
+        return win32Utf16ToUtf8Dupe(allocator, wslice);
+    }
     var z: PathZ = undefined;
     try pathZInto(file_path, &z);
     // realpath wants a PATH_MAX buffer. Stack-allocate, then dup
@@ -290,7 +353,16 @@ fn copyFileImpl(src: []const u8, dst: []const u8) FileError!void {
 /// the same filesystem; cross-device renames surface
 /// `FsError.CrossDevice` (caller can fall back to copy + delete).
 pub fn rename(old_path: []const u8, new_path: []const u8) FsError!void {
-    if (is_windows) @compileError("Windows rename: pending");
+    if (is_windows) {
+        const zo = try win32.WPathZ.fromUtf8(old_path);
+        const zn = try win32.WPathZ.fromUtf8(new_path);
+        // REPLACE_EXISTING matches POSIX rename's overwrite; COPY_ALLOWED
+        // lets the kernel fall back to copy+delete across volumes.
+        if (win32.MoveFileExW(zo.ptr(), zn.ptr(), win32.MOVEFILE_REPLACE_EXISTING | win32.MOVEFILE_COPY_ALLOWED) == 0) {
+            return win32.fromLastError(win32.GetLastError());
+        }
+        return;
+    }
     var z_old: PathZ = undefined;
     try pathZInto(old_path, &z_old);
     var z_new: PathZ = undefined;
@@ -301,7 +373,14 @@ pub fn rename(old_path: []const u8, new_path: []const u8) FsError!void {
 /// Make a hard link from `link_path` to `target`. Both must live
 /// on the same filesystem (POSIX hard-link constraint).
 pub fn hardLink(target: []const u8, link_path: []const u8) FsError!void {
-    if (is_windows) @compileError("Windows hardlink: pending");
+    if (is_windows) {
+        const zt = try win32.WPathZ.fromUtf8(target);
+        const zl = try win32.WPathZ.fromUtf8(link_path);
+        if (win32.CreateHardLinkW(zl.ptr(), zt.ptr(), null) == 0) {
+            return win32.fromLastError(win32.GetLastError());
+        }
+        return;
+    }
     var z_t: PathZ = undefined;
     try pathZInto(target, &z_t);
     var z_l: PathZ = undefined;
@@ -312,7 +391,22 @@ pub fn hardLink(target: []const u8, link_path: []const u8) FsError!void {
 /// Create a symbolic link `link_path` pointing at `target`. Unlike
 /// `hardLink`, `target` need not exist when the link is created.
 pub fn symlink(target: []const u8, link_path: []const u8) FsError!void {
-    if (is_windows) @compileError("Windows symlink: pending");
+    if (is_windows) {
+        const zt = try win32.WPathZ.fromUtf8(target);
+        const zl = try win32.WPathZ.fromUtf8(link_path);
+        var flags: win32.DWORD = win32.SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+        // A symlink to a directory needs the DIRECTORY flag. Probe the
+        // target's attributes; if it doesn't exist yet, assume a file
+        // link (matches the common case).
+        const tattr = win32.GetFileAttributesW(zt.ptr());
+        if (tattr != win32.INVALID_FILE_ATTRIBUTES and (tattr & win32.FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            flags |= win32.SYMBOLIC_LINK_FLAG_DIRECTORY;
+        }
+        if (win32.CreateSymbolicLinkW(zl.ptr(), zt.ptr(), flags) == 0) {
+            return win32.fromLastError(win32.GetLastError());
+        }
+        return;
+    }
     var z_t: PathZ = undefined;
     try pathZInto(target, &z_t);
     var z_l: PathZ = undefined;
@@ -322,7 +416,7 @@ pub fn symlink(target: []const u8, link_path: []const u8) FsError!void {
 
 /// Read the target of a symbolic link. Returns owned slice.
 pub fn readLink(allocator: std.mem.Allocator, link_path: []const u8) (FsError || error{OutOfMemory})![]u8 {
-    if (is_windows) @compileError("Windows readlink: pending");
+    if (is_windows) return winReadLink(allocator, link_path);
     var z: PathZ = undefined;
     try pathZInto(link_path, &z);
     var buf: [syscall.PATH_MAX]u8 = undefined;
@@ -334,7 +428,21 @@ pub fn readLink(allocator: std.mem.Allocator, link_path: []const u8) (FsError ||
 /// Unlink a file (regular or symbolic link). For directories, use
 /// `Dir.remove`.
 pub fn unlink(file_path: []const u8) FsError!void {
-    if (is_windows) @compileError("Windows unlink: pending");
+    if (is_windows) {
+        const z = try win32.WPathZ.fromUtf8(file_path);
+        if (win32.DeleteFileW(z.ptr()) != 0) return;
+        const code = win32.GetLastError();
+        // POSIX unlink removes read-only files; Windows DeleteFileW
+        // refuses them. Emulate by clearing the bit and retrying once.
+        if (code == win32.ERROR_ACCESS_DENIED) {
+            const attrs = win32.GetFileAttributesW(z.ptr());
+            if (attrs != win32.INVALID_FILE_ATTRIBUTES and (attrs & win32.FILE_ATTRIBUTE_READONLY) != 0) {
+                _ = win32.SetFileAttributesW(z.ptr(), attrs & ~win32.FILE_ATTRIBUTE_READONLY);
+                if (win32.DeleteFileW(z.ptr()) != 0) return;
+            }
+        }
+        return win32.fromLastError(code);
+    }
     var z: PathZ = undefined;
     try pathZInto(file_path, &z);
     if (syscall.c_unlink(&z.buf) != 0) return fs_error.fromErrno(fs_error.currentErrno());
@@ -343,7 +451,18 @@ pub fn unlink(file_path: []const u8) FsError!void {
 /// The system temp directory (`TMPDIR` env var on POSIX with a
 /// `/tmp` fallback). Returned slice is owned by `allocator`.
 pub fn tempDir(allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
-    if (is_windows) @compileError("Windows TEMP: pending");
+    if (is_windows) {
+        var wbuf: [win32.WPATH_MAX]u16 = undefined;
+        const n = win32.GetTempPathW(win32.WPATH_MAX, &wbuf);
+        if (n == 0 or n >= win32.WPATH_MAX) return try allocator.dupe(u8, "C:\\Windows\\Temp");
+        var u8buf: [win32.WPATH_MAX * 3]u8 = undefined;
+        const u8len = std.unicode.utf16LeToUtf8(&u8buf, wbuf[0..n]) catch
+            return try allocator.dupe(u8, "C:\\Windows\\Temp");
+        // GetTempPathW returns a trailing backslash; trim for parity
+        // with the POSIX (no-trailing-slash) result.
+        const trimmed = std.mem.trimEnd(u8, u8buf[0..u8len], "\\");
+        return try allocator.dupe(u8, if (trimmed.len > 0) trimmed else "C:\\Windows\\Temp");
+    }
     if (std.c.getenv("TMPDIR")) |t| {
         const len = std.mem.len(t);
         const slice = t[0..len];
@@ -358,7 +477,25 @@ pub fn tempDir(allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
 /// Caller should also `unlink` the path when done (this fn doesn't
 /// auto-clean — explicit lifetimes only).
 pub fn tempFile(allocator: std.mem.Allocator, prefix: []const u8) (FileError || error{OutOfMemory})!struct { path: []u8, file: File } {
-    if (is_windows) @compileError("Windows tempFile: pending");
+    if (is_windows) {
+        const dir = try tempDir(allocator);
+        defer allocator.free(dir);
+        const wdir = try win32.WPathZ.fromUtf8(dir);
+        // GetTempFileNameW uses only the first 3 chars of the prefix.
+        const wprefix = try win32.WPathZ.fromUtf8(prefix);
+        var wname: [win32.WPATH_MAX]u16 = undefined;
+        // uUnique = 0 ⇒ the API generates a unique name AND creates
+        // the (empty) file atomically.
+        if (win32.GetTempFileNameW(wdir.ptr(), wprefix.ptr(), 0, &wname) == 0) {
+            return win32.fromLastError(win32.GetLastError());
+        }
+        const wlen = std.mem.indexOfScalar(u16, &wname, 0) orelse wname.len;
+        const path_owned = try win32Utf16ToUtf8Dupe(allocator, wname[0..wlen]);
+        errdefer allocator.free(path_owned);
+        // Re-open the created file with read+write for the caller.
+        const f = try File.openOptions(path_owned, .{ .read = true, .write = true });
+        return .{ .path = path_owned, .file = f };
+    }
     const dir = try tempDir(allocator);
     defer allocator.free(dir);
 
@@ -382,6 +519,71 @@ const c_link = if (is_windows) {} else @extern(
     *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) c_int,
     .{ .name = "link" },
 );
+
+// ─── Windows path-op helpers ─────────────────────────────────────
+// Only referenced from `is_windows` comptime branches → never
+// analysed on POSIX.
+
+/// Open an attribute-only handle and stat it. `follow = false` opens
+/// the reparse point itself (the lstat analog).
+fn winStatPath(file_path: []const u8, follow: bool) FsError!Metadata {
+    const z = try win32.WPathZ.fromUtf8(file_path);
+    var flags = win32.FILE_FLAG_BACKUP_SEMANTICS;
+    if (!follow) flags |= win32.FILE_FLAG_OPEN_REPARSE_POINT;
+    const h = win32.CreateFileW(z.ptr(), win32.FILE_READ_ATTRIBUTES, win32.FILE_SHARE_ALL, null, win32.OPEN_EXISTING, flags, null);
+    if (h == win32.INVALID_HANDLE_VALUE) return win32.fromLastError(win32.GetLastError());
+    defer _ = win32.CloseHandle(h);
+    var info: win32.BY_HANDLE_FILE_INFORMATION = undefined;
+    if (win32.GetFileInformationByHandle(h, &info) == 0) return win32.fromLastError(win32.GetLastError());
+    return metadata_mod.metadataFromWindowsInfo(info);
+}
+
+fn win32Utf16ToUtf8Dupe(allocator: std.mem.Allocator, utf16: []const u16) (FsError || error{OutOfMemory})![]u8 {
+    var u8buf: [win32.WPATH_MAX * 3]u8 = undefined;
+    const n = std.unicode.utf16LeToUtf8(&u8buf, utf16) catch return error.InvalidPath;
+    return allocator.dupe(u8, u8buf[0..n]);
+}
+
+/// Read a symlink/junction target via FSCTL_GET_REPARSE_POINT, parsing
+/// the REPARSE_DATA_BUFFER and returning the (user-facing) print name.
+fn winReadLink(allocator: std.mem.Allocator, link_path: []const u8) (FsError || error{OutOfMemory})![]u8 {
+    const z = try win32.WPathZ.fromUtf8(link_path);
+    const h = win32.CreateFileW(z.ptr(), win32.FILE_READ_ATTRIBUTES, win32.FILE_SHARE_ALL, null, win32.OPEN_EXISTING, win32.FILE_FLAG_BACKUP_SEMANTICS | win32.FILE_FLAG_OPEN_REPARSE_POINT, null);
+    if (h == win32.INVALID_HANDLE_VALUE) return win32.fromLastError(win32.GetLastError());
+    defer _ = win32.CloseHandle(h);
+
+    var buf: [win32.MAXIMUM_REPARSE_DATA_BUFFER_SIZE]u8 align(8) = undefined;
+    var returned: win32.DWORD = 0;
+    if (win32.DeviceIoControl(h, win32.FSCTL_GET_REPARSE_POINT, null, 0, &buf, buf.len, &returned, null) == 0) {
+        return win32.fromLastError(win32.GetLastError());
+    }
+
+    // REPARSE_DATA_BUFFER: ReparseTag(u32) ReparseDataLength(u16)
+    // Reserved(u16), then the per-tag union at offset 8. The symlink
+    // union has an extra Flags(u32) before PathBuffer; the mount-point
+    // union does not.
+    const tag = std.mem.readInt(u32, buf[0..4], .little);
+    const print_off = std.mem.readInt(u16, buf[12..14], .little);
+    const print_len = std.mem.readInt(u16, buf[14..16], .little);
+    const path_buffer_at: usize = switch (tag) {
+        win32.IO_REPARSE_TAG_SYMLINK => 20,
+        win32.IO_REPARSE_TAG_MOUNT_POINT => 16,
+        else => return error.NotSupported,
+    };
+
+    const start = path_buffer_at + print_off;
+    const wcount = print_len / 2;
+    if (start + print_len > buf.len) return error.Unexpected;
+
+    // Copy out as aligned u16s (the byte slice may be 2-aligned only).
+    var wide: [win32.WPATH_MAX]u16 = undefined;
+    if (wcount > wide.len) return error.NameTooLong;
+    var i: usize = 0;
+    while (i < wcount) : (i += 1) {
+        wide[i] = std.mem.readInt(u16, buf[start + i * 2 ..][0..2], .little);
+    }
+    return win32Utf16ToUtf8Dupe(allocator, wide[0..wcount]);
+}
 
 // ─── Internal: NUL-terminate a path on the stack ─────────────────
 
@@ -417,84 +619,62 @@ test {
 // ─── Tests ───────────────────────────────────────────────────────
 
 const testing = std.testing;
+const tu = @import("testing.zig");
 
-/// Minimal scoped temp dir built on libc — std.Io.Dir wants an `io`
-/// arg in Zig 0.16 and we don't run an Io instance in unit tests.
+/// Cross-platform scoped temp dir for fs tests. Thin wrapper over
+/// `volt.testing.TempDir` that keeps the method names the existing
+/// tests use, built on volt's own (cross-platform) fs API so the
+/// same tests run on POSIX and Windows. Bare `writeFile` / `makeDir`
+/// inside the methods resolve to the file-scope fs functions, not the
+/// struct methods (Zig members aren't ambient identifiers).
 const TmpDir = struct {
-    path: [:0]u8,
+    inner: tu.TempDir,
+    path: []const u8,
     allocator: std.mem.Allocator,
 
     fn init(allocator: std.mem.Allocator) !TmpDir {
-        const template = "/tmp/volt-fstest-XXXXXX";
-        const buf = try allocator.allocSentinel(u8, template.len, 0);
-        @memcpy(buf[0..template.len], template);
-        const result = syscall.c_mkdtemp(buf.ptr);
-        if (result == null) {
-            allocator.free(buf);
-            return error.MkdtempFailed;
-        }
-        return .{ .path = buf, .allocator = allocator };
+        const inner = try tu.TempDir.create(allocator);
+        return .{ .inner = inner, .path = inner.path, .allocator = allocator };
     }
 
     fn deinit(self: *TmpDir) void {
-        // Best-effort cleanup: rmdir; leftover children leak (tests
-        // are responsible for cleaning them up).
-        _ = syscall.c_rmdir(self.path.ptr);
-        self.allocator.free(self.path);
+        self.inner.deinit();
     }
 
-    /// Make `path/sub` and return an owned NUL-terminated path.
+    /// Create an empty file `path/sub`; returns an owned NUL-term path.
     fn touchFile(self: *TmpDir, sub: []const u8) ![:0]u8 {
         const full = try std.fmt.allocPrintSentinel(self.allocator, "{s}/{s}", .{ self.path, sub }, 0);
-        const fd = syscall.c_open(full.ptr, syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC, 0o644);
-        if (fd < 0) {
-            self.allocator.free(full);
-            return error.OpenFailed;
-        }
-        _ = syscall.c_close(fd);
+        errdefer self.allocator.free(full);
+        try @import("fs.zig").writeFile(full, "");
         return full;
     }
 
     fn writeFile(self: *TmpDir, sub: []const u8, data: []const u8) ![:0]u8 {
         const full = try std.fmt.allocPrintSentinel(self.allocator, "{s}/{s}", .{ self.path, sub }, 0);
-        const fd = syscall.c_open(full.ptr, syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC, 0o644);
-        if (fd < 0) {
-            self.allocator.free(full);
-            return error.OpenFailed;
-        }
-        defer _ = syscall.c_close(fd);
-        if (data.len > 0) {
-            const n = syscall.c_write(fd, data.ptr, data.len);
-            if (n != @as(isize, @intCast(data.len))) {
-                self.allocator.free(full);
-                return error.WriteFailed;
-            }
-        }
+        errdefer self.allocator.free(full);
+        try @import("fs.zig").writeFile(full, data);
         return full;
     }
 
     fn mkSubdir(self: *TmpDir, sub: []const u8) ![:0]u8 {
         const full = try std.fmt.allocPrintSentinel(self.allocator, "{s}/{s}", .{ self.path, sub }, 0);
-        if (syscall.c_mkdir(full.ptr, 0o755) != 0) {
-            self.allocator.free(full);
-            return error.MkdirFailed;
-        }
+        errdefer self.allocator.free(full);
+        try makeDir(full, .{});
         return full;
     }
 
     fn rm(self: *TmpDir, p: [:0]u8) void {
-        _ = syscall.c_unlink(p.ptr);
+        unlink(p) catch {};
         self.allocator.free(p);
     }
 
     fn rmdir(self: *TmpDir, p: [:0]u8) void {
-        _ = syscall.c_rmdir(p.ptr);
+        removeDir(self.allocator, p, .{}) catch {};
         self.allocator.free(p);
     }
 };
 
 test "fs.stat: round-trip on temp file" {
-    if (is_windows) return error.SkipZigTest;
     var tmp = try TmpDir.init(testing.allocator);
     defer tmp.deinit();
     const fp = try tmp.writeFile("stat-test.txt", "hello");
@@ -513,7 +693,6 @@ test "fs.stat: round-trip on temp file" {
 }
 
 test "fs.exists: real path returns true; missing returns false" {
-    if (is_windows) return error.SkipZigTest;
     var tmp = try TmpDir.init(testing.allocator);
     defer tmp.deinit();
     const fp = try tmp.touchFile("here.txt");
@@ -527,13 +706,12 @@ test "fs.exists: real path returns true; missing returns false" {
 }
 
 test "fs.access: write check on read-only file returns false" {
-    if (is_windows) return error.SkipZigTest;
     var tmp = try TmpDir.init(testing.allocator);
     defer tmp.deinit();
     const fp = try tmp.touchFile("ro.txt");
     defer {
-        // Restore so unlink can succeed.
-        _ = syscall.chmod(fp.ptr, 0o644);
+        // Restore writability so cleanup can remove it.
+        chmod(fp, Permissions.fromOctal(0o644)) catch {};
         tmp.rm(fp);
     }
 
@@ -543,7 +721,6 @@ test "fs.access: write check on read-only file returns false" {
 }
 
 test "fs.canonicalize: resolves '..' segment" {
-    if (is_windows) return error.SkipZigTest;
     var tmp = try TmpDir.init(testing.allocator);
     defer tmp.deinit();
     const subdir = try tmp.mkSubdir("sub");
@@ -569,7 +746,6 @@ test "fs.canonicalize: resolves '..' segment" {
 }
 
 test "fs.setTimes: round-trip preserves mtime" {
-    if (is_windows) return error.SkipZigTest;
     var tmp = try TmpDir.init(testing.allocator);
     defer tmp.deinit();
     const fp = try tmp.touchFile("times.txt");
@@ -586,7 +762,7 @@ test "fs.setTimes: round-trip preserves mtime" {
 const RT = @import("lib.zig");
 
 const FacadeState = struct {
-    tmp: [:0]const u8,
+    tmp: []const u8,
     ok: bool = false,
 };
 
@@ -618,49 +794,40 @@ fn facadeReadWriteCopy(state: *FacadeState) !void {
 }
 
 test "fs facade: readFile / writeFile / copyFile / appendFile round-trip" {
-    if (is_windows) return error.SkipZigTest;
-    var tmpl = "/tmp/volt-facade-XXXXXX\x00".*;
-    if (syscall.c_mkdtemp(@ptrCast(&tmpl)) == null) return error.MkdtempFailed;
-    const tmp: [:0]const u8 = tmpl[0 .. tmpl.len - 1 :0];
-    defer {
-        for ([_][]const u8{ "src.txt", "dst.txt" }) |name| {
-            var p: [256:0]u8 = undefined;
-            const z = std.fmt.bufPrintZ(&p, "{s}/{s}", .{ tmp, name }) catch continue;
-            _ = syscall.c_unlink(z.ptr);
-        }
-        _ = syscall.c_rmdir(tmp.ptr);
-    }
+    var tmp = try TmpDir.init(testing.allocator);
+    defer tmp.deinit();
 
     var rt = try RT.Runtime.init(.{ .allocator = @import("testing.zig").allocator });
     defer rt.deinit();
-    var state = FacadeState{ .tmp = tmp };
+    var state = FacadeState{ .tmp = tmp.path };
     try (try rt.run(facadeReadWriteCopy, .{&state}));
     try testing.expect(state.ok);
 }
 
 test "fs.tempDir: returns an existing directory" {
-    if (is_windows) return error.SkipZigTest;
     const t = try tempDir(testing.allocator);
     defer testing.allocator.free(t);
     try testing.expect(exists(t));
 }
 
 test "fs.symlink + readLink: round-trip the target" {
-    if (is_windows) return error.SkipZigTest;
-    var tmpl = "/tmp/volt-facade-XXXXXX\x00".*;
-    if (syscall.c_mkdtemp(@ptrCast(&tmpl)) == null) return error.MkdtempFailed;
-    const tmp: [:0]const u8 = tmpl[0 .. tmpl.len - 1 :0];
-    defer _ = syscall.c_rmdir(tmp.ptr);
+    var tmp = try TmpDir.init(testing.allocator);
+    defer tmp.deinit();
 
-    var target_buf: [256:0]u8 = undefined;
-    const target = try std.fmt.bufPrintZ(&target_buf, "{s}/target.txt", .{tmp});
-    try writeFile(target, "");
-    defer _ = syscall.c_unlink(target.ptr);
+    const target = try tmp.writeFile("target.txt", "");
+    defer tmp.rm(target);
 
-    var link_buf: [256:0]u8 = undefined;
-    const link = try std.fmt.bufPrintZ(&link_buf, "{s}/link.txt", .{tmp});
-    try symlink(target, link);
-    defer _ = syscall.c_unlink(link.ptr);
+    const link = try tmp.inner.childPath(testing.allocator, "link.txt");
+    defer {
+        unlink(link) catch {};
+        testing.allocator.free(link);
+    }
+    symlink(target, link) catch |e| {
+        // Windows requires Developer Mode / elevation to create
+        // symlinks; skip where the privilege isn't held.
+        if (e == error.AccessDenied) return error.SkipZigTest;
+        return e;
+    };
 
     const got = try readLink(testing.allocator, link);
     defer testing.allocator.free(got);
@@ -668,38 +835,38 @@ test "fs.symlink + readLink: round-trip the target" {
 }
 
 test "fs.rename: moves a file under the same dir" {
-    if (is_windows) return error.SkipZigTest;
-    var tmpl = "/tmp/volt-facade-XXXXXX\x00".*;
-    if (syscall.c_mkdtemp(@ptrCast(&tmpl)) == null) return error.MkdtempFailed;
-    const tmp: [:0]const u8 = tmpl[0 .. tmpl.len - 1 :0];
-    defer _ = syscall.c_rmdir(tmp.ptr);
+    var tmp = try TmpDir.init(testing.allocator);
+    defer tmp.deinit();
 
-    var src_buf: [256:0]u8 = undefined;
-    const src = try std.fmt.bufPrintZ(&src_buf, "{s}/a.txt", .{tmp});
-    try writeFile(src, "X");
+    const src = try tmp.writeFile("a.txt", "X");
+    defer tmp.rm(src); // renamed away; rm's unlink is a no-op, frees the path
 
-    var dst_buf: [256:0]u8 = undefined;
-    const dst = try std.fmt.bufPrintZ(&dst_buf, "{s}/b.txt", .{tmp});
+    const dst = try tmp.inner.childPath(testing.allocator, "b.txt");
+    defer {
+        unlink(dst) catch {};
+        testing.allocator.free(dst);
+    }
     try rename(src, dst);
-    defer _ = syscall.c_unlink(dst.ptr);
 
     try testing.expect(!exists(src));
     try testing.expect(exists(dst));
 }
 
 test "fs.lstat: symlink reports itself, not target" {
-    if (is_windows) return error.SkipZigTest;
     var tmp = try TmpDir.init(testing.allocator);
     defer tmp.deinit();
     const target = try tmp.writeFile("real.txt", "hello");
     defer tmp.rm(target);
 
-    const link = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/link.txt", .{tmp.path}, 0);
+    const link = try tmp.inner.childPath(testing.allocator, "link.txt");
     defer {
-        _ = syscall.c_unlink(link.ptr);
+        unlink(link) catch {};
         testing.allocator.free(link);
     }
-    if (syscall.c_symlink(target.ptr, link.ptr) != 0) return error.SymlinkFailed;
+    symlink(target, link) catch |e| {
+        if (e == error.AccessDenied) return error.SkipZigTest;
+        return e;
+    };
 
     const via_stat = try stat(link); // follows
     const via_lstat = try lstat(link); // does not

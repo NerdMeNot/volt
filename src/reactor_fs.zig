@@ -23,11 +23,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const lib = @import("lib.zig");
 
-comptime {
-    if (builtin.os.tag == .windows) {
-        @compileError("reactor_fs.zig is POSIX-only; Windows fs lands in a separate phase");
-    }
-}
+// This module's spawnBlocking proxies are POSIX-only and are only
+// referenced from the POSIX reactor backends (kqueue/epoll/io_uring),
+// never IOCP — so on Windows the syscall functions + libc externs
+// below are lazily skipped (unreferenced). The plain result types
+// (`FsResult` / `FdResult`) are still needed cross-platform: `fs_ring`
+// and `runtime` reference them, so the module must remain importable
+// on Windows. (It used to hard-`@compileError` here, which broke that.)
 
 // ─── Result vocabulary ───────────────────────────────────────────
 

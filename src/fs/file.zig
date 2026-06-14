@@ -31,9 +31,15 @@ const builtin = @import("builtin");
 const syscall = @import("syscall.zig");
 const fs_error = @import("error.zig");
 const metadata_mod = @import("metadata.zig");
+const win32 = @import("win32.zig");
 const lib = @import("../lib.zig");
 
 const is_windows = builtin.os.tag == .windows;
+
+/// Raw OS handle representation. A POSIX `int` fd, or a Windows
+/// `HANDLE` (a pointer — which is why this can't be `c_int`: `c_int`
+/// is 32-bit on x86_64-windows but a HANDLE is a 64-bit pointer).
+pub const Handle = if (is_windows) win32.HANDLE else c_int;
 
 pub const FsError = fs_error.FsError;
 pub const FileError = fs_error.FileError;
@@ -78,8 +84,9 @@ pub const OpenOptions = struct {
 /// callers may pass it to direct-syscall helpers (`fcntl`, `flock`,
 /// `mmap`).
 pub const File = struct {
-    /// Raw OS handle. POSIX fd or Windows HANDLE (cast to c_int).
-    fd: c_int,
+    /// Raw OS handle — POSIX fd (`c_int`) or Windows `HANDLE`. See
+    /// `Handle`.
+    fd: Handle,
 
     /// Append mode — every write seeks to EOF first. Mirrors the
     /// `O_APPEND` flag we opened with so `writeAt` knows it's a
@@ -105,10 +112,11 @@ pub const File = struct {
     /// Open `path` with custom options. The least-surprising form
     /// for unusual cases.
     pub fn openOptions(path: []const u8, opts: OpenOptions) FsError!File {
-        if (is_windows) @compileError("Windows File: pending (Phase B.2 follow-up)");
         if (opts.create_new and !opts.create) return error.InvalidPath;
         if (opts.truncate and !opts.write) return error.InvalidPath;
         if (!opts.read and !opts.write) return error.InvalidPath;
+
+        if (is_windows) return windowsOpen(path, opts);
 
         var z: PathZ = undefined;
         try pathZInto(path, &z);
@@ -143,7 +151,7 @@ pub const File = struct {
     /// Take ownership of an existing fd (e.g. one passed in from
     /// the parent process via fd inheritance). Caller is
     /// responsible for the fd's mode flags — they're not queried.
-    pub fn fromFd(fd: c_int) File {
+    pub fn fromFd(fd: Handle) File {
         return .{ .fd = fd };
     }
 
@@ -153,7 +161,11 @@ pub const File = struct {
     /// close (e.g. async I/O writeback failure on Linux) are
     /// surfaced.
     pub fn close(self: *File) void {
-        if (is_windows) @compileError("Windows File: pending");
+        if (is_windows) {
+            _ = win32.CloseHandle(self.fd);
+            self.fd = win32.INVALID_HANDLE_VALUE;
+            return;
+        }
         _ = syscall.c_close(self.fd);
         self.fd = -1;
     }
@@ -229,7 +241,18 @@ pub const File = struct {
     /// Move the file pointer. `offset` may be negative for
     /// `.current` / `.end`. Returns the new absolute offset.
     pub fn seek(self: *File, offset: i64, whence: SeekWhence) FileError!u64 {
-        if (is_windows) @compileError("Windows File: pending");
+        if (is_windows) {
+            const method: win32.DWORD = switch (whence) {
+                .start => win32.FILE_BEGIN,
+                .current => win32.FILE_CURRENT,
+                .end => win32.FILE_END,
+            };
+            var new_pos: win32.LARGE_INTEGER = 0;
+            if (win32.SetFilePointerEx(self.fd, offset, &new_pos, method) == 0) {
+                return win32.fromLastError(win32.GetLastError());
+            }
+            return @intCast(new_pos);
+        }
         const result = c_lseek(self.fd, offset, @intFromEnum(whence));
         if (result < 0) return fs_error.fromErrno(fs_error.currentErrno());
         return @intCast(result);
@@ -243,7 +266,11 @@ pub const File = struct {
     /// Flush kernel-side dirty buffers to disk. Honoured by every
     /// modern fs. Blocking — bridges through the pool.
     pub fn sync(self: *File) FileError!void {
-        if (is_windows) @compileError("Windows File: pending");
+        if (is_windows) {
+            if (inCoroutine()) return blockingFsync(self.fd) catch |e| return e;
+            if (win32.FlushFileBuffers(self.fd) == 0) return win32.fromLastError(win32.GetLastError());
+            return;
+        }
         if (inCoroutine()) {
             return blockingFsync(self.fd) catch |e| return e;
         }
@@ -253,7 +280,13 @@ pub const File = struct {
     /// Like `sync` but only flushes data, not metadata. On Linux
     /// uses `fdatasync`; elsewhere falls back to `fsync`.
     pub fn dataSync(self: *File) FileError!void {
-        if (is_windows) @compileError("Windows File: pending");
+        if (is_windows) {
+            // Windows has no fdatasync; FlushFileBuffers is the only
+            // durability primitive, so dataSync == sync here.
+            if (inCoroutine()) return blockingFdatasync(self.fd) catch |e| return e;
+            if (win32.FlushFileBuffers(self.fd) == 0) return win32.fromLastError(win32.GetLastError());
+            return;
+        }
         if (inCoroutine()) {
             return blockingFdatasync(self.fd) catch |e| return e;
         }
@@ -267,7 +300,20 @@ pub const File = struct {
     /// Truncate or extend the file to exactly `size` bytes. New
     /// pages on extend are zero-filled per POSIX.
     pub fn setLen(self: *File, size: u64) FileError!void {
-        if (is_windows) @compileError("Windows File: pending");
+        if (is_windows) {
+            // No ftruncate on Windows. Save the current position, move
+            // to `size`, mark EOF there, then restore — so setLen
+            // matches POSIX's "offset unchanged" contract.
+            var cur: win32.LARGE_INTEGER = 0;
+            if (win32.SetFilePointerEx(self.fd, 0, &cur, win32.FILE_CURRENT) == 0)
+                return win32.fromLastError(win32.GetLastError());
+            if (win32.SetFilePointerEx(self.fd, @intCast(size), null, win32.FILE_BEGIN) == 0)
+                return win32.fromLastError(win32.GetLastError());
+            if (win32.SetEndOfFile(self.fd) == 0)
+                return win32.fromLastError(win32.GetLastError());
+            _ = win32.SetFilePointerEx(self.fd, cur, null, win32.FILE_BEGIN);
+            return;
+        }
         if (c_ftruncate(self.fd, @intCast(size)) != 0) {
             return fs_error.fromErrno(fs_error.currentErrno());
         }
@@ -275,14 +321,40 @@ pub const File = struct {
 
     /// Stat by fd.
     pub fn metadata(self: *File) FsError!Metadata {
+        if (is_windows) {
+            var info: win32.BY_HANDLE_FILE_INFORMATION = undefined;
+            if (win32.GetFileInformationByHandle(self.fd, &info) == 0) {
+                return win32.fromLastError(win32.GetLastError());
+            }
+            return metadata_mod.metadataFromWindowsInfo(info);
+        }
         var buf: metadata_mod.PlatformStat = undefined;
         if (syscall.fstat(self.fd, &buf) != 0) return fs_error.fromErrno(fs_error.currentErrno());
         return Metadata.fromStat(buf);
     }
 
-    /// Set permissions by fd (`fchmod`).
+    /// Set permissions by fd. On POSIX this is `fchmod`. On Windows
+    /// the only mode bit that maps is read-only — we toggle
+    /// `FILE_ATTRIBUTE_READONLY` to mirror what `Metadata` reports.
     pub fn setPermissions(self: *File, perms: Permissions) FsError!void {
-        if (is_windows) @compileError("Windows File: pending");
+        if (is_windows) {
+            var info: win32.BY_HANDLE_FILE_INFORMATION = undefined;
+            if (win32.GetFileInformationByHandle(self.fd, &info) == 0) {
+                return win32.fromLastError(win32.GetLastError());
+            }
+            var attrs = info.dwFileAttributes;
+            if (perms.readonly()) {
+                attrs |= win32.FILE_ATTRIBUTE_READONLY;
+            } else {
+                attrs &= ~win32.FILE_ATTRIBUTE_READONLY;
+            }
+            if (attrs == 0) attrs = win32.FILE_ATTRIBUTE_NORMAL;
+            var basic = win32.FILE_BASIC_INFO{ .FileAttributes = attrs };
+            if (win32.SetFileInformationByHandle(self.fd, win32.FileBasicInfo, &basic, @sizeOf(win32.FILE_BASIC_INFO)) == 0) {
+                return win32.fromLastError(win32.GetLastError());
+            }
+            return;
+        }
         const m: std.c.mode_t = @intCast(perms.getMode());
         if (syscall.fchmod(self.fd, m) != 0) return fs_error.fromErrno(fs_error.currentErrno());
     }
@@ -357,7 +429,12 @@ pub const File = struct {
     }
 
     pub fn syncCancel(self: *File, c: *lib.Cancel) (FileError || error{Cancelled})!void {
-        if (is_windows) @compileError("Windows File: pending");
+        if (is_windows) {
+            if (inCoroutine()) return blockingFsyncCancel(self.fd, c) catch |e| return e;
+            if (c.isFired()) return error.Cancelled;
+            if (win32.FlushFileBuffers(self.fd) == 0) return win32.fromLastError(win32.GetLastError());
+            return;
+        }
         if (inCoroutine()) {
             return blockingFsyncCancel(self.fd, c) catch |e| return e;
         }
@@ -481,60 +558,78 @@ fn blockingOpen(z: *const PathZ, flags: c_int, mode: c_uint) c_int {
     return result.fd;
 }
 
-fn blockingRead(fd: c_int, buf: []u8) FileError!usize {
+fn blockingRead(fd: Handle, buf: []u8) FileError!usize {
+    if (is_windows) return winIoBlocking(winRead, fd, buf.ptr, buf.len, null);
     const result = lib.runtime().reactor.fsRead(@intCast(fd), buf, reactor_fs.OFFSET_CUR, null);
     if (result.value < 0) return fs_error.fromErrno(result.err);
     return @intCast(result.value);
 }
 
-fn readRaw(fd: c_int, buf: []u8) FileError!usize {
+fn readRaw(fd: Handle, buf: []u8) FileError!usize {
+    if (is_windows) return winIoResultToErr(winRead(fd, buf.ptr, buf.len, null));
     const n = c_read(fd, buf.ptr, buf.len);
     if (n < 0) return fs_error.fromErrno(fs_error.currentErrno());
     return @intCast(n);
 }
 
-fn blockingWrite(fd: c_int, buf: []const u8) FileError!usize {
+fn blockingWrite(fd: Handle, buf: []const u8) FileError!usize {
+    if (is_windows) return winIoBlocking(winWrite, fd, buf.ptr, buf.len, null);
     const result = lib.runtime().reactor.fsWrite(@intCast(fd), buf, reactor_fs.OFFSET_CUR, null);
     if (result.value < 0) return fs_error.fromErrno(result.err);
     return @intCast(result.value);
 }
 
-fn writeRaw(fd: c_int, buf: []const u8) FileError!usize {
+fn writeRaw(fd: Handle, buf: []const u8) FileError!usize {
+    if (is_windows) return winIoResultToErr(winWrite(fd, buf.ptr, buf.len, null));
     const n = c_write(fd, buf.ptr, buf.len);
     if (n < 0) return fs_error.fromErrno(fs_error.currentErrno());
     return @intCast(n);
 }
 
-fn blockingPread(fd: c_int, buf: []u8, offset: u64) FileError!usize {
+fn blockingPread(fd: Handle, buf: []u8, offset: u64) FileError!usize {
+    if (is_windows) return winIoBlocking(winRead, fd, buf.ptr, buf.len, offset);
     const result = lib.runtime().reactor.fsRead(@intCast(fd), buf, offset, null);
     if (result.value < 0) return fs_error.fromErrno(result.err);
     return @intCast(result.value);
 }
 
-fn preadRaw(fd: c_int, buf: []u8, offset: u64) FileError!usize {
+fn preadRaw(fd: Handle, buf: []u8, offset: u64) FileError!usize {
+    if (is_windows) return winIoResultToErr(winRead(fd, buf.ptr, buf.len, offset));
     const n = c_pread(fd, buf.ptr, buf.len, @intCast(offset));
     if (n < 0) return fs_error.fromErrno(fs_error.currentErrno());
     return @intCast(n);
 }
 
-fn blockingPwrite(fd: c_int, buf: []const u8, offset: u64) FileError!usize {
+fn blockingPwrite(fd: Handle, buf: []const u8, offset: u64) FileError!usize {
+    if (is_windows) return winIoBlocking(winWrite, fd, buf.ptr, buf.len, offset);
     const result = lib.runtime().reactor.fsWrite(@intCast(fd), buf, offset, null);
     if (result.value < 0) return fs_error.fromErrno(result.err);
     return @intCast(result.value);
 }
 
-fn pwriteRaw(fd: c_int, buf: []const u8, offset: u64) FileError!usize {
+fn pwriteRaw(fd: Handle, buf: []const u8, offset: u64) FileError!usize {
+    if (is_windows) return winIoResultToErr(winWrite(fd, buf.ptr, buf.len, offset));
     const n = c_pwrite(fd, buf.ptr, buf.len, @intCast(offset));
     if (n < 0) return fs_error.fromErrno(fs_error.currentErrno());
     return @intCast(n);
 }
 
-fn blockingFsync(fd: c_int) FileError!void {
+fn blockingFsync(fd: Handle) FileError!void {
+    if (is_windows) {
+        const r = lib.spawnBlocking(winFlush, .{fd}) catch return error.SystemResources;
+        if (r.err != 0) return win32.fromLastError(r.err);
+        return;
+    }
     const result = lib.runtime().reactor.fsFsync(@intCast(fd), null);
     if (result.value != 0) return fs_error.fromErrno(result.err);
 }
 
-fn blockingFdatasync(fd: c_int) FileError!void {
+fn blockingFdatasync(fd: Handle) FileError!void {
+    if (is_windows) {
+        const r = lib.spawnBlocking(winFlush, .{fd}) catch return error.SystemResources;
+        if (r.err != 0) return win32.fromLastError(r.err);
+        return;
+    }
     const result = lib.runtime().reactor.fsFdatasync(@intCast(fd), null);
     if (result.value != 0) return fs_error.fromErrno(result.err);
 }
@@ -552,7 +647,14 @@ fn blockingFdatasync(fd: c_int) FileError!void {
 // cancelled CQE; we translate it to `error.Cancelled` here so the
 // caller's error set stays `FileError || error{Cancelled}`.
 
-fn blockingReadCancel(fd: c_int, buf: []u8, c: *lib.Cancel) (FileError || error{Cancelled})!usize {
+fn blockingReadCancel(fd: Handle, buf: []u8, c: *lib.Cancel) (FileError || error{Cancelled})!usize {
+    if (is_windows) {
+        // Boundary-only cancel: Windows fs rides spawnBlocking (no
+        // overlapped/IOCP file path yet), so the syscall runs to
+        // completion — same semantics as the Darwin fallback.
+        if (c.isFired()) return error.Cancelled;
+        return winIoBlocking(winRead, fd, buf.ptr, buf.len, null);
+    }
     const result = lib.runtime().reactor.fsRead(@intCast(fd), buf, reactor_fs.OFFSET_CUR, c);
     if (result.value < 0) {
         if (result.err == @intFromEnum(std.c.E.CANCELED)) return error.Cancelled;
@@ -561,7 +663,11 @@ fn blockingReadCancel(fd: c_int, buf: []u8, c: *lib.Cancel) (FileError || error{
     return @intCast(result.value);
 }
 
-fn blockingWriteCancel(fd: c_int, buf: []const u8, c: *lib.Cancel) (FileError || error{Cancelled})!usize {
+fn blockingWriteCancel(fd: Handle, buf: []const u8, c: *lib.Cancel) (FileError || error{Cancelled})!usize {
+    if (is_windows) {
+        if (c.isFired()) return error.Cancelled;
+        return winIoBlocking(winWrite, fd, buf.ptr, buf.len, null);
+    }
     const result = lib.runtime().reactor.fsWrite(@intCast(fd), buf, reactor_fs.OFFSET_CUR, c);
     if (result.value < 0) {
         if (result.err == @intFromEnum(std.c.E.CANCELED)) return error.Cancelled;
@@ -570,12 +676,129 @@ fn blockingWriteCancel(fd: c_int, buf: []const u8, c: *lib.Cancel) (FileError ||
     return @intCast(result.value);
 }
 
-fn blockingFsyncCancel(fd: c_int, c: *lib.Cancel) (FileError || error{Cancelled})!void {
+fn blockingFsyncCancel(fd: Handle, c: *lib.Cancel) (FileError || error{Cancelled})!void {
+    if (is_windows) {
+        if (c.isFired()) return error.Cancelled;
+        return blockingFsync(fd);
+    }
     const result = lib.runtime().reactor.fsFsync(@intCast(fd), c);
     if (result.value != 0) {
         if (result.err == @intFromEnum(std.c.E.CANCELED)) return error.Cancelled;
         return fs_error.fromErrno(result.err);
     }
+}
+
+// ─── Windows backend helpers ─────────────────────────────────────
+//
+// The Windows fs path mirrors the Darwin model: synchronous Win32
+// syscalls, bridged through `spawnBlocking` when called from a
+// coroutine so the calling worker isn't pinned. (Overlapped/IOCP
+// file I/O — the Windows analog of Linux's io_uring fs fast path —
+// is a later optimisation, not part of the capability landing.)
+// These helpers are only referenced from `is_windows` comptime
+// branches, so they're never analysed on POSIX.
+
+const WinOpenResult = struct { handle: win32.HANDLE, err: win32.DWORD };
+/// `n >= 0` is bytes transferred; `n < 0` means failure (see `err`).
+const WinIoResult = struct { n: i64, err: win32.DWORD };
+const WinFlushResult = struct { err: win32.DWORD };
+
+fn windowsOpen(path: []const u8, opts: OpenOptions) FsError!File {
+    const z = try win32.WPathZ.fromUtf8(path);
+
+    var access: win32.DWORD = 0;
+    if (opts.read) access |= win32.GENERIC_READ;
+    if (opts.append) {
+        // Append must use FILE_APPEND_DATA (not GENERIC_WRITE) so the
+        // kernel forces every write to EOF — the O_APPEND analog.
+        access |= win32.FILE_APPEND_DATA;
+    } else if (opts.write) {
+        access |= win32.GENERIC_WRITE;
+    }
+
+    const share = win32.FILE_SHARE_READ | win32.FILE_SHARE_WRITE | win32.FILE_SHARE_DELETE;
+
+    const disp: win32.DWORD = if (opts.create_new)
+        win32.CREATE_NEW
+    else if (opts.create and opts.truncate)
+        win32.CREATE_ALWAYS
+    else if (opts.create)
+        win32.OPEN_ALWAYS
+    else if (opts.truncate)
+        win32.TRUNCATE_EXISTING
+    else
+        win32.OPEN_EXISTING;
+
+    const attrs: win32.DWORD = if ((opts.mode & 0o200) == 0)
+        win32.FILE_ATTRIBUTE_READONLY
+    else
+        win32.FILE_ATTRIBUTE_NORMAL;
+
+    const r = if (inCoroutine())
+        (lib.spawnBlocking(winOpen, .{ &z, access, share, disp, attrs }) catch return error.SystemResources)
+    else
+        winOpen(&z, access, share, disp, attrs);
+
+    if (r.handle == win32.INVALID_HANDLE_VALUE) return win32.fromLastError(r.err);
+    return .{ .fd = r.handle, .append = opts.append };
+}
+
+fn winOpen(z: *const win32.WPathZ, access: win32.DWORD, share: win32.DWORD, disp: win32.DWORD, attrs: win32.DWORD) WinOpenResult {
+    const h = win32.CreateFileW(z.ptr(), access, share, null, disp, attrs, null);
+    if (h == win32.INVALID_HANDLE_VALUE) return .{ .handle = h, .err = win32.GetLastError() };
+    return .{ .handle = h, .err = 0 };
+}
+
+fn overlappedFor(offset: ?u64, ov: *win32.OVERLAPPED) ?*win32.OVERLAPPED {
+    const o = offset orelse return null;
+    ov.DUMMYUNIONNAME = .{ .DUMMYSTRUCTNAME = .{
+        .Offset = @truncate(o),
+        .OffsetHigh = @truncate(o >> 32),
+    } };
+    return ov;
+}
+
+fn winRead(h: win32.HANDLE, ptr: [*]u8, len: usize, offset: ?u64) WinIoResult {
+    var ov: win32.OVERLAPPED = .{};
+    const ovp = overlappedFor(offset, &ov);
+    const want: win32.DWORD = @intCast(@min(len, @as(usize, std.math.maxInt(win32.DWORD))));
+    var got: win32.DWORD = 0;
+    if (win32.ReadFile(h, ptr, want, &got, ovp) == 0) {
+        const e = win32.GetLastError();
+        // Reading at/after EOF via OVERLAPPED returns FALSE +
+        // ERROR_HANDLE_EOF; normalise to a 0-byte (EOF) read.
+        if (e == win32.ERROR_HANDLE_EOF) return .{ .n = 0, .err = 0 };
+        return .{ .n = -1, .err = e };
+    }
+    return .{ .n = @intCast(got), .err = 0 };
+}
+
+fn winWrite(h: win32.HANDLE, ptr: [*]const u8, len: usize, offset: ?u64) WinIoResult {
+    var ov: win32.OVERLAPPED = .{};
+    const ovp = overlappedFor(offset, &ov);
+    const want: win32.DWORD = @intCast(@min(len, @as(usize, std.math.maxInt(win32.DWORD))));
+    var put: win32.DWORD = 0;
+    if (win32.WriteFile(h, ptr, want, &put, ovp) == 0) {
+        return .{ .n = -1, .err = win32.GetLastError() };
+    }
+    return .{ .n = @intCast(put), .err = 0 };
+}
+
+fn winFlush(h: win32.HANDLE) WinFlushResult {
+    if (win32.FlushFileBuffers(h) == 0) return .{ .err = win32.GetLastError() };
+    return .{ .err = 0 };
+}
+
+/// Run a Win32 read/write helper on the blocking pool and map its
+/// result to the typed error set.
+fn winIoBlocking(comptime io_fn: anytype, fd: Handle, ptr: anytype, len: usize, offset: ?u64) FileError!usize {
+    const r = lib.spawnBlocking(io_fn, .{ fd, ptr, len, offset }) catch return error.SystemResources;
+    return winIoResultToErr(r);
+}
+
+fn winIoResultToErr(r: WinIoResult) FileError!usize {
+    if (r.n < 0) return win32.fromLastError(r.err);
+    return @intCast(r.n);
 }
 
 // ─── libc externs not in std.c ───────────────────────────────────
@@ -627,30 +850,12 @@ fn pathZInto(p: []const u8, out: *PathZ) FsError!void {
 // ─── Tests ───────────────────────────────────────────────────────
 
 const testing = std.testing;
+const tu = @import("../testing.zig");
 
 const TestState = struct {
-    tmp_path: [:0]const u8,
+    tmp_path: []const u8,
     ok: bool = false,
 };
-
-/// Allocate a NUL-terminated unique temp dir under /tmp via
-/// mkdtemp. Returned slice is allocator-owned.
-fn allocTmpDir(allocator: std.mem.Allocator) ![:0]u8 {
-    const tmpl = "/tmp/volt-file-XXXXXX";
-    const buf = try allocator.allocSentinel(u8, tmpl.len, 0);
-    @memcpy(buf[0..tmpl.len], tmpl);
-    if (syscall.c_mkdtemp(buf.ptr) == null) {
-        allocator.free(buf);
-        return error.MkdtempFailed;
-    }
-    return buf;
-}
-
-fn cleanupTmpFile(tmp: [:0]const u8, leaf: []const u8) void {
-    var buf: [256:0]u8 = undefined;
-    const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ tmp, leaf }) catch return;
-    _ = syscall.c_unlink(full.ptr);
-}
 
 fn writeReadCycle(state: *TestState) !void {
     var path_buf: [256:0]u8 = undefined;
@@ -673,18 +878,12 @@ fn writeReadCycle(state: *TestState) !void {
 }
 
 test "File: create, writeAll, sync, seek-to-start, readFull round-trip" {
-    if (is_windows) return error.SkipZigTest;
-
-    const tmp = try allocTmpDir(testing.allocator);
-    defer {
-        cleanupTmpFile(tmp, "wr.txt");
-        _ = syscall.c_rmdir(tmp.ptr);
-        testing.allocator.free(tmp);
-    }
+    var tmp = try tu.TempDir.create(testing.allocator);
+    defer tmp.deinit();
 
     var rt = try lib.Runtime.init(.{ .allocator = testing.allocator });
     defer rt.deinit();
-    var state = TestState{ .tmp_path = tmp };
+    var state = TestState{ .tmp_path = tmp.path };
     try (try rt.run(writeReadCycle, .{&state}));
     try testing.expect(state.ok);
 }
@@ -710,16 +909,11 @@ fn pwriteReadAt(state: *TestState) !void {
 }
 
 test "File: pwrite / pread at offset" {
-    if (is_windows) return error.SkipZigTest;
-    const tmp = try allocTmpDir(testing.allocator);
-    defer {
-        cleanupTmpFile(tmp, "poff.txt");
-        _ = syscall.c_rmdir(tmp.ptr);
-        testing.allocator.free(tmp);
-    }
+    var tmp = try tu.TempDir.create(testing.allocator);
+    defer tmp.deinit();
     var rt = try lib.Runtime.init(.{ .allocator = testing.allocator });
     defer rt.deinit();
-    var state = TestState{ .tmp_path = tmp };
+    var state = TestState{ .tmp_path = tmp.path };
     try (try rt.run(pwriteReadAt, .{&state}));
     try testing.expect(state.ok);
 }
@@ -737,16 +931,11 @@ fn truncateShrinks(state: *TestState) !void {
 }
 
 test "File: setLen truncates to exact size" {
-    if (is_windows) return error.SkipZigTest;
-    const tmp = try allocTmpDir(testing.allocator);
-    defer {
-        cleanupTmpFile(tmp, "trunc.txt");
-        _ = syscall.c_rmdir(tmp.ptr);
-        testing.allocator.free(tmp);
-    }
+    var tmp = try tu.TempDir.create(testing.allocator);
+    defer tmp.deinit();
     var rt = try lib.Runtime.init(.{ .allocator = testing.allocator });
     defer rt.deinit();
-    var state = TestState{ .tmp_path = tmp };
+    var state = TestState{ .tmp_path = tmp.path };
     try (try rt.run(truncateShrinks, .{&state}));
     try testing.expect(state.ok);
 }
@@ -767,16 +956,11 @@ fn createNewRejectsExisting(state: *TestState) !void {
 }
 
 test "File: create_new on existing file returns error.AlreadyExists" {
-    if (is_windows) return error.SkipZigTest;
-    const tmp = try allocTmpDir(testing.allocator);
-    defer {
-        cleanupTmpFile(tmp, "exists.txt");
-        _ = syscall.c_rmdir(tmp.ptr);
-        testing.allocator.free(tmp);
-    }
+    var tmp = try tu.TempDir.create(testing.allocator);
+    defer tmp.deinit();
     var rt = try lib.Runtime.init(.{ .allocator = testing.allocator });
     defer rt.deinit();
-    var state = TestState{ .tmp_path = tmp };
+    var state = TestState{ .tmp_path = tmp.path };
     try (try rt.run(createNewRejectsExisting, .{&state}));
     try testing.expect(state.ok);
 }
@@ -802,16 +986,11 @@ fn stdIoReaderRoundTrip(state: *TestState) !void {
 }
 
 test "File: std.Io.Reader adapter — takeDelimiterExclusive" {
-    if (is_windows) return error.SkipZigTest;
-    const tmp = try allocTmpDir(testing.allocator);
-    defer {
-        cleanupTmpFile(tmp, "std-io.txt");
-        _ = syscall.c_rmdir(tmp.ptr);
-        testing.allocator.free(tmp);
-    }
+    var tmp = try tu.TempDir.create(testing.allocator);
+    defer tmp.deinit();
     var rt = try lib.Runtime.init(.{ .allocator = testing.allocator });
     defer rt.deinit();
-    var state = TestState{ .tmp_path = tmp };
+    var state = TestState{ .tmp_path = tmp.path };
     try (try rt.run(stdIoReaderRoundTrip, .{&state}));
     try testing.expect(state.ok);
 }
@@ -889,7 +1068,7 @@ test "File.readCancel: in-flight cancel returns error.Cancelled" {
 // ─── Phase 3E tests: additional cancel coverage ────────────────
 
 const Phase3ECtx = struct {
-    tmp_path: [:0]const u8,
+    tmp_path: []const u8,
     c: *lib.Cancel,
     first_write_n: usize = 0,
     second_write_was_cancelled: bool = false,
@@ -915,16 +1094,12 @@ test "File.writeCancel: cancel that never fires returns the actual result" {
     defer rt.deinit();
     if (rt.fs_rings == null) return error.SkipZigTest;
 
-    const tmp = try allocTmpDir(testing.allocator);
-    defer {
-        cleanupTmpFile(tmp, "happy.txt");
-        _ = syscall.c_rmdir(tmp.ptr);
-        testing.allocator.free(tmp);
-    }
+    var tmp = try tu.TempDir.create(testing.allocator);
+    defer tmp.deinit();
 
     var cancel = lib.Cancel.init(rt);
     defer cancel.deinit();
-    var ctx = Phase3ECtx{ .tmp_path = tmp, .c = &cancel };
+    var ctx = Phase3ECtx{ .tmp_path = tmp.path, .c = &cancel };
     try (try rt.run(phase3eHappyBody, .{&ctx}));
     try testing.expectEqual(@as(usize, 5), ctx.happy_path_n);
 }
@@ -952,16 +1127,12 @@ test "File.writeCancel: post-success fire makes the next op return Cancelled" {
     defer rt.deinit();
     if (rt.fs_rings == null) return error.SkipZigTest;
 
-    const tmp = try allocTmpDir(testing.allocator);
-    defer {
-        cleanupTmpFile(tmp, "reuse.txt");
-        _ = syscall.c_rmdir(tmp.ptr);
-        testing.allocator.free(tmp);
-    }
+    var tmp = try tu.TempDir.create(testing.allocator);
+    defer tmp.deinit();
 
     var cancel = lib.Cancel.init(rt);
     defer cancel.deinit();
-    var ctx = Phase3ECtx{ .tmp_path = tmp, .c = &cancel };
+    var ctx = Phase3ECtx{ .tmp_path = tmp.path, .c = &cancel };
     try (try rt.run(phase3eReuseBody, .{&ctx}));
     try testing.expectEqual(@as(usize, 5), ctx.first_write_n);
     try testing.expect(ctx.second_write_was_cancelled);
@@ -992,16 +1163,12 @@ test "File.writeCancel: double Cancel.fire() is idempotent" {
     defer rt.deinit();
     if (rt.fs_rings == null) return error.SkipZigTest;
 
-    const tmp = try allocTmpDir(testing.allocator);
-    defer {
-        cleanupTmpFile(tmp, "double.txt");
-        _ = syscall.c_rmdir(tmp.ptr);
-        testing.allocator.free(tmp);
-    }
+    var tmp = try tu.TempDir.create(testing.allocator);
+    defer tmp.deinit();
 
     var cancel = lib.Cancel.init(rt);
     defer cancel.deinit();
-    var ctx = Phase3ECtx{ .tmp_path = tmp, .c = &cancel };
+    var ctx = Phase3ECtx{ .tmp_path = tmp.path, .c = &cancel };
     try (try rt.run(phase3eDoubleFireBody, .{&ctx}));
     try testing.expect(ctx.double_fire_was_cancelled);
 }

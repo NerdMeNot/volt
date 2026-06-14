@@ -15,12 +15,23 @@ const builtin = @import("builtin");
 
 const syscall = @import("syscall.zig");
 const fs_error = @import("error.zig");
+const win32 = @import("win32.zig");
 const PlatformStat = @import("metadata.zig").PlatformStat;
 
 const is_windows = builtin.os.tag == .windows;
 const page_size = std.heap.page_size_min;
 
 pub const FsError = fs_error.FsError;
+
+/// Handle type accepted by `mapFile` — a POSIX fd or a Windows file
+/// `HANDLE` (matches `File.fd`).
+pub const MapHandle = if (is_windows) win32.HANDLE else c_int;
+
+/// Windows keeps a separate mapping-object handle alongside the view
+/// pointer; it must be closed on `deinit`. Empty on POSIX.
+const WinMapState = if (is_windows) struct {
+    mapping: win32.HANDLE = undefined,
+} else struct {};
 
 // ─── Options ─────────────────────────────────────────────────────
 
@@ -66,6 +77,8 @@ pub const MappedFile = struct {
     len: usize,
     /// Whether the mapping is writable (drives `asBytesMut` access).
     writable: bool,
+    /// Windows-only mapping-object handle (empty struct on POSIX).
+    win: WinMapState = .{},
 
     /// Read-only slice of the mapped region.
     pub fn asBytes(self: MappedFile) []const u8 {
@@ -80,7 +93,12 @@ pub const MappedFile = struct {
 
     /// Pass an access hint to the kernel for the whole mapping.
     pub fn advise(self: *MappedFile, hint: Advice) FsError!void {
-        if (is_windows) @compileError("Windows madvise: pending");
+        if (is_windows) {
+            // Windows has no direct madvise equivalent for most hints
+            // (PrefetchVirtualMemory only covers WILLNEED). Advice is a
+            // non-binding hint, so a no-op is a correct implementation.
+            return;
+        }
         const adv = darwinOrLinuxAdvice(hint);
         if (std.c.madvise(@ptrCast(self.data), pageRound(self.len), adv) != 0) {
             return fs_error.fromErrno(fs_error.currentErrno());
@@ -90,14 +108,24 @@ pub const MappedFile = struct {
     /// Lock pages in physical memory — kernel won't page them out.
     /// Requires CAP_IPC_LOCK / root on Linux; bounded by RLIMIT_MEMLOCK.
     pub fn lock(self: *MappedFile) FsError!void {
-        if (is_windows) @compileError("Windows VirtualLock: pending");
+        if (is_windows) {
+            if (win32.VirtualLock(@ptrCast(self.data), pageRound(self.len)) == 0) {
+                return win32.fromLastError(win32.GetLastError());
+            }
+            return;
+        }
         if (c_mlock(@ptrCast(self.data), pageRound(self.len)) != 0) {
             return fs_error.fromErrno(fs_error.currentErrno());
         }
     }
 
     pub fn unlock(self: *MappedFile) FsError!void {
-        if (is_windows) @compileError("Windows VirtualUnlock: pending");
+        if (is_windows) {
+            if (win32.VirtualUnlock(@ptrCast(self.data), pageRound(self.len)) == 0) {
+                return win32.fromLastError(win32.GetLastError());
+            }
+            return;
+        }
         if (c_munlock(@ptrCast(self.data), pageRound(self.len)) != 0) {
             return fs_error.fromErrno(fs_error.currentErrno());
         }
@@ -105,15 +133,26 @@ pub const MappedFile = struct {
 
     /// Synchronously flush dirty pages back to the file.
     pub fn flush(self: *MappedFile) FsError!void {
-        if (is_windows) @compileError("Windows FlushViewOfFile: pending");
+        if (is_windows) {
+            if (win32.FlushViewOfFile(@ptrCast(self.data), self.len) == 0) {
+                return win32.fromLastError(win32.GetLastError());
+            }
+            return;
+        }
         if (std.c.msync(@ptrCast(self.data), pageRound(self.len), std.c.MSF.SYNC) != 0) {
             return fs_error.fromErrno(fs_error.currentErrno());
         }
     }
 
-    /// Async msync — kicks off the flush, doesn't wait.
+    /// Async msync — kicks off the flush, doesn't wait. (Windows
+    /// FlushViewOfFile has no async variant; behaves like `flush`.)
     pub fn flushAsync(self: *MappedFile) FsError!void {
-        if (is_windows) @compileError("Windows FlushViewOfFile: pending");
+        if (is_windows) {
+            if (win32.FlushViewOfFile(@ptrCast(self.data), self.len) == 0) {
+                return win32.fromLastError(win32.GetLastError());
+            }
+            return;
+        }
         if (std.c.msync(@ptrCast(self.data), pageRound(self.len), std.c.MSF.ASYNC) != 0) {
             return fs_error.fromErrno(fs_error.currentErrno());
         }
@@ -122,7 +161,15 @@ pub const MappedFile = struct {
     /// Change protection on the live mapping. Useful for write-once-
     /// then-protect patterns.
     pub fn protect(self: *MappedFile, protection: Protection) FsError!void {
-        if (is_windows) @compileError("Windows VirtualProtect: pending");
+        if (is_windows) {
+            const np: win32.DWORD = if (protection == .read_write) win32.PAGE_READWRITE else win32.PAGE_READONLY;
+            var old: win32.DWORD = 0;
+            if (win32.VirtualProtect(@ptrCast(self.data), pageRound(self.len), np, &old) == 0) {
+                return win32.fromLastError(win32.GetLastError());
+            }
+            self.writable = (protection == .read_write);
+            return;
+        }
         const prot = protToC(protection);
         if (std.c.mprotect(@ptrCast(self.data), pageRound(self.len), prot) != 0) {
             return fs_error.fromErrno(fs_error.currentErrno());
@@ -147,7 +194,12 @@ pub const MappedFile = struct {
     /// Release the mapping.
     pub fn deinit(self: *MappedFile) void {
         if (self.len == 0) return;
-        if (is_windows) @compileError("Windows UnmapViewOfFile: pending");
+        if (is_windows) {
+            _ = win32.UnmapViewOfFile(@ptrCast(self.data));
+            _ = win32.CloseHandle(self.win.mapping);
+            self.len = 0;
+            return;
+        }
         _ = std.c.munmap(@ptrCast(self.data), pageRound(self.len));
         self.len = 0;
     }
@@ -156,8 +208,8 @@ pub const MappedFile = struct {
 // ─── Mapping entry points ────────────────────────────────────────
 
 /// Map an open file's contents into memory.
-pub fn mapFile(fd: c_int, opts: MapOptions) FsError!MappedFile {
-    if (is_windows) @compileError("Windows MapViewOfFile: pending");
+pub fn mapFile(fd: MapHandle, opts: MapOptions) FsError!MappedFile {
+    if (is_windows) return winMapFile(fd, opts);
     if (opts.offset != 0 and opts.offset % page_size != 0) return error.InvalidPath;
 
     var actual_len = opts.length;
@@ -190,7 +242,24 @@ pub fn mapFile(fd: c_int, opts: MapOptions) FsError!MappedFile {
 /// Anonymous mapping — backed by zeroed pages, not by a file.
 /// Useful for large scratch buffers that the kernel can swap.
 pub fn mapAnonymous(opts: AnonOptions) FsError!MappedFile {
-    if (is_windows) @compileError("Windows anonymous mapping: pending");
+    if (is_windows) {
+        if (opts.length == 0) return error.InvalidPath;
+        // Anonymous = file mapping backed by the system paging file
+        // (hFile = INVALID_HANDLE_VALUE). Always shared-style access.
+        const flprotect = winMapProtect(opts.protection, .shared);
+        const size: u64 = opts.length;
+        const hmap = win32.CreateFileMappingW(win32.INVALID_HANDLE_VALUE, null, flprotect, @truncate(size >> 32), @truncate(size), null) orelse
+            return win32.fromLastError(win32.GetLastError());
+        errdefer _ = win32.CloseHandle(hmap);
+        const view = win32.MapViewOfFile(hmap, winMapAccess(opts.protection, .shared), 0, 0, opts.length) orelse
+            return win32.fromLastError(win32.GetLastError());
+        return .{
+            .data = @ptrCast(@alignCast(view)),
+            .len = opts.length,
+            .writable = opts.protection == .read_write,
+            .win = .{ .mapping = hmap },
+        };
+    }
     if (opts.length == 0) return error.InvalidPath;
 
     const prot = protToC(opts.protection);
@@ -205,6 +274,60 @@ pub fn mapAnonymous(opts: AnonOptions) FsError!MappedFile {
         .data = @ptrCast(@alignCast(raw)),
         .len = opts.length,
         .writable = opts.protection == .read_write,
+    };
+}
+
+// ─── Windows mapping helpers ─────────────────────────────────────
+// Only referenced from `is_windows` branches → never analysed on POSIX.
+
+fn winMapFile(fd: MapHandle, opts: MapOptions) FsError!MappedFile {
+    // Windows requires the view offset to be allocation-granularity
+    // aligned (64 KiB); MapViewOfFile fails otherwise and we surface
+    // it as an error from GetLastError.
+    var actual_len = opts.length;
+    if (actual_len == 0) {
+        var info: win32.BY_HANDLE_FILE_INFORMATION = undefined;
+        if (win32.GetFileInformationByHandle(fd, &info) == 0) return win32.fromLastError(win32.GetLastError());
+        const file_size = (@as(u64, info.nFileSizeHigh) << 32) | @as(u64, info.nFileSizeLow);
+        if (file_size <= opts.offset) return error.InvalidPath;
+        actual_len = @intCast(file_size - opts.offset);
+    }
+    if (actual_len == 0) return error.InvalidPath;
+
+    // The mapping object must be sized to cover offset + length.
+    const max_size: u64 = opts.offset + actual_len;
+    const hmap = win32.CreateFileMappingW(fd, null, winMapProtect(opts.protection, opts.sharing), @truncate(max_size >> 32), @truncate(max_size), null) orelse
+        return win32.fromLastError(win32.GetLastError());
+    errdefer _ = win32.CloseHandle(hmap);
+
+    const view = win32.MapViewOfFile(hmap, winMapAccess(opts.protection, opts.sharing), @truncate(opts.offset >> 32), @truncate(opts.offset), actual_len) orelse
+        return win32.fromLastError(win32.GetLastError());
+
+    return .{
+        .data = @ptrCast(@alignCast(view)),
+        .len = actual_len,
+        .writable = opts.protection == .read_write,
+        .win = .{ .mapping = hmap },
+    };
+}
+
+fn winMapProtect(p: Protection, s: Sharing) win32.DWORD {
+    return switch (p) {
+        .read_only => win32.PAGE_READONLY,
+        .read_write => switch (s) {
+            .shared => win32.PAGE_READWRITE,
+            .private => win32.PAGE_WRITECOPY,
+        },
+    };
+}
+
+fn winMapAccess(p: Protection, s: Sharing) win32.DWORD {
+    return switch (p) {
+        .read_only => win32.FILE_MAP_READ,
+        .read_write => switch (s) {
+            .shared => win32.FILE_MAP_WRITE,
+            .private => win32.FILE_MAP_COPY,
+        },
     };
 }
 
@@ -254,45 +377,23 @@ const c_munlock = if (is_windows) {} else @extern(
 // ─── Tests ───────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn allocMmapTmp(allocator: std.mem.Allocator) ![:0]u8 {
-    const tmpl = "/tmp/volt-mmap-XXXXXX";
-    const buf = try allocator.allocSentinel(u8, tmpl.len, 0);
-    @memcpy(buf[0..tmpl.len], tmpl);
-    if (syscall.c_mkdtemp(buf.ptr) == null) {
-        allocator.free(buf);
-        return error.MkdtempFailed;
-    }
-    return buf;
-}
+const test_util = @import("../testing.zig");
+const File = @import("file.zig").File;
 
 test "MappedFile: map read-only file, read slice" {
-    if (is_windows) return error.SkipZigTest;
-    const tmp = try allocMmapTmp(testing.allocator);
-    defer testing.allocator.free(tmp);
-    defer _ = syscall.c_rmdir(tmp.ptr);
+    var tmp = try test_util.TempDir.create(testing.allocator);
+    defer tmp.deinit();
+    const fp = try tmp.writeChild(testing.allocator, "data.bin", "hello mmap");
+    defer testing.allocator.free(fp);
 
-    var fp_buf: [256:0]u8 = undefined;
-    const fp = try std.fmt.bufPrintZ(&fp_buf, "{s}/data.bin", .{tmp});
-    defer _ = syscall.c_unlink(fp.ptr);
-
-    const fd_create = syscall.c_open(fp.ptr, syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC, 0o644);
-    try testing.expect(fd_create >= 0);
-    const payload = "hello mmap";
-    try testing.expectEqual(@as(isize, payload.len), syscall.c_write(fd_create, payload.ptr, payload.len));
-    _ = syscall.c_close(fd_create);
-
-    const fd_read = syscall.c_open(fp.ptr, syscall.O_RDONLY, 0);
-    try testing.expect(fd_read >= 0);
-    defer _ = syscall.c_close(fd_read);
-
-    var m = try mapFile(fd_read, .{});
+    var f = try File.open(fp);
+    defer f.close();
+    var m = try mapFile(f.fd, .{});
     defer m.deinit();
-    try testing.expectEqualStrings(payload, m.asBytes()[0..payload.len]);
+    try testing.expectEqualStrings("hello mmap", m.asBytes()[0..10]);
 }
 
 test "MappedFile: anonymous mapping is zeroed + writable" {
-    if (is_windows) return error.SkipZigTest;
     var m = try mapAnonymous(.{ .length = page_size });
     defer m.deinit();
 
@@ -305,40 +406,36 @@ test "MappedFile: anonymous mapping is zeroed + writable" {
 }
 
 test "MappedFile: writable shared map + flush round-trip" {
-    if (is_windows) return error.SkipZigTest;
-    const tmp = try allocMmapTmp(testing.allocator);
-    defer testing.allocator.free(tmp);
-    defer _ = syscall.c_rmdir(tmp.ptr);
+    var tmp = try test_util.TempDir.create(testing.allocator);
+    defer tmp.deinit();
+    const fp = try tmp.childPath(testing.allocator, "rw.bin");
+    defer testing.allocator.free(fp);
 
-    var fp_buf: [256:0]u8 = undefined;
-    const fp = try std.fmt.bufPrintZ(&fp_buf, "{s}/rw.bin", .{tmp});
-    defer _ = syscall.c_unlink(fp.ptr);
-
-    // Create a 1-page file (mmap requires non-zero size).
-    const fd = syscall.c_open(fp.ptr, syscall.O_RDWR | syscall.O_CREAT | syscall.O_TRUNC, 0o644);
-    try testing.expect(fd >= 0);
-    var zeros = [_]u8{0} ** 64;
-    try testing.expect(syscall.c_write(fd, &zeros, zeros.len) == zeros.len);
+    // Create a 64-byte file (mmap requires non-zero size).
     {
-        var m = try mapFile(fd, .{ .protection = .read_write, .sharing = .shared, .length = zeros.len });
+        var cf = try File.create(fp);
+        try cf.writeAll(&([_]u8{0} ** 64));
+        cf.close();
+    }
+    {
+        var f = try File.openOptions(fp, .{ .read = true, .write = true });
+        defer f.close();
+        var m = try mapFile(f.fd, .{ .protection = .read_write, .sharing = .shared, .length = 64 });
         defer m.deinit();
         const mut = try m.asBytesMut();
         @memcpy(mut[0..5], "READY");
         try m.flush();
     }
-    _ = syscall.c_close(fd);
 
-    // Reopen + readback.
-    const fd2 = syscall.c_open(fp.ptr, syscall.O_RDONLY, 0);
-    defer _ = syscall.c_close(fd2);
+    // Reopen + readback through the (cross-platform) File API.
+    var rf = try File.open(fp);
+    defer rf.close();
     var buf: [5]u8 = undefined;
-    const c_read = @extern(*const fn (c_int, [*]u8, usize) callconv(.c) isize, .{ .name = "read" });
-    _ = c_read(fd2, &buf, buf.len);
+    _ = try rf.readFull(&buf);
     try testing.expectEqualStrings("READY", &buf);
 }
 
 test "MappedFile: advise works on a live mapping" {
-    if (is_windows) return error.SkipZigTest;
     var m = try mapAnonymous(.{ .length = page_size * 4 });
     defer m.deinit();
     try m.advise(.sequential);
@@ -347,7 +444,6 @@ test "MappedFile: advise works on a live mapping" {
 }
 
 test "MappedFile: protect read-only blocks subsequent write" {
-    if (is_windows) return error.SkipZigTest;
     var m = try mapAnonymous(.{ .length = page_size });
     defer m.deinit();
     const mut = try m.asBytesMut();

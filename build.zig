@@ -131,6 +131,44 @@ pub fn build(b: *std.Build) void {
         b.step("stress", "Run 60s multi-primitive stress test under multi-worker").dependOn(&run.step);
     }
 
+    // Windows fs cross-compile gate (issue #6). Forces an
+    // `x86_64-windows-gnu` target so every `is_windows @compileError`
+    // in `src/fs*` is instantiated — the default-target build does NOT
+    // catch them because `lib.zig` never calls the gated paths.
+    // Compile-only: we build (and cross-link) the artifact, never run
+    // it. Green ⇔ no Windows fs stub survives.
+    {
+        const win_target = b.resolveTargetQuery(.{
+            .cpu_arch = .x86_64,
+            .os_tag = .windows,
+            .abi = .gnu,
+        });
+        const volt_win = b.createModule(.{
+            .root_source_file = b.path("src/lib.zig"),
+            .target = win_target,
+            .optimize = .Debug,
+        });
+        volt_win.link_libc = true;
+        link_x86_64_ctx(volt_win, b, win_target);
+
+        const check_mod = b.createModule(.{
+            .root_source_file = b.path("tools/check_windows.zig"),
+            .target = win_target,
+            .optimize = .Debug,
+        });
+        check_mod.link_libc = true;
+        check_mod.addImport("volt", volt_win);
+
+        const check_exe = b.addExecutable(.{
+            .name = "volt-check-windows",
+            .root_module = check_mod,
+        });
+        b.step(
+            "check-windows",
+            "Cross-compile fs.* for Windows to catch is_windows @compileError gaps (issue #6)",
+        ).dependOn(&check_exe.step);
+    }
+
     // POC spikes — isolated proof-of-concept benches under `spike/`.
     // Each is standalone; POCs do not import the volt module.
     const spikes = [_]struct { name: []const u8, src: []const u8, desc: []const u8 }{

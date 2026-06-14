@@ -13,6 +13,7 @@ const builtin = @import("builtin");
 const syscall = @import("syscall.zig");
 const fs_error = @import("error.zig");
 const metadata_mod = @import("metadata.zig");
+const win32 = @import("win32.zig");
 const fs = @import("../fs.zig");
 
 const is_windows = builtin.os.tag == .windows;
@@ -42,13 +43,14 @@ pub const RemoveOptions = struct {
 /// parent directories (`mkdir -p`); a pre-existing leaf is not an
 /// error in that mode.
 pub fn create(path: []const u8, opts: CreateOptions) FsError!void {
-    if (is_windows) @compileError("Windows Dir.create: pending");
     if (!opts.recursive) return mkdirOne(path, opts.mode);
 
-    // Walk each prefix, ensuring it exists as a directory.
+    // Walk each prefix, ensuring it exists as a directory. Windows
+    // accepts both separators, so treat `\` as a separator too there.
     var end: usize = 0;
     while (end <= path.len) : (end += 1) {
-        if (end == path.len or path[end] == '/') {
+        const at_sep = end == path.len or path[end] == '/' or (is_windows and path[end] == '\\');
+        if (at_sep) {
             if (end == 0) continue;
             mkdirOne(path[0..end], opts.mode) catch |e| switch (e) {
                 error.AlreadyExists => {},
@@ -61,7 +63,6 @@ pub fn create(path: []const u8, opts: CreateOptions) FsError!void {
 /// Remove a directory. `opts.recursive = true` deletes contents
 /// first (`rm -rf`); the default expects the directory to be empty.
 pub fn remove(allocator: std.mem.Allocator, path: []const u8, opts: RemoveOptions) (FsError || error{OutOfMemory})!void {
-    if (is_windows) @compileError("Windows Dir.remove: pending");
     if (!opts.recursive) return rmdirOne(path);
 
     var d = try Dir.open(path);
@@ -76,6 +77,10 @@ pub fn remove(allocator: std.mem.Allocator, path: []const u8, opts: RemoveOption
                 remove(allocator, child, opts) catch |e| {
                     saw_err = e;
                 };
+            } else if (is_windows) {
+                fs.unlink(child) catch |e| {
+                    saw_err = e;
+                };
             } else {
                 if (syscall.c_unlink(@ptrCast(try toZ(child))) != 0) {
                     saw_err = fs_error.fromErrno(fs_error.currentErrno());
@@ -88,6 +93,11 @@ pub fn remove(allocator: std.mem.Allocator, path: []const u8, opts: RemoveOption
 }
 
 fn mkdirOne(path: []const u8, mode: u32) FsError!void {
+    if (is_windows) {
+        const z = try win32.WPathZ.fromUtf8(path);
+        if (win32.CreateDirectoryW(z.ptr(), null) == 0) return win32.fromLastError(win32.GetLastError());
+        return;
+    }
     const z = try toZ(path);
     if (syscall.c_mkdir(z, @intCast(mode)) != 0) {
         return fs_error.fromErrno(fs_error.currentErrno());
@@ -95,6 +105,11 @@ fn mkdirOne(path: []const u8, mode: u32) FsError!void {
 }
 
 fn rmdirOne(path: []const u8) FsError!void {
+    if (is_windows) {
+        const z = try win32.WPathZ.fromUtf8(path);
+        if (win32.RemoveDirectoryW(z.ptr()) == 0) return win32.fromLastError(win32.GetLastError());
+        return;
+    }
     const z = try toZ(path);
     if (syscall.c_rmdir(z) != 0) return fs_error.fromErrno(fs_error.currentErrno());
 }
@@ -160,31 +175,63 @@ pub fn freeEntries(allocator: std.mem.Allocator, es: []Entry) void {
 
 // ─── Dir handle ──────────────────────────────────────────────────
 
-/// Live directory iterator. Wraps `DIR *` from libc. Single-pass —
-/// to rewind, close and reopen.
+/// Per-OS directory-handle backing. POSIX is a `DIR *`; Windows is a
+/// `FindFirstFileW` handle plus the buffered first result (Windows
+/// hands back the first entry from the *open* call, so the iterator
+/// must remember to yield it before calling `FindNextFileW`).
+const DirHandle = if (is_windows) win32.HANDLE else *std.c.DIR;
+
+const WinDirState = if (is_windows) struct {
+    find_data: win32.WIN32_FIND_DATAW = undefined,
+    /// The first entry is already in `find_data` after `open`.
+    first_pending: bool = false,
+    done: bool = false,
+    /// UTF-8 scratch for the current entry's name. `Entry.name`
+    /// borrows from here — valid until the next `next`/`close`, same
+    /// contract as the POSIX readdir buffer. Sized for a worst-case
+    /// MAX_PATH UTF-16 component.
+    name_buf: [win32.MAX_PATH * 3]u8 = undefined,
+} else struct {};
+
+/// Live directory iterator. Single-pass — to rewind, close and reopen.
 pub const Dir = struct {
-    handle: *std.c.DIR,
+    handle: DirHandle,
+    win: WinDirState = .{},
 
     /// Open `path` for streaming iteration. Caller closes via
     /// `close`. Fails with `FsError.NotFound` / `NotDirectory` /
-    /// `AccessDenied` per the underlying opendir errno.
+    /// `AccessDenied` per the underlying open errno.
     pub fn open(path: []const u8) FsError!Dir {
-        if (is_windows) @compileError("Windows Dir.open: pending");
+        if (is_windows) {
+            // FindFirstFileW wants a search glob: `<path>\*`.
+            var pattern_buf: [win32.WPATH_MAX]u8 = undefined;
+            const pattern = std.fmt.bufPrint(&pattern_buf, "{s}\\*", .{path}) catch return error.NameTooLong;
+            const wpat = try win32.WPathZ.fromUtf8(pattern);
+            var dir: Dir = .{ .handle = undefined, .win = .{} };
+            const h = win32.FindFirstFileW(wpat.ptr(), &dir.win.find_data);
+            if (h == win32.INVALID_HANDLE_VALUE) return win32.fromLastError(win32.GetLastError());
+            dir.handle = h;
+            dir.win.first_pending = true;
+            return dir;
+        }
         const z = try toZ(path);
         const handle = std.c.opendir(z) orelse return fs_error.fromErrno(fs_error.currentErrno());
         return .{ .handle = handle };
     }
 
     pub fn close(self: *Dir) void {
-        if (is_windows) @compileError("Windows Dir.close: pending");
+        if (is_windows) {
+            _ = win32.FindClose(self.handle);
+            return;
+        }
         _ = std.c.closedir(self.handle);
     }
 
     /// Next entry, or null at end. Skips `.` and `..`. The
-    /// returned name is borrowed from the readdir buffer — valid
+    /// returned name is borrowed from the iterator's buffer — valid
     /// only until the next `next` or `close`.
     pub fn next(self: *Dir) FsError!?Entry {
-        if (is_windows) @compileError("Windows Dir.next: pending");
+        if (is_windows) return self.nextWindows();
         while (true) {
             const entry = std.c.readdir(self.handle) orelse return null;
             const name_slice: []const u8 = if (comptime is_darwin())
@@ -197,6 +244,32 @@ pub const Dir = struct {
             return .{
                 .name = name_slice,
                 .kind = decodeDType(entry.type),
+            };
+        }
+    }
+
+    fn nextWindows(self: *Dir) FsError!?Entry {
+        while (true) {
+            if (self.win.done) return null;
+            if (self.win.first_pending) {
+                self.win.first_pending = false;
+            } else if (win32.FindNextFileW(self.handle, &self.win.find_data) == 0) {
+                const code = win32.GetLastError();
+                self.win.done = true;
+                if (code == win32.ERROR_NO_MORE_FILES) return null;
+                return win32.fromLastError(code);
+            }
+
+            const wname = &self.win.find_data.cFileName;
+            const wlen = std.mem.indexOfScalar(u16, wname, 0) orelse wname.len;
+            const u8len = std.unicode.utf16LeToUtf8(&self.win.name_buf, wname[0..wlen]) catch continue;
+            const name_slice = self.win.name_buf[0..u8len];
+
+            if (std.mem.eql(u8, name_slice, ".") or std.mem.eql(u8, name_slice, "..")) continue;
+
+            return .{
+                .name = name_slice,
+                .kind = winAttrKind(self.win.find_data.dwFileAttributes),
             };
         }
     }
@@ -320,6 +393,13 @@ fn decodeDType(t: u8) FileType {
     };
 }
 
+/// Windows entry kind from `WIN32_FIND_DATAW.dwFileAttributes`.
+fn winAttrKind(attrs: u32) FileType {
+    if ((attrs & win32.FILE_ATTRIBUTE_REPARSE_POINT) != 0) return .sym_link;
+    if ((attrs & win32.FILE_ATTRIBUTE_DIRECTORY) != 0) return .directory;
+    return .file;
+}
+
 fn is_darwin() bool {
     return switch (builtin.os.tag) {
         .macos, .ios, .tvos, .watchos => true,
@@ -351,7 +431,8 @@ fn toZ(p: []const u8) FsError![*:0]const u8 {
 /// `[abc]` / `[a-z]`. Returns owned paths; caller frees each
 /// + the slice.
 pub fn glob(allocator: std.mem.Allocator, pattern: []const u8) (FsError || error{OutOfMemory})![][]u8 {
-    if (is_windows) @compileError("Windows glob: pending");
+    // Portable: built entirely on Dir.open/next + fs.exists + path
+    // utilities, all of which are cross-platform.
     var results = std.array_list.Managed([]u8).init(allocator);
     errdefer {
         for (results.items) |item| allocator.free(item);
@@ -508,42 +589,27 @@ fn matchClass(class: []const u8, c: u8) bool {
 // ─── Tests ───────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn allocTmpDirGlob(allocator: std.mem.Allocator) ![:0]u8 {
-    const tmpl = "/tmp/volt-dirtest-XXXXXX";
-    const buf = try allocator.allocSentinel(u8, tmpl.len, 0);
-    @memcpy(buf[0..tmpl.len], tmpl);
-    if (syscall.c_mkdtemp(buf.ptr) == null) {
-        allocator.free(buf);
-        return error.MkdtempFailed;
-    }
-    return buf;
-}
+const tu = @import("../testing.zig");
 
 test "Dir.create + Dir.remove (non-recursive)" {
-    if (is_windows) return error.SkipZigTest;
-    const tmp = try allocTmpDirGlob(testing.allocator);
-    defer testing.allocator.free(tmp);
+    var tmp = try tu.TempDir.create(testing.allocator);
+    defer tmp.deinit();
 
-    var path_buf: [256]u8 = undefined;
-    const child = try std.fmt.bufPrint(&path_buf, "{s}/sub", .{tmp});
+    const child = try tmp.childPath(testing.allocator, "sub");
+    defer testing.allocator.free(child);
 
     try create(child, .{});
     const m = try fs.stat(child);
     try testing.expect(m.isDir());
     try remove(testing.allocator, child, .{});
-
-    // Parent tmp dir cleanup.
-    _ = syscall.c_rmdir(tmp.ptr);
 }
 
 test "Dir.create recursive (mkdir -p) + Dir.remove recursive (rm -rf)" {
-    if (is_windows) return error.SkipZigTest;
-    const tmp = try allocTmpDirGlob(testing.allocator);
-    defer testing.allocator.free(tmp);
+    var tmp = try tu.TempDir.create(testing.allocator);
+    defer tmp.deinit();
 
-    var path_buf: [256]u8 = undefined;
-    const deep = try std.fmt.bufPrint(&path_buf, "{s}/a/b/c/d", .{tmp});
+    const deep = try tmp.childPath(testing.allocator, "a/b/c/d");
+    defer testing.allocator.free(deep);
 
     try create(deep, .{ .recursive = true });
     const m = try fs.stat(deep);
@@ -551,42 +617,26 @@ test "Dir.create recursive (mkdir -p) + Dir.remove recursive (rm -rf)" {
 
     // Drop a file in `c` so the recursive remove has something to
     // clean up too.
-    var file_buf: [256:0]u8 = undefined;
-    const fp = try std.fmt.bufPrintZ(&file_buf, "{s}/a/b/c/note.txt", .{tmp});
-    const fd = syscall.c_open(fp.ptr, syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC, 0o644);
-    try testing.expect(fd >= 0);
-    _ = syscall.c_close(fd);
+    const note = try tmp.writeChild(testing.allocator, "a/b/c/note.txt", "");
+    testing.allocator.free(note);
 
-    var root_buf: [256]u8 = undefined;
-    const root = try std.fmt.bufPrint(&root_buf, "{s}/a", .{tmp});
+    const root = try tmp.childPath(testing.allocator, "a");
+    defer testing.allocator.free(root);
     try remove(testing.allocator, root, .{ .recursive = true });
 
     try testing.expect(!fs.exists(root));
-    _ = syscall.c_rmdir(tmp.ptr);
 }
 
 test "Dir.entries: snapshot returns files in the directory" {
-    if (is_windows) return error.SkipZigTest;
-    const tmp = try allocTmpDirGlob(testing.allocator);
-    defer testing.allocator.free(tmp);
-    defer _ = syscall.c_rmdir(tmp.ptr);
+    var tmp = try tu.TempDir.create(testing.allocator);
+    defer tmp.deinit();
 
     inline for (.{ "a.txt", "b.txt", "c.txt" }) |name| {
-        var fp: [256:0]u8 = undefined;
-        const z = try std.fmt.bufPrintZ(&fp, "{s}/{s}", .{ tmp, name });
-        const fd = syscall.c_open(z.ptr, syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC, 0o644);
-        try testing.expect(fd >= 0);
-        _ = syscall.c_close(fd);
-    }
-    defer {
-        inline for (.{ "a.txt", "b.txt", "c.txt" }) |name| {
-            var fp: [256:0]u8 = undefined;
-            const z = std.fmt.bufPrintZ(&fp, "{s}/{s}", .{ tmp, name }) catch unreachable;
-            _ = syscall.c_unlink(z.ptr);
-        }
+        const p = try tmp.writeChild(testing.allocator, name, "");
+        testing.allocator.free(p);
     }
 
-    const list = try entries(testing.allocator, tmp);
+    const list = try entries(testing.allocator, tmp.path);
     defer freeEntries(testing.allocator, list);
     try testing.expectEqual(@as(usize, 3), list.len);
 }
@@ -607,32 +657,24 @@ const CountVisitor = struct {
 };
 
 test "Dir.walk: counts entries across a small tree" {
-    if (is_windows) return error.SkipZigTest;
-    const tmp = try allocTmpDirGlob(testing.allocator);
-    defer testing.allocator.free(tmp);
+    var tmp = try tu.TempDir.create(testing.allocator);
+    defer tmp.deinit();
 
     // Build: tmp/sub1/{f1, f2}, tmp/sub2/{f3}, tmp/top
-    {
-        var p: [256]u8 = undefined;
-        try create(try std.fmt.bufPrint(&p, "{s}/sub1", .{tmp}), .{});
-    }
-    {
-        var p: [256]u8 = undefined;
-        try create(try std.fmt.bufPrint(&p, "{s}/sub2", .{tmp}), .{});
+    inline for (.{ "sub1", "sub2" }) |sub| {
+        const p = try tmp.childPath(testing.allocator, sub);
+        defer testing.allocator.free(p);
+        try create(p, .{});
     }
     inline for (.{ "sub1/f1", "sub1/f2", "sub2/f3", "top" }) |rel| {
-        var fp: [256:0]u8 = undefined;
-        const z = try std.fmt.bufPrintZ(&fp, "{s}/{s}", .{ tmp, rel });
-        const fd = syscall.c_open(z.ptr, syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC, 0o644);
-        try testing.expect(fd >= 0);
-        _ = syscall.c_close(fd);
+        const p = try tmp.writeChild(testing.allocator, rel, "");
+        testing.allocator.free(p);
     }
-    defer remove(testing.allocator, tmp, .{ .recursive = true }) catch {};
 
-    var d = try Dir.open(tmp);
+    var d = try Dir.open(tmp.path);
     defer d.close();
     var visitor = CountVisitor{};
-    try d.walk(tmp, testing.allocator, &visitor, .{});
+    try d.walk(tmp.path, testing.allocator, &visitor, .{});
 
     try testing.expectEqual(@as(u32, 4), visitor.files);
     try testing.expectEqual(@as(u32, 2), visitor.dirs);
@@ -650,56 +692,32 @@ const FirstStopVisitor = struct {
 };
 
 test "Dir.walk: visitor `.stop` aborts after first entry" {
-    if (is_windows) return error.SkipZigTest;
-    const tmp = try allocTmpDirGlob(testing.allocator);
-    defer testing.allocator.free(tmp);
-    defer _ = syscall.c_rmdir(tmp.ptr);
+    var tmp = try tu.TempDir.create(testing.allocator);
+    defer tmp.deinit();
 
     inline for (.{ "a", "b", "c" }) |name| {
-        var fp: [256:0]u8 = undefined;
-        const z = try std.fmt.bufPrintZ(&fp, "{s}/{s}", .{ tmp, name });
-        const fd = syscall.c_open(z.ptr, syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC, 0o644);
-        try testing.expect(fd >= 0);
-        _ = syscall.c_close(fd);
-    }
-    defer {
-        inline for (.{ "a", "b", "c" }) |name| {
-            var fp: [256:0]u8 = undefined;
-            const z = std.fmt.bufPrintZ(&fp, "{s}/{s}", .{ tmp, name }) catch unreachable;
-            _ = syscall.c_unlink(z.ptr);
-        }
+        const p = try tmp.writeChild(testing.allocator, name, "");
+        testing.allocator.free(p);
     }
 
-    var d = try Dir.open(tmp);
+    var d = try Dir.open(tmp.path);
     defer d.close();
     var v = FirstStopVisitor{};
-    try d.walk(tmp, testing.allocator, &v, .{});
+    try d.walk(tmp.path, testing.allocator, &v, .{});
     try testing.expectEqual(@as(u32, 1), v.seen);
 }
 
 test "glob: matches *.txt in flat directory" {
-    if (is_windows) return error.SkipZigTest;
-    const tmp = try allocTmpDirGlob(testing.allocator);
-    defer testing.allocator.free(tmp);
-    defer _ = syscall.c_rmdir(tmp.ptr);
+    var tmp = try tu.TempDir.create(testing.allocator);
+    defer tmp.deinit();
 
     inline for (.{ "match.txt", "miss.md", "match2.txt" }) |name| {
-        var fp: [256:0]u8 = undefined;
-        const z = try std.fmt.bufPrintZ(&fp, "{s}/{s}", .{ tmp, name });
-        const fd = syscall.c_open(z.ptr, syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC, 0o644);
-        try testing.expect(fd >= 0);
-        _ = syscall.c_close(fd);
-    }
-    defer {
-        inline for (.{ "match.txt", "miss.md", "match2.txt" }) |name| {
-            var fp: [256:0]u8 = undefined;
-            const z = std.fmt.bufPrintZ(&fp, "{s}/{s}", .{ tmp, name }) catch unreachable;
-            _ = syscall.c_unlink(z.ptr);
-        }
+        const p = try tmp.writeChild(testing.allocator, name, "");
+        testing.allocator.free(p);
     }
 
-    var pat_buf: [256]u8 = undefined;
-    const pat = try std.fmt.bufPrint(&pat_buf, "{s}/*.txt", .{tmp});
+    const pat = try tmp.childPath(testing.allocator, "*.txt");
+    defer testing.allocator.free(pat);
     const matches = try glob(testing.allocator, pat);
     defer {
         for (matches) |m| testing.allocator.free(m);
