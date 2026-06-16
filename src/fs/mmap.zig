@@ -93,14 +93,12 @@ pub const MappedFile = struct {
 
     /// Pass an access hint to the kernel for the whole mapping.
     pub fn advise(self: *MappedFile, hint: Advice) FsError!void {
-        if (is_windows) {
-            // Windows has no direct madvise equivalent for most hints
-            // (PrefetchVirtualMemory only covers WILLNEED). Advice is a
-            // non-binding hint, so a no-op is a correct implementation.
-            return;
-        }
+        // Windows has no direct madvise equivalent for most hints
+        // (PrefetchVirtualMemory only covers WILLNEED). Advice is a
+        // non-binding hint, so a no-op is a correct implementation.
+        if (is_windows) return;
         const adv = darwinOrLinuxAdvice(hint);
-        if (std.c.madvise(@ptrCast(self.data), pageRound(self.len), adv) != 0) {
+        if (c_madvise(@ptrCast(self.data), pageRound(self.len), adv) != 0) {
             return fs_error.fromErrno(fs_error.currentErrno());
         }
     }
@@ -139,7 +137,7 @@ pub const MappedFile = struct {
             }
             return;
         }
-        if (std.c.msync(@ptrCast(self.data), pageRound(self.len), std.c.MSF.SYNC) != 0) {
+        if (c_msync(@ptrCast(self.data), pageRound(self.len), std.c.MSF.SYNC) != 0) {
             return fs_error.fromErrno(fs_error.currentErrno());
         }
     }
@@ -153,7 +151,7 @@ pub const MappedFile = struct {
             }
             return;
         }
-        if (std.c.msync(@ptrCast(self.data), pageRound(self.len), std.c.MSF.ASYNC) != 0) {
+        if (c_msync(@ptrCast(self.data), pageRound(self.len), std.c.MSF.ASYNC) != 0) {
             return fs_error.fromErrno(fs_error.currentErrno());
         }
     }
@@ -171,7 +169,7 @@ pub const MappedFile = struct {
             return;
         }
         const prot = protToC(protection);
-        if (std.c.mprotect(@ptrCast(self.data), pageRound(self.len), prot) != 0) {
+        if (c_mprotect(@ptrCast(self.data), pageRound(self.len), prot) != 0) {
             return fs_error.fromErrno(fs_error.currentErrno());
         }
         self.writable = (protection == .read_write);
@@ -194,13 +192,16 @@ pub const MappedFile = struct {
     /// Release the mapping.
     pub fn deinit(self: *MappedFile) void {
         if (self.len == 0) return;
+        // comptime if/else so the POSIX `std.c.*` calls are not even
+        // analysed on Windows — a trailing call after `if (is_windows)
+        // { ...; return; }` is NOT reliably pruned and leaks an
+        // undefined `munmap` at link time.
         if (is_windows) {
             _ = win32.UnmapViewOfFile(@ptrCast(self.data));
             _ = win32.CloseHandle(self.win.mapping);
-            self.len = 0;
-            return;
+        } else {
+            _ = c_munmap(@ptrCast(self.data), pageRound(self.len));
         }
-        _ = std.c.munmap(@ptrCast(self.data), pageRound(self.len));
         self.len = 0;
     }
 };
@@ -226,7 +227,7 @@ pub fn mapFile(fd: MapHandle, opts: MapOptions) FsError!MappedFile {
     const prot = protToC(opts.protection);
     const map = mapToC(opts.sharing, false);
 
-    const raw = std.c.mmap(null, actual_len, prot, map, fd, @intCast(opts.offset));
+    const raw = c_mmap(null, actual_len, prot, map, fd, @intCast(opts.offset));
     if (@intFromPtr(raw) == std.math.maxInt(usize)) {
         // MAP_FAILED == (void *)-1
         return fs_error.fromErrno(fs_error.currentErrno());
@@ -265,7 +266,7 @@ pub fn mapAnonymous(opts: AnonOptions) FsError!MappedFile {
     const prot = protToC(opts.protection);
     const map = mapToC(opts.sharing, true);
 
-    const raw = std.c.mmap(null, opts.length, prot, map, -1, 0);
+    const raw = c_mmap(null, opts.length, prot, map, -1, 0);
     if (@intFromPtr(raw) == std.math.maxInt(usize)) {
         return fs_error.fromErrno(fs_error.currentErrno());
     }
@@ -372,6 +373,34 @@ const c_mlock = if (is_windows) {} else @extern(
 const c_munlock = if (is_windows) {} else @extern(
     *const fn (*align(page_size) const anyopaque, usize) callconv(.c) c_int,
     .{ .name = "munlock" },
+);
+
+// mmap/munmap/msync/madvise/mprotect via guarded `@extern` rather than
+// `std.c.*`. A `std.c.munmap` reference emits the (POSIX) symbol even
+// from a comptime-dead branch — it routes through `std.posix.munmap` —
+// and fails to link on Windows. The `if (is_windows) {} else @extern`
+// form is never referenced on Windows (same pattern as `c_mlock`), so
+// no POSIX mm symbol leaks. The per-OS flag *values* still come from
+// `std.c.PROT`/`MAP`/`MSF` (only analysed on POSIX paths).
+const c_mmap = if (is_windows) {} else @extern(
+    *const fn (?*anyopaque, usize, std.c.PROT, std.c.MAP, c_int, i64) callconv(.c) *anyopaque,
+    .{ .name = "mmap" },
+);
+const c_munmap = if (is_windows) {} else @extern(
+    *const fn (*align(page_size) const anyopaque, usize) callconv(.c) c_int,
+    .{ .name = "munmap" },
+);
+const c_msync = if (is_windows) {} else @extern(
+    *const fn (*align(page_size) const anyopaque, usize, std.c.MSF) callconv(.c) c_int,
+    .{ .name = "msync" },
+);
+const c_madvise = if (is_windows) {} else @extern(
+    *const fn (*align(page_size) const anyopaque, usize, u32) callconv(.c) c_int,
+    .{ .name = "madvise" },
+);
+const c_mprotect = if (is_windows) {} else @extern(
+    *const fn (*align(page_size) const anyopaque, usize, std.c.PROT) callconv(.c) c_int,
+    .{ .name = "mprotect" },
 );
 
 // ─── Tests ───────────────────────────────────────────────────────
