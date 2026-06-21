@@ -137,6 +137,20 @@ pub const Config = struct {
     /// concurrent sync work at 128 threads; raise for sync-IO-heavy
     /// services. See `src/blocking_pool.zig`.
     blocking: blocking_pool_mod.Config = .{},
+    /// **Opt-in, off by default.** When true (and the host is Linux
+    /// with io_uring available), `fs.File` ops route through per-worker
+    /// io_uring rings instead of the `spawnBlocking` pool.
+    ///
+    /// Default is `false` because the io_uring fs path — though built,
+    /// correct, and cancellation-safe — does **not** currently beat the
+    /// spawnBlocking baseline on the (only, cache-compromised) bench we
+    /// have (≈1.2× slower warm, 1.9× slower cold; see `bench-fs-read`).
+    /// Shipping it as the default would be slower than the fallback.
+    /// Kept as an opt-in so it can be re-measured on bare-metal NVMe
+    /// (where the gap should narrow) without being the default path.
+    /// On non-Linux / no-io_uring hosts this knob is a no-op — fs always
+    /// uses spawnBlocking there. See GitHub issue #20.
+    fs_io_uring: bool = false,
     /// Optional instrumentation hook. Set to `&my_observer` to
     /// receive callbacks on spawn / park / unpark / complete.
     /// Default `null` — every hook site folds away at optimisation
@@ -481,7 +495,7 @@ pub const Runtime = struct {
         // back to the spawnBlocking proxy when null, so the
         // failure mode is "no async fs win on this host", not
         // "Runtime.init fails".
-        if (builtin.os.tag == .linux) {
+        if (builtin.os.tag == .linux and cfg.fs_io_uring) {
             tryInitFsRings(rt, cfg.allocator);
             // Phase 2C.1: if the rings were created, wire each
             // ring's eventfd into the shared reactor's epoll +
@@ -1820,7 +1834,8 @@ test "runtime: spawn typed fn returning u32" {
 // io_uring, fs_rings stays null and fs ops will fall back to
 // spawnBlocking once Phase 2C wires the Reactor surface.
 test "runtime: fs_rings populated when io_uring is available" {
-    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 3 });
+    // io_uring fs is opt-in (default spawnBlocking); enable it to test.
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 3, .fs_io_uring = true });
     defer rt.deinit();
     if (builtin.os.tag != .linux) {
         try std.testing.expect(rt.fs_rings == null);
@@ -1845,7 +1860,7 @@ test "runtime: fs_rings populated when io_uring is available" {
 // eventfd readable (proves the Layer 2 path is hot).
 test "runtime: fs ring eventfd is wired into the shared reactor" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2, .fs_io_uring = true });
     defer rt.deinit();
 
     const rings = rt.fs_rings orelse return error.SkipZigTest; // probe-blocked env

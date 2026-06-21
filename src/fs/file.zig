@@ -868,7 +868,7 @@ test "File.readCancel: in-flight cancel returns error.Cancelled" {
     // which races with cross-worker spawn writes and SEGVs.
     // See feedback_debug_stack_frames + src/testing.zig.
     const volt_test_alloc = @import("../testing.zig").allocator;
-    var rt = try lib.Runtime.init(.{ .allocator = volt_test_alloc });
+    var rt = try lib.Runtime.init(.{ .allocator = volt_test_alloc, .fs_io_uring = true });
     defer rt.deinit();
     if (rt.fs_rings == null) return error.SkipZigTest;
 
@@ -911,7 +911,7 @@ test "File.writeCancel: cancel that never fires returns the actual result" {
     if (is_windows) return error.SkipZigTest;
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const volt_test_alloc = @import("../testing.zig").allocator;
-    var rt = try lib.Runtime.init(.{ .allocator = volt_test_alloc });
+    var rt = try lib.Runtime.init(.{ .allocator = volt_test_alloc, .fs_io_uring = true });
     defer rt.deinit();
     if (rt.fs_rings == null) return error.SkipZigTest;
 
@@ -948,7 +948,7 @@ test "File.writeCancel: post-success fire makes the next op return Cancelled" {
     if (is_windows) return error.SkipZigTest;
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const volt_test_alloc = @import("../testing.zig").allocator;
-    var rt = try lib.Runtime.init(.{ .allocator = volt_test_alloc });
+    var rt = try lib.Runtime.init(.{ .allocator = volt_test_alloc, .fs_io_uring = true });
     defer rt.deinit();
     if (rt.fs_rings == null) return error.SkipZigTest;
 
@@ -988,7 +988,7 @@ test "File.writeCancel: double Cancel.fire() is idempotent" {
     if (is_windows) return error.SkipZigTest;
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const volt_test_alloc = @import("../testing.zig").allocator;
-    var rt = try lib.Runtime.init(.{ .allocator = volt_test_alloc });
+    var rt = try lib.Runtime.init(.{ .allocator = volt_test_alloc, .fs_io_uring = true });
     defer rt.deinit();
     if (rt.fs_rings == null) return error.SkipZigTest;
 

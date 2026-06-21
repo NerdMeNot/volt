@@ -176,7 +176,9 @@ fn benchOnce(
     mode: Mode,
     cache: Cache,
 ) !RunResult {
-    var rt = try volt.Runtime.init(.{ .allocator = allocator });
+    // io_uring fs is opt-in (default spawnBlocking); this A/B bench
+    // needs the rings created so it can compare both routings.
+    var rt = try volt.Runtime.init(.{ .allocator = allocator, .fs_io_uring = true });
     defer rt.deinit();
 
     // Honest A/B: in `force_spawn_blocking` mode we keep the
