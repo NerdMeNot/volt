@@ -587,6 +587,10 @@ pub const Oneshot = channel.Oneshot;
 pub const Watch = channel.Watch;
 pub const Broadcast = channel.Broadcast;
 
+// ─── Streams — pull-based async iterators (see docs/design/streams.md) ──
+pub const streams = @import("streams.zig");
+pub const Stream = streams.Stream;
+
 pub const Mutex = sync.Mutex;
 pub const Notify = sync.Notify;
 pub const Semaphore = sync.Semaphore;
@@ -638,6 +642,7 @@ test {
     _ = @import("task.zig");
     _ = @import("coroutine.zig");
     _ = @import("channel.zig");
+    _ = @import("streams.zig");
     _ = @import("sync.zig");
     _ = @import("net.zig");
     _ = @import("park.zig");
