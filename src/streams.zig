@@ -489,6 +489,111 @@ pub fn generate(allocator: Allocator, ctx: anytype, comptime gen: anytype) Alloc
     };
 }
 
+/// Fan-in: concurrently pull `inputs` and interleave them into one
+/// stream. One producer coroutine per input feeds a shared MPMC buffer
+/// (capacity `cap`); the merged `next()` recv's from it. Output order is
+/// nondeterministic. The first error from any input ends the merge and
+/// surfaces from `next()`. Consumes the input streams (don't `deinit`
+/// them yourself — the producers do). **Call from inside a coroutine.**
+///
+/// Same teardown contract as `buffered`: drain to completion or use
+/// finite inputs; `deinit` closes the buffer (waking producers parked on
+/// `send`) and joins every producer.
+pub fn merge(
+    comptime T: type,
+    comptime cap: usize,
+    allocator: Allocator,
+    inputs: []const Stream(T),
+) (lib.SpawnError || Allocator.Error)!Stream(T) {
+    const State = struct {
+        ch: channel.Mpmc(T, cap) = .{},
+        inputs: []Stream(T),
+        tasks: []?*lib.Task(void),
+        remaining: std.atomic.Value(usize),
+        err_set: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        err: ?anyerror = null,
+    };
+
+    const st = try allocator.create(State);
+    errdefer allocator.destroy(st);
+    const inputs_copy = try allocator.alloc(Stream(T), inputs.len);
+    errdefer allocator.free(inputs_copy);
+    @memcpy(inputs_copy, inputs);
+    const tasks = try allocator.alloc(?*lib.Task(void), inputs.len);
+    errdefer allocator.free(tasks);
+    @memset(tasks, null);
+    st.* = .{
+        .inputs = inputs_copy,
+        .tasks = tasks,
+        .remaining = std.atomic.Value(usize).init(inputs.len),
+    };
+
+    const Producer = struct {
+        fn run(s: *State, idx: usize) void {
+            defer s.inputs[idx].deinit();
+            while (true) {
+                const item = s.inputs[idx].next() catch |e| {
+                    // First error wins; publish before close (happens-before).
+                    if (s.err_set.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) s.err = e;
+                    s.ch.close();
+                    return;
+                };
+                const v = item orelse break;
+                s.ch.send(v) catch return; // buffer closed (consumer done / sibling errored)
+            }
+            // Input exhausted cleanly; the last producer closes the buffer.
+            if (s.remaining.fetchSub(1, .acq_rel) == 1) s.ch.close();
+        }
+    };
+
+    var i: usize = 0;
+    while (i < inputs_copy.len) : (i += 1) {
+        st.tasks[i] = lib.spawn(Producer.run, .{ st, i }) catch |e| {
+            // Spawn failed mid-way: shut down what's running, deinit the
+            // not-yet-spawned inputs, then let the errdefers free memory.
+            st.ch.close();
+            var j: usize = 0;
+            while (j < i) : (j += 1) {
+                if (st.tasks[j]) |t| _ = t.join();
+            }
+            var k: usize = i;
+            while (k < inputs_copy.len) : (k += 1) inputs_copy[k].deinit();
+            return e;
+        };
+    }
+    // No inputs → an immediately-closed (empty) stream, else next() hangs.
+    if (inputs_copy.len == 0) st.ch.close();
+
+    const Impl = struct {
+        fn next(ctx: *anyopaque) anyerror!?T {
+            const s: *State = @ptrCast(@alignCast(ctx));
+            const v = s.ch.recv() catch {
+                if (s.err) |e| {
+                    s.err = null;
+                    return e;
+                }
+                return null;
+            };
+            return v;
+        }
+        fn deinit(ctx: *anyopaque, a: Allocator) void {
+            const s: *State = @ptrCast(@alignCast(ctx));
+            s.ch.close(); // wake producers parked on send
+            for (s.tasks) |t| {
+                if (t) |task| _ = task.join();
+            }
+            a.free(s.inputs);
+            a.free(s.tasks);
+            a.destroy(s);
+        }
+    };
+    return .{
+        .ctx = st,
+        .vtable = &.{ .next = Impl.next, .deinit = Impl.deinit },
+        .allocator = allocator,
+    };
+}
+
 // ─── comptime type inference helpers ─────────────────────────────────
 
 /// `T` from a channel pointer type whose `recv` returns `error{...}!T`.
@@ -857,5 +962,91 @@ test "intoChannel: drains a stream into a channel" {
     var state = IntoState{};
     try (try rt.run(intoChannelBody, .{&state}));
     try testing.expectEqual(@as(u32, 15), state.sum);
+    try testing.expect(state.ok);
+}
+
+const MergeState = struct { sum: u32 = 0, n: usize = 0, ok: bool = false };
+
+fn mergeFanInBody(state: *MergeState) !void {
+    const a = [_]u32{ 1, 2, 3 };
+    const b = [_]u32{ 10, 20 };
+    const c = [_]u32{100};
+    var inputs = [_]Stream(u32){
+        try fromSlice(u32, lib.testing.allocator, &a),
+        try fromSlice(u32, lib.testing.allocator, &b),
+        try fromSlice(u32, lib.testing.allocator, &c),
+    };
+    var s = try merge(u32, 8, lib.testing.allocator, &inputs);
+    defer s.deinit();
+    while (try s.next()) |v| {
+        state.sum += v;
+        state.n += 1;
+    }
+    state.ok = true;
+}
+
+test "merge: fans in N streams (order-independent)" {
+    const guard = lib.testing.deadlineGuard(15, "merge fan-in");
+    defer guard.disarm();
+    var rt = try lib.Runtime.init(.{ .allocator = lib.testing.allocator, .workers = 3 });
+    defer rt.deinit();
+    var state = MergeState{};
+    try (try rt.run(mergeFanInBody, .{&state}));
+    try testing.expectEqual(@as(usize, 6), state.n);
+    try testing.expectEqual(@as(u32, 136), state.sum); // 1+2+3+10+20+100
+}
+
+fn mergeErrBody(state: *MergeState) !void {
+    const a = [_]u32{ 1, 2, 3, 4 };
+    const Ctx = struct { n: u32 };
+    var ec = Ctx{ .n = 0 };
+    var inputs = [_]Stream(u32){
+        try fromSlice(u32, lib.testing.allocator, &a),
+        try generate(lib.testing.allocator, &ec, struct {
+            fn gen(c: *Ctx) anyerror!?u32 {
+                c.n += 1;
+                if (c.n == 2) return error.Boom;
+                return 50;
+            }
+        }.gen),
+    };
+    var s = try merge(u32, 8, lib.testing.allocator, &inputs);
+    defer s.deinit();
+    var saw_err = false;
+    while (true) {
+        const item = s.next() catch |e| {
+            if (e == error.Boom) saw_err = true;
+            break;
+        };
+        if (item == null) break;
+    }
+    state.ok = saw_err;
+}
+
+test "merge: first input error ends the merge" {
+    const guard = lib.testing.deadlineGuard(15, "merge error");
+    defer guard.disarm();
+    var rt = try lib.Runtime.init(.{ .allocator = lib.testing.allocator, .workers = 3 });
+    defer rt.deinit();
+    var state = MergeState{};
+    try (try rt.run(mergeErrBody, .{&state}));
+    try testing.expect(state.ok);
+}
+
+fn mergeEmptyBody(state: *MergeState) !void {
+    var inputs = [_]Stream(u32){};
+    var s = try merge(u32, 4, lib.testing.allocator, &inputs);
+    defer s.deinit();
+    try std.testing.expectEqual(@as(?u32, null), try s.next());
+    state.ok = true;
+}
+
+test "merge: empty input set yields an empty stream" {
+    const guard = lib.testing.deadlineGuard(15, "merge empty");
+    defer guard.disarm();
+    var rt = try lib.Runtime.init(.{ .allocator = lib.testing.allocator, .workers = 2 });
+    defer rt.deinit();
+    var state = MergeState{};
+    try (try rt.run(mergeEmptyBody, .{&state}));
     try testing.expect(state.ok);
 }

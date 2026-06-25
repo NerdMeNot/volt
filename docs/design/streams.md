@@ -161,12 +161,16 @@ We do **not** ship a zoo of `mapMul`/`filterGt` shortcuts in v1 (open Q3).
    finite upstream); tests are deadline-guarded so a teardown hang is a
    visible failure, and cover early-abandon.
 
-Slice 1 validated the whole design; 2–4 followed. **Remaining (deferred):**
-- `merge` (N-producer fan-in) — reuses `buffered`'s producer+channel
-  pattern × N inputs + a done-counter; the obvious next step.
+4b. ✅ **`merge`** — N-producer fan-in: one producer coroutine per input
+   feeds a shared MPMC buffer, a done-counter has the last producer close
+   it, first-error-wins ends the merge. Handles empty input + partial
+   spawn-failure cleanup; deadline-guarded tests.
+
+Slice 1 validated the whole design; everything after was mechanical.
+**Remaining (deferred):**
 - `combine` (latest-of-both) — niche, **dropped from v1**.
 - `flatMap` / `onEach` / `catch` / `retry` / `timeout` / `single` — add
-  when a consumer needs them (most are small).
+  when a consumer needs them (most are small, sequential operators).
 
 ## 8. Open questions
 
