@@ -93,7 +93,163 @@ pub fn Stream(comptime T: type) type {
             while (try self.next()) |v| acc = f(acc, v);
             return acc;
         }
+
+        // ─── Lazy operators ──────────────────────────────────────────
+        //
+        // Each boxes its state once (via the carried allocator) and
+        // returns a new Stream wrapping `self`. They **consume the
+        // receiver**: don't use or `deinit` a stream after passing it to
+        // an operator — `deinit` only the final stream, which walks +
+        // frees the whole chain. (Rust-iterator move semantics.)
+        // `f`/`pred` are comptime → monomorphized into the stage's
+        // `next` (inlined; the only indirection is the one vtable hop).
+
+        /// Transform each item with an infallible `f: fn (T) U`.
+        pub fn map(self: Self, comptime f: anytype) Allocator.Error!Stream(MapU(@TypeOf(f))) {
+            const U = MapU(@TypeOf(f));
+            const Box = struct { up: Self };
+            const box = try self.allocator.create(Box);
+            box.* = .{ .up = self };
+            const Impl = struct {
+                fn next(ctx: *anyopaque) anyerror!?U {
+                    const b: *Box = @ptrCast(@alignCast(ctx));
+                    const v = (try b.up.next()) orelse return null;
+                    return f(v);
+                }
+                fn deinit(ctx: *anyopaque, a: Allocator) void {
+                    const b: *Box = @ptrCast(@alignCast(ctx));
+                    b.up.deinit();
+                    a.destroy(b);
+                }
+            };
+            return .{
+                .ctx = box,
+                .vtable = &.{ .next = Impl.next, .deinit = Impl.deinit },
+                .allocator = self.allocator,
+            };
+        }
+
+        /// Transform each item with a fallible `f: fn (T) !U`; the first
+        /// error ends the stream (surfaces from the terminal).
+        pub fn mapTry(self: Self, comptime f: anytype) Allocator.Error!Stream(MapTryU(@TypeOf(f))) {
+            const U = MapTryU(@TypeOf(f));
+            const Box = struct { up: Self };
+            const box = try self.allocator.create(Box);
+            box.* = .{ .up = self };
+            const Impl = struct {
+                fn next(ctx: *anyopaque) anyerror!?U {
+                    const b: *Box = @ptrCast(@alignCast(ctx));
+                    const v = (try b.up.next()) orelse return null;
+                    return try f(v);
+                }
+                fn deinit(ctx: *anyopaque, a: Allocator) void {
+                    const b: *Box = @ptrCast(@alignCast(ctx));
+                    b.up.deinit();
+                    a.destroy(b);
+                }
+            };
+            return .{
+                .ctx = box,
+                .vtable = &.{ .next = Impl.next, .deinit = Impl.deinit },
+                .allocator = self.allocator,
+            };
+        }
+
+        /// Keep only items where `pred: fn (T) bool` holds.
+        pub fn filter(self: Self, comptime pred: fn (T) bool) Allocator.Error!Self {
+            const Box = struct { up: Self };
+            const box = try self.allocator.create(Box);
+            box.* = .{ .up = self };
+            const Impl = struct {
+                fn next(ctx: *anyopaque) anyerror!?T {
+                    const b: *Box = @ptrCast(@alignCast(ctx));
+                    while (try b.up.next()) |v| {
+                        if (pred(v)) return v;
+                    }
+                    return null;
+                }
+                fn deinit(ctx: *anyopaque, a: Allocator) void {
+                    const b: *Box = @ptrCast(@alignCast(ctx));
+                    b.up.deinit();
+                    a.destroy(b);
+                }
+            };
+            return .{
+                .ctx = box,
+                .vtable = &.{ .next = Impl.next, .deinit = Impl.deinit },
+                .allocator = self.allocator,
+            };
+        }
+
+        /// Yield at most the first `n` items, then end.
+        pub fn take(self: Self, n: usize) Allocator.Error!Self {
+            const Box = struct { up: Self, remaining: usize };
+            const box = try self.allocator.create(Box);
+            box.* = .{ .up = self, .remaining = n };
+            const Impl = struct {
+                fn next(ctx: *anyopaque) anyerror!?T {
+                    const b: *Box = @ptrCast(@alignCast(ctx));
+                    if (b.remaining == 0) return null;
+                    const v = (try b.up.next()) orelse {
+                        b.remaining = 0;
+                        return null;
+                    };
+                    b.remaining -= 1;
+                    return v;
+                }
+                fn deinit(ctx: *anyopaque, a: Allocator) void {
+                    const b: *Box = @ptrCast(@alignCast(ctx));
+                    b.up.deinit();
+                    a.destroy(b);
+                }
+            };
+            return .{
+                .ctx = box,
+                .vtable = &.{ .next = Impl.next, .deinit = Impl.deinit },
+                .allocator = self.allocator,
+            };
+        }
+
+        /// Skip the first `n` items, yield the rest.
+        pub fn drop(self: Self, n: usize) Allocator.Error!Self {
+            const Box = struct { up: Self, to_drop: usize };
+            const box = try self.allocator.create(Box);
+            box.* = .{ .up = self, .to_drop = n };
+            const Impl = struct {
+                fn next(ctx: *anyopaque) anyerror!?T {
+                    const b: *Box = @ptrCast(@alignCast(ctx));
+                    while (b.to_drop > 0) {
+                        _ = (try b.up.next()) orelse {
+                            b.to_drop = 0;
+                            return null;
+                        };
+                        b.to_drop -= 1;
+                    }
+                    return b.up.next();
+                }
+                fn deinit(ctx: *anyopaque, a: Allocator) void {
+                    const b: *Box = @ptrCast(@alignCast(ctx));
+                    b.up.deinit();
+                    a.destroy(b);
+                }
+            };
+            return .{
+                .ctx = box,
+                .vtable = &.{ .next = Impl.next, .deinit = Impl.deinit },
+                .allocator = self.allocator,
+            };
+        }
     };
+}
+
+/// `U` from an infallible map fn `fn (T) U`.
+fn MapU(comptime F: type) type {
+    return @typeInfo(F).@"fn".return_type.?;
+}
+
+/// `U` from a fallible map fn `fn (T) E!U`.
+fn MapTryU(comptime F: type) type {
+    return @typeInfo(@typeInfo(F).@"fn".return_type.?).error_union.payload;
 }
 
 // ─── Sources ─────────────────────────────────────────────────────────
@@ -314,4 +470,96 @@ test "fromChannel: drains a producer then ends on close" {
     var state = ChanTestState{ .ch = &ch };
     try (try rt.run(channelStreamBody, .{&state}));
     try testing.expect(state.ok);
+}
+
+// ─── Slice 2: lazy operators ─────────────────────────────────────────
+
+test "map: transforms each item (incl. changing type)" {
+    const items = [_]u32{ 1, 2, 3 };
+    const src = try fromSlice(u32, testing.allocator, &items);
+    var s = try src.map(struct {
+        fn f(v: u32) u64 {
+            return @as(u64, v) * 100;
+        }
+    }.f);
+    defer s.deinit();
+    const list = try s.toList(testing.allocator);
+    defer testing.allocator.free(list);
+    try testing.expectEqualSlices(u64, &[_]u64{ 100, 200, 300 }, list);
+}
+
+test "filter: keeps matching items" {
+    const items = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    const src = try fromSlice(u32, testing.allocator, &items);
+    var s = try src.filter(struct {
+        fn even(v: u32) bool {
+            return v % 2 == 0;
+        }
+    }.even);
+    defer s.deinit();
+    const list = try s.toList(testing.allocator);
+    defer testing.allocator.free(list);
+    try testing.expectEqualSlices(u32, &[_]u32{ 2, 4, 6 }, list);
+}
+
+test "take: yields at most n" {
+    const items = [_]u32{ 1, 2, 3, 4, 5 };
+    const src = try fromSlice(u32, testing.allocator, &items);
+    var s = try src.take(3);
+    defer s.deinit();
+    const list = try s.toList(testing.allocator);
+    defer testing.allocator.free(list);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 2, 3 }, list);
+}
+
+test "take: more than available is fine" {
+    const items = [_]u32{ 1, 2 };
+    const src = try fromSlice(u32, testing.allocator, &items);
+    var s = try src.take(10);
+    defer s.deinit();
+    try testing.expectEqual(@as(usize, 2), try s.count());
+}
+
+test "drop: skips first n" {
+    const items = [_]u32{ 1, 2, 3, 4, 5 };
+    const src = try fromSlice(u32, testing.allocator, &items);
+    var s = try src.drop(2);
+    defer s.deinit();
+    const list = try s.toList(testing.allocator);
+    defer testing.allocator.free(list);
+    try testing.expectEqualSlices(u32, &[_]u32{ 3, 4, 5 }, list);
+}
+
+test "mapTry: first error ends the stream" {
+    const items = [_]u32{ 1, 2, 3 };
+    const src = try fromSlice(u32, testing.allocator, &items);
+    var s = try src.mapTry(struct {
+        fn f(v: u32) anyerror!u32 {
+            if (v == 2) return error.Bad;
+            return v * 10;
+        }
+    }.f);
+    defer s.deinit();
+    try testing.expectEqual(@as(?u32, 10), try s.next());
+    try testing.expectError(error.Bad, s.next());
+}
+
+test "chain: filter -> map -> take frees the whole pipeline" {
+    const items = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const src = try fromSlice(u32, testing.allocator, &items);
+    const evens = try src.filter(struct {
+        fn even(v: u32) bool {
+            return v % 2 == 0;
+        }
+    }.even);
+    const scaled = try evens.map(struct {
+        fn f(v: u32) u32 {
+            return v * 10;
+        }
+    }.f);
+    var s = try scaled.take(2);
+    defer s.deinit(); // walks take -> map -> filter -> fromSlice
+    const list = try s.toList(testing.allocator);
+    defer testing.allocator.free(list);
+    try testing.expectEqualSlices(u32, &[_]u32{ 20, 40 }, list);
 }
