@@ -75,11 +75,14 @@ pipeline is 4 small allocs total.
 ## 3. Cancellation, backpressure, errors — all inherited
 
 - **Cancellation:** Volt cancellation is *per-op explicit* (`recvCancel(*Cancel)`,
-  not ambient), so the stream carries an optional `cancel: ?*Cancel`
-  (default null, set at the source or via `.withCancel(c)`). Cancel-aware
-  sources thread it into their `recvCancel`/`readCancel` variant; `next()`
-  then surfaces `error.Cancelled`. Wired in Slice 3 — Slice 1 sources use
-  the plain blocking variant (`cancel` reserved, unused).
+  not ambient), so cancel is bound at the **blocking source**, not the
+  stream wrapper. `fromChannelCancel(ch, c)` parks on `recvCancel(c)`; a
+  fired cancel surfaces as `error.Cancelled` and **propagates up through
+  every operator automatically** (each does `try upstream.next()`).
+  `generate` sources thread their own cancel via `ctx` (call
+  `readCancel(ctx.cancel)` inside the generator). There is no stream-level
+  `.withCancel` — `fromSlice` has no suspend point to inject at, and the
+  two blocking source kinds each have a natural place. *(Shipped, Slice 3.)*
 - **Backpressure:** inherent in pull (§1.3). Operators that decouple
   producer/consumer (`buffered(n)`, `merge`) opt *into* buffering via an
   internal channel + coroutine; nothing else buffers.
@@ -145,17 +148,19 @@ We do **not** ship a zoo of `mapMul`/`filterGt` shortcuts in v1 (open Q3).
 
 ## 7. Implementation plan (incremental — each a reviewable slice)
 
-1. **Core + sources + terminals** — `Stream(T)`, vtable, `fromSlice`,
+1. ✅ **Core + sources + terminals** — `Stream(T)`, vtable, `fromSlice`,
    `fromChannel`, `generate`, `forEach`/`toList`/`count`/`first`/`fold`.
-   Leak-gated tests (alloc + deinit of every stage). This proves the
-   model end-to-end with the cheapest sources.
-2. **Lazy transforms** — `map`/`filter`/`mapTry`/`take`/`drop`.
-3. **`intoChannel` + cancellation tests** — cancel a collecting coro
-   mid-stream, assert `error.Cancelled` + no leak.
-4. **Concurrency operators** — `merge`/`zip`/`combine`/`buffered` (these
-   spawn coroutines; most design risk, so last).
+   Leak-gated. Proves the model end-to-end.
+2. ✅ **Lazy transforms** — `map`/`mapTry`/`filter`/`take`/`drop`.
+3. ✅ **Cancellation** — `fromChannelCancel` + propagation through
+   operators (test: cancel a coro parked on `recv`, assert
+   `error.Cancelled` through a `map`, no leak).
+4. **Concurrency operators + `intoChannel`** — `merge`/`zip`/`combine`/
+   `buffered` and `intoChannel`. All spawn an internal coroutine (most
+   design risk), so they're grouped last.
 
-Slice 1 is the one to validate the whole design; the rest is mechanical.
+Slice 1 validated the whole design; 2–3 were mechanical. Slice 4 is the
+only remaining risk (coroutine + channel plumbing inside operators).
 
 ## 8. Open questions
 

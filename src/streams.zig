@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const cancel_mod = @import("cancel.zig");
 
 /// A pull-based async stream of `T`. Construct via a source
 /// (`fromSlice` / `fromChannel` / `generate`), drive via a terminal
@@ -304,6 +305,43 @@ pub fn fromChannel(allocator: Allocator, ch: anytype) Allocator.Error!Stream(Cha
     };
 }
 
+/// Like `fromChannel`, but parks on `recvCancel(c)` so a fired cancel
+/// surfaces as `error.Cancelled` from `next()` — and propagates up
+/// through any operators automatically (they all `try upstream.next()`).
+/// The channel + cancel must outlive the stream. This is the cancellable
+/// counterpart for the built-in channel source; `generate`-based sources
+/// thread their own cancel via `ctx` (call `readCancel(ctx.cancel)` etc.
+/// inside the generator).
+pub fn fromChannelCancel(
+    allocator: Allocator,
+    ch: anytype,
+    c: *cancel_mod.Cancel,
+) Allocator.Error!Stream(ChanItem(@TypeOf(ch))) {
+    const T = ChanItem(@TypeOf(ch));
+    const ChPtr = @TypeOf(ch);
+    const Box = struct { ch: ChPtr, c: *cancel_mod.Cancel };
+    const box = try allocator.create(Box);
+    box.* = .{ .ch = ch, .c = c };
+    const Impl = struct {
+        fn next(ctx: *anyopaque) anyerror!?T {
+            const b: *Box = @ptrCast(@alignCast(ctx));
+            const v = b.ch.recvCancel(b.c) catch |e| {
+                if (e == error.Closed) return null; // end of stream
+                return e; // error.Cancelled propagates to the caller
+            };
+            return v;
+        }
+        fn deinit(ctx: *anyopaque, a: Allocator) void {
+            a.destroy(@as(*Box, @ptrCast(@alignCast(ctx))));
+        }
+    };
+    return .{
+        .ctx = box,
+        .vtable = &.{ .next = Impl.next, .deinit = Impl.deinit },
+        .allocator = allocator,
+    };
+}
+
 /// The general source hook: `gen(ctx)` produces the next item, `null` at
 /// end, or an error. This is what the I/O-source libs build on — `gen`
 /// does the page-fetch / socket-read / cursor-advance. `ctx` is a
@@ -562,4 +600,54 @@ test "chain: filter -> map -> take frees the whole pipeline" {
     const list = try s.toList(testing.allocator);
     defer testing.allocator.free(list);
     try testing.expectEqualSlices(u32, &[_]u32{ 20, 40 }, list);
+}
+
+// ─── Slice 3: cancellation ───────────────────────────────────────────
+
+const CancelState = struct {
+    ch: *channel.Spsc(u32, 8),
+    c: *lib.Cancel,
+    got_cancelled: bool = false,
+};
+
+fn cancelReader(state: *CancelState) void {
+    // map on top of the cancellable source: proves Cancelled propagates
+    // up through an operator, not just out of the bare source.
+    const src = fromChannelCancel(lib.testing.allocator, state.ch, state.c) catch return;
+    var s = src.map(struct {
+        fn f(v: u32) u32 {
+            return v + 1;
+        }
+    }.f) catch return;
+    defer s.deinit();
+    // The channel is empty with no producer, so next() parks on
+    // recvCancel until the sibling fires the cancel.
+    _ = s.next() catch |e| {
+        if (e == error.Cancelled) state.got_cancelled = true;
+        return;
+    };
+}
+
+fn cancelFirer(state: *CancelState) void {
+    var i: u32 = 0;
+    while (i < 128) : (i += 1) lib.yield();
+    state.c.fire();
+}
+
+fn cancelBody(state: *CancelState) !void {
+    var reader = try lib.spawn(cancelReader, .{state});
+    var firer = try lib.spawn(cancelFirer, .{state});
+    _ = reader.join();
+    _ = firer.join();
+}
+
+test "fromChannelCancel: cancel while parked propagates Cancelled through map" {
+    var rt = try lib.Runtime.init(.{ .allocator = lib.testing.allocator, .workers = 2 });
+    defer rt.deinit();
+    var ch = channel.Spsc(u32, 8){};
+    var cancel = lib.Cancel.init(rt);
+    defer cancel.deinit();
+    var state = CancelState{ .ch = &ch, .c = &cancel };
+    try (try rt.run(cancelBody, .{&state}));
+    try testing.expect(state.got_cancelled);
 }
