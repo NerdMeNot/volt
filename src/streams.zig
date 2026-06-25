@@ -20,6 +20,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const cancel_mod = @import("cancel.zig");
+const lib = @import("lib.zig");
+const channel = @import("channel.zig");
 
 /// A pull-based async stream of `T`. Construct via a source
 /// (`fromSlice` / `fromChannel` / `generate`), drive via a terminal
@@ -239,6 +241,124 @@ pub fn Stream(comptime T: type) type {
                 .vtable = &.{ .next = Impl.next, .deinit = Impl.deinit },
                 .allocator = self.allocator,
             };
+        }
+
+        // ─── Slice 4: combine / concurrency ──────────────────────────
+
+        /// Pairwise-combine with `other` via `f: fn (T, B) C`, ending when
+        /// *either* stream ends. Sequential — no coroutine spawn; pulls
+        /// one item from each per output. Consumes both streams.
+        pub fn zip(self: Self, other: anytype, comptime f: anytype) Allocator.Error!Stream(MapU(@TypeOf(f))) {
+            const C = MapU(@TypeOf(f));
+            const Other = @TypeOf(other);
+            const Box = struct { a: Self, b: Other };
+            const box = try self.allocator.create(Box);
+            box.* = .{ .a = self, .b = other };
+            const Impl = struct {
+                fn next(ctx: *anyopaque) anyerror!?C {
+                    const bx: *Box = @ptrCast(@alignCast(ctx));
+                    const av = (try bx.a.next()) orelse return null;
+                    const bv = (try bx.b.next()) orelse return null;
+                    return f(av, bv);
+                }
+                fn deinit(ctx: *anyopaque, a: Allocator) void {
+                    const bx: *Box = @ptrCast(@alignCast(ctx));
+                    bx.a.deinit();
+                    bx.b.deinit();
+                    a.destroy(bx);
+                }
+            };
+            return .{
+                .ctx = box,
+                .vtable = &.{ .next = Impl.next, .deinit = Impl.deinit },
+                .allocator = self.allocator,
+            };
+        }
+
+        /// Prefetch up to `n` items ahead on a background coroutine, so a
+        /// slow consumer doesn't stall a fast (or latency-bursty) source.
+        /// Spawns one producer + an SPSC buffer — **call from inside a
+        /// coroutine.**
+        ///
+        /// Teardown contract: drain to completion (until `next()` returns
+        /// `null`/error) before `deinit`, or ensure the upstream is
+        /// finite. `deinit` closes the buffer (waking a producer parked on
+        /// `send`) then joins the producer; it can only hang if you
+        /// abandon early while the producer is parked pulling an *infinite*
+        /// upstream — cancel that upstream's source first.
+        pub fn buffered(self: Self, comptime n: usize) (lib.SpawnError || Allocator.Error)!Self {
+            const State = struct {
+                up: Self,
+                ch: channel.Spsc(T, n) = .{},
+                producer: ?*lib.Task(void) = null,
+                err: ?anyerror = null,
+            };
+            const st = try self.allocator.create(State);
+            st.* = .{ .up = self };
+            errdefer {
+                st.up.deinit();
+                self.allocator.destroy(st);
+            }
+            const Worker = struct {
+                fn run(s: *State) void {
+                    defer s.up.deinit();
+                    defer s.ch.close();
+                    while (true) {
+                        const item = s.up.next() catch |e| {
+                            s.err = e; // published before close (happens-before via channel)
+                            return;
+                        };
+                        const v = item orelse return;
+                        s.ch.send(v) catch return; // consumer closed the buffer
+                    }
+                }
+            };
+            st.producer = try lib.spawn(Worker.run, .{st});
+            const Impl = struct {
+                fn next(ctx: *anyopaque) anyerror!?T {
+                    const s: *State = @ptrCast(@alignCast(ctx));
+                    const v = s.ch.recv() catch {
+                        if (s.err) |e| {
+                            s.err = null;
+                            return e;
+                        }
+                        return null;
+                    };
+                    return v;
+                }
+                fn deinit(ctx: *anyopaque, a: Allocator) void {
+                    const s: *State = @ptrCast(@alignCast(ctx));
+                    s.ch.close(); // wake the producer if parked on send
+                    if (s.producer) |p| _ = p.join();
+                    a.destroy(s);
+                }
+            };
+            return .{
+                .ctx = st,
+                .vtable = &.{ .next = Impl.next, .deinit = Impl.deinit },
+                .allocator = self.allocator,
+            };
+        }
+
+        /// Drain this stream into `ch` on a background coroutine, closing
+        /// `ch` when the stream ends or errors. Returns the producer
+        /// `*Task(anyerror!void)` — `join()` it to observe completion + any
+        /// stream error. The producer owns + `deinit`s the stream. **Call
+        /// from inside a coroutine.** Fan-out / decouple: lets `select`
+        /// and other consumers work on the channel side.
+        pub fn intoChannel(self: Self, ch: anytype) lib.SpawnError!*lib.Task(anyerror!void) {
+            const ChPtr = @TypeOf(ch);
+            const Worker = struct {
+                fn run(s: Self, c: ChPtr) anyerror!void {
+                    var stream = s;
+                    defer stream.deinit(); // runs after c.close()
+                    defer c.close();
+                    while (try stream.next()) |v| {
+                        c.send(v) catch return; // consumer closed the channel
+                    }
+                }
+            };
+            return lib.spawn(Worker.run, .{ self, ch });
         }
     };
 }
@@ -475,8 +595,6 @@ test "generate: a failing generator surfaces the error" {
 }
 
 // fromChannel needs a live producer → run inside a Runtime.
-const lib = @import("lib.zig");
-const channel = @import("channel.zig");
 
 const ChanTestState = struct {
     ch: *channel.Spsc(u32, 8),
@@ -650,4 +768,94 @@ test "fromChannelCancel: cancel while parked propagates Cancelled through map" {
     var state = CancelState{ .ch = &ch, .c = &cancel };
     try (try rt.run(cancelBody, .{&state}));
     try testing.expect(state.got_cancelled);
+}
+
+// ─── Slice 4: combine / concurrency ──────────────────────────────────
+
+test "zip: pairwise combine, ends at the shorter stream" {
+    const a = [_]u32{ 1, 2, 3 };
+    const b = [_]u64{ 10, 20, 30, 40 };
+    const sa = try fromSlice(u32, testing.allocator, &a);
+    const sb = try fromSlice(u64, testing.allocator, &b);
+    var s = try sa.zip(sb, struct {
+        fn f(x: u32, y: u64) u64 {
+            return @as(u64, x) + y;
+        }
+    }.f);
+    defer s.deinit();
+    const list = try s.toList(testing.allocator);
+    defer testing.allocator.free(list);
+    try testing.expectEqualSlices(u64, &[_]u64{ 11, 22, 33 }, list);
+}
+
+const BufState = struct { ok: bool = false };
+
+fn bufferedDrainBody(state: *BufState) !void {
+    const items = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    const src = try fromSlice(u32, lib.testing.allocator, &items);
+    var s = try src.buffered(2);
+    defer s.deinit();
+    const list = try s.toList(lib.testing.allocator);
+    defer lib.testing.allocator.free(list);
+    try std.testing.expectEqualSlices(u32, &items, list);
+    state.ok = true;
+}
+
+test "buffered: prefetches + drains in order" {
+    const guard = lib.testing.deadlineGuard(15, "buffered drain");
+    defer guard.disarm();
+    var rt = try lib.Runtime.init(.{ .allocator = lib.testing.allocator, .workers = 2 });
+    defer rt.deinit();
+    var state = BufState{};
+    try (try rt.run(bufferedDrainBody, .{&state}));
+    try testing.expect(state.ok);
+}
+
+fn bufferedAbandonBody(state: *BufState) !void {
+    const items = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const src = try fromSlice(u32, lib.testing.allocator, &items);
+    var s = try src.buffered(2);
+    // Take only two, then abandon (deinit without draining). Finite
+    // upstream → the producer is parked on `send` (buffer full); deinit's
+    // close + join must tear down without hang or leak.
+    _ = try s.next();
+    _ = try s.next();
+    s.deinit();
+    state.ok = true;
+}
+
+test "buffered: early abandon of a finite upstream tears down cleanly" {
+    const guard = lib.testing.deadlineGuard(15, "buffered abandon");
+    defer guard.disarm();
+    var rt = try lib.Runtime.init(.{ .allocator = lib.testing.allocator, .workers = 2 });
+    defer rt.deinit();
+    var state = BufState{};
+    try (try rt.run(bufferedAbandonBody, .{&state}));
+    try testing.expect(state.ok);
+}
+
+const IntoState = struct { sum: u32 = 0, ok: bool = false };
+
+fn intoChannelBody(state: *IntoState) !void {
+    var ch = channel.Spsc(u32, 4){};
+    const items = [_]u32{ 1, 2, 3, 4, 5 };
+    const src = try fromSlice(u32, lib.testing.allocator, &items);
+    var task = try src.intoChannel(&ch);
+    while (true) {
+        const v = ch.recv() catch break; // Closed when the producer ends
+        state.sum += v;
+    }
+    _ = task.join() catch {}; // observe completion; no error expected
+    state.ok = true;
+}
+
+test "intoChannel: drains a stream into a channel" {
+    const guard = lib.testing.deadlineGuard(15, "intoChannel");
+    defer guard.disarm();
+    var rt = try lib.Runtime.init(.{ .allocator = lib.testing.allocator, .workers = 2 });
+    defer rt.deinit();
+    var state = IntoState{};
+    try (try rt.run(intoChannelBody, .{&state}));
+    try testing.expectEqual(@as(u32, 15), state.sum);
+    try testing.expect(state.ok);
 }

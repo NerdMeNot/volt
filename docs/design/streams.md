@@ -155,12 +155,18 @@ We do **not** ship a zoo of `mapMul`/`filterGt` shortcuts in v1 (open Q3).
 3. ✅ **Cancellation** — `fromChannelCancel` + propagation through
    operators (test: cancel a coro parked on `recv`, assert
    `error.Cancelled` through a `map`, no leak).
-4. **Concurrency operators + `intoChannel`** — `merge`/`zip`/`combine`/
-   `buffered` and `intoChannel`. All spawn an internal coroutine (most
-   design risk), so they're grouped last.
+4. ✅ **Combine / concurrency (partial)** — `zip` (sequential, no spawn),
+   `buffered(n)` (single-producer SPSC prefetch), `intoChannel` (fan-out).
+   The spawn-based ops carry a documented teardown contract (drain or
+   finite upstream); tests are deadline-guarded so a teardown hang is a
+   visible failure, and cover early-abandon.
 
-Slice 1 validated the whole design; 2–3 were mechanical. Slice 4 is the
-only remaining risk (coroutine + channel plumbing inside operators).
+Slice 1 validated the whole design; 2–4 followed. **Remaining (deferred):**
+- `merge` (N-producer fan-in) — reuses `buffered`'s producer+channel
+  pattern × N inputs + a done-counter; the obvious next step.
+- `combine` (latest-of-both) — niche, **dropped from v1**.
+- `flatMap` / `onEach` / `catch` / `retry` / `timeout` / `single` — add
+  when a consumer needs them (most are small).
 
 ## 8. Open questions
 
