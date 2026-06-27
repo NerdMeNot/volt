@@ -499,6 +499,37 @@ fn ScopeReturn(comptime BodyT: type) type {
     return ret;
 }
 
+/// Like `scope`, but a body error does **not** fire the scope cancel —
+/// children the body spawned (and joins) run to completion instead of
+/// being cancelled. Use when siblings should finish independently of one
+/// failing; use `scope` when the first failure should cancel the rest.
+///
+/// (This is the callback form, symmetric to `scope`. A reactive
+/// "child failure cancels siblings the moment it happens" needs the
+/// object-form nursery — `s.launch` / `s.join` — which isn't shipped;
+/// in the callback form the body owns spawning + joining its children.)
+pub fn supervisorScope(comptime body: anytype) ScopeReturn(@TypeOf(body)) {
+    var c = Cancel.init(runtime());
+    defer c.deinit();
+    return body(&c);
+}
+
+/// Run `body(args..., *Cancel)` with a Cancel that is **never fired**, so
+/// any cancel-aware op inside (`sleepCancel`, `recvCancel`, `lockCancel`,
+/// …) using that cancel runs to completion uninterrupted. Body shape
+/// mirrors `withTimeout`: a trailing `*Cancel`. Returns body's result
+/// unchanged (no error widening).
+///
+/// Use for cleanup that must complete even when the surrounding scope was
+/// cancelled. (Volt cancellation is opt-in per op, so a region with no
+/// Cancel threaded in is already uncancellable; this is for cleanup that
+/// itself needs cancel-aware I/O but must not observe a fired cancel.)
+pub fn uncancellable(comptime body: anytype, args: anytype) @typeInfo(@TypeOf(body)).@"fn".return_type.? {
+    var c = Cancel.init(runtime());
+    defer c.deinit();
+    return @call(.auto, body, args ++ .{&c});
+}
+
 /// Race `body(args..., *Cancel)` against `d`. Returns `body`'s
 /// result if it completes first; returns `error.Timeout` if the
 /// duration elapses first.
@@ -755,6 +786,70 @@ test "scope: ok body returns OK; error body propagates error" {
     defer rt.deinit();
     var dummy: void = {};
     try (try rt.run(scopeRoot, .{&dummy}));
+}
+
+// ─── supervisorScope tests ───────────────────────────────────────────
+
+var sup_seen_fired: bool = false;
+var sup_child_ran: bool = false;
+
+fn supChildBody(_: *void) void {
+    yield();
+    sup_child_ran = true;
+}
+
+fn supOkBody(c: *Cancel) anyerror!void {
+    var dummy: void = {};
+    var t = try spawn(supChildBody, .{&dummy});
+    defer t.join();
+    if (c.isFired()) sup_seen_fired = true;
+}
+
+fn supErrBody(c: *Cancel) anyerror!void {
+    if (c.isFired()) sup_seen_fired = true;
+    return error.Boom;
+}
+
+fn supScopeRoot(_: *void) !void {
+    sup_seen_fired = false;
+    sup_child_ran = false;
+    // ok body with a joined child → completes; cancel never fired.
+    try supervisorScope(supOkBody);
+    try std.testing.expect(sup_child_ran);
+    try std.testing.expect(!sup_seen_fired);
+
+    // error body → propagates the error, still no fire.
+    sup_seen_fired = false;
+    const r = supervisorScope(supErrBody);
+    try std.testing.expectError(error.Boom, r);
+    try std.testing.expect(!sup_seen_fired);
+}
+
+test "supervisorScope: propagates body result, never fires the scope cancel" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+    var dummy: void = {};
+    try (try rt.run(supScopeRoot, .{&dummy}));
+}
+
+// ─── uncancellable tests ─────────────────────────────────────────────
+
+fn uncBody(x: u32, c: *Cancel) anyerror!u32 {
+    // The supplied cancel is never fired, so this checkpoint passes.
+    try c.checkpoint();
+    return x * 2;
+}
+
+fn uncRoot(_: *void) !void {
+    const r = try uncancellable(uncBody, .{21});
+    try std.testing.expectEqual(@as(u32, 42), r);
+}
+
+test "uncancellable: runs body with a never-fired cancel" {
+    var rt = try Runtime.init(.{ .allocator = test_allocator });
+    defer rt.deinit();
+    var dummy: void = {};
+    try (try rt.run(uncRoot, .{&dummy}));
 }
 
 // ─── withTimeout tests ───────────────────────────────────────────────
