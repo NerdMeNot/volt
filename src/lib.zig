@@ -530,6 +530,105 @@ pub fn uncancellable(comptime body: anytype, args: anytype) @typeInfo(@TypeOf(bo
     return @call(.auto, body, args ++ .{&c});
 }
 
+/// Object-form structured-concurrency scope (a "nursery"). Tracks the
+/// children spawned via `launch`; `join` waits for all of them.
+///
+/// Default (**fail-fast**): the first child error fires the scope cancel
+/// — cancelling cancel-aware siblings — and is propagated from `join`.
+/// **Supervised** (`.{ .supervised = true }`): a child failure neither
+/// cancels siblings nor propagates.
+///
+/// Cancellation is effective here (unlike the callback `scope`) because
+/// the fail-fast `cancel.fire()` runs inside each child's wrapper the
+/// instant it errors — concurrently — so siblings wake while `join` is
+/// still waiting, rather than only after the body returned.
+///
+/// Children opt into cancellation by taking a trailing `*Cancel` and
+/// being launched with `&s.cancel` in their args; CPU-bound children can
+/// ignore it. (A returned value is discarded — use `spawn` for
+/// value-returning children.)
+///
+/// Idiom:
+/// ```zig
+/// var s = volt.Scope.init(allocator, .{});
+/// defer s.deinit();                 // cleanup on early return
+/// for (items) |x| try s.launch(work, .{ x, &s.cancel });
+/// try s.join();                     // wait all; first error cancels rest + propagates
+/// ```
+pub const Scope = struct {
+    cancel: Cancel,
+    children: std.array_list.Managed(*Task(void)),
+    supervised: bool,
+    err_set: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    first_err: ?anyerror = null,
+    drained: bool = false,
+
+    pub const Options = struct { supervised: bool = false };
+
+    pub fn init(allocator: std.mem.Allocator, opts: Options) Scope {
+        return .{
+            .cancel = Cancel.init(runtime()),
+            .children = std.array_list.Managed(*Task(void)).init(allocator),
+            .supervised = opts.supervised,
+        };
+    }
+
+    /// Spawn a tracked child. `f` returns `void` or `E!void`.
+    pub fn launch(self: *Scope, comptime f: anytype, args: anytype) (SpawnError || std.mem.Allocator.Error)!void {
+        const Args = @TypeOf(args);
+        const Wrapper = struct {
+            fn run(sc: *Scope, a: Args) void {
+                const R = @typeInfo(@TypeOf(f)).@"fn".return_type.?;
+                if (comptime @typeInfo(R) == .error_union) {
+                    if (@call(.auto, f, a)) |_| {} else |e| {
+                        // First error wins; published before the fire/return.
+                        if (sc.err_set.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+                            sc.first_err = e;
+                            if (!sc.supervised) sc.cancel.fire();
+                        }
+                    }
+                } else {
+                    @call(.auto, f, a);
+                    _ = &sc; // unused on the infallible path
+                }
+            }
+        };
+        // Reserve first so the post-spawn append can't fail (no orphaned
+        // untracked child).
+        try self.children.ensureUnusedCapacity(1);
+        const task = try spawn(Wrapper.run, .{ self, args });
+        self.children.appendAssumeCapacity(task);
+    }
+
+    /// Wait for every child. Fail-fast returns the first child error (the
+    /// cancel was already fired by that child's wrapper, waking cancel-
+    /// aware siblings). Supervised returns void.
+    pub fn join(self: *Scope) anyerror!void {
+        self.drain();
+        if (!self.supervised) {
+            if (self.first_err) |e| return e;
+        }
+    }
+
+    /// Cleanup safety-net for `defer`. If `join` hasn't run (early
+    /// return), cancel the children and wait for them; then release the
+    /// cancel. A no-op beyond freeing the cancel once `join` has drained.
+    pub fn deinit(self: *Scope) void {
+        if (!self.drained) self.cancel.fire();
+        self.drain();
+        self.cancel.deinit();
+    }
+
+    fn drain(self: *Scope) void {
+        if (self.drained) return;
+        self.drained = true;
+        for (self.children.items) |task| {
+            _ = task.join();
+        }
+        self.children.deinit();
+    }
+};
+
 /// Race `body(args..., *Cancel)` against `d`. Returns `body`'s
 /// result if it completes first; returns `error.Timeout` if the
 /// duration elapses first.
@@ -850,6 +949,113 @@ test "uncancellable: runs body with a never-fired cancel" {
     defer rt.deinit();
     var dummy: void = {};
     try (try rt.run(uncRoot, .{&dummy}));
+}
+
+// ─── Scope (object-form nursery) tests ───────────────────────────────
+
+const ScopeTestState = struct {
+    a_completed: bool = false,
+    a_cancelled: bool = false,
+    counter: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+};
+
+fn scopeChildBlocking(st: *ScopeTestState, c: *Cancel) void {
+    sleepCancel(Duration.fromSecs(10), c) catch {
+        st.a_cancelled = true;
+        return;
+    };
+    st.a_completed = true;
+}
+
+fn scopeChildShort(st: *ScopeTestState, c: *Cancel) void {
+    sleepCancel(Duration.fromMillis(5), c) catch {
+        st.a_cancelled = true;
+        return;
+    };
+    st.a_completed = true;
+}
+
+fn scopeChildErrors(_: *ScopeTestState) anyerror!void {
+    return error.Boom;
+}
+
+fn scopeChildCount(st: *ScopeTestState) void {
+    _ = st.counter.fetchAdd(1, .monotonic);
+}
+
+fn scopeFailFastRoot(st: *ScopeTestState) !void {
+    var s = Scope.init(test_allocator, .{});
+    defer s.deinit();
+    try s.launch(scopeChildBlocking, .{ st, &s.cancel });
+    try s.launch(scopeChildErrors, .{st});
+    const r = s.join();
+    try std.testing.expectError(error.Boom, r);
+    try std.testing.expect(st.a_cancelled); // sibling was cancelled by the fire
+    try std.testing.expect(!st.a_completed);
+}
+
+test "Scope: fail-fast — first child error cancels siblings + propagates" {
+    const guard = testing.deadlineGuard(15, "scope fail-fast");
+    defer guard.disarm();
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 3 });
+    defer rt.deinit();
+    var st = ScopeTestState{};
+    try (try rt.run(scopeFailFastRoot, .{&st}));
+}
+
+fn scopeSupervisedRoot(st: *ScopeTestState) !void {
+    var s = Scope.init(test_allocator, .{ .supervised = true });
+    defer s.deinit();
+    try s.launch(scopeChildShort, .{ st, &s.cancel });
+    try s.launch(scopeChildErrors, .{st});
+    try s.join(); // supervised: returns void, child error does not propagate
+    try std.testing.expect(st.a_completed); // sibling ran to completion
+    try std.testing.expect(!st.a_cancelled);
+}
+
+test "Scope: supervised — child error neither cancels siblings nor propagates" {
+    const guard = testing.deadlineGuard(15, "scope supervised");
+    defer guard.disarm();
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 3 });
+    defer rt.deinit();
+    var st = ScopeTestState{};
+    try (try rt.run(scopeSupervisedRoot, .{&st}));
+}
+
+fn scopeHappyRoot(st: *ScopeTestState) !void {
+    var s = Scope.init(test_allocator, .{});
+    defer s.deinit();
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) try s.launch(scopeChildCount, .{st});
+    try s.join();
+    try std.testing.expectEqual(@as(u32, 3), st.counter.load(.monotonic));
+}
+
+test "Scope: happy path joins all children" {
+    const guard = testing.deadlineGuard(15, "scope happy");
+    defer guard.disarm();
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 3 });
+    defer rt.deinit();
+    var st = ScopeTestState{};
+    try (try rt.run(scopeHappyRoot, .{&st}));
+}
+
+fn scopeEarlyReturnRoot(st: *ScopeTestState) !void {
+    var s = Scope.init(test_allocator, .{});
+    defer s.deinit(); // safety net: cancel + join the blocking child
+    try s.launch(scopeChildBlocking, .{ st, &s.cancel });
+    return error.EarlyOut; // early return BEFORE join
+}
+
+test "Scope: deinit cancels + joins children on early return" {
+    const guard = testing.deadlineGuard(15, "scope early return");
+    defer guard.disarm();
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 3 });
+    defer rt.deinit();
+    var st = ScopeTestState{};
+    const r = try rt.run(scopeEarlyReturnRoot, .{&st});
+    try std.testing.expectError(error.EarlyOut, r);
+    try std.testing.expect(st.a_cancelled);
 }
 
 // ─── withTimeout tests ───────────────────────────────────────────────
