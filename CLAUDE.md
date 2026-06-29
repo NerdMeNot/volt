@@ -35,30 +35,56 @@ zig build spike-A            # POC validations (A, B, C, D, F, G, H)
 
 ## Source tree
 
+Convention: a public subsystem is a `foo.zig` facade + a `foo/`
+subdir of its parts. `reactor/`, `fs/`, `net/`, `time/` follow it.
+Single-file modules (the scheduler core, primitives) stay flat.
+
 ```
 src/
-├── lib.zig                # Public surface: Runtime, Task, yield, channel,
-│                          # net, sync, reactor, current
+├── lib.zig                # Public surface + composition: spawn, scope,
+│                          # joinAll/joinFirst, withTimeout, sleep, re-exports
 ├── runtime.zig            # Runtime: workers + injection + reactor; run/spawn/
 │                          # dispatch/parkWorker/wakeOneParked
+├── runtime_fs_ring.zig    # Per-P io_uring fs-ring glue (extracted from runtime)
+├── runtime_signal.zig     # SIGINT graceful-shutdown plumbing for runWithSignals
 ├── worker.zig             # M (OS thread) + Mailbox (per-P MPMC queue)
 ├── p.zig                  # P: WSQ + lifo_slot + mailbox + per-P pools
 ├── work_steal_queue.zig   # Fixed-256 lock-free WSQ (Tokio-style)
 ├── coroutine.zig          # Coroutine struct, Frame factory, park_state machine
+├── context.zig            # ctx-switch dispatch → context_arm64 / context_x86_64
 ├── context_arm64.zig      # AAPCS64 wide ctx switch + trampoline (asm)
+├── context_x86_64.zig     # System V x86-64 ctx switch (.S linked via build.zig)
 ├── current.zig            # threadlocal current coroutine pointer
 ├── parker.zig             # __ulock_wait (Darwin) / FUTEX_WAIT (Linux) Parker
 ├── park.zig               # Parking lot — sharded bucket-locked waiter queues
-├── reactor_kqueue.zig     # kqueue reactor + non-blocking IO helpers
+├── poll_desc.zig          # Go-netpoll-style per-fd readiness state machine
+├── pd_handle.zig          # Lazy per-fd PollDesc slot (atomic ensure/release)
+├── cancel.zig             # Cancel token + cancel-aware waiter registration
+├── select.zig             # select over multiple channel/sync ops
+├── race.zig               # race() — first-of-N coroutine composition
+├── signal.zig             # Public POSIX signal API (sigaction, ignoreSigpipe)
+├── blocking_pool.zig      # spawnBlocking thread pool
+├── stack.zig              # Coroutine stack slab arena
 ├── task.zig               # Task(T) typed handle (atomic-counter join)
-├── channel.zig            # Spsc(T, cap) — comptime-specialized SPSC ring
-├── sync.zig               # Mutex, Notify, Semaphore (parking-lot based)
-└── net.zig                # TcpListener, TcpStream, Address (IPv4 loopback)
+├── channel.zig            # Spsc / Mpmc / Oneshot / Watch / Broadcast
+├── streams.zig            # Pull-based async Stream(T) + operators
+├── sync.zig               # Mutex, RwLock, OnceCell, Barrier, Notify, Semaphore
+├── testing.zig            # Leak-detecting multi-worker-safe test allocator
+├── reactor.zig            # Reactor facade — comptime-picks the backend
+├── reactor/               # kqueue, epoll, io_uring, linux, posix (shared
+│                          # helpers), fs (spawnBlocking proxy), conformance_test
+├── fs.zig + fs/           # File, Dir, Metadata, mmap, path, syscall, watcher,
+│                          # error, ring (per-P io_uring fs ring)
+├── net.zig + net/         # Tcp*, address, options, resolver, udp, unix
+└── time.zig + time/       # Duration/clock + after, ticker, timer
 
 bench/                     # Perf benches — each one a standalone executable
 spike/                     # POC validations (kept as historical reference)
 docs/                      # Astro-Starlight site
 ```
+
+Windows/IOCP was dropped 2026-06-16; its reactor backend lives on
+branch `feat/windows-fs` (issue #6), not in this tree.
 
 ## Benchmarks (Darwin arm64, 11 cores, ReleaseFast)
 
