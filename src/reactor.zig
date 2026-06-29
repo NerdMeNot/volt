@@ -7,12 +7,13 @@
 //! codebase (`runtime.zig`, `net.zig`, `lib.zig`) imports a single
 //! file regardless of platform.
 //!
-//! Each backend lives in its own file:
-//!   * `reactor_kqueue.zig`   — Darwin / BSD
-//!   * `reactor_epoll.zig`    — Linux (readiness; the only public Linux backend)
-//!   * `reactor_io_uring.zig` — Linux (completion; internal, reserved for the
+//! Each backend lives in its own file under `reactor/`:
+//!   * `reactor/kqueue.zig`   — Darwin / BSD
+//!   * `reactor/epoll.zig`    — Linux (readiness; the only public Linux backend)
+//!   * `reactor/io_uring.zig` — Linux (completion; internal, reserved for the
 //!                              future async-file-I/O path — not user-selectable)
-//!   * `reactor_iocp.zig`     — Windows
+//! Windows (IOCP) was dropped 2026-06-16; that backend is preserved on
+//! branch `feat/windows-fs` (issue #6), not built here.
 //!
 //! Adding a backend is a self-contained file + an entry in the
 //! switch below. The interface (`Reactor.init`/`deinit`/
@@ -22,9 +23,9 @@
 const builtin = @import("builtin");
 
 const backend = switch (builtin.os.tag) {
-    .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly => @import("reactor_kqueue.zig"),
-    .linux => @import("reactor_linux.zig"), // tagged-union dispatch for epoll/io_uring
-    .windows => @import("reactor_iocp.zig"),
+    .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly => @import("reactor/kqueue.zig"),
+    .linux => @import("reactor/linux.zig"), // tagged-union dispatch for epoll/io_uring
+    .windows => @compileError("Volt: Windows dropped 2026-06-16; IOCP backend lives on branch feat/windows-fs — see issue #6"),
     else => @compileError("Volt: no reactor backend for this platform — see src/reactor.zig"),
 };
 

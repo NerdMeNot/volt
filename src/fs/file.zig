@@ -473,7 +473,7 @@ fn inCoroutine() bool {
 // sentinel meaning "use current file position"; the helpers
 // dispatch to read(2)/write(2) vs pread(2)/pwrite(2) on it.
 
-const reactor_fs = @import("../reactor_fs.zig");
+const reactor_fs = @import("../reactor/fs.zig");
 
 fn blockingOpen(z: *const PathZ, flags: c_int, mode: c_uint) c_int {
     const result = lib.runtime().reactor.fsOpen(@as([*:0]const u8, &z.buf), flags, mode);

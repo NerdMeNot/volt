@@ -789,7 +789,7 @@ test {
     _ = @import("select.zig");
     _ = @import("fs.zig");
     _ = @import("poll_desc.zig");
-    _ = @import("reactor_conformance_test.zig");
+    _ = @import("reactor/conformance_test.zig");
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
