@@ -8,6 +8,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const reactor_mod = @import("reactor.zig");
+const poll_desc = @import("poll_desc.zig");
+const pd_handle = @import("pd_handle.zig");
 const runtime = @import("runtime.zig");
 const current = @import("current.zig");
 
@@ -56,6 +58,11 @@ const EAGAIN: c_int = switch (builtin.os.tag) {
     .windows => 10035, // WSAEWOULDBLOCK
     else => @compileError("EAGAIN not defined for this OS"),
 };
+// EINTR is 4 on every POSIX target. A signal can interrupt a
+// blocking-shaped syscall (accept/connect) before it would return
+// EAGAIN/EINPROGRESS; the call must be retried (accept) or treated
+// as in-progress (connect), never surfaced as a hard failure.
+const EINTR: c_int = 4;
 
 // `sockaddr_in` layout is not portable. Darwin / *BSD prepend a
 // `sin_len` byte and treat `sin_family` as u8; Linux and Windows
@@ -120,6 +127,31 @@ inline fn errnoVal() c_int {
 // platform's backend). The duplicate that used to live here was
 // consolidated as part of the L1 reactor refactor.
 
+/// Dispatch a socket close through the reactor's `closeFd` when we
+/// have a runtime in scope (any coroutine context), falling back to
+/// the bare libc close otherwise (test cleanup, `defer s.close()`
+/// outside a coroutine).
+///
+/// Why this matters: a peer coroutine calling `close()` on a fd that
+/// another coroutine is parked on must dispatch the parked waiter,
+/// not just orphan the kernel registration. The reactor's `closeFd`
+/// owns that dispatch logic — see `src/reactor_kqueue.zig` for the
+/// full kqueue implementation. The epoll / io_uring / IOCP backends
+/// today have stub closeFd implementations that just call libc
+/// close; the two SkipZigTest cases in
+/// `src/reactor_conformance_test.zig` keep those gaps visible.
+///
+/// Outside coroutine context (test cleanup after rt.deinit, etc.),
+/// no coroutine can be parked, so a plain libc close is correct.
+fn closeFdDispatch(fd: i32) void {
+    if (current.get()) |c| {
+        const rt: *runtime.Runtime = @ptrCast(@alignCast(c.runtime));
+        rt.reactor.closeFd(fd);
+    } else {
+        _ = c_close(@intCast(fd));
+    }
+}
+
 /// Re-exported from `src/net/address.zig` — full IPv4 + IPv6
 /// support, posix.sockaddr.storage-backed. See that file for the
 /// complete public surface.
@@ -163,6 +195,11 @@ test {
 
 pub const TcpListener = struct {
     fd: i32,
+    /// Per-fd PollDesc — allocated on first wait (lazy because
+    /// `bind` is callable before `rt.run()` with no coroutine
+    /// context to access the allocator). Owned by this listener:
+    /// closed and freed in `close`.
+    pd: pd_handle.Atomic = .{},
     /// Windows-only: tracks whether `fd` has been associated with
     /// the reactor's IOCP yet. CreateIoCompletionPort is one-shot
     /// per handle (calling it twice fails), so we set this flag on
@@ -196,7 +233,8 @@ pub const TcpListener = struct {
     }
 
     pub fn close(self: *TcpListener) void {
-        _ = c_close(@intCast(self.fd));
+        pd_handle.release(&self.pd, self.fd);
+        closeFdDispatch(self.fd);
     }
 
     // ─── Socket options on the listener ──────────────────────────
@@ -234,14 +272,18 @@ pub const TcpListener = struct {
         if (comptime builtin.os.tag == .windows) {
             return acceptWindows(self, rt);
         }
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
         while (true) {
             const new_fd = c_accept(@intCast(self.fd), null, null);
             if (new_fd >= 0) {
                 try reactor_mod.setNonblock(@intCast(new_fd));
                 return .{ .fd = @intCast(new_fd) };
             }
-            if (errnoVal() != EAGAIN) return error.AcceptFailed;
-            try rt.reactor.waitReadable(self.fd);
+            const e = errnoVal();
+            if (e == EINTR) continue; // interrupted before ready — retry
+            if (e != EAGAIN) return error.AcceptFailed;
+            try rt.reactor.waitFd(self.fd, pd, .read);
         }
     }
 };
@@ -290,6 +332,9 @@ fn acceptWindows(listener: *TcpListener, rt: *runtime.Runtime) !TcpStream {
 
 pub const TcpStream = struct {
     fd: i32,
+    /// Per-fd PollDesc — symmetric with TcpListener; lazy-init at
+    /// first wait, closed and freed in `close`.
+    pd: pd_handle.Atomic = .{},
 
     pub fn connect(addr: Address) !TcpStream {
         const af: c_int = if (addr.isIpv6()) AF_INET6 else AF_INET;
@@ -307,16 +352,25 @@ pub const TcpStream = struct {
         // an IPv6 addr will fail here — that's caught at connect time.
         if (c_connect(fd, addr.sockaddr(), addr.len) < 0) {
             const e = errnoVal();
-            if (e != EINPROGRESS) return error.ConnectFailed;
+            // EINTR means the connect was initiated and is proceeding
+            // in the background — same as EINPROGRESS, you must NOT
+            // re-call connect() (that returns EALREADY/EISCONN); wait
+            // for write-readiness instead.
+            if (e != EINPROGRESS and e != EINTR) return error.ConnectFailed;
             // Wait for writable = connect completed.
             const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
-            try rt.reactor.waitWritable(fd);
+            var stream: TcpStream = .{ .fd = @intCast(fd) };
+            const pd = try pd_handle.ensure(&stream.pd, rt, stream.fd);
+            defer pd.decref();
+            try rt.reactor.waitFd(stream.fd, pd, .write);
+            return stream;
         }
         return .{ .fd = @intCast(fd) };
     }
 
     pub fn close(self: *TcpStream) void {
-        _ = c_close(@intCast(self.fd));
+        pd_handle.release(&self.pd, self.fd);
+        closeFdDispatch(self.fd);
     }
 
     // Windows connect via `ConnectEx`: same reason as AcceptEx —
@@ -344,22 +398,30 @@ pub const TcpStream = struct {
 
     pub fn read(self: *TcpStream, buf: []u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
-        return reactor_mod.readAsync(&rt.reactor, self.fd, buf);
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
+        return reactor_mod.readAsync(&rt.reactor, self.fd, pd, buf);
     }
 
     pub fn write(self: *TcpStream, buf: []const u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
-        return reactor_mod.writeAsync(&rt.reactor, self.fd, buf);
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
+        return reactor_mod.writeAsync(&rt.reactor, self.fd, pd, buf);
     }
 
     pub fn writeAll(self: *TcpStream, buf: []const u8) !void {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
-        return reactor_mod.writeAll(&rt.reactor, self.fd, buf);
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
+        return reactor_mod.writeAll(&rt.reactor, self.fd, pd, buf);
     }
 
     pub fn readFull(self: *TcpStream, buf: []u8) !usize {
         const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
-        return reactor_mod.readFull(&rt.reactor, self.fd, buf);
+        const pd = try pd_handle.ensure(&self.pd, rt, self.fd);
+        defer pd.decref();
+        return reactor_mod.readFull(&rt.reactor, self.fd, pd, buf);
     }
 
     // ─── Socket options ─────────────────────────────────────────────
@@ -504,7 +566,12 @@ pub const TcpStream = struct {
             const self: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
             const dest = limit.slice(try io_w.writableSliceGreedy(1));
             const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
-            const n = reactor_mod.readAsync(&rt.reactor, self.stream.fd, dest) catch |err| {
+            const pd = pd_handle.ensure(&self.stream.pd, rt, self.stream.fd) catch {
+                self.err = error.SystemResources;
+                return error.ReadFailed;
+            };
+            defer pd.decref();
+            const n = reactor_mod.readAsync(&rt.reactor, self.stream.fd, pd, dest) catch |err| {
                 self.err = err;
                 return error.ReadFailed;
             };
@@ -534,11 +601,16 @@ pub const TcpStream = struct {
         fn drainImpl(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
             const self: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
             const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
+            const pd = pd_handle.ensure(&self.stream.pd, rt, self.stream.fd) catch {
+                self.err = error.SystemResources;
+                return error.WriteFailed;
+            };
+            defer pd.decref();
 
             // First, drain the writer's internal buffer.
             const buffered = io_w.buffer[0..io_w.end];
             if (buffered.len > 0) {
-                reactor_mod.writeAll(&rt.reactor, self.stream.fd, buffered) catch |err| {
+                reactor_mod.writeAll(&rt.reactor, self.stream.fd, pd, buffered) catch |err| {
                     self.err = err;
                     return error.WriteFailed;
                 };
@@ -554,7 +626,7 @@ pub const TcpStream = struct {
                 const repeats: usize = if (i == last_idx) splat else 1;
                 var rep: usize = 0;
                 while (rep < repeats) : (rep += 1) {
-                    reactor_mod.writeAll(&rt.reactor, self.stream.fd, slice) catch |err| {
+                    reactor_mod.writeAll(&rt.reactor, self.stream.fd, pd, slice) catch |err| {
                         self.err = err;
                         return error.WriteFailed;
                     };
@@ -643,6 +715,13 @@ test "TCP echo single client round-trip" {
     try std.testing.expectEqual(@as(u8, 0x42), ctx.result_byte);
 }
 
+// NOTE: the SIGPIPE-ignore behavior (Runtime.init -> signal.ignoreSigpipe)
+// cannot be guarded by an in-suite `zig test` test: the Zig test runner
+// installs its own SIGPIPE handler, which masks the crash regardless of
+// our fix. The behavioral regression guard is the standalone
+// `bench/repro_sigpipe.zig` (run: `zig build bench-repro-sigpipe`),
+// which starts at the default disposition and exits 141 without the fix.
+
 // std.Io.Reader/Writer adapter round-trip — proves the adapters work
 // with the new Zig 0.16 vtable. The server reads via the std.Io.Reader
 // (formatter-friendly path), and the client writes via std.Io.Writer.
@@ -717,7 +796,9 @@ fn cancelAcceptServer(ctx: *CancelAcceptCtx) !void {
     const rt: *runtime.Runtime = @ptrCast(@alignCast(current.require().runtime));
     // Direct reactor path: we want to test the cancel hook,
     // not the higher-level accept wrapper.
-    const result = rt.reactor.waitReadableCancel(ctx.listener.fd, ctx.cancel);
+    const pd = try pd_handle.ensure(&ctx.listener.pd, rt, ctx.listener.fd);
+    defer pd.decref();
+    const result = rt.reactor.waitFdCancel(ctx.listener.fd, pd, .read, ctx.cancel);
     ctx.got = if (result) |_| null else |e| e;
 }
 
@@ -875,28 +956,4 @@ test "reactor: waitReadableCancel wakes a parked accept on Cancel.fire" {
     try (try rt.run(cancelAcceptRoot, .{&ctx}));
 
     try std.testing.expectEqual(@as(?anyerror, error.Cancelled), ctx.got);
-}
-
-// Linux-only: force the epoll backend (auto-mode silently picks
-// io_uring on every modern kernel, leaving the epoll path
-// untested in CI). Same workload as the auto-mode TCP echo above
-// — gives us regression coverage on the second Linux reactor.
-test "TCP echo round-trip on forced .epoll backend (Linux only)" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    var rt = try runtime.Runtime.init(.{
-        .allocator = test_allocator,
-        .workers = 1,
-        .io_backend = .epoll,
-    });
-    defer rt.deinit();
-
-    var listener = try TcpListener.bind(Address.loopback4(0));
-    defer listener.close();
-    var ctx = EchoTestCtx{ .listener = &listener };
-    ctx.addr = try listener.localAddress();
-    try (try rt.run(echoTestRoot, .{&ctx}));
-
-    try std.testing.expect(ctx.server_done);
-    try std.testing.expect(ctx.client_done);
-    try std.testing.expectEqual(@as(u8, 0x42), ctx.result_byte);
 }

@@ -100,8 +100,18 @@ echo "==> Running: ${ZIG_CMD[*]} (in $IMAGE)"
 TTY_ARG=""
 [[ -t 1 ]] && TTY_ARG="-t"
 
+# --security-opt flags: same rationale as scripts/probe-linux.sh.
+# Fedora 41's default podman seccomp profile blocks io_uring
+# syscalls (returning ENOSYS to disguise the rejection); SELinux
+# additionally refuses io_uring_setup for the container_t context
+# (EACCES). Both flags are needed for any test that exercises
+# io_uring — which now includes src/fs_ring.zig's unit tests.
+# Acceptable for a local dev container.
+
 exec "$PODMAN" run --rm -i ${TTY_ARG} \
     --platform "$PLATFORM" \
+    --security-opt seccomp=unconfined \
+    --security-opt label=disable \
     -v "$REPO_ROOT":/work:Z \
     -v "$CACHE_VOLUME":/work/.zig-cache:U \
     -w /work \

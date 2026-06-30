@@ -56,22 +56,42 @@ pub const Error = error{Cancelled};
 ///     that address. Fire calls `parking_lot.unparkAll` on the key
 ///     and the validator-under-lock pattern re-checks `isFired`.
 ///     Used by `Mutex.lockCancel`, `Spsc.recvCancel`, etc.
-///   * `.reactor_coro` — owner is parked in the kernel's event
-///     queue (kqueue/epoll/io_uring/IOCP). Fire calls
+///   * `.reactor_coro` — owner is parked via a per-coroutine kernel
+///     registration (e.g., kqueue `EVFILT_TIMER`). Fire calls
 ///     `runtime.reactor.cancelCoro(coro)`, which performs the
-///     per-platform deregistration syscall and unparks. The
-///     reactor's deregister returns "did we actually remove the
-///     pending op", arbitrating the race against a concurrent
-///     poll() to avoid double-unpark / double-decrement.
+///     deregistration syscall and unparks. Used by
+///     `waitTimerCancel`. Fd-parked waiters will move to the
+///     `.deliver` variant once the PollDesc migration lands; the
+///     kernel-keyed cancel path stays only for timers.
+///   * `.deliver` — owner is parked behind a user-space state
+///     machine (the `PollDesc` from the reactor-restructure work).
+///     Fire calls the registered callback with `ctx`. The callback
+///     itself decides how to wake the parked coro (state-machine
+///     CAS + `runtime.unpark`). Dependency-inverted so cancel.zig
+///     doesn't need to import poll_desc.zig.
+///
+/// Lifetime caveat for `.deliver`: `ctx` must point to memory that
+/// outlives any in-flight dispatch. `fire()` snapshots the list
+/// under the lock, then dispatches outside it. A `deregister()`
+/// concurrent with dispatch returns immediately (its `in_list`
+/// flag was already cleared by the snapshot), but the callback
+/// may still run. Pass a heap-stable `ctx` — the PollDesc heap
+/// pointer is the canonical case.
 pub const Waiter = struct {
     kind: Kind = .{ .park_addr = 0 },
     next: ?*Waiter = null,
     prev: ?*Waiter = null,
     in_list: bool = false,
 
+    pub const DeliverFn = *const fn (ctx: *anyopaque) void;
+
     pub const Kind = union(enum) {
         park_addr: usize,
         reactor_coro: *coroutine.Coroutine,
+        deliver: struct {
+            ctx: *anyopaque,
+            unblock: DeliverFn,
+        },
     };
 };
 
@@ -125,12 +145,28 @@ pub const Cancel = struct {
     }
 
     /// Register `w` to be woken on fire via the reactor's
-    /// per-platform `cancelCoro` syscall. Used by cancel-aware
-    /// fd-wait variants (`waitReadableCancel` etc.) whose parked
-    /// owner lives in the kernel's event queue, not the parking
-    /// lot.
+    /// per-platform `cancelCoro` syscall. Used by `waitTimerCancel`
+    /// where the parked owner lives in the kernel's event queue
+    /// (e.g., kqueue `EVFILT_TIMER`).
     pub fn registerReactor(self: *Cancel, w: *Waiter, coro: *coroutine.Coroutine) bool {
         w.kind = .{ .reactor_coro = coro };
+        return self.registerCommon(w);
+    }
+
+    /// Register `w` to be woken on fire via a user-space callback.
+    /// The callback receives `ctx` and is responsible for waking
+    /// the parked coro (typically a state-machine CAS plus
+    /// `runtime.unpark`). Used by `PollDesc.waitCancel`.
+    ///
+    /// `ctx` MUST be heap-stable for the lifetime of any concurrent
+    /// `fire()` dispatch — see Waiter docs for the lifetime caveat.
+    pub fn registerCallback(
+        self: *Cancel,
+        w: *Waiter,
+        ctx: *anyopaque,
+        cb: Waiter.DeliverFn,
+    ) bool {
+        w.kind = .{ .deliver = .{ .ctx = ctx, .unblock = cb } };
         return self.registerCommon(w);
     }
 
@@ -154,8 +190,22 @@ pub const Cancel = struct {
     /// Remove `w` from the waiter list. Idempotent — safe to call
     /// even if `fire()` already drained `w`.
     pub fn deregister(self: *Cancel, w: *Waiter) void {
+        _ = self.deregisterRemoved(w);
+    }
+
+    /// Like `deregister`, but returns whether `w` was still on the
+    /// list (i.e., we unlinked it ourselves). A `false` return means
+    /// `fire()` already snapshotted `w` for dispatch; the dispatch
+    /// MAY still be in flight when this returns.
+    ///
+    /// `.deliver` callers use this to decide who owns lifecycle
+    /// resources (refcounts on shared state, etc.): if removed=true
+    /// the callback will not run, so the caller cleans up; otherwise
+    /// the callback runs and is responsible.
+    pub fn deregisterRemoved(self: *Cancel, w: *Waiter) bool {
         self.acquireLock();
-        if (w.in_list) {
+        const was_in_list = w.in_list;
+        if (was_in_list) {
             if (w.prev) |p| {
                 p.next = w.next;
             } else {
@@ -165,6 +215,7 @@ pub const Cancel = struct {
             w.in_list = false;
         }
         self.releaseLock();
+        return was_in_list;
     }
 
     /// Set the fired flag and wake every registered waiter.
@@ -185,14 +236,15 @@ pub const Cancel = struct {
         }
         self.head = null;
         self.releaseLock();
-        // Wake each parked op (outside the lock — both paths can be
-        // a non-trivial amount of work).
+        // Wake each parked op (outside the lock — all three paths
+        // can be a non-trivial amount of work).
         var w = drained;
         while (w) |it| {
             w = it.next;
             switch (it.kind) {
                 .park_addr => |addr| _ = park.unparkAll(self.rt, @ptrFromInt(addr)),
                 .reactor_coro => |c| self.rt.reactor.cancelCoro(c),
+                .deliver => |d| d.unblock(d.ctx),
             }
         }
     }

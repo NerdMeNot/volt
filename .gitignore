@@ -10,6 +10,12 @@ lib.lib
 # Scratch / generated
 tmp/
 
+# Reference clones (libuv, mio, tokio-uring, tokio) — read-only
+# sources we mine for proven test patterns and reactor designs.
+# Not deps, not vendored — just a study reference. Cloned via
+# scripts/sync-refs.sh.
+.refs/
+
 # Rust build artifacts (entire target directory)
 bench/rust_bench/target/
 

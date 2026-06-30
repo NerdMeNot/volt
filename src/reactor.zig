@@ -7,11 +7,13 @@
 //! codebase (`runtime.zig`, `net.zig`, `lib.zig`) imports a single
 //! file regardless of platform.
 //!
-//! Each backend lives in its own file:
-//!   * `reactor_kqueue.zig`   — Darwin / BSD
-//!   * `reactor_epoll.zig`    — Linux (readiness)
-//!   * `reactor_io_uring.zig` — Linux (poll-mode)
-//!   * `reactor_iocp.zig`     — Windows
+//! Each backend lives in its own file under `reactor/`:
+//!   * `reactor/kqueue.zig`   — Darwin / BSD
+//!   * `reactor/epoll.zig`    — Linux (readiness; the only public Linux backend)
+//!   * `reactor/io_uring.zig` — Linux (completion; internal, reserved for the
+//!                              future async-file-I/O path — not user-selectable)
+//! Windows (IOCP) was dropped 2026-06-16; that backend is preserved on
+//! branch `feat/windows-fs` (issue #6), not built here.
 //!
 //! Adding a backend is a self-contained file + an entry in the
 //! switch below. The interface (`Reactor.init`/`deinit`/
@@ -21,18 +23,13 @@
 const builtin = @import("builtin");
 
 const backend = switch (builtin.os.tag) {
-    .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly => @import("reactor_kqueue.zig"),
-    .linux => @import("reactor_linux.zig"), // tagged-union dispatch for epoll/io_uring
-    .windows => @import("reactor_iocp.zig"),
+    .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly => @import("reactor/kqueue.zig"),
+    .linux => @import("reactor/linux.zig"), // tagged-union dispatch for epoll/io_uring
+    .windows => @compileError("Volt: Windows dropped 2026-06-16; IOCP backend lives on branch feat/windows-fs — see issue #6"),
     else => @compileError("Volt: no reactor backend for this platform — see src/reactor.zig"),
 };
 
 pub const Reactor = backend.Reactor;
-
-/// Linux-only — `Runtime.Config.io_backend` selects between
-/// `.epoll` and `.io_uring`; on other platforms the Config field
-/// is accepted but ignored. Public for `runtime.zig`'s use.
-pub const IoBackend = enum { auto, epoll, io_uring };
 
 // ─── Public error vocabulary ─────────────────────────────────────
 //
@@ -65,6 +62,13 @@ pub const ReactorWaitError = ReactorSetupError || error{
     /// The fd was closed (or never valid) before the registration
     /// landed — EBADF / WSAENOTSOCK.
     BadDescriptor,
+    /// Timer duration exceeds `std.math.maxInt(i64)` nanoseconds
+    /// (~292 years). All four backends' kernel timer types are
+    /// signed 64-bit; values above that would wrap silently. The
+    /// public timer API caps at i64_max ns so callers passing
+    /// `std.math.maxInt(u64)` as a sentinel get a clean error
+    /// rather than an unpredictable wrap.
+    TimeoutOutOfRange,
 };
 
 /// Errors from `readAsync` / `writeAsync` / `readFull` / `writeAll`.

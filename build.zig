@@ -90,6 +90,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "parallel-compute", .src = "bench/bench_parallel_compute.zig", .desc = "Parallel CPU-bound work across N workers" },
         .{ .name = "reactor-throughput", .src = "bench/bench_reactor_throughput.zig", .desc = "Reactor wakes/s — single connection, 1-byte payload, 1 worker (cross-platform receipt)" },
         .{ .name = "reactor-fanout", .src = "bench/bench_reactor_fanout.zig", .desc = "High-fd-pressure TCP echo (512 clients × 64 RTT, NumCPU workers) — Lane 4 measurement bench" },
+        .{ .name = "fs-read", .src = "bench/bench_fs_read.zig", .desc = "fs.File random 4KB pread (16 coros × 256 ops, 64 MiB file) — io_uring vs spawnBlocking perf gate" },
+        .{ .name = "blocking-deadlock-repro", .src = "bench/repro_blocking_deadlock.zig", .desc = "Regression: spawnBlocking closure-lifetime deadlock under bursty concurrency (watchdog-guarded)" },
+        .{ .name = "repro-sigpipe", .src = "bench/repro_sigpipe.zig", .desc = "Regression: Runtime.init ignores SIGPIPE (write to peer-closed socket returns EPIPE, not process death)" },
     };
     for (benches) |bench| {
         const mod = b.createModule(.{

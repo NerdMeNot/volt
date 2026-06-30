@@ -60,7 +60,7 @@ That's the whole shape. No `async`, no `await`, no `Future`, no `.poll()`, no ma
 - **Channels** comptime-specialized at the call site — `Spsc(T, cap)` (single-producer/single-consumer), `Mpmc(T, cap)` (Vyukov bounded ring), `Oneshot(T)` (1:1 handoff), `Watch(T)` (1:N latest-value, seqlock), `Broadcast(T, cap)` (1:N history-aware). All block via the parking lot.
 - **Sync primitives** — `Mutex`, `Notify`, `Semaphore` — built on a shared parking lot.
 - **Cancellation** — `volt.Cancel` carries an atomic flag + waiter list. Cancel-aware variants (`Mutex.lockCancel`, `Spsc.recvCancel`, etc.) wake with `error.Cancelled` when fired. `volt.scope` ties Cancel lifetime to a lexical block.
-- **Reactor with four backend implementations** behind one interface — kqueue (Darwin/BSD), epoll (Linux), io_uring (Linux ≥ 5.10, poll mode), IOCP (Windows, polyfilled as readiness via zero-byte `WSARecv`/`WSASend`). Single-poller claim, one-shot registrations, `*Coroutine` as the wake identity. Darwin is the primary dev platform; Linux backends cross-compile and run their unit tests; Windows cross-compiles, runtime validation pending.
+- **Reactor backends** behind one interface — kqueue (Darwin/BSD), epoll (Linux), io_uring (Linux ≥ 5.10, poll mode). Single-poller claim, one-shot registrations, `*Coroutine` as the wake identity. Supported platforms are **Linux + macOS, arm64 + x86_64**; Darwin is the primary dev platform and the Linux backends run their unit tests in CI. (A Windows IOCP backend exists in-tree but is **dormant/unsupported** — Windows was dropped from scope 2026-06-16; see issue #6.)
 
 ## Performance — Go as scale reference
 
@@ -100,14 +100,13 @@ the coordination cost. On any shape with actual parallel work
 | Darwin x86_64 kqueue | **Working** — Intel Mac; runs natively + via Rosetta from Apple Silicon |
 | Linux arm64 (epoll / io_uring) | **Working** — native test CI on `ubuntu-24.04-arm` green |
 | Linux x86_64 (epoll / io_uring) | **Working** — native test CI on `ubuntu-latest` green; SysV x86-64 ctx switch (L6a) |
-| Windows x86_64 IOCP | **Working** — native test CI on `windows-latest` green; Microsoft x64 ABI ctx switch with XMM6-XMM15 save (L6b) |
-| Windows arm64 IOCP | **Cross-compile only** — code complete; native testing blocked by an upstream Zig 0.16 bug (`zig build` segfaults on `windows-11-arm`). Revisit when Zig fixes it |
+| Windows (IOCP) | **Dropped from scope (2026-06-16)** — IOCP reactor + Win64 ctx switch remain in-tree but dormant: not built, not tested, unsupported. The windows-latest test build never actually linked (a separate `std.posix.munmap` toolchain gap). Revisit another day. See issue #6 |
 | Cancellation | **Shipping** — `Cancel`, cancel-aware variants of every blocking op, `scope` for lexical lifetime |
 | File I/O / DNS / TLS | Not yet — these belong in libraries on top of Volt, not in core |
 | Mutex throughput | Parking-lot + spin loop redesign on 2026-05-16 — contended-Mutex bench now 15 ns/op, ~5.4× faster than Go's 81 ns |
 | Stack allocation | Slab-arena redesign on 2026-05-16 — one `mmap` at runtime init, lazy per-slot `mprotect`, per-P pool with fair-share cap overflows to arena. Removed the VM-lock cliff that the prior pool-of-64 design hit at BATCH > 64. |
 
-The honest case for using Volt today: you want a stackful coroutine substrate for Zig on ARM64, you want the synchronous-shape ergonomics, you can live with the multi-worker spawn-heavy gap to Go, and you're OK being an early user on Linux (epoll + io_uring backends are written but not yet CI-validated) or willing to wait on Windows (cross-compiles cleanly; runtime validation pass pending).
+The honest case for using Volt today: you want a stackful coroutine substrate for Zig on Linux or macOS (arm64 or x86_64), you want the synchronous-shape ergonomics, and you can live with the multi-worker spawn-heavy gap to Go. Windows is out of scope for now.
 
 ## Versioning
 

@@ -15,7 +15,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const reactor_mod = @import("reactor.zig");
+const reactor_mod = @import("../reactor.zig");
+const poll_desc = @import("../poll_desc.zig");
 
 pub const IoError = reactor_mod.IoError;
 pub const ReactorSetupError = reactor_mod.ReactorSetupError;
@@ -62,6 +63,11 @@ pub const EAGAIN: c_int = switch (builtin.os.tag) {
     .freebsd, .openbsd, .netbsd, .dragonfly => 35,
     else => @compileError("EAGAIN not defined for this OS"),
 };
+// On Linux and Darwin EWOULDBLOCK == EAGAIN, but POSIX permits them
+// to differ; check both so a backend that ever runs where they
+// diverge still yields instead of erroring. Matches net/unix.zig and
+// net/udp.zig, which already check both.
+pub const EWOULDBLOCK: c_int = EAGAIN;
 
 // Errno values used for the IoError mapping. Linux glibc + Darwin
 // disagree on the numbers; we keep both branches in one place.
@@ -140,19 +146,25 @@ pub fn setNonblock(fd: i32) ReactorSetupError!void {
 /// Read up to `buf.len` bytes from `fd`, yielding to `rx` on
 /// `EAGAIN`. `rx` is taken as `anytype` so each reactor backend can
 /// supply its own concrete type without a shared base class — the
-/// only requirement is a `waitReadable(fd: i32) !void` method.
+/// only requirement is a `waitFd(fd, *PollDesc, Mode) !void` method
+/// (the Step 2b PollDesc-aware reactor interface).
+///
+/// `pd` is the per-socket PollDesc the kqueue backend dispatches
+/// kernel events to. Shim backends ignore it and fall back to their
+/// per-wait registration path. Net.zig allocates one PollDesc per
+/// socket and threads it through here.
 ///
 /// Non-EAGAIN errnos map through `errnoToIoError` into the typed
 /// `IoError` set. Library callers can match on `error.ConnectionReset`
 /// vs `error.BrokenPipe` etc. instead of a single coarse
 /// `ReadFailed`.
-pub fn readAsync(rx: anytype, fd: i32, buf: []u8) IoError!usize {
+pub fn readAsync(rx: anytype, fd: i32, pd: *poll_desc.PollDesc, buf: []u8) IoError!usize {
     while (true) {
         const r = read(@intCast(fd), buf.ptr, buf.len);
         if (r >= 0) return @intCast(r);
         const e = errnoVal();
-        if (e == EAGAIN) {
-            try rx.waitReadable(fd);
+        if (e == EAGAIN or e == EWOULDBLOCK) {
+            try rx.waitFd(fd, pd, .read);
             continue;
         }
         if (e == Errno.EINTR) continue; // retry transparently
@@ -160,13 +172,13 @@ pub fn readAsync(rx: anytype, fd: i32, buf: []u8) IoError!usize {
     }
 }
 
-pub fn writeAsync(rx: anytype, fd: i32, buf: []const u8) IoError!usize {
+pub fn writeAsync(rx: anytype, fd: i32, pd: *poll_desc.PollDesc, buf: []const u8) IoError!usize {
     while (true) {
         const w = write(@intCast(fd), buf.ptr, buf.len);
         if (w >= 0) return @intCast(w);
         const e = errnoVal();
-        if (e == EAGAIN) {
-            try rx.waitWritable(fd);
+        if (e == EAGAIN or e == EWOULDBLOCK) {
+            try rx.waitFd(fd, pd, .write);
             continue;
         }
         if (e == Errno.EINTR) continue;
@@ -176,10 +188,10 @@ pub fn writeAsync(rx: anytype, fd: i32, buf: []const u8) IoError!usize {
 
 /// Read EXACTLY `buf.len` bytes (loop until EOF or full). Returns the
 /// total bytes read — may be < buf.len if the peer closed early.
-pub fn readFull(rx: anytype, fd: i32, buf: []u8) IoError!usize {
+pub fn readFull(rx: anytype, fd: i32, pd: *poll_desc.PollDesc, buf: []u8) IoError!usize {
     var total: usize = 0;
     while (total < buf.len) {
-        const got = try readAsync(rx, fd, buf[total..]);
+        const got = try readAsync(rx, fd, pd, buf[total..]);
         if (got == 0) return total;
         total += got;
     }
@@ -187,16 +199,16 @@ pub fn readFull(rx: anytype, fd: i32, buf: []u8) IoError!usize {
 }
 
 /// Write EXACTLY `buf.len` bytes (loop on partial writes).
-pub fn writeAll(rx: anytype, fd: i32, buf: []const u8) IoError!void {
+pub fn writeAll(rx: anytype, fd: i32, pd: *poll_desc.PollDesc, buf: []const u8) IoError!void {
     var total: usize = 0;
     while (total < buf.len) {
-        const w = try writeAsync(rx, fd, buf[total..]);
+        const w = try writeAsync(rx, fd, pd, buf[total..]);
         total += w;
     }
 }
 
 comptime {
     if (builtin.os.tag == .windows) {
-        @compileError("reactor_posix.zig is POSIX-only; Windows uses reactor_iocp.zig directly");
+        @compileError("posix.zig is POSIX-only; Windows backend removed 2026-06-16 (see branch feat/windows-fs)");
     }
 }

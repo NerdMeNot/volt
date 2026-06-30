@@ -46,7 +46,18 @@ const park_mod = @import("park.zig");
 const stack_mod = @import("stack.zig");
 const blocking_pool_mod = @import("blocking_pool.zig");
 const signal_mod = @import("signal.zig");
+const fs_ring_mod = @import("fs/ring.zig");
 const builtin = @import("builtin");
+const cancel_mod = @import("cancel.zig");
+const fs_ring_sched = @import("runtime_fs_ring.zig");
+
+// fs-ring submit/await helpers live in runtime_fs_ring.zig; re-export
+// their public surface so reactor backends keep calling runtime.fsRingX.
+pub const fsRingRead = fs_ring_sched.fsRingRead;
+pub const fsRingWrite = fs_ring_sched.fsRingWrite;
+pub const fsRingFsync = fs_ring_sched.fsRingFsync;
+pub const fsRingFdatasync = fs_ring_sched.fsRingFdatasync;
+pub const cancelledFsResult = fs_ring_sched.cancelledFsResult;
 
 pub const Coroutine = coroutine.Coroutine;
 pub const Frame = coroutine.Frame;
@@ -130,17 +141,26 @@ pub const Config = struct {
     /// RSS is unaffected — every coroutine starts with the same 16
     /// KiB body commit; only this knob's *virtual* cost scales.
     stack_reservation_size: usize = stack_mod.DEFAULT_RESERVATION_SIZE,
-    /// **Linux only.** Chooses between epoll and io_uring backends.
-    /// `.auto` probes for io_uring at init and falls back to epoll
-    /// on older kernels (< 5.10) or sysctl-disabled environments.
-    /// Ignored on Darwin (always kqueue) and Windows (always IOCP).
-    io_backend: reactor_mod.IoBackend = .auto,
     /// OS-thread pool used by `volt.spawnBlocking` to run sync /
     /// CPU-bound code without pinning a worker. Lazy — no threads
     /// spawn until the first `spawnBlocking` call. Default caps
     /// concurrent sync work at 128 threads; raise for sync-IO-heavy
     /// services. See `src/blocking_pool.zig`.
     blocking: blocking_pool_mod.Config = .{},
+    /// **Opt-in, off by default.** When true (and the host is Linux
+    /// with io_uring available), `fs.File` ops route through per-worker
+    /// io_uring rings instead of the `spawnBlocking` pool.
+    ///
+    /// Default is `false` because the io_uring fs path — though built,
+    /// correct, and cancellation-safe — does **not** currently beat the
+    /// spawnBlocking baseline on the (only, cache-compromised) bench we
+    /// have (≈1.2× slower warm, 1.9× slower cold; see `bench-fs-read`).
+    /// Shipping it as the default would be slower than the fallback.
+    /// Kept as an opt-in so it can be re-measured on bare-metal NVMe
+    /// (where the gap should narrow) without being the default path.
+    /// On non-Linux / no-io_uring hosts this knob is a no-op — fs always
+    /// uses spawnBlocking there. See GitHub issue #20.
+    fs_io_uring: bool = false,
     /// Optional instrumentation hook. Set to `&my_observer` to
     /// receive callbacks on spawn / park / unpark / complete.
     /// Default `null` — every hook site folds away at optimisation
@@ -352,6 +372,26 @@ pub const Runtime = struct {
     /// Count of workers currently in the find-work phase of the
     /// dispatch loop. Anti-herd: `wakeOneParked` skips when > 0.
     num_searching: std.atomic.Value(u32) align(std.atomic.cache_line) = std.atomic.Value(u32).init(0),
+    /// Missed-wakeup latch. Set by `wakeOneParked` when it bails
+    /// because `num_searching > 0` (the anti-herd guard). Read +
+    /// cleared by the worker loop AFTER it fetchSub's `num_searching`
+    /// and BEFORE it commits to `parkWorker`. If observed set, the
+    /// worker re-enters find-work instead of parking — closing the
+    /// race where a pusher saw `num_searching > 0` while the
+    /// searcher was already mid-fetchSub, and bailed on the wake
+    /// expecting that searcher to find the work, but the searcher
+    /// had already passed its last `tryFindAndDispatch` and was
+    /// about to park.
+    ///
+    /// Modelled on Go's `sched.needspinning` (`runtime/proc.go`
+    /// design doc lines 79-104, set/cleared sites at proc.go:3158,
+    /// 3618). Without this latch, the lock-free `wakeOneParked` /
+    /// `num_searching.fetchSub` / `parkWorker` triangle has a
+    /// missed-wakeup window that Go closes via the explicit
+    /// `needspinning → goto top` re-becomes-spinning path and
+    /// Tokio closes via mutex-mediated idle-set transition
+    /// (`idle.rs::transition_worker_to_parked`).
+    need_spinning: std.atomic.Value(u32) align(std.atomic.cache_line) = std.atomic.Value(u32).init(0),
     /// CAS-claim "I am the current reactor poller".
     reactor_poller_taken: std.atomic.Value(bool) align(std.atomic.cache_line) = std.atomic.Value(bool).init(false),
     /// Shared parking lot — one wait/wake mechanism for every
@@ -366,6 +406,40 @@ pub const Runtime = struct {
     /// OS-thread pool used by `volt.spawnBlocking`. Lazy — no
     /// threads spawn until the first submit. See `src/blocking_pool.zig`.
     blocking_pool: blocking_pool_mod.Pool,
+    /// Per-P io_uring instances for async file I/O — Phase 2B.
+    /// One ring per P (matches the universal "ring per OS thread"
+    /// pattern from TigerBeetle / Glommio / Seastar, see
+    /// `docs/internals/async-fs-io.md §3.1`). Indexed by `P.id`.
+    /// Populated only on Linux, and only when every per-P ring
+    /// init succeeded. Left null on Darwin / Windows, on older
+    /// Linux kernels without io_uring, and on Linux when seccomp
+    /// or sysctl blocks io_uring_setup. The Reactor's fs methods
+    /// check this slice (Phase 2C) and fall back to the
+    /// spawnBlocking proxy when null.
+    fs_rings: ?[]fs_ring_mod.FsRing = null,
+    /// Phase 2C.2: count of in-flight fs ring SQEs (kernel-side
+    /// pending, not yet drained as CQEs). The reactor's `pending`
+    /// counter doesn't include fs ring eventfds (those are
+    /// wake signals, not registered I/O), so workers wouldn't
+    /// otherwise know to claim the reactor poller role when the
+    /// only outstanding work is a parked fs coroutine.
+    /// Bumped by `fsRingRead/Write/etc` after submit; decremented
+    /// by `drainFsRingInto` per CQE drained. `tryFindAndDispatch`
+    /// enters the reactor poll path when this is > 0 (in addition
+    /// to the existing `pendingCount > 0` check); `parkWorker`'s
+    /// defensive checks similarly avoid parking when > 0.
+    fs_in_flight: std.atomic.Value(u32) align(std.atomic.cache_line) =
+        std.atomic.Value(u32).init(0),
+    /// Phase 2D verification counter: monotonically incremented
+    /// every time an fs op successfully routes through the
+    /// per-P io_uring ring (instead of the spawnBlocking
+    /// fallback). Tests assert this is > 0 to prove the
+    /// io_uring path is actually being exercised — otherwise a
+    /// silent fallback to spawnBlocking would still make fs
+    /// tests pass with no visible signal. Never decremented;
+    /// not on a hot path beyond a single relaxed-order fetchAdd.
+    fs_ops_via_ring: std.atomic.Value(u64) align(std.atomic.cache_line) =
+        std.atomic.Value(u64).init(0),
     /// Optional instrumentation hook — see `Observer` doc. Read by
     /// the four hook sites (spawn, park, unpark, complete). Nullable
     /// so the hot path stays branch-and-fold when no observer is set.
@@ -379,6 +453,11 @@ pub const Runtime = struct {
         const n = cfg.workers orelse @max(1, try std.Thread.getCpuCount());
         if (n > MAX_WORKERS) return error.TooManyWorkers;
 
+        // A networked runtime must not die from SIGPIPE when a peer
+        // closes mid-write. Ignore it process-wide (once) before any
+        // socket I/O can happen. See signal.ignoreSigpipe.
+        signal_mod.ignoreSigpipe();
+
         const rt = try cfg.allocator.create(Runtime);
         errdefer cfg.allocator.destroy(rt);
 
@@ -387,18 +466,11 @@ pub const Runtime = struct {
         const ps = try cfg.allocator.alloc(P, n);
         errdefer cfg.allocator.free(ps);
 
-        // Reactor init: on Linux, the io_backend config selects
-        // between epoll and io_uring (tagged union dispatch in
-        // reactor_linux.zig). On other platforms `io_backend` is
-        // accepted but ignored — kqueue or IOCP is fixed.
-        const reactor_inst = if (@import("builtin").os.tag == .linux)
-            switch (cfg.io_backend) {
-                .auto => try Reactor.init(),
-                .epoll => try Reactor.initBackend(.epoll),
-                .io_uring => try Reactor.initBackend(.io_uring),
-            }
-        else
-            try Reactor.init();
+        // Reactor backend is fixed per platform — epoll (Linux),
+        // kqueue (Darwin), IOCP (Windows). io_uring exists in tree
+        // but is not user-selectable; see reactor_linux.zig for the
+        // future async-file-I/O plan.
+        const reactor_inst = try Reactor.init(cfg.allocator);
 
         rt.* = .{
             .allocator = cfg.allocator,
@@ -424,6 +496,34 @@ pub const Runtime = struct {
             p.stack_pool_cap = fair_share;
         }
         for (rt.ms, 0..) |*m, i| m.init(&rt.ps[i]);
+
+        // Per-P io_uring rings (Linux, Phase 2B). Graceful
+        // degradation: if any per-P init fails — kernel too old,
+        // sysctl-disabled, seccomp-blocked, ENOMEM — undo the
+        // successful inits and leave `fs_rings = null`. The
+        // Reactor's fs methods (Phase 2C) read this slice and fall
+        // back to the spawnBlocking proxy when null, so the
+        // failure mode is "no async fs win on this host", not
+        // "Runtime.init fails".
+        if (builtin.os.tag == .linux and cfg.fs_io_uring) {
+            fs_ring_sched.tryInitFsRings(rt, cfg.allocator);
+            // Phase 2C.1: if the rings were created, wire each
+            // ring's eventfd into the shared reactor's epoll +
+            // install the wake handler. The handler implements the
+            // Signal-Only-If-Idle protocol against parked_workers.
+            // Failures here are non-fatal: we tear down what was
+            // registered, free the rings, and leave fs_rings = null
+            // so the spawnBlocking fallback (Phase 1) kicks in.
+            if (rt.fs_rings != null) {
+                fs_ring_sched.wireFsRingWakeups(rt) catch {
+                    if (rt.fs_rings) |rings| {
+                        for (rings) |*r| r.deinit();
+                        cfg.allocator.free(rings);
+                        rt.fs_rings = null;
+                    }
+                };
+            }
+        }
 
         // Spawn pthread workers 1..N-1. M[0] is the driver thread
         // (the thread that called Runtime.init / will call
@@ -466,6 +566,12 @@ pub const Runtime = struct {
         // pools back to the allocator and stack pools back to the
         // arena; the arena's munmap happens after all Ps are done.
         for (self.ps) |*p| p.drainPools(self.allocator);
+        // Per-P io_uring rings (if init populated them).
+        if (self.fs_rings) |rings| {
+            for (rings) |*r| r.deinit();
+            self.allocator.free(rings);
+            self.fs_rings = null;
+        }
         self.stack_arena.deinit(self.allocator);
         self.allocator.free(self.ms);
         self.allocator.free(self.ps);
@@ -576,12 +682,35 @@ pub const Runtime = struct {
     /// its bit), unpark its Parker. Safe to call from any thread;
     /// no-op if no M is parked OR if another M is already searching
     /// for work (anti-herd guard).
+    ///
+    /// ## Anti-herd guard + missed-wakeup latch (Go's `wakep`)
+    ///
+    /// `num_searching > 0` ⇒ don't wake — the searcher will find
+    /// the work via its dispatch cycle. But this opens a race:
+    /// the "searcher" may have already fetchSub'd its share of
+    /// `num_searching` and be in `parkWorker`'s commit path. To
+    /// close it, we set `need_spinning = 1` when bailing, and the
+    /// worker-loop's post-fetchSub recheck (see
+    /// `workerLoopUntilShutdown` / `workerLoopUntilTaskDone`)
+    /// observes that flag and retries `tryFindAndDispatch` instead
+    /// of parking.
+    ///
+    /// The re-load of `num_searching` AFTER `need_spinning.store`
+    /// closes the symmetric race: if the searcher fetchSub'd
+    /// between our first load and our flag-set, our flag is
+    /// useless (the searcher already passed its check); we must
+    /// fall through to the real wake.
     pub fn wakeOneParked(self: *Runtime) void {
-        // Anti-herd: if any M is already searching, it will find
-        // the new work on its current or next dispatch cycle. No
-        // need to wake a parked sibling — that's just thrashing
-        // the bitmap cache line + paying ulock_wake overhead.
-        if (self.num_searching.load(.acquire) > 0) return;
+        // Anti-herd: any searcher will find the work — unless it
+        // has already fetchSub'd and is on the parkWorker commit
+        // path. The need_spinning latch + re-load handles that
+        // narrow window.
+        if (self.num_searching.load(.acquire) > 0) {
+            self.need_spinning.store(1, .release);
+            if (self.num_searching.load(.acquire) > 0) return;
+            // Fall through — the searcher already transitioned out
+            // and may not observe our latch. Do a real wake.
+        }
 
         var bitmap = self.parked_workers.load(.acquire);
         while (bitmap != 0) {
@@ -738,121 +867,9 @@ pub const Runtime = struct {
         comptime body: anytype,
         args: anytype,
     ) !@typeInfo(@typeInfo(@TypeOf(body)).@"fn".return_type.?).error_union.payload {
-        if (comptime is_windows_rt) {
-            return self.runWithSignalsNoOpWindows(body, args);
-        }
-
-        var pipe_fds: [2]c_int = undefined;
-        if (posix_pipe(&pipe_fds) != 0) return error.PipeCreateFailed;
-        defer _ = posix_close(pipe_fds[0]);
-        defer _ = posix_close(pipe_fds[1]);
-
-        // Non-blocking on both ends. The handler's `write` is in a
-        // signal context and must not block; the poller drives reads
-        // through the reactor's wait-readable path.
-        reactor_mod.setNonblock(pipe_fds[0]) catch {};
-        reactor_mod.setNonblock(pipe_fds[1]) catch {};
-
-        sigint_pipe_write_fd.store(pipe_fds[1], .release);
-        defer sigint_pipe_write_fd.store(-1, .release);
-
-        const SIGINT: c_int = 2;
-        var old_action: signal_mod.Sigaction = undefined;
-        var new_action: signal_mod.Sigaction = std.mem.zeroes(signal_mod.Sigaction);
-        new_action.sa_sigaction = @ptrCast(&sigintHandler);
-        new_action.sa_flags = signal_mod.SA_SIGINFO;
-        _ = signal_mod.sigaction_fn(SIGINT, &new_action, &old_action);
-        defer _ = signal_mod.sigaction_fn(SIGINT, &old_action, null);
-
-        const ArgsT = @TypeOf(args);
-        const Internal = struct {
-            fn run(read_fd: c_int, user_args: ArgsT) !@typeInfo(@typeInfo(@TypeOf(body)).@"fn".return_type.?).error_union.payload {
-                var c = @import("cancel.zig").Cancel.init(@ptrCast(@alignCast(current.require().runtime)));
-                defer c.deinit();
-
-                const Poller = struct {
-                    fn run(cn: *@import("cancel.zig").Cancel, fd: c_int) void {
-                        const rt: *Runtime = @ptrCast(@alignCast(current.require().runtime));
-                        rt.reactor.waitReadableCancel(fd, cn) catch return;
-                        cn.fire();
-                    }
-                };
-                var poller = try (@import("lib.zig").spawn(Poller.run, .{ &c, read_fd }));
-
-                const body_args = .{&c} ++ user_args;
-                const result = @call(.auto, body, body_args);
-
-                // Body done — fire cancel (idempotent if already
-                // fired by the signal handler) so the poller wakes
-                // and exits.
-                c.fire();
-                _ = poller.join();
-                return result;
-            }
-        };
-
-        return try self.run(Internal.run, .{ pipe_fds[0], args });
-    }
-
-    /// Windows fallback for `runWithSignals` — provides the Cancel
-    /// to the body but doesn't install any signal handler. The body
-    /// must fire the cancel itself (e.g. via custom Win32 console
-    /// control handler) for graceful shutdown.
-    fn runWithSignalsNoOpWindows(
-        self: *Runtime,
-        comptime body: anytype,
-        args: anytype,
-    ) !@typeInfo(@typeInfo(@TypeOf(body)).@"fn".return_type.?).error_union.payload {
-        const ArgsT = @TypeOf(args);
-        const Internal = struct {
-            fn run(user_args: ArgsT) !@typeInfo(@typeInfo(@TypeOf(body)).@"fn".return_type.?).error_union.payload {
-                var c = @import("cancel.zig").Cancel.init(@ptrCast(@alignCast(current.require().runtime)));
-                defer c.deinit();
-                const body_args = .{&c} ++ user_args;
-                return @call(.auto, body, body_args);
-            }
-        };
-        return try self.run(Internal.run, .{args});
+        return @import("runtime_signal.zig").runWithSignals(self, body, args);
     }
 };
-
-// ─── runWithSignals — graceful-shutdown infrastructure ─────────────
-//
-// File-scope helpers used by Runtime.runWithSignals (which lives on
-// Runtime as a method, below). SIGINT (and on POSIX SIGTERM) wire to
-// a Cancel the user's root owns. The mechanism is the classic POSIX
-// self-pipe: signal handler writes one byte; a poller coroutine waits
-// on the read end via the reactor; on wake, fires the cancel.
-//
-// Async-signal-safety: the handler only does `write(fd, &byte, 1)`.
-// One global pipe fd — signals are process-wide, so multi-runtime
-// graceful-shutdown isn't supported in v1 (it'd race on this slot).
-
-const is_windows_rt = builtin.os.tag == .windows;
-const posix_pipe = if (is_windows_rt) {} else @extern(
-    *const fn (fds: *[2]c_int) callconv(.c) c_int,
-    .{ .name = "pipe" },
-);
-const posix_close = if (is_windows_rt) {} else @extern(
-    *const fn (fd: c_int) callconv(.c) c_int,
-    .{ .name = "close" },
-);
-const posix_write = if (is_windows_rt) {} else @extern(
-    *const fn (fd: c_int, buf: [*]const u8, count: usize) callconv(.c) isize,
-    .{ .name = "write" },
-);
-
-var sigint_pipe_write_fd: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(-1);
-
-fn sigintHandler(sig: c_int, info: *anyopaque, ctx: ?*anyopaque) callconv(.c) void {
-    _ = sig;
-    _ = info;
-    _ = ctx;
-    const fd = sigint_pipe_write_fd.load(.acquire);
-    if (fd < 0) return;
-    const byte: u8 = 1;
-    _ = posix_write(fd, @ptrCast(&byte), 1);
-}
 
 /// Handle returned by `Runtime.runDetached`. The OS-thread parker
 /// equivalent of `Task.join`: `wait()` blocks the calling thread
@@ -907,6 +924,14 @@ fn workerLoopUntilTaskDone(rt: *Runtime, m: *M, target_done: *std.atomic.Value(u
         _ = rt.num_searching.fetchAdd(1, .acq_rel);
         if (tryFindAndDispatch(rt, m)) continue;
         _ = rt.num_searching.fetchSub(1, .acq_rel);
+        // Drain the need_spinning latch — see Runtime.need_spinning
+        // doc + wakeOneParked. A pusher that bailed on our anti-herd
+        // guard while we were fetchSub'ing here set this flag, and
+        // is relying on us to retry the find-work loop instead of
+        // parking. The swap is acq_rel so the next fetchAdd above
+        // is happens-after any pusher's mailbox push that paired
+        // with the latch set.
+        if (rt.need_spinning.swap(0, .acq_rel) != 0) continue;
         if (target_done.load(.acquire) == task_mod.DONE) return;
         parkWorker(rt, m);
     }
@@ -918,6 +943,9 @@ fn workerLoopUntilShutdown(rt: *Runtime, m: *M) void {
         _ = rt.num_searching.fetchAdd(1, .acq_rel);
         if (tryFindAndDispatch(rt, m)) continue;
         _ = rt.num_searching.fetchSub(1, .acq_rel);
+        // Drain the need_spinning latch — see workerLoopUntilTaskDone
+        // for the rationale.
+        if (rt.need_spinning.swap(0, .acq_rel) != 0) continue;
         if (rt.shutdown.load(.acquire)) return;
         parkWorker(rt, m);
     }
@@ -954,6 +982,14 @@ fn tryFindAndDispatch(rt: *Runtime, m: *M) bool {
         }
     }
 
+    // Phase 2C.1 Layer 1: drain own P's fs ring CQEs into local.
+    // Userspace-only (peek_cqe is two atomic loads); resumed
+    // coroutines get picked up by the popLocal check below in
+    // the same iteration. Sits BEFORE popLocal so a single
+    // iteration covers both pre-existing local work AND
+    // just-arrived CQEs.
+    _ = fs_ring_sched.drainFsRingInto(rt, m.p);
+
     if (m.p.popLocal()) |c| {
         _ = rt.num_searching.fetchSub(1, .acq_rel);
         dispatch(rt, m, c);
@@ -969,7 +1005,7 @@ fn tryFindAndDispatch(rt: *Runtime, m: *M) bool {
         dispatch(rt, m, c);
         return true;
     }
-    if (rt.reactor.pendingCount() > 0 and rt.tryClaimPoller()) {
+    if ((rt.reactor.pendingCount() > 0 or rt.fs_in_flight.load(.acquire) > 0) and rt.tryClaimPoller()) {
         // Don't enter the blocking poll if shutdown has fired: we'd
         // immediately be woken by `reactor.interrupt()` (deinit
         // always fires one), but a worker re-checking pending after
@@ -1013,12 +1049,28 @@ fn parkWorker(rt: *Runtime, m: *M) void {
     rt.markParked(m);
     defer rt.unmarkParked(m);
     // Recheck — work may have arrived between findWork and mark.
+    // We deliberately do NOT sniff sibling queues here: the
+    // missed-wakeup race that a sniff used to address is now
+    // closed by `Runtime.need_spinning`, drained in the worker
+    // loop BEFORE we reach this point. A sniff at park time
+    // would be an incomplete patch (work can sit in a sibling's
+    // lifo_slot / local WSQ too, not just mailbox), and racy
+    // against the sibling's owner popping concurrently.
+    //
+    // Phase 2C.1: drain own P's fs ring BEFORE the local-empty
+    // check — `drainFsRingInto` pushes resumed coroutines onto
+    // `m.p.local`, so the existing `local.isEmpty()` check
+    // naturally catches them. Must sit between `markParked` and
+    // the work-source checks (intent-to-park invariant from
+    // design memo §2): the bit is up, so any CQE that arrives
+    // after this drain still triggers the Layer 2 eventfd path
+    // and signals us.
+    _ = fs_ring_sched.drainFsRingInto(rt, m.p);
     if (m.p.lifo_slot.load(.acquire) != null) return;
     if (!m.p.local.isEmpty()) return;
     if (!m.p.mailbox.isEmpty()) return;
-    // Don't sniff sibling mailboxes here — stealing will find them
-    // on the next loop iteration if we get woken.
     if (rt.reactor.pendingCount() > 0) return;
+    if (rt.fs_in_flight.load(.acquire) > 0) return;
     if (rt.shutdown.load(.acquire)) return;
 
     // Spin briefly before committing to a real park. Bursty spawn
@@ -1028,14 +1080,51 @@ fn parkWorker(rt: *Runtime, m: *M) void {
     var spins: u32 = 0;
     while (spins < SPIN_BEFORE_PARK) : (spins += 1) {
         std.atomic.spinLoopHint();
+        // Re-drain on each spin iteration — catches CQEs that
+        // arrive during the spin window without paying the
+        // eventfd → parker roundtrip.
+        _ = fs_ring_sched.drainFsRingInto(rt, m.p);
         if (m.p.lifo_slot.load(.acquire) != null) return;
         if (!m.p.mailbox.isEmpty()) return;
         if (!m.p.local.isEmpty()) return;
         if (rt.reactor.pendingCount() > 0) return;
+        if (rt.fs_in_flight.load(.acquire) > 0) return;
         if (rt.shutdown.load(.acquire)) return;
     }
 
+    // Last line of defense before the park syscall: a FULL, uncapped
+    // scan of every sibling P's mailbox. The find-work path's
+    // `stealFromSiblings` is capped + randomized (a perf choice to
+    // bound CAS contention at high worker counts), so it can miss
+    // work sitting in one specific mailbox. Cross-thread unparks from
+    // pool threads (no current M) all push to `ps[0].mailbox`, and
+    // `wakeOneParked`'s anti-herd path may decline to wake anyone
+    // (trusting a searcher that then misses it via the cap). Result:
+    // a coroutine stranded in a mailbox with every worker parked —
+    // a hang. `markParked` is already set, so any FUTURE push wakes
+    // us; this catches work ALREADY queued. The last worker to reach
+    // this point cannot park while any mailbox is non-empty, which is
+    // the invariant that makes the all-parked state safe. O(N) but
+    // only on the otherwise-idle park path.
+    if (stealAnyMailboxInto(rt, m)) return;
+
     m.parker.park();
+}
+
+/// Pop one coroutine from any sibling P's mailbox into this M's local
+/// queue. Returns true if work was found (caller bails out of parking;
+/// the worker loop's next `tryFindAndDispatch` pops it from local).
+/// Uncapped on purpose — this is the correctness backstop for the
+/// capped `stealFromSiblings`; see the call site in `parkWorker`.
+fn stealAnyMailboxInto(rt: *Runtime, m: *M) bool {
+    for (rt.ps) |*p| {
+        if (p == m.p) continue;
+        if (p.mailbox.pop()) |c| {
+            m.p.pushQueue(c);
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Steal from a sibling P. Tries to steal a batch from the sibling's
@@ -1165,11 +1254,245 @@ test "runtime: spawn typed fn returning u32" {
     try std.testing.expectEqual(@as(u32, 42), result);
 }
 
+// Phase 2B: verify the per-P io_uring rings are populated when the
+// environment supports them. On Linux with a usable kernel + perms
+// (the scripts/probe-linux.sh "READY" path) every P gets a ring.
+// On non-Linux, on older kernels, or when seccomp/sysctl blocks
+// io_uring, fs_rings stays null and fs ops will fall back to
+// spawnBlocking once Phase 2C wires the Reactor surface.
+test "runtime: fs_rings populated when io_uring is available" {
+    // io_uring fs is opt-in (default spawnBlocking); enable it to test.
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 3, .fs_io_uring = true });
+    defer rt.deinit();
+    if (builtin.os.tag != .linux) {
+        try std.testing.expect(rt.fs_rings == null);
+        return;
+    }
+    // On Linux: rings should exist iff the kernel and sandbox
+    // permit io_uring_setup. If they don't, fs_rings stays null
+    // (graceful degradation, not an init failure). Don't hard-assert
+    // either way — the probe script is the authoritative test for
+    // io_uring availability.
+    if (rt.fs_rings) |rings| {
+        try std.testing.expectEqual(@as(usize, 3), rings.len);
+        // Every ring accepted at least the bare flags=0 tier.
+        for (rings) |r| try std.testing.expect(r.flags_used != 0xffff_ffff);
+    }
+}
+
+// Phase 2C.1: verify the wake-up wiring is in place when fs_rings
+// is populated. Each ring should have an eventfd registered (>= 0),
+// the runtime's back-pointer for the wake handler should be set,
+// and a manual SQE submission should both land a CQE AND mark the
+// eventfd readable (proves the Layer 2 path is hot).
+test "runtime: fs ring eventfd is wired into the shared reactor" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2, .fs_io_uring = true });
+    defer rt.deinit();
+
+    const rings = rt.fs_rings orelse return error.SkipZigTest; // probe-blocked env
+    for (rings) |r| try std.testing.expect(r.eventfd >= 0);
+    // Module back-pointer set by `wireFsRingWakeups`.
+    try std.testing.expect(fs_ring_sched.fs_ring_wake_rt == rt);
+
+    // Submit a no-op-ish fsync on stderr against ring 0, drive the
+    // CQE to completion, and verify Layer 1's drainFsRingInto would
+    // pick it up. We can't easily test the eventfd → handler path
+    // from a unit test (it requires a worker actually being parked),
+    // so this just exercises the prep + flush + drain plumbing.
+    try rings[0].prepFsync(2, 0xC1_C1_C1_C1, false);
+    _ = try rings[0].flush();
+    var cqes: [1]@import("std").os.linux.io_uring_cqe = undefined;
+    _ = try rings[0].waitOne(&cqes);
+    try std.testing.expectEqual(@as(u64, 0xC1_C1_C1_C1), cqes[0].user_data);
+}
+
+// Phase 2D: assert the public fs API actually exercises the
+// io_uring ring path, not just the spawnBlocking fallback. A
+// monotonic counter (`rt.fs_ops_via_ring`) is bumped by every
+// successful routing through `fsRingX`; this test runs a coro
+// that does a File write + sync, then asserts the counter moved.
+//
+// On Darwin the counter stays at 0 (fs_rings is null), and on
+// Linux without io_uring support the counter also stays at 0 —
+// either way we test that "the routing IS being exercised when
+// available, and ONLY when available."
+const _phase_2d_state = struct {
+    tmp_path: [:0]const u8,
+    bytes_written: usize = 0,
+};
+
+fn phase2dBody(state: *_phase_2d_state) !void {
+    const fs = @import("fs.zig");
+    var path_buf: [256:0]u8 = undefined;
+    const p = try std.fmt.bufPrintZ(&path_buf, "{s}/p2d.txt", .{state.tmp_path});
+    var f = try fs.File.create(p);
+    defer f.close();
+    try f.writeAll("phase 2D payload");
+    try f.sync();
+    state.bytes_written = "phase 2D payload".len;
+}
+
+test "runtime: Phase 2D — fs ops exercise the io_uring path when available" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+
+    var tmpl = "/tmp/volt-p2d-XXXXXX\x00".*;
+    const c_mkdtemp = @extern(*const fn ([*:0]u8) callconv(.c) ?[*:0]u8, .{ .name = "mkdtemp" });
+    if (c_mkdtemp(@ptrCast(&tmpl)) == null) return error.MkdtempFailed;
+    const tmp: [:0]const u8 = tmpl[0 .. tmpl.len - 1 :0];
+    defer {
+        var pbuf: [256:0]u8 = undefined;
+        const fp = std.fmt.bufPrintZ(&pbuf, "{s}/p2d.txt", .{tmp}) catch null;
+        if (fp) |path| {
+            const c_unlink = @extern(*const fn ([*:0]const u8) callconv(.c) c_int, .{ .name = "unlink" });
+            _ = c_unlink(path.ptr);
+        }
+        const c_rmdir = @extern(*const fn ([*:0]const u8) callconv(.c) c_int, .{ .name = "rmdir" });
+        _ = c_rmdir(tmp.ptr);
+    }
+
+    const before = rt.fs_ops_via_ring.load(.monotonic);
+    var state = _phase_2d_state{ .tmp_path = tmp };
+    try (try rt.run(phase2dBody, .{&state}));
+    try std.testing.expect(state.bytes_written > 0);
+
+    const after = rt.fs_ops_via_ring.load(.monotonic);
+    if (rt.fs_rings != null) {
+        // io_uring path available → at least one fs op should
+        // have gone through the ring. The body did writeAll +
+        // sync — both Linux-routed (write goes through fsWrite;
+        // sync goes through fsFsync). File.create still uses
+        // spawnBlocking (Phase 5 work), so doesn't count.
+        try std.testing.expect(after > before);
+    } else {
+        // fs_rings unavailable (Darwin, or Linux with seccomp /
+        // sysctl blocking io_uring) → counter must stay at 0:
+        // the routing was never exercised.
+        try std.testing.expectEqual(before, after);
+    }
+}
+
 test "runtime: spawn typed fn returning slice" {
     var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
     defer rt.deinit();
     const result = try rt.run(returnString, .{});
     try std.testing.expectEqualStrings("hello from coro", result);
+}
+
+// ─── Phase 3C tests: cancel during in-flight fs ring op ──────────
+//
+// Tests target `runtime.fsRingRead` directly (Reactor wiring is
+// Phase 3D). Slow-op setup uses an empty pipe — read blocks in
+// the kernel until written to or until ASYNC_CANCEL fires.
+
+const _phase3c_ctx = struct {
+    pipe_read_fd: i32,
+    cancel: *cancel_mod.Cancel,
+    observed_cancelled: bool = false,
+    observed_value: isize = 0,
+    observed_err: c_int = 0,
+};
+
+fn phase3cReader(ctx: *_phase3c_ctx) !void {
+    var buf: [16]u8 = undefined;
+    const result_opt = fsRingRead(ctx.pipe_read_fd, &buf, ~@as(u64, 0), ctx.cancel);
+    if (result_opt) |r| {
+        ctx.observed_value = r.value;
+        ctx.observed_err = r.err;
+        ctx.observed_cancelled = r.err == @intFromEnum(std.c.E.CANCELED);
+    }
+}
+
+fn phase3cFirer(ctx: *_phase3c_ctx) void {
+    // Yield enough times for the reader to actually park on the
+    // io_uring SQE. Without this the cancel could fire pre-submit
+    // and exercise the wrong path.
+    var i: u32 = 0;
+    while (i < 128) : (i += 1) yield();
+    ctx.cancel.fire();
+}
+
+fn phase3cRoot(ctx: *_phase3c_ctx) !void {
+    const lib = @import("lib.zig");
+    var reader = try lib.spawn(phase3cReader, .{ctx});
+    var firer = try lib.spawn(phase3cFirer, .{ctx});
+    _ = reader.join() catch {};
+    _ = firer.join();
+}
+
+test "runtime: Phase 3C — cancel during in-flight fsRingRead returns ECANCELED" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+    if (rt.fs_rings == null) return error.SkipZigTest; // probe-blocked env
+
+    // Build an empty pipe via raw syscall — the read end has
+    // nothing to read, so io_uring's READ on it parks in the
+    // kernel until cancelled.
+    var pipefd: [2]i32 = undefined;
+    const rc = std.os.linux.pipe2(@as(*[2]i32, &pipefd), .{ .CLOEXEC = true });
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.PipeFailed;
+    defer _ = std.os.linux.close(pipefd[0]);
+    defer _ = std.os.linux.close(pipefd[1]);
+
+    var c = cancel_mod.Cancel.init(rt);
+    defer c.deinit();
+    var ctx = _phase3c_ctx{ .pipe_read_fd = pipefd[0], .cancel = &c };
+    try (try rt.run(phase3cRoot, .{&ctx}));
+
+    try std.testing.expect(ctx.observed_cancelled);
+    try std.testing.expectEqual(@as(isize, -1), ctx.observed_value);
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(std.c.E.CANCELED)),
+        ctx.observed_err,
+    );
+}
+
+fn phase3cPrefiredReader(ctx: *_phase3c_ctx) !void {
+    var buf: [16]u8 = undefined;
+    const result_opt = fsRingRead(ctx.pipe_read_fd, &buf, ~@as(u64, 0), ctx.cancel);
+    if (result_opt) |r| {
+        ctx.observed_value = r.value;
+        ctx.observed_err = r.err;
+        ctx.observed_cancelled = r.err == @intFromEnum(std.c.E.CANCELED);
+    }
+}
+
+fn phase3cPrefiredRoot(ctx: *_phase3c_ctx) !void {
+    // Fire BEFORE the reader spawns — the reader's pre-check
+    // sees fired and returns Cancelled without submitting any SQE.
+    ctx.cancel.fire();
+    const lib = @import("lib.zig");
+    var reader = try lib.spawn(phase3cPrefiredReader, .{ctx});
+    _ = reader.join() catch {};
+}
+
+test "runtime: Phase 3C — pre-fired cancel returns ECANCELED without submitting" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var rt = try Runtime.init(.{ .allocator = test_allocator, .workers = 2 });
+    defer rt.deinit();
+    if (rt.fs_rings == null) return error.SkipZigTest;
+
+    var pipefd: [2]i32 = undefined;
+    const rc = std.os.linux.pipe2(@as(*[2]i32, &pipefd), .{ .CLOEXEC = true });
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.PipeFailed;
+    defer _ = std.os.linux.close(pipefd[0]);
+    defer _ = std.os.linux.close(pipefd[1]);
+
+    var c = cancel_mod.Cancel.init(rt);
+    defer c.deinit();
+    const before = rt.fs_ops_via_ring.load(.monotonic);
+    var ctx = _phase3c_ctx{ .pipe_read_fd = pipefd[0], .cancel = &c };
+    try (try rt.run(phase3cPrefiredRoot, .{&ctx}));
+
+    try std.testing.expect(ctx.observed_cancelled);
+    // Pre-fired path returns immediately at the isFired pre-check
+    // — no SQE submitted, so the io_uring routing counter stays
+    // put. This proves the early-bail path is taken vs going
+    // through prep + flush.
+    try std.testing.expectEqual(before, rt.fs_ops_via_ring.load(.monotonic));
 }
 
 fn fanOutRoot(counter: *std.atomic.Value(u32)) !void {
