@@ -146,6 +146,7 @@ regressions.
 - `zig build bench-scaling` — single-driver curve (false-parallelism receipt)
 - `zig build bench-parallel-compute`
 - `zig build bench-tcp-echo`
+- `zig build bench-reactor-fanout` — high-fd-pressure oversubscribed TCP; guards the kqueue persistent-registration close-churn livelock (regressed silently once because tcp-echo's 64 clients stayed under the threshold)
 - `zig build bench-rss` — RSS per idle coroutine
 - `zig build stress` (3 runs)
 

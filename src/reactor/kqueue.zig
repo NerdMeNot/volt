@@ -95,6 +95,17 @@ pub const Reactor = struct {
     /// See `unregisterFd`'s wait spin.
     in_poll: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// Monotonic count of completed `poll()` dispatch cycles, bumped in
+    /// poll()'s defer. `unregisterFd` waits for this to advance (or for
+    /// `in_poll` to clear) before freeing a PollDesc — guaranteeing any
+    /// poll that already pulled the closing fd's event into its `events[]`
+    /// buffer has finished its dispatch loop. This replaces the old
+    /// spin-until-`in_poll`-false protocol, which livelocked: a lone
+    /// steady poller (all other workers parked) re-enters `kevent`
+    /// immediately, so the brief `in_poll == false` window between polls
+    /// was never observed by the spinning closer.
+    poll_completions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     pub fn init(allocator: std.mem.Allocator) !Reactor {
         _ = allocator; // no per-reactor allocation needed in the persistent-registration model
         const kq = std.c.kqueue();
@@ -212,8 +223,20 @@ pub const Reactor = struct {
         // returned to the caller yet), then spin until `in_poll`
         // clears. The dispatch loop is non-blocking; the spin is
         // typically a handful of cache-line bounces.
+        const seq0 = self.poll_completions.load(.acquire);
         self.interrupt();
-        while (self.in_poll.load(.acquire)) std.atomic.spinLoopHint();
+        // Wait until either no poll is in flight (in_poll == false ⟹ the
+        // last dispatch finished) OR a poll cycle has COMPLETED since we
+        // captured seq0 (poll_completions advanced ⟹ any poll that already
+        // had our event in its events[] buffer has finished dispatch). We
+        // must NOT rely on catching the brief in_poll==false window: a
+        // lone steady poller re-enters poll() between our interrupt() and
+        // our load, so the window is effectively unobservable. interrupt()
+        // forces the in-flight poll's kevent to return promptly so the
+        // counter advances without waiting for a real socket event.
+        while (self.in_poll.load(.acquire) and self.poll_completions.load(.acquire) == seq0) {
+            std.atomic.spinLoopHint();
+        }
     }
 
     /// Park the current coroutine until `fd` is ready in `mode`.
@@ -408,7 +431,12 @@ pub const Reactor = struct {
         // EVFILT_USER event (plus any events the kernel had queued
         // before our EV_DELETE flushed its pre-delivery list).
         self.in_poll.store(true, .release);
-        defer self.in_poll.store(false, .release);
+        defer {
+            // Bump the completion counter BEFORE clearing in_poll so a
+            // closer that observes in_poll==false also sees the bump.
+            _ = self.poll_completions.fetchAdd(1, .release);
+            self.in_poll.store(false, .release);
+        }
         const n = posix.system.kevent(self.kq, &.{}, 0, &events, KEV_BATCH, timeout_ptr);
         if (n <= 0) return 0;
         const count: usize = @intCast(n);

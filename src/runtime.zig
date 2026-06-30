@@ -1069,7 +1069,18 @@ fn parkWorker(rt: *Runtime, m: *M) void {
     if (m.p.lifo_slot.load(.acquire) != null) return;
     if (!m.p.local.isEmpty()) return;
     if (!m.p.mailbox.isEmpty()) return;
-    if (rt.reactor.pendingCount() > 0) return;
+    // NOTE: deliberately do NOT bail on `reactor.pendingCount() > 0`.
+    // In the persistent-registration reactor model, pendingCount tracks
+    // *registered fds* (≈ open sockets), not outstanding waits — so it
+    // stays high for the entire life of any I/O-bound workload. Bailing
+    // here made every non-poller worker busy-spin instead of parking,
+    // starving the single reactor poller into a livelock under high fd
+    // pressure (bench-reactor-fanout: 512 sockets → ~838% CPU, no
+    // progress). Idle non-poller workers MUST be allowed to park; the
+    // poller wakes them via unpark → wakeOneParked when readiness lands.
+    // The "someone always polls" invariant is upheld by the poller claim
+    // in tryFindAndDispatch — parkWorker is only reached when this worker
+    // is NOT the poller (another worker holds it) or there is no I/O.
     if (rt.fs_in_flight.load(.acquire) > 0) return;
     if (rt.shutdown.load(.acquire)) return;
 
@@ -1087,7 +1098,7 @@ fn parkWorker(rt: *Runtime, m: *M) void {
         if (m.p.lifo_slot.load(.acquire) != null) return;
         if (!m.p.mailbox.isEmpty()) return;
         if (!m.p.local.isEmpty()) return;
-        if (rt.reactor.pendingCount() > 0) return;
+        // See the pendingCount note above — same reasoning in the spin loop.
         if (rt.fs_in_flight.load(.acquire) > 0) return;
         if (rt.shutdown.load(.acquire)) return;
     }
