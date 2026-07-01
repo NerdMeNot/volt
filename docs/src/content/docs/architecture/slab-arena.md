@@ -26,7 +26,8 @@ slot"; pulling out is "release my slot to the free list". The lot
 itself was paved once. You don't pave a fresh slot every time a
 car arrives.
 
-The slot in Volt is a 256 KiB virtual reservation per coroutine.
+The slot in Volt is a 1 MiB virtual reservation per coroutine
+(`DEFAULT_RESERVATION_SIZE`, tunable via `Config.stack_reservation_size`).
 Only the top 16 KiB is committed-RW (PROT_READ|PROT_WRITE); the
 rest is PROT_NONE until needed. The bottom page is the guard —
 overflow there aborts the process. See
@@ -37,7 +38,7 @@ region grows on demand.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│           Arena.mapping_base ── ONE mmap (n_slots × 256 KiB)    │
+│           Arena.mapping_base ── ONE mmap (n_slots × 1 MiB)      │
 │                                                                 │
 │  ┌──────┐ ┌──────┐ ┌──────┐         ┌──────┐ ┌──────┐ ┌──────┐  │
 │  │ slot │ │ slot │ │ slot │   ...   │ slot │ │ slot │ │ slot │  │

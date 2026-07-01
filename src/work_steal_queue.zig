@@ -215,13 +215,33 @@ pub const WorkStealQueue = struct {
         }
 
         // Phase 2 — copy. First task returns to caller; rest go to dst.
-        const first_task = src.buffer[src_h.real & MASK].load(.acquire);
+        //
+        // The per-slot src loads and dst stores are `.monotonic`, not
+        // acquire/release — the barriers are already carried by the
+        // surrounding ops:
+        //   • src reads: the owner publishes a slot with
+        //     `buffer[idx].store(.release)` then `tail.store(.release)`
+        //     (see `push`). Our `src.tail.load(.acquire)` at the top of
+        //     this fn synchronizes-with that tail release, so every
+        //     slot store before the observed tail already
+        //     happens-before us. We only read slots in
+        //     `[real, real+to_steal) ⊆ [head, tail)`, so they are
+        //     visible without a per-slot acquire. The phase-1 claim CAS
+        //     (`.acq_rel`) additionally fences the range vs other
+        //     stealers.
+        //   • dst writes: these become observable to a future consumer
+        //     of dst only via the single `dst.tail.store(.release)`
+        //     below, which carries all preceding slot stores. A
+        //     per-slot release would be redundant.
+        // On arm64 this lowers LDA/STL → plain LDR/STR per stolen item.
+        // (See memory-model.md, work-stealing-queue section.)
+        const first_task = src.buffer[src_h.real & MASK].load(.monotonic);
         var i: u32 = 1;
         while (i < to_steal) : (i += 1) {
             const src_idx = (src_h.real +% i) & MASK;
             const dst_idx = (dst_tail +% (i - 1)) & MASK;
-            const task = src.buffer[src_idx].load(.acquire);
-            dst.buffer[dst_idx].store(task, .release);
+            const task = src.buffer[src_idx].load(.monotonic);
+            dst.buffer[dst_idx].store(task, .monotonic);
         }
         if (to_steal > 1) {
             dst.tail.store(dst_tail +% (to_steal - 1), .release);
