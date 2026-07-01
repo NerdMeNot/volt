@@ -208,7 +208,13 @@ pub const PollDesc = struct {
         const gpp = self.slot(mode);
         const new_state: usize = if (ioready) PD_READY else PD_NIL;
         while (true) {
-            const old = gpp.load(.acquire);
+            // seq_cst: the "load slot" half of the evict/wait Dekker.
+            // Pairs with `wait`'s seq_cst PD_WAIT commit + evict's seq_cst
+            // `publishInfo` so a close (evict) can't read a stale empty
+            // slot and skip waking a waiter that has already committed
+            // PD_WAIT and parked. Stronger than the ioready (deliverReady)
+            // path strictly needs, but keeps a single wake-source path.
+            const old = gpp.load(.seq_cst);
             // Already delivered — no-op.
             if (old == PD_READY) return null;
             // For non-ioready (close/cancel), don't store PD_READY
@@ -348,7 +354,16 @@ pub const PollDesc = struct {
             if (gpp.cmpxchgWeak(PD_READY, PD_NIL, .acq_rel, .acquire) == null) {
                 return .ready;
             }
-            if (gpp.cmpxchgWeak(PD_NIL, PD_WAIT, .acq_rel, .acquire) == null) {
+            // seq_cst on success: this commit of PD_WAIT is the "store
+            // slot" half of the evict/wait Dekker. It must be globally
+            // ordered before step 2's seq_cst `isClosing` load — paired
+            // with evict's seq_cst `publishInfo` (store closing) + seq_cst
+            // slot load in `unblock` — so the two threads can't both-miss
+            // on weak memory (arm64): a waiter that commits PD_WAIT and a
+            // concurrent evict are guaranteed that at least one observes
+            // the other. acq_rel alone left an SB hole that stranded the
+            // waiter (parked, never woken) ~5% of the time under load.
+            if (gpp.cmpxchgWeak(PD_NIL, PD_WAIT, .seq_cst, .acquire) == null) {
                 break;
             }
             const v = gpp.load(.acquire);
