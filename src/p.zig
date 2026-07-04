@@ -13,7 +13,8 @@
 //! - `mailbox` — MPMC Treiber stack. Receives cross-P pushes and
 //!   local-queue overflow. Owner P pops in dispatch; sibling Ps can
 //!   pop during stealing.
-//! - `dispatch_count` — fairness counter (see `runtime.zig`).
+//! - `fairness_countdown` — periodic mailbox-fairness down-counter
+//!   (see `tryFindAndDispatch` in `runtime.zig`).
 //! - `coro_pool` — owner-only LIFO free list for recycled Coroutine
 //!   structs. Capped at `POOL_CAP`; overflow goes back to the
 //!   allocator.
@@ -53,6 +54,14 @@ pub const POOL_CAP: u16 = 64;
 /// rebalance concern so the cap value is immaterial.
 pub const TEST_STACK_POOL_CAP: u32 = std.math.maxInt(u32);
 
+/// Every Nth dispatch, `tryFindAndDispatch` checks this P's mailbox
+/// before its local queue, so a tight local-fed yield loop can't
+/// starve coroutines unparked into the mailbox. 61 is prime (mirrors
+/// Go's `schedule.checkGlobalRunq`) — chosen so the check doesn't
+/// phase-lock with any power-of-two queue/batch size. Consumed via a
+/// down-counter (`P.fairness_countdown`), not a modulo.
+pub const INJECTION_CHECK_INTERVAL: u32 = 61;
+
 pub const P = struct {
     id: usize,
     runtime: *anyopaque, // *Runtime; opaque to avoid cycle
@@ -65,11 +74,17 @@ pub const P = struct {
     /// Per-P MPMC mailbox. Cross-P pushes target a specific P's
     /// mailbox instead of one shared global queue, partitioning the
     /// cache-line contention. Padded so the owner's adjacent
-    /// owner-only fields (dispatch_count, rng, coro_pool) don't
+    /// owner-only fields (fairness_countdown, rng, coro_pool) don't
     /// share a line with the cross-P-written head pointer.
     mailbox: Mailbox align(std.atomic.cache_line) = .{},
-    /// Per-dispatch counter for periodic mailbox/injection fairness.
-    dispatch_count: u32 = 0,
+    /// Per-dispatch down-counter for periodic mailbox/injection
+    /// fairness. Reloads to `INJECTION_CHECK_INTERVAL - 1` each time it
+    /// hits 0; the fairness check fires on the reload. A down-counter
+    /// (decrement + compare-to-zero) avoids the `udiv`/`msub` that a
+    /// `% 61` (prime, no strength-reduction) would emit on every
+    /// dispatch. Initialised so the first check fires on the 61st
+    /// dispatch, matching the old `count % 61 == 0` schedule.
+    fairness_countdown: u32 = INJECTION_CHECK_INTERVAL - 1,
     rng: std.Random.DefaultPrng,
     /// Owner-only LIFO free list of recycled `Coroutine` structs.
     /// Threaded through `Coroutine.next` (unused while a coro is

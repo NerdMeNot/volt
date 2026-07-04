@@ -961,25 +961,26 @@ fn workerLoopUntilShutdown(rt: *Runtime, m: *M) void {
 /// we fetchSub *before* the ctx swap so other pushers correctly see
 /// that we're no longer searching. (A worker mid-dispatch can't
 /// pick up new work; it must not count as searching.)
-/// Every Nth dispatch, check the injection queue BEFORE the local
-/// queue. Without this, a worker whose local queue is repeatedly
-/// fed (e.g. a tight yield loop) never observes coroutines that
-/// get unparked into the injection queue — the local-first
-/// priority starves them. Mirrors Go's `schedule.checkGlobalRunq`.
-const INJECTION_CHECK_INTERVAL: u32 = 61;
-
 fn tryFindAndDispatch(rt: *Runtime, m: *M) bool {
-    m.p.dispatch_count +%= 1;
-
-    // Periodic fairness: check own mailbox before local. Prevents
-    // starvation when local is fed by tight yield loops.
-    if (m.p.dispatch_count % INJECTION_CHECK_INTERVAL == 0) {
+    // Periodic fairness: every `INJECTION_CHECK_INTERVAL`th dispatch,
+    // check this P's mailbox BEFORE its local queue. Without this, a
+    // worker whose local queue is repeatedly fed (e.g. a tight yield
+    // loop) never observes coroutines unparked into the mailbox — the
+    // local-first priority starves them. Mirrors Go's
+    // `schedule.checkGlobalRunq`. Driven by a reload-on-zero
+    // down-counter rather than `count % 61` so the hottest loop in the
+    // scheduler doesn't emit a `udiv`/`msub` every dispatch (61 is
+    // prime — no power-of-two strength reduction).
+    if (m.p.fairness_countdown == 0) {
+        m.p.fairness_countdown = p_mod.INJECTION_CHECK_INTERVAL - 1;
         if (m.p.popMailbox()) |c| {
             _ = m.p.stat_fairness_hits.fetchAdd(1, .monotonic);
             _ = rt.num_searching.fetchSub(1, .acq_rel);
             dispatch(rt, m, c);
             return true;
         }
+    } else {
+        m.p.fairness_countdown -= 1;
     }
 
     // Phase 2C.1 Layer 1: drain own P's fs ring CQEs into local.

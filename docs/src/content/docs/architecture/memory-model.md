@@ -275,8 +275,21 @@ Efficient Work-Stealing for Weak Memory Models"* (PPoPP'13). Summary:
   "actually advanced" so producers refuse to overflow into a
   stealing region.
 * `buffer[idx]`: atomic slots. Producer writes with `.release`
-  before advancing tail. Consumer/stealer reads with `.acquire`
-  after observing tail/head.
+  before advancing tail; the owner `pop` reads with `.acquire`
+  after observing head.
+  * **Stealer bulk copy is `.monotonic`, not acquire/release.** In
+    `stealInto`, the per-slot src loads and dst stores use
+    `.monotonic` because the fences are carried by surrounding ops,
+    not the per-slot access: the stealer's `src.tail.load(.acquire)`
+    synchronizes-with the producer's `tail.store(.release)`, so every
+    slot store below the observed tail already happens-before the
+    copy (and the stealer only touches slots in
+    `[real, real+to_steal) ⊆ [head, tail)`); the phase-1 claim CAS
+    (`.acq_rel`) fences the claimed range against rival stealers; and
+    the copied-in dst slots are published to any dst consumer solely
+    by the trailing `dst.tail.store(.release)`. Per-slot
+    acquire/release would be redundant. On arm64 this is LDR/STR
+    instead of LDA/STL per stolen item.
 * Fixed capacity → no `grow()` → no realloc race. Overflow on push
   spills half to `InjectionQueue` (Tokio strategy).
 
