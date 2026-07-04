@@ -4,8 +4,16 @@
 //! peak RSS, then unblocks them all. Reports RSS-per-idle-coro.
 //!
 //! This is the **headline Zig-native metric**: how cheap is an idle
-//! coroutine? Lower is better; Phase 4 stack-grow work should drive it
-//! down (4× on Linux when initial-commit is 1 page = 4 KiB).
+//! coroutine? Lower is better. The idle floor is one *touched* stack
+//! page plus the Coroutine/Frame/Task overhead — it is NOT driven by
+//! `stack.BODY_SIZE`. `mprotect(RW)` only makes pages accessible, not
+//! resident; Linux demand-pages, so RSS reflects pages actually touched
+//! (an idle waiter touches ~1). Measured byte-for-byte identical at
+//! BODY_SIZE 16 KiB vs 4 KiB on Linux (4 KiB pages) — 4.8 KiB/coro
+//! either way. Darwin reports 16.6 KiB/coro purely because its page
+//! size *is* 16 KiB (a single touch faults a whole page). So shrinking
+//! the initial commit reclaims no idle RSS (it only risks earlier
+//! grow-faults); the win, if any, is in `Coroutine`/allocation size.
 //!
 //! macOS note: `ru_maxrss` is reported in bytes; Linux reports in
 //! kilobytes. This bench normalizes to bytes.
